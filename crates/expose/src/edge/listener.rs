@@ -355,7 +355,7 @@ fn extract_host(buf: &[u8]) -> HostParseResult {
 /// the first byte after the header terminator, i.e. the header region is
 /// `&buf[..pos]` (excluding the terminator itself). Both orders are scanned
 /// byte-wise in a single O(n) pass.
-fn find_headers_end(buf: &[u8]) -> Option<usize> {
+const fn find_headers_end(buf: &[u8]) -> Option<usize> {
     let mut i = 0;
     let n = buf.len();
     while i + 1 < n {

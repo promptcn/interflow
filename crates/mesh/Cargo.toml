@@ -78,7 +78,7 @@ chrono = "0.4"
 # Shared test/bench harness (dev-dependency cycle: testkit depends on mesh, officially
 # supported by cargo, same pattern as tokio/tokio-test; testkit stays out of the
 # production dependency graph)
-interflow-testkit = { path = "../testkit" }
+interflow-testkit = { path = "../testkit", version = "0.1" }
 # bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion
 # when creating streams at high frequency)
 libc = "0.2"
