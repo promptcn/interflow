@@ -37,11 +37,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install zig (Linux musl cross-link)
+      - name: Install NASM (aws-lc-sys asm on msvc)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          choco install nasm -y
+          echo "C:/Program Files/NASM" >> $GITHUB_PATH
+      - name: Install zig + cargo-zigbuild (Linux musl cross-link)
         if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y zig
+          # zig is not in Ubuntu's apt repos; the ziglang PyPI wheel is the
+          # cargo-zigbuild-documented CI install (ships a `zig` entry point).
+          pip3 install ziglang
           cargo install --locked cargo-zigbuild
       - name: Build (Linux musl via zigbuild)
         if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
@@ -57,7 +64,7 @@ jobs:
           cp target/${{ matrix.target }}/release/interflow-mesh target/${{ matrix.target }}/release/interflow-expose $staging/
           cp README.md LICENSE* $staging/
           tar czf $staging.tar.gz $staging
-          sha256sum $staging.tar.gz > $staging.tar.gz.sha256
+          shasum -a 256 $staging.tar.gz > $staging.tar.gz.sha256
       - name: Stage artifacts (Windows)
         if: matrix.archive == 'zip'
         shell: bash
@@ -67,7 +74,7 @@ jobs:
           cp target/${{ matrix.target }}/release/interflow-mesh.exe target/${{ matrix.target }}/release/interflow-expose.exe $staging/
           cp README.md LICENSE* $staging/
           (cd $staging && zip -r ../$staging.zip .)
-          sha256sum $staging.zip > $staging.zip.sha256
+          shasum -a 256 $staging.zip > $staging.zip.sha256
       - name: Upload artifacts
         uses: softprops/action-gh-release@v2
         with:
@@ -137,7 +144,7 @@ jobs:
         run: |
           cd "target/${{ matrix.target }}/release/bundle"
           find . -type f \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' -o -name '*.msi' \) \
-            -exec sh -c 'sha256sum "$1" > "$1.sha256"' _ {} \;
+            -exec sh -c 'shasum -a 256 "$1" > "$1.sha256"' _ {} \;
       - name: Upload artifacts
         uses: softprops/action-gh-release@v2
         with:
