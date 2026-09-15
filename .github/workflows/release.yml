@@ -69,15 +69,15 @@ jobs:
           shasum -a 256 $staging.tar.gz > $staging.tar.gz.sha256
       - name: Stage artifacts (Windows)
         if: matrix.archive == 'zip'
-        shell: bash
+        # Pure PowerShell: Git Bash carries neither `zip` nor `shasum`, so the
+        # staging uses native Compress-Archive / Get-FileHash instead.
+        shell: pwsh
         run: |
-          staging=interflow-${{ github.ref_name }}-${{ matrix.target }}
-          mkdir -p $staging
-          cp target/${{ matrix.target }}/release/interflow-mesh.exe target/${{ matrix.target }}/release/interflow-expose.exe $staging/
-          cp README.md LICENSE* $staging/
-          # Git Bash has no `zip`; 7-Zip is preinstalled on windows runners.
-          (cd $staging && 7z a "../$staging.zip" .)
-          shasum -a 256 $staging.zip > $staging.zip.sha256
+          $staging = "interflow-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/interflow-mesh.exe, target/${{ matrix.target }}/release/interflow-expose.exe, README.md, LICENSE $staging
+          Compress-Archive $staging "$staging.zip"
+          "$((Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower())  $staging.zip" | Out-File "$staging.zip.sha256" -Encoding ascii
       - name: Upload artifacts
         uses: softprops/action-gh-release@v2
         with:
