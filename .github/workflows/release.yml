@@ -75,7 +75,8 @@ jobs:
           mkdir -p $staging
           cp target/${{ matrix.target }}/release/interflow-mesh.exe target/${{ matrix.target }}/release/interflow-expose.exe $staging/
           cp README.md LICENSE* $staging/
-          (cd $staging && zip -r ../$staging.zip .)
+          # Git Bash has no `zip`; 7-Zip is preinstalled on windows runners.
+          (cd $staging && 7z a "../$staging.zip" .)
           shasum -a 256 $staging.zip > $staging.zip.sha256
       - name: Upload artifacts
         uses: softprops/action-gh-release@v2
@@ -117,6 +118,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (aws-lc-sys asm, msvc)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install nasm -y
+          echo "C:/Program Files/NASM" >> $GITHUB_PATH
       - name: Install GUI system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
