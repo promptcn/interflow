@@ -77,7 +77,8 @@ jobs:
           New-Item -ItemType Directory -Force $staging | Out-Null
           Copy-Item target/${{ matrix.target }}/release/interflow-mesh.exe, target/${{ matrix.target }}/release/interflow-expose.exe, README.md, LICENSE $staging
           Compress-Archive $staging "$staging.zip"
-          "$((Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower())  $staging.zip" | Out-File "$staging.zip.sha256" -Encoding ascii
+          $hash = (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$PWD/$staging.zip.sha256", "$hash  $staging.zip`n")
       - name: Upload artifacts
         uses: softprops/action-gh-release@v2
         with:
@@ -150,12 +151,26 @@ jobs:
       - name: Build GUI bundle (tauri)
         shell: bash
         run: npm run tauri build -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
-      - name: Checksums
+      # Sidecars carry the bare filename so `shasum -c` works next to a
+      # downloaded asset, with LF endings so GNU sha256sum accepts them. Git
+      # Bash's shasum produced empty files (upload rejected: size >= 1), hence
+      # the platform split.
+      - name: Checksums (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           cd "target/${{ matrix.target }}/release/bundle"
-          find . -type f \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' -o -name '*.msi' \) \
-            -exec sh -c 'shasum -a 256 "$1" > "$1.sha256"' _ {} \;
+          find . -type f \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' -o -name '*.msi' \) | while IFS= read -r f; do
+            shasum -a 256 "$f" | sed 's|  \./[^ ]*/|  |' > "$f.sha256"
+          done
+      - name: Checksums (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem "target/${{ matrix.target }}/release/bundle" -Recurse -File -Include *.dmg,*.AppImage,*.deb,*.exe,*.msi | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            [IO.File]::WriteAllText("$($_.FullName).sha256", "$hash  $($_.Name)`n")
+          }
       - name: Upload artifacts
         uses: softprops/action-gh-release@v2
         with:
