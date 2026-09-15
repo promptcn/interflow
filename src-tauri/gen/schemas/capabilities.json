@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Main window capabilities: core API + events + dialog + clipboard write","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-show","core:window:allow-hide","core:window:allow-set-focus","core:window:allow-minimize","core:event:default","dialog:default","clipboard-manager:allow-write-text"]}}

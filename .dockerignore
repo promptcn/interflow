@@ -1,0 +1,14 @@
+target/
+**/target/
+.git/
+.github/
+.bin/
+node_modules/
+*.log
+*.zip
+interflow-linux-*
+interflow-macos-*
+interflow-windows-*
+.DS_Store
+agent-*.log
+hub.log

@@ -1,0 +1,132 @@
+//! `/poll` handling: long-lived connection that streams `TunnelData` from hub → agent.
+
+use crate::hub::service::{HubService, text_response};
+use crate::hub::state::{HubResponseBody, RxStream};
+use http_body_util::{BodyExt, StreamBody};
+use hyper::body::Incoming;
+use hyper::{Request, Response, StatusCode};
+use interflow_core::error::{InterflowError, Result};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+impl HubService {
+    /// Handles a `/poll` long-polling request.
+    ///
+    /// Four cases:
+    /// 1. `rx` idle → take it and start streaming dispatch.
+    /// 2. Channel closed → rebuild in place and keep serving.
+    /// 3. `rx` held by another poll connection → return 409 Conflict.
+    /// 4. Agent unregistered → implicit re-registration (an evicted agent
+    ///    recovers on its very next poll).
+    pub(crate) async fn handle_poll(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Response<HubResponseBody>> {
+        let agent_id = req
+            .headers()
+            .get("x-agent-id")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| InterflowError::config("missing agent-id".to_string()))?;
+
+        // Identity binding check
+        {
+            let mut identity = self.connection_identity.write().await;
+            if let Some(existing_id) = &*identity {
+                if existing_id != agent_id {
+                    warn!(
+                        "identity mismatch: connection is bound to {}, but poll attempt is for {}",
+                        existing_id, agent_id
+                    );
+                    return Ok(text_response(StatusCode::FORBIDDEN, "Identity mismatch"));
+                }
+            } else {
+                *identity = Some(agent_id.to_string());
+                debug!("Connection bound to identity (poll): {}", agent_id);
+            }
+        }
+
+        // Take the AgentSession Arc (outer read lock is very short-lived)
+        let state_arc = {
+            let agents = self.agents.read().await;
+            agents.get(agent_id).cloned()
+        };
+
+        let state_arc = if let Some(a) = state_arc {
+            a
+        } else {
+            // Implicit re-registration: when an agent that was evicted (poll
+            // grace / heartbeat / send timeout) still holds a healthy
+            // connection, its next /poll restores registration right here,
+            // without waiting for a disconnect to trigger reconnect and
+            // re-registration (edge processes never re-register and rely on
+            // this self-healing path in particular).
+            // The identity binding check above already passed, so the
+            // authentication level is equivalent to /register.
+            self.implicit_re_register(agent_id).await
+        };
+
+        // Decide under the inner write lock: take the existing rx /
+        // rebuild the channel in place / return 409
+        let (rx, ctrl_rx, ctrl_backlog, generation, waker_slot) = {
+            let mut state = state_arc.write().await;
+            if let Some(rx) = state.rx.take() {
+                let ctrl_rx = state
+                    .ctrl_rx
+                    .take()
+                    .expect("ctrl_rx and rx share a lifetime (poll take/return are paired)");
+                let backlog = state.ctrl_backlog.clone();
+                (
+                    rx,
+                    ctrl_rx,
+                    backlog,
+                    state.generation,
+                    state.poll_waker.clone(),
+                )
+            } else if state.tx.is_closed() {
+                info!("Agent {} channel closed or lost, recreating", agent_id);
+                let (tx, rx) = mpsc::channel(256);
+                let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+                state.tx = tx;
+                state.ctrl_tx = ctrl_tx;
+                state.ctrl_backlog = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                state.generation += 1;
+                let generation = state.generation;
+                // Wake the old poll body: the generation has advanced, so it
+                // should end (it may still be hanging on the old channel)
+                state.wake_poll();
+                let backlog = state.ctrl_backlog.clone();
+                let waker_slot = state.poll_waker.clone();
+                // Heartbeats are served by the global supervision loop (see
+                // hub/heartbeat.rs); channel rebuilds no longer need (or have)
+                // a per-agent heartbeat task taking over
+                (rx, ctrl_rx, backlog, generation, waker_slot)
+            } else {
+                warn!(
+                    "Agent {} attempted poll but no channel available (in use)",
+                    agent_id
+                );
+                return Ok(text_response(StatusCode::CONFLICT, "Channel busy"));
+            }
+        };
+
+        let stream = RxStream::new(
+            rx,
+            ctrl_rx,
+            ctrl_backlog,
+            state_arc,
+            generation,
+            waker_slot,
+            self.handles(),
+            agent_id.to_string(),
+        );
+        let body = BodyExt::boxed(StreamBody::new(stream));
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .expect("status+body response is infallible");
+
+        info!("Agent {} entering streaming receive mode", agent_id);
+        Ok(response)
+    }
+}

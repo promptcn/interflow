@@ -1,0 +1,42 @@
+# Agent-1 configuration (v2)
+
+config_version = 2
+
+[agent]
+id = "agent-1"
+hub_url = "https://127.0.0.1:6666"
+# Reads an env var; falls back to the dev default (local development only)
+auth_token = "${INTERFLOW_AGENT_TOKEN:-dev-only-agent-token}"
+
+[tls]
+enabled = true
+ca_path = "certs/ca.crt"
+
+[control]
+enabled = true
+listen_addr = "127.0.0.1:9000"
+# Local token for the control API; required when enabled = true
+auth_token = "${INTERFLOW_AGENT1_CONTROL_TOKEN:-dev-only-control-token}"
+
+[logging]
+level = "info,interflow=debug"
+format = "plain"
+
+[[ingress]]
+name = "to-agent-2"
+listen_addr = "127.0.0.1:3001"
+target_agent = "agent-2"
+remote_addr = "192.168.1.158:3000"
+
+[[ingress]]
+name = "to-agent-2-dns"
+listen_addr = "127.0.0.1:3002"
+listen_protocol = "udp"
+target_agent = "agent-2"
+remote_addr = "192.168.1.158:53"
+# UDP tuning (optional): idle reclamation / anti-amplification rate limits
+# (0 = disables the corresponding item)
+idle_timeout_secs = 60
+udp_per_ip_pps = 50
+udp_per_ip_bytes_per_sec = 10240
+udp_egress_bytes_per_sec = 262144

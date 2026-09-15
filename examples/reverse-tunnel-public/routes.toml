@@ -1,0 +1,20 @@
+# Edge route table (runs on the public server)
+#
+# Public request Host header -> (agent_id, remote_addr)
+# - host: public domain (lowercase, no port; edge normalizes it)
+# - agent_id: the agent_id used by the LAN `interflow-expose expose` registration
+# - remote_addr: the target the LAN expose agent dials (where the local
+#   service actually listens)
+#
+# Schema: crates/expose/src/edge/host_router.rs (deny_unknown_fields)
+
+[[routes]]
+host = "asr.example.com"
+agent_id = "desktop"
+remote_addr = "127.0.0.1:8080"
+
+# Multiple domains can share one expose agent, or use separate agents
+[[routes]]
+host = "tts.example.com"
+agent_id = "desktop"
+remote_addr = "127.0.0.1:8000"

@@ -1,0 +1,48 @@
+.DS_Store
+
+# build artifacts
+/target
+**/target
+
+# frontend (Tauri GUI)
+node_modules/
+dist/
+
+# release binaries
+*.zip
+*.log
+*.exe
+interflow-*-linux-*
+interflow-*-macos-*
+interflow-*-windows-*
+
+# local secrets / runtime state
+*.token
+*.token.*
+
+# Certificates and keys never enter git (policy: 2026-09-15; history purged the
+# same day — any cert material is generated on demand via scripts/gen_certs.sh
+# and lives only on the machine that runs it)
+*.key
+*.key~
+*.crt
+*.crt~
+*.csr
+*.srl
+*.pem
+certs/
+
+# editor
+.idea/
+.vscode/
+.zcode/
+*.swp
+
+# local reference data (unrelated to build)
+/data/
+
+# Local reference pages (Rust API Guidelines / Design Patterns scrapes, unrelated to the build)
+docs/references/
+
+# Soak guardrail artifacts (nightly local runs; CI uploads them as artifacts, never committed)
+bench-results/soak-*/

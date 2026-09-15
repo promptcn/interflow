@@ -1,0 +1,122 @@
+[package]
+name = "interflow-mesh"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Site-to-site TCP tunnel: any TCP traffic between two private networks via a public hub"
+license = "MIT"
+
+[lib]
+name = "interflow_mesh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "interflow-mesh"
+path = "src/main.rs"
+
+[dependencies]
+interflow-core = { path = "../core", version = "0.1" }
+
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+socket2 = "0.6"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+
+# HTTP/2 server and client
+hyper = { version = "1.10", features = ["full", "http2"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http = "1.4"
+http-body-util = "0.1.3"
+
+# TLS support (rustls-only) — some mesh code uses rustls types directly
+rustls = "0.23"
+rustls-pemfile = "2.2.0"
+tokio-rustls = "0.26.4"
+rustls-pki-types = "1.15"
+rustls-native-certs = "0.8.4"
+
+# Config file parsing
+serde = { version = "1.0", features = ["derive"] }
+toml = "1"
+serde_json = "1.0.150"
+# Control API rule write-back: comment-preserving TOML round-trip (version aligned
+# with the existing dependency tree)
+toml_edit = { version = "0.25", features = ["serde"] }
+
+# Logging
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# Metrics
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+
+# Security
+governor = "0.10.4"
+x509-parser = "0.18"
+sha2 = "0.11"
+hex = "0.4"
+ipnetwork = "0.21.1"
+subtle = "2.6"
+
+# Error handling
+thiserror = "2"
+
+# Utility libraries
+bytes = "1.12"
+futures = "0.3"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+
+# Command-line arguments
+clap = { version = "4.6", features = ["derive"] }
+
+[build-dependencies]
+chrono = "0.4"
+
+[dev-dependencies]
+# Shared test/bench harness (dev-dependency cycle: testkit depends on mesh, officially
+# supported by cargo, same pattern as tokio/tokio-test; testkit stays out of the
+# production dependency graph)
+interflow-testkit = { path = "../testkit" }
+# bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion
+# when creating streams at high frequency)
+libc = "0.2"
+# e2e test logging (output goes to the test writer when RUST_LOG=interflow=debug)
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
+# e2e assertions on metrics counters (in-process recorder installed for direct snapshot reads)
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+# ============================================================================
+# Benchmarks
+# ============================================================================
+[[bench]]
+name = "e2e_throughput"
+harness = false
+path = "benches/e2e_throughput.rs"
+
+[[bench]]
+name = "e2e_throughput_multi"
+harness = false
+path = "benches/e2e_throughput_multi.rs"
+
+[[bench]]
+name = "ping_pong_latency"
+harness = false
+path = "benches/ping_pong_latency.rs"
+
+[[bench]]
+name = "udp_throughput"
+harness = false
+path = "benches/udp_throughput.rs"
+
+# Loss comparison (QUIC vs h2 concurrent streams): scenario benchmark with a clap CLI (not criterion)
+[[bench]]
+name = "loss_hol"
+harness = false
+path = "benches/loss_hol.rs"
+
+[lints]
+workspace = true

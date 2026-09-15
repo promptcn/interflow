@@ -1,0 +1,7 @@
+[alias]
+ci = "fmt --all -- --check && clippy --all-targets -- -D warnings && test --all-features"
+lint = "clippy --all-targets -- -D warnings"
+
+[build]
+# Pipelined compilation speeds up the build by emitting .rlib early.
+pipelining = true

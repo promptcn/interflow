@@ -1,0 +1,84 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Advisories with no upstream fix (unmaintained, or upstream has not shipped a
+# replacement yet): each entry includes its rationale; re-evaluate after the next
+# transitive-dependency upgrades.
+ignore = [
+    # The gtk-rs GTK3 bindings are unmaintained — only pulled in transitively by
+    # tauri on the linux desktop build path; macOS / Windows / server-side mesh
+    # scenarios never touch them; remove once tauri upstream switches to the GTK4
+    # bindings.
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2024-0411",
+    "RUSTSEC-2024-0412",
+    "RUSTSEC-2024-0413", # proc-macro-error (transitive via tauri)
+    "RUSTSEC-2024-0414",
+    "RUSTSEC-2024-0415",
+    "RUSTSEC-2024-0416",
+    "RUSTSEC-2024-0417",
+    "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419",
+    "RUSTSEC-2024-0420",
+    # unic-* family: pulled in via tauri → urlpattern → unic-ucd-ident; the
+    # open-source replacements (icu_properties / unicode-ident) are still being
+    # migrated to.
+    "RUSTSEC-2025-0075",
+    "RUSTSEC-2025-0080",
+    "RUSTSEC-2025-0081",
+    "RUSTSEC-2025-0098",
+    "RUSTSEC-2025-0100",
+    # rustls-pemfile: upstream was archived (2025-08), but this repo only uses its
+    # PEM parsing, which is stable; the replacement (migrating to `pem` or writing
+    # our own parser) is tracked as a separate task.
+    "RUSTSEC-2025-0134",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "0BSD",
+    "Unlicense",
+    # MPL-2.0: cssparser / selectors / dom_query / option-ext (dirs-sys) pulled in
+    # transitively via tauri. The Mozilla Public License 2.0 is a weak copyleft
+    # recognized by OSI/FSF; its file-level copyleft does not extend to statically
+    # linked artifacts.
+    "MPL-2.0",
+    # CDLA-Permissive-2.0: used by webpki-root-certs (transitive via
+    # rustls-platform-verifier) to license its root certificate dataset; it is a
+    # data license, not a code license, and imposes no constraints on binary
+    # distribution.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { name = "openssl" },
+    { name = "openssl-sys" },
+]
+skip = [
+    { name = "windows-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

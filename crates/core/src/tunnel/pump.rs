@@ -1,0 +1,387 @@
+//! TCP tunnel stream pump: bidirectional socket ↔ tunnel-frame transfer,
+//! shared by the expose edge and mesh ingress.
+//!
+//! Design motivation (docs/bug/2026-09-13-select-branch-double-await-joinhandle-panic.md):
+//! the old implementation `tokio::spawn`ed the read/write halves separately,
+//! then `select!`ed two `&mut JoinHandle`s and awaited the winning handle
+//! again inside the branch body — polling a JoinHandle already polled to
+//! completion, which makes tokio panic ("JoinHandle polled after
+//! completion"). This module makes the two halves **inline futures**
+//! (`tokio::pin!` + select, no spawn): after the winning branch completes,
+//! the loser is cancelled in place when dropped with its scope, ruling out
+//! the JoinHandle-and-its-double-poll panic class structurally.
+//!
+//! Close-out semantics:
+//! - **Write half exits first** (peer Close frame / channel closed
+//!   (poisoning · peer teardown) / write error / client write stall / idle
+//!   timeout): the read half is cancelled by drop (equivalent to the old
+//!   implementation's abort — leaving the read half running would hold the
+//!   half-open socket until the idle timeout, with the client unable to sense
+//!   the abandonment), then the stream is unregistered;
+//! - **Read half exits first** (client EOF, TCP half-close): unregister the
+//!   stream first (cutting off dispatch delivery of new frames for that
+//!   stream), then wait for the write half to drain the frames already
+//!   buffered in the channel before exiting — the connection task does not
+//!   return before the socket is truly closed, so the caller's connection
+//!   accounting no longer misses the detached write-task window.
+//!
+//! For reference: the egress UDP pump (mesh/src/agent/egress.rs) must spawn
+//! (it shares last_active idle supervision etc., which is not isomorphic);
+//! its rule "a JoinHandle already polled by select must not be awaited
+//! again; on the completion branch only await tasks still pending" is the
+//! correct paradigm for spawn-style supervision loops.
+
+use crate::error::Result;
+use crate::protocol::FrameType;
+use crate::tunnel::AgentTunnel;
+use crate::tunnel::transport::TunnelData;
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tracing::{debug, warn};
+
+/// The minimal peer-operation surface needed by a tunnel stream pump.
+///
+/// These three methods are extracted from [`AgentTunnel`] so the pump can run
+/// in unit tests without a real transport backend.
+#[async_trait]
+pub trait StreamPumpTarget: Send + Sync {
+    /// Sends a data frame to the peer (request direction).
+    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()>;
+
+    /// Notifies the peer of stream teardown (request-direction Close).
+    async fn send_close(&self, stream_id: &str) -> Result<()>;
+
+    /// Unregisters this stream's response-direction channel in dispatch (idempotent).
+    async fn unregister_stream(&self, stream_id: &str);
+}
+
+// Fully-qualified calls forward to AgentTunnel's inherent methods (inherent
+// takes precedence over trait methods); writing them as method calls would
+// rely on the same precedence rule but with unclear intent, so per clippy
+// convention we use `Self::` and keep this note here.
+#[allow(clippy::use_self)]
+#[async_trait]
+impl StreamPumpTarget for AgentTunnel {
+    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()> {
+        Self::send_data(self, stream_id, data).await
+    }
+
+    async fn send_close(&self, stream_id: &str) -> Result<()> {
+        Self::send_close(self, stream_id).await
+    }
+
+    async fn unregister_stream(&self, stream_id: &str) {
+        Self::unregister_stream(self, stream_id).await;
+    }
+}
+
+/// Pump parameters: liveness deadlines + metric counter names (the caller
+/// passes existing names so monitoring dashboards see no change).
+pub struct PumpConfig {
+    /// One-way idle deadline: no data on the read side / no frames on the
+    /// write side for this long closes out the whole stream.
+    pub idle_timeout: Duration,
+    /// Client write-stall deadline: writing one frame to the socket for
+    /// longer than this abandons the connection.
+    pub write_stall_timeout: Duration,
+    /// Idle-timeout counter name (shared by read/write sides, e.g. "interflow_edge_stream_idle_timeout").
+    pub idle_timeout_counter: &'static str,
+    /// Write-stall counter name (e.g. "interflow_edge_client_write_stall").
+    pub write_stall_counter: &'static str,
+    /// Log prefix ("edge" / "ingress").
+    pub log_label: &'static str,
+}
+
+/// Bidirectionally pumps one TCP tunnel stream.
+///
+/// `rd`: the client socket read half; `wr`: the write half; `data_rx`: the
+/// response-direction frames delivered by dispatch (obtained by the caller
+/// via `register_stream` first). On return, the whole stream has been closed
+/// out and unregistered.
+///
+/// Cancellation safety: this future may be cancelled at any time by an outer
+/// select/drop — the socket half and channel half are released in place on
+/// drop, losing at most one in-flight data frame (the stream was being torn
+/// down anyway).
+pub async fn pump_tcp_stream<R, W, T>(
+    rd: R,
+    wr: W,
+    mut data_rx: mpsc::Receiver<TunnelData>,
+    target: &T,
+    stream_id: &str,
+    cfg: &PumpConfig,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    T: StreamPumpTarget + ?Sized,
+{
+    let label = cfg.log_label;
+
+    // Read half: socket → tunnel (request direction).
+    let read_half = async {
+        let mut rd = rd;
+        // Reuse the buffer to avoid per-read allocation; use BytesMut::split
+        // so the Bytes is zero-copy
+        let mut buf = BytesMut::with_capacity(16 * 1024);
+        loop {
+            // Reserve when capacity runs low; capacity shrinks after split
+            if buf.capacity() < 4096 {
+                buf.reserve(16 * 1024);
+            }
+            match tokio::time::timeout(cfg.idle_timeout, rd.read_buf(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(_)) => {
+                    let chunk = buf.split().freeze();
+                    if let Err(e) = target.send_data(stream_id, chunk).await {
+                        warn!("{label} failed to send data: {e}");
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("{label} failed to read socket: {e}");
+                    break;
+                }
+                Err(_) => {
+                    metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                    debug!("{label} stream idle timeout (read side): {stream_id}");
+                    break;
+                }
+            }
+        }
+        // Client direction closed/errored: notify the peer of stream
+        // teardown (the write-half-first cancellation path never gets here).
+        let _ = target.send_close(stream_id).await;
+    };
+
+    // Write half: tunnel → socket (response direction).
+    let write_half = async {
+        let mut wr = wr;
+        loop {
+            match tokio::time::timeout(cfg.idle_timeout, data_rx.recv()).await {
+                Ok(Some(msg)) => {
+                    if matches!(msg.stream_type, FrameType::Close) {
+                        break;
+                    }
+                    if !msg.data.is_empty() {
+                        match tokio::time::timeout(cfg.write_stall_timeout, wr.write_all(&msg.data))
+                            .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                warn!("{label} failed to write socket: {e}");
+                                break;
+                            }
+                            Err(_) => {
+                                metrics::counter!(cfg.write_stall_counter).increment(1);
+                                debug!(
+                                    "{label} client response write stalled, closing: {stream_id}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Channel closed = dispatch poisoning / peer teardown / stream already unregistered
+                Ok(None) => break,
+                Err(_) => {
+                    metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                    debug!("{label} stream idle timeout (write side): {stream_id}");
+                    break;
+                }
+            }
+        }
+    };
+
+    tokio::pin!(read_half, write_half);
+
+    enum HalfDone {
+        Read,
+        Write,
+    }
+    let done = tokio::select! {
+        () = &mut write_half => HalfDone::Write,
+        () = &mut read_half => HalfDone::Read,
+    };
+
+    match done {
+        // Write half exits first: the read half is no longer polled and is
+        // dropped when this function returns (the half-open socket connection
+        // is released with it). No JoinHandle, no close-out await ceremony.
+        HalfDone::Write => {
+            target.unregister_stream(stream_id).await;
+        }
+        // Read half exits first (client EOF, TCP half-close): unregister
+        // first to cut off dispatch delivery of new frames for this stream;
+        // the write half afterwards only drains frames already buffered in
+        // the channel. Awaiting the write half here is legal: it was never
+        // polled to Ready — select only selects a branch future when it
+        // returns Ready.
+        HalfDone::Read => {
+            target.unregister_stream(stream_id).await;
+            (&mut write_half).await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::missing_docs_in_private_items
+)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    /// Recording mock: asserts the pump's calls to the tunnel side.
+    #[derive(Default)]
+    struct MockTarget {
+        data: StdMutex<Vec<Bytes>>,
+        closes: StdMutex<Vec<String>>,
+        unregisters: StdMutex<Vec<String>>,
+    }
+
+    impl MockTarget {
+        fn sent_data(&self) -> Vec<Bytes> {
+            self.data.lock().unwrap().clone()
+        }
+        fn close_calls(&self) -> Vec<String> {
+            self.closes.lock().unwrap().clone()
+        }
+        fn unregister_events(&self) -> Vec<String> {
+            self.unregisters.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl StreamPumpTarget for MockTarget {
+        async fn send_data(&self, _stream_id: &str, data: Bytes) -> Result<()> {
+            self.data.lock().unwrap().push(data);
+            Ok(())
+        }
+        async fn send_close(&self, stream_id: &str) -> Result<()> {
+            self.closes.lock().unwrap().push(stream_id.to_string());
+            Ok(())
+        }
+        async fn unregister_stream(&self, stream_id: &str) {
+            self.unregisters.lock().unwrap().push(stream_id.to_string());
+        }
+    }
+
+    fn td(ftype: FrameType, data: &[u8]) -> TunnelData {
+        TunnelData {
+            stream_id: "s1".to_string(),
+            source: crate::tunnel::transport::FrameSource::Response,
+            data: Bytes::copy_from_slice(data),
+            stream_type: ftype,
+            flags: 0,
+        }
+    }
+
+    fn test_cfg() -> PumpConfig {
+        PumpConfig {
+            idle_timeout: Duration::from_secs(30),
+            write_stall_timeout: Duration::from_millis(50),
+            idle_timeout_counter: "interflow_pump_test_idle",
+            write_stall_counter: "interflow_pump_test_stall",
+            log_label: "pump-test",
+        }
+    }
+
+    /// Peer Close frame (hub rejecting the Open / peer teardown) → the pump
+    /// closes out + unregisters exactly once + the socket closes. A
+    /// unit-level reproduction of the agent-offline scenario (the production
+    /// trigger chain of the 2026-09-13 bug).
+    #[tokio::test]
+    async fn close_frame_ends_pump_and_unregisters_once() {
+        let (sock, mut peer) = duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(sock);
+        let (tx, rx) = mpsc::channel(8);
+        let target = MockTarget::default();
+        tx.send(td(FrameType::Close, b"")).await.unwrap();
+
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+
+        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        // After the pump returns the write half is dropped: the client reads EOF
+        let mut buf = [0u8; 1];
+        assert_eq!(peer.read(&mut buf).await.unwrap(), 0);
+    }
+
+    /// Client EOF (TCP half-close): read-side data goes to the tunnel +
+    /// send_close, then unregister and flush every response frame already
+    /// buffered in the channel to the socket.
+    #[tokio::test(start_paused = true)]
+    async fn client_eof_flushes_buffered_frames_then_unregisters() {
+        let (sock, mut peer) = duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(sock);
+        let (tx, rx) = mpsc::channel(8);
+        let target = MockTarget::default();
+        tx.send(td(FrameType::Data, b"resp-1")).await.unwrap();
+        tx.send(td(FrameType::Data, b"resp-2")).await.unwrap();
+
+        peer.write_all(b"req").await.unwrap();
+        peer.shutdown().await.unwrap();
+
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+
+        assert_eq!(target.sent_data(), vec![Bytes::from_static(b"req")]);
+        assert_eq!(target.close_calls(), vec!["s1".to_string()]);
+        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        let mut got = Vec::new();
+        peer.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"resp-1resp-2");
+    }
+
+    /// Client not reading (send buffer full): the write-stall deadline closes
+    /// out the pump instead of hanging forever on write_all.
+    #[tokio::test(start_paused = true)]
+    async fn write_stall_terminates_pump() {
+        let (sock, _peer_stays_alive) = duplex(8);
+        let (rd, wr) = tokio::io::split(sock);
+        let (tx, rx) = mpsc::channel(8);
+        let target = MockTarget::default();
+        // Frame larger than the duplex buffer with a non-reading peer →
+        // write_all hangs → stall timeout
+        tx.send(td(FrameType::Data, &[7u8; 64])).await.unwrap();
+
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+
+        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+    }
+
+    /// Channel closed (dispatch poisoning / peer teardown / already
+    /// unregistered) → the write half gets Ok(None) and closes out.
+    #[tokio::test]
+    async fn channel_close_terminates_pump() {
+        let (sock, _peer) = duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(sock);
+        let (tx, rx) = mpsc::channel(8);
+        drop(tx);
+        let target = MockTarget::default();
+
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+
+        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+    }
+
+    /// Peer gone: a socket write error closes out the pump.
+    #[tokio::test]
+    async fn socket_write_error_terminates_pump() {
+        let (sock, peer) = duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(sock);
+        drop(peer);
+        let (tx, rx) = mpsc::channel(8);
+        let target = MockTarget::default();
+        tx.send(td(FrameType::Data, b"x")).await.unwrap();
+
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+
+        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+    }
+}
