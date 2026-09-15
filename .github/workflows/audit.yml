@@ -13,8 +13,14 @@ on:
       - "Cargo.lock"
 
 jobs:
-  cargo-audit:
+  cargo-deny-advisories:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      # Advisories via cargo-deny so the exemption list lives in ONE place:
+      # deny.toml [advisories].ignore, each entry carrying its rationale. The
+      # previous rustsec/audit-check action (archived upstream) read no config
+      # and flagged every already-reviewed unmaintained transitive crate.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
