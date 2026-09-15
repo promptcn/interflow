@@ -269,9 +269,9 @@ Named deliberately; this section is part of the document, not a footnote:
    (handshake deadlines, global handshake-rate budgets, SNI/Host consistency
    checks) are designed but arrive together with edge TLS support — they are
    not present capabilities.
-5. **The GUI ships as source only** (`src/` + `src-tauri/`) and is not yet
-   in the release pipeline; its surface is outside this document's reviewed
-   scope.
+5. **The GUI (`src/` + `src-tauri/`) builds in CI and ships as release
+   artifacts (DMG / AppImage / deb / NSIS / MSI), but has not had a dedicated
+   security review; its surface is outside this document's reviewed scope.
 6. **Pre-1.0.** The surface evolves; this document is dated and tracks the
    tree, not aspirations.
 

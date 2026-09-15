@@ -45,10 +45,10 @@ jobs:
           cargo install --locked cargo-zigbuild
       - name: Build (Linux musl via zigbuild)
         if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo zigbuild --release --target ${{ matrix.target }}
+        run: cargo zigbuild --release --target ${{ matrix.target }} --bin interflow-mesh --bin interflow-expose
       - name: Build (macOS / Windows)
         if: matrix.target != 'x86_64-unknown-linux-musl' && matrix.target != 'aarch64-unknown-linux-musl'
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --bin interflow-mesh --bin interflow-expose
       - name: Stage artifacts (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
@@ -76,6 +76,82 @@ jobs:
             interflow-*.tar.gz.sha256
             interflow-*.zip
             interflow-*.zip.sha256
+          fail_on_unmatched_files: false
+
+  gui:
+    name: gui ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: build-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            bundles: dmg
+          - target: x86_64-apple-darwin
+            os: macos-14
+            bundles: dmg
+          # GUI linux builds use gnu, not musl: webkit2gtk has no musl story
+          # and desktop targets don't need static linking.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            bundles: appimage,deb
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            bundles: nsis,msi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GUI system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install frontend dependencies
+        run: npm ci
+      # tauri build runs the vite build itself (beforeBuildCommand) and passes
+      # --target through to cargo; bundles land in
+      # target/<triple>/release/bundle/.
+      - name: Build GUI bundle (tauri)
+        shell: bash
+        run: npm run tauri build -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Checksums
+        shell: bash
+        run: |
+          cd "target/${{ matrix.target }}/release/bundle"
+          find . -type f \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' -o -name '*.msi' \) \
+            -exec sh -c 'sha256sum "$1" > "$1.sha256"' _ {} \;
+      - name: Upload artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            target/${{ matrix.target }}/release/bundle/dmg/*.dmg.sha256
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
+            target/${{ matrix.target }}/release/bundle/appimage/*.AppImage.sha256
+            target/${{ matrix.target }}/release/bundle/deb/*.deb
+            target/${{ matrix.target }}/release/bundle/deb/*.deb.sha256
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            target/${{ matrix.target }}/release/bundle/nsis/*.exe.sha256
+            target/${{ matrix.target }}/release/bundle/msi/*.msi
+            target/${{ matrix.target }}/release/bundle/msi/*.msi.sha256
           fail_on_unmatched_files: false
 
   docker:

@@ -77,9 +77,9 @@ run-agent config:
 
 # ===== Common =====
 
-# GUI DMG packaging (equivalent to ./build-dmg.sh, incl. fallback cleanup of create-dmg leaks)
+# GUI DMG packaging (equivalent to ./scripts/build-dmg.sh, incl. fallback cleanup of create-dmg leaks)
 dmg:
-    bash build-dmg.sh
+    bash scripts/build-dmg.sh
 
 # Clean build artifacts
 clean:

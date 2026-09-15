@@ -232,10 +232,13 @@ cargo build --workspace
 # recovery / slow backends / Open floods / disconnect self-healing)
 cargo test --workspace
 
-# Cross-platform release builds (zig for cross-compilation)
-./build-linux.sh       # → interflow-mesh-linux-x86_64, interflow-expose-linux-x86_64
-./build-macos.sh
-./build-windows.sh
+# Cross-platform release builds (zig for cross-compilation; artifacts land in artifacts/)
+./scripts/build-linux.sh       # x86_64 musl; pass "aarch64" for the arm build
+./scripts/build-macos.sh
+./scripts/build-windows.sh
+
+# GUI (Tauri 2, experimental): macOS DMG
+./scripts/build-dmg.sh
 
 # Docker (mesh by default; --build-arg BINARY=interflow-expose also works)
 docker build -t interflow:latest .

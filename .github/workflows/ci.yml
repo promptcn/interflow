@@ -29,8 +29,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # interflow-gui (Tauri) is excluded here and covered by the `gui` job
+      # below: its webkit2gtk/Node toolchain is heavy and failure isolation is
+      # clearer as a separate job.
       - name: clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --workspace --exclude interflow-gui --all-targets --all-features
 
   test:
     runs-on: ubuntu-24.04
@@ -39,7 +42,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --all-features --no-fail-fast
+        run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast
+
+  gui:
+    name: gui (tauri)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Tauri 2 system dependencies (linux webview stack)
+      - name: Install GUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # dist/ must exist before cargo compiles src-tauri: generate_context!
+      # embeds the frontend assets at compile time.
+      - name: Frontend typecheck and build
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+      - name: clippy (gui)
+        run: cargo clippy -p interflow-gui --all-targets --all-features
+      - name: cargo test (gui)
+        run: cargo test -p interflow-gui --all-features --no-fail-fast
 
   deny:
     runs-on: ubuntu-24.04

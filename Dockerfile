@@ -34,13 +34,17 @@ ARG BINARY
 
 WORKDIR /src
 
-# Copy manifests + all crate sources first (leverages the BuildKit cache to speed up dependency compilation)
+# Copy manifests + all crate sources first (leverages the BuildKit cache to speed up dependency compilation).
+# src-tauri is a workspace member so its manifest must be present for cargo to
+# load the workspace; the --bin selection below keeps the GUI itself (and its
+# webkit2gtk dependency tree) out of the image build.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+COPY src-tauri src-tauri
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --bin ${BINARY} && \
+    cargo build --release --locked --bin ${BINARY} && \
     cp target/release/${BINARY} /app
 
 # -------- runtime stage --------

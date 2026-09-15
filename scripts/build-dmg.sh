@@ -9,7 +9,7 @@
 # A trap is used here to guarantee scripts/dmg-cleanup.sh runs as a fallback on
 # success, failure, or interruption.
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 bash scripts/dmg-cleanup.sh   # clean up leftovers from a previous run first
 trap 'bash scripts/dmg-cleanup.sh' EXIT

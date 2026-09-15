@@ -1,17 +1,16 @@
 {
   "name": "interflow",
-  "version": "1.0.0",
-  "description": "Hub-agent traffic forwarding system over HTTP/2 multiplexing; forwards arbitrary TCP streams across machines.",
-  "main": "index.js",
+  "version": "0.1.0",
+  "description": "Interflow GUI (Tauri 2 + React): frontend and tooling for the expose desktop app.",
+  "private": true,
   "scripts": {
     "tauri": "tauri",
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "PromptcnAI",
+  "license": "Apache-2.0",
   "type": "commonjs",
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",

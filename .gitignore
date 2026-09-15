@@ -4,17 +4,15 @@
 /target
 **/target
 
-# frontend (Tauri GUI)
+# frontend (Tauri GUI); vite build wipes dist/, so CLI build scripts use artifacts/
 node_modules/
 dist/
+artifacts/
 
-# release binaries
+# release binaries (scripts/build-*.sh output; artifacts/ itself is ignored above)
 *.zip
 *.log
 *.exe
-interflow-*-linux-*
-interflow-*-macos-*
-interflow-*-windows-*
 
 # local secrets / runtime state
 *.token

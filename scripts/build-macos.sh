@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+cd "$(dirname "$0")/.."
+
 # Detect architecture
 ARCH=$(uname -m)
 if [ "$ARCH" = "x86_64" ]; then
@@ -17,8 +19,10 @@ echo "Starting build for macos-$TARGET_NAME..."
 # Build for release
 cargo build --release --bin interflow-mesh --bin interflow-expose
 
+# Copy the artifacts
+mkdir -p artifacts
 for BIN in interflow-mesh interflow-expose; do
-    OUTPUT_FILE="${BIN}-macos-$TARGET_NAME"
+    OUTPUT_FILE="artifacts/${BIN}-macos-$TARGET_NAME"
     if [ -f "target/release/${BIN}" ]; then
         cp "target/release/${BIN}" "$OUTPUT_FILE"
         echo "Built: $PWD/$OUTPUT_FILE"
