@@ -54,16 +54,16 @@ hex = "0.4"
 # CLI
 clap = { version = "4.6", features = ["derive"] }
 
-# Raise the fd soft limit (unix only)
-[target.'cfg(unix)'.dependencies]
-rlimit = "0.10"
-
 # Metrics
 metrics = "0.24.6"
 
-# Hot reload: atomic route-table replacement
+# Hot reload: atomic route-table replacement + graceful task utilities
 arc-swap = "1"
 tokio-util = "0.7.19"
+
+# Raise the fd soft limit (unix only)
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.10"
 
 [build-dependencies]
 chrono = "0.4"

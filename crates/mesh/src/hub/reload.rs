@@ -2,7 +2,8 @@
 
 #[cfg(unix)]
 use crate::config::load_hub_config;
-#[cfg(unix)]
+// Unconditional: the spawn_reload_task signature references HubLimits on all
+// platforms (the non-Unix body is a no-op, but the type must still resolve).
 use crate::hub::state::HubLimits;
 use crate::hub::{SharedHubConfig, SharedTlsAcceptor};
 #[cfg(unix)]

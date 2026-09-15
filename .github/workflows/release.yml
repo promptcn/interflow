@@ -12,6 +12,8 @@ jobs:
   build-matrix:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -89,6 +91,8 @@ jobs:
     name: gui ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     needs: build-matrix
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
