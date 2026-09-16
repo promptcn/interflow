@@ -1,6 +1,6 @@
 [package]
 name = "interflow-testkit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.97"
 description = "Shared test/bench harness for interflow: stack assembly, certificates, impairment injection, metrics (dev-only, not in the production dependency graph)"
