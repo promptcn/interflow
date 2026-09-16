@@ -288,6 +288,7 @@ async fn spawn_stack() -> (
             auth_token: None,
             connect_timeout_secs: 5,
             poll_idle_timeout_secs: None,
+            request_establish_timeout_secs: None,
         },
         ingress: vec![],
         egress: vec![EgressRule {
@@ -333,6 +334,7 @@ async fn spawn_stack() -> (
             auth_token: None,
             connect_timeout_secs: 5,
             poll_idle_timeout_secs: None,
+            request_establish_timeout_secs: None,
         },
         ingress: vec![IngressRule {
             name: "to-egress".into(),

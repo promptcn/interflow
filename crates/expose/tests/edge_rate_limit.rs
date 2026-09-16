@@ -110,6 +110,7 @@ remote_addr = "{echo_addr}"
         route_breaker_failure_threshold: 10,
         route_breaker_window_secs: 60,
         route_breaker_cooldown_secs: 30,
+        agent_recovery_timeout_secs: 120,
     };
     tokio::task::spawn(interflow_expose::edge::run(edge_args));
 

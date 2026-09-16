@@ -102,6 +102,7 @@ remote_addr = "127.0.0.1:9"
         route_breaker_failure_threshold: 10,
         route_breaker_window_secs: 60,
         route_breaker_cooldown_secs: 30,
+        agent_recovery_timeout_secs: 120,
     };
     let edge_handle = tokio::task::spawn(run(edge_args));
 

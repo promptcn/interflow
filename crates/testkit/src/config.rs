@@ -141,6 +141,7 @@ pub fn agent_config(id: &str, hub_port: u16) -> AgentConfig {
             auth_token: None,
             connect_timeout_secs: 5,
             poll_idle_timeout_secs: None,
+            request_establish_timeout_secs: None,
         },
         ingress: vec![],
         egress: vec![],

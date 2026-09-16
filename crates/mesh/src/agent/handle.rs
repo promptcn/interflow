@@ -11,6 +11,7 @@
 //!   (TLS/TCP normal close), without aborting.
 
 use interflow_core::error::Result;
+use interflow_core::tunnel::{AgentTunnel, SessionSlot};
 use serde::Serialize;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -57,6 +58,7 @@ pub struct AgentHandle {
     events_rx: Option<mpsc::Receiver<AgentEvent>>,
     shutdown: CancellationToken,
     tracker: TaskTracker,
+    slot: SessionSlot,
     join: JoinHandle<Result<()>>,
 }
 
@@ -85,6 +87,7 @@ impl AgentHandle {
         events_rx: mpsc::Receiver<AgentEvent>,
         shutdown: CancellationToken,
         tracker: TaskTracker,
+        slot: SessionSlot,
         join: JoinHandle<Result<()>>,
     ) -> Self {
         Self {
@@ -92,8 +95,21 @@ impl AgentHandle {
             events_rx: Some(events_rx),
             shutdown,
             tracker,
+            slot,
             join,
         }
+    }
+
+    /// The embedder-facing tunnel: rides across session rebuilds.
+    ///
+    /// The returned [`AgentTunnel`] is backed by the session slot — the
+    /// supervisor installs each freshly established session's transport into
+    /// it and withdraws it during session wind-down. Embedders (expose edge
+    /// etc.) hold this for their whole lifetime: sends during a reconnect gap
+    /// fail fast instead of hanging, and the facade is live again as soon as
+    /// the next session registers.
+    pub fn tunnel(&self) -> AgentTunnel {
+        self.slot.tunnel()
     }
 
     /// Snapshot of the current state.

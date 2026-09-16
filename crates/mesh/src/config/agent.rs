@@ -172,6 +172,17 @@ pub struct AgentInfo {
     /// detected by the receiving end.
     #[serde(default)]
     pub poll_idle_timeout_secs: Option<u64>,
+    /// Tunnel request send-establishment timeout (seconds): the upper bound
+    /// for one `/poll` or `/stream/up` request to reach response headers.
+    /// Exceeding it is treated as connection death (session rebuild), because
+    /// the receive-side watchdog can never observe this failure form — it
+    /// only starts once headers arrive.
+    ///
+    /// Defaults to `None` = 15s (healthy hubs answer these headers
+    /// immediately; the body then streams indefinitely). `Some(0)` keeps the
+    /// default; `Some(n ≥ 1)` pins a value (tests, unusually slow links).
+    #[serde(default)]
+    pub request_establish_timeout_secs: Option<u64>,
 }
 
 /// Ingress rule: local listener → forwarded to a remote agent.

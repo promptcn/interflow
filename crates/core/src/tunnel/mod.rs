@@ -14,7 +14,7 @@ pub mod pump;
 pub mod quic;
 pub mod transport;
 
-pub use agent::{AgentTunnel, H2Liveness};
+pub use agent::{AgentTunnel, DEFAULT_REQUEST_ESTABLISH_TIMEOUT, H2Liveness, SessionSlot};
 pub use h2::{H2RequestBody, empty_request_body};
 pub use pump::{PumpConfig, StreamPumpTarget, pump_tcp_stream};
 pub use transport::{

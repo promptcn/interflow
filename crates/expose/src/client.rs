@@ -168,6 +168,7 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
             auth_token: Some(args.auth_token.clone()),
             connect_timeout_secs: 15,
             poll_idle_timeout_secs: None,
+            request_establish_timeout_secs: None,
         },
         ingress: vec![],
         egress,

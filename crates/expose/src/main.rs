@@ -10,7 +10,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use interflow_core::config::paths::absolutize;
 use interflow_expose::client::{self, ExposeArgs};
-use interflow_expose::edge::{self, DEFAULT_STREAM_IDLE_TIMEOUT_SECS, EdgeArgs, EdgeHubTls};
+use interflow_expose::edge::{
+    self, DEFAULT_AGENT_RECOVERY_TIMEOUT_SECS, DEFAULT_STREAM_IDLE_TIMEOUT_SECS, EdgeArgs,
+    EdgeHubTls,
+};
 use interflow_expose::{init, profile};
 use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
@@ -101,6 +104,17 @@ enum Commands {
             value_parser = clap::value_parser!(u64).range(1..)
         )]
         stream_idle_timeout_secs: u64,
+        /// Outer health-watch timeout over the internal agent (seconds): the
+        /// edge exits for a systemd restart when the agent stays
+        /// non-connected with no state change at all for this long, or hits a
+        /// no-retry failure. Normal reconnect cycling never trips this.
+        /// Default 120.
+        #[arg(
+            long,
+            default_value_t = DEFAULT_AGENT_RECOVERY_TIMEOUT_SECS,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        agent_recovery_timeout_secs: u64,
         /// Route-level circuit breaker: backend-failure closes (within a window)
         /// trip a route; tripped routes are closed at the edge without an Open
         /// through the tunnel until a recovery probe succeeds.
@@ -294,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             route_breaker_failure_threshold,
             route_breaker_window_secs,
             route_breaker_cooldown_secs,
+            agent_recovery_timeout_secs,
         } => {
             let hub_tls = match (hub_cert, hub_key) {
                 (Some(cert_path), Some(key_path)) => Some(EdgeHubTls {
@@ -322,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 route_breaker_failure_threshold,
                 route_breaker_window_secs,
                 route_breaker_cooldown_secs,
+                agent_recovery_timeout_secs,
             };
             edge::run(args).await?;
         }

@@ -116,6 +116,7 @@ impl H2Tunnel {
             auth_token.clone(),
             shutdown.clone(),
             Some(first_up_rx),
+            liveness.establish_timeout,
         ));
 
         let dispatch_for_poll = dispatch.clone();
@@ -249,6 +250,7 @@ impl H2Tunnel {
         auth_token: Option<String>,
         shutdown: CancellationToken,
         mut first_rx: Option<mpsc::Receiver<Bytes>>,
+        establish_timeout: Duration,
     ) {
         const BASE_INTERVAL: Duration = Duration::from_millis(100);
         const MAX_INTERVAL: Duration = Duration::from_secs(5);
@@ -298,9 +300,27 @@ impl H2Tunnel {
                 sender_locked.send_request(req)
             };
 
+            // Send-establishment bound (the upload-side mirror of the poll
+            // receive watchdog): the future raced only against shutdown
+            // before, so a request that never resolves (hyper SendRequest
+            // hang edge states after connection death included) parked this
+            // loop forever. Healthy hubs answer headers immediately, so
+            // exceeding the bound is a dead request path — cancel the
+            // session token and let the supervisor rebuild.
             let resp = tokio::select! {
                 () = shutdown.cancelled() => break,
-                r = resp_result => r,
+                r = tokio::time::timeout(establish_timeout, resp_result) => {
+                    let Ok(resp) = r else {
+                        metrics::counter!("interflow_agent_tunnel_establish_timeout_total", "stream" => "upload").increment(1);
+                        warn!(
+                            "upload stream request not answered within {establish_timeout:?} \
+                             (no response headers), treating as connection death, rebuilding session"
+                        );
+                        shutdown.cancel();
+                        break;
+                    };
+                    resp
+                }
             };
             let resp = match resp {
                 Ok(r) if r.status().is_success() => r,
@@ -426,9 +446,27 @@ impl H2Tunnel {
 
             let outcome = match resp_result {
                 Ok(fut) => {
+                    // Send-establishment bound: same rationale as the upload
+                    // loop's — the receive-side watchdog only starts once
+                    // headers arrive, so a poll request that never resolves
+                    // is invisible to it. Exceeding the bound cancels the
+                    // session token (supervisor rebuild / direct-dialer
+                    // fail-fast).
                     let resp = tokio::select! {
                         () = shutdown.cancelled() => break,
-                        r = fut => r,
+                        r = tokio::time::timeout(liveness.establish_timeout, fut) => {
+                            let Ok(resp) = r else {
+                                metrics::counter!("interflow_agent_tunnel_establish_timeout_total", "stream" => "poll").increment(1);
+                                warn!(
+                                    "poll stream request not answered within {:?} \
+                                     (no response headers), treating as connection death, rebuilding session",
+                                    liveness.establish_timeout
+                                );
+                                shutdown.cancel();
+                                break;
+                            };
+                            resp
+                        }
                     };
                     Self::drain_poll_response(
                         resp,

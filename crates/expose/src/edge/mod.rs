@@ -2,11 +2,18 @@
 //!
 //! Flow:
 //! 1. Start [`interflow_mesh::hub::HubServer`] (listens on 127.0.0.1:internal_port, static-token auth)
-//! 2. Once the hub is up, dial the local hub as agent_id=`edge` and construct an [`AgentTunnel`]
+//! 2. Once the hub is up, start the internal agent (agent_id=`edge`, supervised
+//!    auto-reconnect) and take the session-slot tunnel facade from its handle
 //! 3. Inject the tunnel into [`EdgeListener`] (listens on the public listen_addr), routing by Host to the target agent
 //!
 //! Public request path: client → nginx (TLS) → edge listener → tunnel (loopback HTTP/2)
 //! → hub → remote expose client (egress agent, h2 or QUIC) → local service.
+//!
+//! Recovery model: the internal agent's session deaths (connection-level errors
+//! included) are rebuilt in process by the supervisor — the facade held by the
+//! listener rides across rebuilds, and during a reconnect gap opens fail fast.
+//! [`watch_agent_health`] is the outer belt: only a wedged recovery (sustained
+//! state silence) or a no-retry failure ends the process for a systemd restart.
 //!
 //! With `quic_listen` set, the embedded hub additionally accepts expose
 //! clients over QUIC (one QUIC stream per tunnel stream). The edge's own
@@ -23,7 +30,6 @@ pub use host_router::{HostRouter, Route, RoutesConfig};
 use crate::edge::listener::EdgeListener;
 use interflow_core::config::AuditConfig;
 use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker};
-use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::agent::client::AgentClient;
 use interflow_mesh::config::{
     AGENT_CONFIG_VERSION, AclConfig, AgentTlsConfig as TlsConfig, AuthConfig, AuthMode,
@@ -33,13 +39,23 @@ use interflow_mesh::config::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{error, info};
 
 /// Host-header peek timeout for public connections (mitigates slow-loris connection dragging).
 const HOST_PEEK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default public-stream idle timeout in seconds. Source of the CLI `--stream-idle-timeout-secs` default.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Default outer health-watch timeout over the internal agent, in seconds.
+/// Source of the CLI `--agent-recovery-timeout-secs` default.
+///
+/// Sized above the hub's 75s eviction grace and the supervisor's 30s backoff
+/// cap combined: an agent struggling to reconnect inside this window is
+/// normal operation (no restart churn), while true supervisor silence beyond
+/// it means the recovery path itself is broken (the 2026-09-16 incident
+/// class) and only a process restart can help.
+pub const DEFAULT_AGENT_RECOVERY_TIMEOUT_SECS: u64 = 120;
 
 /// Edge startup arguments.
 pub struct EdgeArgs {
@@ -88,6 +104,12 @@ pub struct EdgeArgs {
     /// Cooldown (seconds) a tripped route stays OPEN before one recovery
     /// probe connection is admitted.
     pub route_breaker_cooldown_secs: u64,
+    /// Outer health-watch timeout over the internal agent (seconds): if the
+    /// agent stays non-connected with **no state change at all** for this
+    /// long (recovery wedged), or enters the no-retry `Failed` state, the
+    /// edge exits so systemd can restart it. Normal reconnect cycling never
+    /// trips this.
+    pub agent_recovery_timeout_secs: u64,
 }
 
 impl Default for EdgeArgs {
@@ -106,6 +128,7 @@ impl Default for EdgeArgs {
             route_breaker_failure_threshold: 10,
             route_breaker_window_secs: 60,
             route_breaker_cooldown_secs: 30,
+            agent_recovery_timeout_secs: DEFAULT_AGENT_RECOVERY_TIMEOUT_SECS,
         }
     }
 }
@@ -196,31 +219,32 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
     // 5. Wait for the hub listener to be ready (simple retry; avoids adding a health-check channel)
     wait_for_tcp(args.hub_listen_addr, std::time::Duration::from_secs(2)).await?;
 
-    // 6. Dial the local hub as `edge` to obtain the tunnel
+    // 6. Start the internal agent (supervised auto-reconnect): dials the
+    //    local hub as `edge` and, on any session death — connection-level
+    //    errors included — the supervisor reconnects and re-registers in
+    //    process, the same battle-tested path every expose client runs. The
+    //    tunnel handed to the listener is the session-slot facade: it rides
+    //    across session rebuilds, and during a reconnect gap opens fail fast
+    //    (nginx surfaces an immediate 502 instead of a black hole).
+    //
+    //    Background: this used to be a one-shot dial whose only fail-fast
+    //    trigger was the poll watchdog — which lives inside the poll loop and
+    //    dies with it on connection-level errors, leaving a zombie listener
+    //    (docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md).
     let edge_agent_cfg = build_edge_agent_config(&args, &hub_url)?;
-    let edge_client = AgentClient::new(edge_agent_cfg)?;
-    let conn = edge_client.connect_and_register().await?;
-    // Session liveness is derived from the registration negotiation (data-plane
-    // Pong + poll watchdog). When the watchdog fires, edge_token.cancel() lets
-    // the main select fail fast (aligning with the "fail whole if hub/listener
-    // dies" philosophy; systemd restarts to self-heal), so we never keep
-    // serving with a dead data plane and producing black-hole connections.
-    let liveness = conn.h2_liveness();
-    let edge_token = tokio_util::sync::CancellationToken::new();
-    let tunnel = AgentTunnel::from_sender(
-        "edge".to_string(),
-        &hub_url,
-        conn.send_request,
-        Some(args.agent_token.clone()),
-        edge_token.clone(),
-        liveness,
-    )?;
-    info!("Edge dialed the local hub, agent_id=edge");
+    let agent = AgentClient::new(edge_agent_cfg)?.start();
+    let tunnel = agent.tunnel();
+    wait_initial_registration(&agent, Duration::from_secs(30)).await?;
+    info!("Edge internal agent started (agent_id=edge, supervised auto-reconnect)");
 
-    // 7. Run the public listener; if the hub, the listener, or the edge's own
-    //    data plane dies, fail as a whole — once the hub is dead every tunnel
-    //    dial from the listener fails, and continuing to serve would only
-    //    produce black-hole connections.
+    // 7. Run the public listener; if the hub, the listener, or the internal
+    //    agent's recovery dies, fail as a whole — once the hub is dead every
+    //    tunnel dial from the listener fails, and continuing to serve would
+    //    only produce black-hole connections. The internal agent's own
+    //    session deaths are NOT in this set: the supervisor rebuilds them in
+    //    process (step 6); only a supervisor that stops making progress for
+    //    a sustained stretch (watch_agent_health) is a whole-process
+    //    failure.
     let route_breaker = args.route_breaker_enabled.then(|| {
         std::sync::Arc::new(interflow_mesh::agent::target_breaker::TargetBreakers::new(
             interflow_mesh::agent::target_breaker::BreakerConfig {
@@ -243,6 +267,11 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
     };
     let listener_task = listener.run();
     tokio::pin!(listener_task);
+    let agent_health = watch_agent_health(
+        &agent,
+        Duration::from_secs(args.agent_recovery_timeout_secs.max(1)),
+    );
+    tokio::pin!(agent_health);
     tokio::select! {
         res = &mut listener_task => Ok(res?),
         hub_res = hub_task => {
@@ -255,12 +284,103 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
                 "internal HubServer has stopped: {reason}"
             )))
         }
-        // Poll watchdog fired (data-plane stall): fail-fast exit; systemd
-        // restarts to self-heal
-        () = edge_token.cancelled() => {
-            Err(interflow_core::error::InterflowError::connection(
-                "edge poll data-plane stall (receive-side watchdog triggered), fail-fast exit".to_string(),
-            ))
+        // Outer supervision over the internal agent (the recovery path's own
+        // failure handling): the supervisor reconnecting — even struggling —
+        // is normal operation; only "no Connected state and no state change
+        // at all for a sustained stretch" (wedged recovery, the 2026-09-16
+        // incident class) or a no-retry Failed state ends the process, letting
+        // systemd restart as the final backstop.
+        health = &mut agent_health => {
+            error!("edge internal agent health watch tripped: {health}");
+            Err(interflow_core::error::InterflowError::connection(format!(
+                "edge internal agent recovery failed: {health}"
+            )))
+        }
+    }
+}
+
+/// Waits for the internal agent's first successful registration (or fails on
+/// the no-retry `Failed` state / timeout): startup must not serve a listener
+/// whose tunnel facade cannot possibly work yet.
+pub async fn wait_initial_registration(
+    agent: &interflow_mesh::agent::AgentHandle,
+    timeout: Duration,
+) -> interflow_core::error::Result<()> {
+    let mut rx = agent.subscribe_state();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        // Snapshot before matching: the watch Ref (significant Drop) must not
+        // live across the match scrutinee.
+        let state = rx.borrow_and_update().clone();
+        match state {
+            interflow_mesh::agent::AgentState::Connected { agent_id } => {
+                info!("edge internal agent registered as {agent_id}");
+                return Ok(());
+            }
+            interflow_mesh::agent::AgentState::Failed { error } => {
+                return Err(interflow_core::error::InterflowError::config(format!(
+                    "edge internal agent failed to start: {error}"
+                )));
+            }
+            _ => {}
+        }
+        if tokio::time::timeout_at(deadline, rx.changed())
+            .await
+            .is_err()
+        {
+            return Err(interflow_core::error::InterflowError::connection(format!(
+                "edge internal agent did not register within {timeout:?}"
+            )));
+        }
+    }
+}
+
+/// Outer supervision over the supervised internal agent; resolves with a
+/// reason string when the process should fail fast:
+///
+/// - `Failed` — a configuration-class error; the supervisor will not retry.
+/// - no state change at all while non-`Connected` for `recovery_timeout` —
+///   the supervisor itself is wedged (a bug of the recovery path — the exact
+///   class of the 2026-09-16 incident) or the hub is unreachable without the
+///   supervisor even cycling states. Restarting the process is then the only
+///   remaining lever (systemd `Restart=on-failure`).
+///
+/// Deliberately NOT tripped by: state *flapping* while non-connected
+/// (`Connecting`/`Reconnecting` alternating) — that is the supervisor alive
+/// and working, just not succeeding yet; churning process restarts would not
+/// help and would drop the in-process hub with it. Every observed state
+/// change re-arms the window; only true silence exceeds it.
+pub async fn watch_agent_health(
+    agent: &interflow_mesh::agent::AgentHandle,
+    recovery_timeout: Duration,
+) -> String {
+    let mut rx = agent.subscribe_state();
+    loop {
+        let state = rx.borrow_and_update().clone();
+        match state {
+            interflow_mesh::agent::AgentState::Connected { .. } => {
+                // Healthy: wait for the next transition, unbounded.
+                if rx.changed().await.is_err() {
+                    return "agent state channel closed".to_string();
+                }
+            }
+            interflow_mesh::agent::AgentState::Failed { error } => {
+                return format!("agent failed (no-retry error): {error}");
+            }
+            other => {
+                // Non-connected with a re-armed window: any further state
+                // change (the supervisor cycling) re-arms it again; only
+                // total silence trips.
+                if tokio::time::timeout(recovery_timeout, rx.changed())
+                    .await
+                    .is_err()
+                {
+                    return format!(
+                        "agent stayed in {other:?} with no state change for over \
+                         {recovery_timeout:?} — supervisor recovery presumed wedged"
+                    );
+                }
+            }
         }
     }
 }
@@ -348,6 +468,7 @@ fn build_edge_agent_config(
             auth_token: Some(args.agent_token.clone()),
             connect_timeout_secs: 15,
             poll_idle_timeout_secs: None,
+            request_establish_timeout_secs: None,
         },
         ingress: vec![],
         egress: vec![],

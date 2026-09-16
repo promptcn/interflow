@@ -168,6 +168,7 @@ fn base_agent_config(
             auth_token: None,
             connect_timeout_secs: 10, // handshake retransmit headroom under packet loss
             poll_idle_timeout_secs: None, // derived from the negotiation (105s watchdog) — gate criterion
+            request_establish_timeout_secs: None,
         },
         ingress: vec![],
         egress: vec![],

@@ -39,6 +39,7 @@ async fn wrong_token_agent_fails_to_register() {
         auth_token: Some("WRONG-TOKEN".to_string()),
         connect_timeout_secs: 5,
         poll_idle_timeout_secs: None,
+        request_establish_timeout_secs: None,
     };
     let agent_handle = spawn_agent(cfg);
 

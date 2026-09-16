@@ -11,7 +11,10 @@ use hyper::Request;
 use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use interflow_core::error::{InterflowError, Result};
-use interflow_core::tunnel::{AgentTunnel, H2Liveness, H2RequestBody, empty_request_body};
+use interflow_core::tunnel::{
+    AgentTunnel, DEFAULT_REQUEST_ESTABLISH_TIMEOUT, H2Liveness, H2RequestBody, SessionSlot,
+    empty_request_body,
+};
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use rustls_pemfile::certs;
@@ -38,6 +41,14 @@ const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 /// write). Exceeding it indicates a structural defect (a task ignoring the
 /// token), counted + a loud warning.
 const SESSION_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Final bounded join grace for session child-task handles after the drain
+/// grace has already warned: a task that still has not exited here is
+/// ignoring the cancellation token — abort instead of waiting forever, so
+/// `run_session` always returns and the supervisor always reaches its next
+/// reconnect iteration (mechanism A of
+/// docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md).
+const HANDLER_JOIN_GRACE: Duration = Duration::from_secs(1);
 
 /// The agent client.
 #[derive(Clone)]
@@ -90,6 +101,7 @@ impl HubConnection {
         H2Liveness {
             poll_watchdog: self.negotiated.poll_watchdog(),
             pong_via_upload: self.negotiated.pong_via_upload(),
+            establish_timeout: DEFAULT_REQUEST_ESTABLISH_TIMEOUT,
         }
     }
 }
@@ -133,6 +145,7 @@ impl AgentClient {
     pub fn start(self) -> AgentHandle {
         let shutdown = CancellationToken::new();
         let tracker = TaskTracker::new();
+        let slot = SessionSlot::new();
         let (state_tx, state_rx) = tokio::sync::watch::channel(AgentState::Connecting);
         let (event_tx, event_rx) = mpsc::channel(64);
         let sink = EventSink { state_tx, event_tx };
@@ -140,10 +153,14 @@ impl AgentClient {
         let join = {
             let shutdown = shutdown.clone();
             let tracker = tracker.clone();
-            tokio::spawn(async move { self.supervise(sink, shutdown, tracker).await })
+            let slot_for_supervisor = slot.clone();
+            tokio::spawn(async move {
+                self.supervise(sink, shutdown, tracker, slot_for_supervisor)
+                    .await
+            })
         };
 
-        AgentHandle::new(state_rx, event_rx, shutdown, tracker, join)
+        AgentHandle::new(state_rx, event_rx, shutdown, tracker, slot, join)
     }
 
     /// Supervisor: state machine + reconnect loop (exponential backoff +
@@ -155,6 +172,7 @@ impl AgentClient {
         sink: EventSink,
         shutdown: CancellationToken,
         tracker: TaskTracker,
+        slot: SessionSlot,
     ) -> Result<()> {
         info!("Agent starting (auto-reconnect mode)");
         let mut attempt: u32 = 0;
@@ -162,12 +180,17 @@ impl AgentClient {
 
         loop {
             sink.set_state(AgentState::Connecting);
+            // Per-iteration visibility: with only the in-establishment
+            // "Connecting to hub" log, a supervisor wedged between
+            // iterations would leave zero log traces (the exact silence of
+            // the 2026-09-16 edge incident).
+            info!("Agent connecting (attempt {})", attempt.saturating_add(1));
             // Await directly: run_session itself responds to cancellation
             // (including the unified wind-down: session_token.cancel ->
             // tunnel.shutdown -> bounded tracker close-out); do not wrap it
             // in an outer select, otherwise shutdown would drop the future
             // and skip the wind-down.
-            let outcome = self.run_session(&sink, &shutdown).await;
+            let outcome = self.run_session(&sink, &shutdown, &slot).await;
 
             let (reason, established) = match outcome {
                 Ok(SessionOutcome::Shutdown) => break,
@@ -230,6 +253,7 @@ impl AgentClient {
         &self,
         sink: &EventSink,
         shutdown: &CancellationToken,
+        slot: &SessionSlot,
     ) -> Result<SessionOutcome> {
         // Session-level token: when the session ends (disconnect or user
         // shutdown alike), cancels all child tasks of this session.
@@ -241,6 +265,12 @@ impl AgentClient {
             r = self.establish_tunnel(&session_token) => r?,
             () = session_token.cancelled() => return Ok(SessionOutcome::Shutdown),
         };
+
+        // Publish this session's transport into the embedder-facing slot
+        // BEFORE broadcasting Connected: consumers must never observe a
+        // connected agent whose facade sends fail (the reverse ordering —
+        // withdraw on wind-down — is enforced below).
+        slot.install(tunnel.backend()).await;
 
         sink.set_state(AgentState::Connected {
             agent_id: agent_id.clone(),
@@ -405,6 +435,11 @@ impl AgentClient {
         // 3. bounded close-out of the session-level tracker: teardown only
         //    counts as complete when all child tasks exit within the grace.
         session_token.cancel();
+        // Withdraw the embedder facade first: from this point new sends fail
+        // fast ("session re-establishing") instead of riding a transport
+        // that is about to be torn down. The bounded termination contract
+        // below still runs on the concrete per-session tunnel.
+        slot.withdraw();
         if tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, teardown_tunnel.shutdown())
             .await
             .is_err()
@@ -417,8 +452,8 @@ impl AgentClient {
         if let Some(h) = connection_handle.as_mut() {
             h.abort();
         }
-        if let Some(h) = control_handle.take() {
-            let _ = h.await;
+        if let Some(mut control_handle) = control_handle.take() {
+            join_or_abort(&mut control_handle, HANDLER_JOIN_GRACE, "control").await;
         }
         session_tracker.close();
         if tokio::time::timeout(SESSION_DRAIN_GRACE, session_tracker.wait())
@@ -440,18 +475,21 @@ impl AgentClient {
             // When Shutdown/Disconnected wins, the handler handle was never
             // polled to Ready (a branch polled to Ready necessarily wins on
             // the spot); the post-cancel await is a legal first wait — wait
-            // for the handler to exit, preventing leaks.
+            // for the handler to exit, preventing leaks. The join is
+            // bounded: a handler ignoring the token is aborted rather than
+            // allowed to park run_session (and with it the supervisor's
+            // reconnect loop) forever.
             SessionEnd::Shutdown => {
-                let _ = handler_task.await;
+                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
                 Ok(SessionOutcome::Shutdown)
             }
             SessionEnd::Disconnected => {
-                let _ = handler_task.await;
+                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
                 error!("Hub connection lost");
                 Ok(SessionOutcome::Ended("Hub connection lost".into()))
             }
             SessionEnd::Watchdog => {
-                let _ = handler_task.await;
+                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
                 warn!(
                     "poll data-plane stall (receive-side watchdog triggered), rebuilding session"
                 );
@@ -495,6 +533,13 @@ impl AgentClient {
                     Some(0) => liveness.poll_watchdog = Duration::ZERO,
                     Some(secs) => liveness.poll_watchdog = Duration::from_secs(secs),
                     None => {}
+                }
+                // Request send-establishment bound: same layering contract
+                // (Some(0) keeps the negotiated default; Some(n) pins).
+                if let Some(secs) = self.config.agent.request_establish_timeout_secs
+                    && secs > 0
+                {
+                    liveness.establish_timeout = Duration::from_secs(secs);
                 }
                 let tunnel = AgentTunnel::from_sender(
                     conn.agent_id.clone(),
@@ -892,6 +937,34 @@ enum SessionEnd {
     Handler(std::result::Result<Result<()>, tokio::task::JoinError>),
 }
 
+/// Bounded final join for a session child-task handle.
+///
+/// By the time this runs, the session token has been cancelled and the drain
+/// grace has already elapsed (with a loud warning) — a task that still has
+/// not exited is ignoring the token, a structural defect. Abort it instead
+/// of waiting forever: `run_session` must always return so the supervisor
+/// reaches its next reconnect iteration; an unbounded join here is exactly
+/// how a wedged wind-down turns into a never-reconnecting agent
+/// (docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md §机制A).
+async fn join_or_abort<T>(
+    handle: &mut tokio::task::JoinHandle<T>,
+    grace: Duration,
+    task: &'static str,
+) {
+    if tokio::time::timeout(grace, &mut *handle).await.is_err() {
+        metrics::counter!("interflow_agent_session_join_timeout_total", "task" => task)
+            .increment(1);
+        error!(
+            "{task} task did not exit within {grace:?} of session cancellation — \
+             aborting (structural defect: the task ignores the cancellation token)"
+        );
+        handle.abort();
+        // Reap the aborted task so the JoinHandle completes (and the tracker
+        // close-out stays truthful).
+        let _ = handle.await;
+    }
+}
+
 /// Build the client root certificate store: system roots + optional custom
 /// CA.
 ///
@@ -996,5 +1069,36 @@ impl AgentClient {
             }
         );
         Ok(negotiated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bounded-join contract (mechanism A hardening,
+    /// docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md): a task
+    /// that never exits is aborted within the grace — never awaited forever.
+    #[tokio::test]
+    async fn join_or_abort_aborts_a_task_that_never_exits() {
+        let mut handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let started = std::time::Instant::now();
+        join_or_abort(&mut handle, Duration::from_millis(100), "test").await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "join_or_abort must be bounded, took {:?}",
+            started.elapsed()
+        );
+        assert!(handle.is_finished(), "the stuck task must be aborted");
+    }
+
+    /// A well-behaved task passes through untouched (completes, no abort).
+    #[tokio::test]
+    async fn join_or_abort_passes_through_a_well_behaved_task() {
+        let mut handle = tokio::spawn(async { 7_u32 });
+        join_or_abort(&mut handle, Duration::from_secs(5), "test").await;
+        assert!(handle.is_finished());
     }
 }
