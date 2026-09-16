@@ -40,5 +40,9 @@ chrono = "0.4"
 # soak CLI
 clap = { version = "4.6", features = ["derive"] }
 
+[dev-dependencies]
+# paused-clock unit tests (impair delay line)
+tokio = { version = "1.52", features = ["test-util"] }
+
 [lints]
 workspace = true

@@ -37,23 +37,52 @@ use crate::tunnel::AgentTunnel;
 use crate::tunnel::transport::TunnelData;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-/// Remaining wait until the shared idle budget expires, or `None` when it
-/// already has (no progress on either direction for `budget`).
-fn shared_remaining(clock: &Mutex<tokio::time::Instant>, budget: Duration) -> Option<Duration> {
-    let last = *clock.lock().unwrap();
-    let elapsed = tokio::time::Instant::now().checked_duration_since(last)?;
-    budget.checked_sub(elapsed).filter(|d| !d.is_zero())
+/// Lock-free shared progress clock: elapsed-micros since a per-pump epoch,
+/// bumped by whichever direction last moved.
+///
+/// An atomic replaces the earlier `Mutex<Instant>` outright: the mutex's
+/// critical section was a single copy, so lock-freedom costs nothing while
+/// removing the lock/poison class entirely; `fetch_max` keeps the clock
+/// monotonic under concurrent `touch`es. `tokio::time::Instant` is required
+/// so paused-clock tests observe the same clock as the `timeout()` waits.
+struct SharedProgress {
+    epoch: tokio::time::Instant,
+    last_progress_us: AtomicU64,
 }
 
-/// Marks progress on one direction, extending both halves' deadlines.
-fn touch(clock: &Mutex<tokio::time::Instant>) {
-    *clock.lock().unwrap() = tokio::time::Instant::now();
+impl SharedProgress {
+    fn new() -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+            last_progress_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Marks progress on one direction, extending both halves' deadlines.
+    #[allow(clippy::cast_possible_truncation)] // truncation wraps after ~585k
+    // years of monotonic clock; the epoch is per-pump, so unreachable
+    fn touch(&self) {
+        let us = tokio::time::Instant::now()
+            .checked_duration_since(self.epoch)
+            .map_or(0, |d| d.as_micros() as u64);
+        self.last_progress_us.fetch_max(us, Ordering::Release);
+    }
+
+    /// Remaining wait until the shared idle budget expires, or `None` when it
+    /// already has (no progress on either direction for `budget`).
+    fn remaining(&self, budget: Duration) -> Option<Duration> {
+        let last = Duration::from_micros(self.last_progress_us.load(Ordering::Acquire));
+        let since_last = tokio::time::Instant::now()
+            .checked_duration_since(self.epoch)?
+            .checked_sub(last)?;
+        budget.checked_sub(since_last).filter(|d| !d.is_zero())
+    }
 }
 
 /// The minimal peer-operation surface needed by a tunnel stream pump.
@@ -68,7 +97,15 @@ pub trait StreamPumpTarget: Send + Sync {
     /// Notifies the peer of stream teardown (request-direction Close).
     async fn send_close(&self, stream_id: &str) -> Result<()>;
 
-    /// Unregisters this stream's response-direction channel in dispatch (idempotent).
+    /// Unregisters this stream's response-direction channel in dispatch
+    /// (idempotent).
+    ///
+    /// Contract: once this returns, dispatch MUST stop delivering new frames
+    /// for the stream — the response channel is closed/detached, so the
+    /// pump's write half drains what is already buffered and then observes
+    /// `None`. This coupling was implicit (undocumented, untested) until the
+    /// 2026-09-16 one-way-idle postmortem; it is now part of the trait
+    /// contract and mirrored by the pump unit-test mock.
     async fn unregister_stream(&self, stream_id: &str);
 }
 
@@ -143,9 +180,7 @@ pub async fn pump_tcp_stream<R, W, T>(
     // extends its deadline (the fix for the one-way-idle teardown the soak
     // gate caught on 2026-09-16: receive-only streams died at exactly
     // idle_timeout of stream age no matter how much response data flowed).
-    let last_activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
-    let read_clock = Arc::clone(&last_activity);
-    let write_clock = Arc::clone(&last_activity);
+    let progress = SharedProgress::new();
 
     // Read half: socket → tunnel (request direction).
     let read_half = async {
@@ -158,7 +193,7 @@ pub async fn pump_tcp_stream<R, W, T>(
             if buf.capacity() < 4096 {
                 buf.reserve(16 * 1024);
             }
-            let Some(remaining) = shared_remaining(&read_clock, cfg.idle_timeout) else {
+            let Some(remaining) = progress.remaining(cfg.idle_timeout) else {
                 metrics::counter!(cfg.idle_timeout_counter).increment(1);
                 debug!("{label} stream idle timeout (read side): {stream_id}");
                 break;
@@ -166,7 +201,7 @@ pub async fn pump_tcp_stream<R, W, T>(
             match tokio::time::timeout(remaining, rd.read_buf(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(_)) => {
-                    touch(&read_clock);
+                    progress.touch();
                     let chunk = buf.split().freeze();
                     if let Err(e) = target.send_data(stream_id, chunk).await {
                         warn!("{label} failed to send data: {e}");
@@ -179,7 +214,7 @@ pub async fn pump_tcp_stream<R, W, T>(
                 }
                 // Own deadline hit: loop and re-derive from the shared clock —
                 // either the write side extended it, or the next iteration's
-                // `shared_remaining` expires the stream.
+                // `remaining` expires the stream.
                 Err(_) => {}
             }
         }
@@ -192,14 +227,14 @@ pub async fn pump_tcp_stream<R, W, T>(
     let write_half = async {
         let mut wr = wr;
         loop {
-            let Some(remaining) = shared_remaining(&write_clock, cfg.idle_timeout) else {
+            let Some(remaining) = progress.remaining(cfg.idle_timeout) else {
                 metrics::counter!(cfg.idle_timeout_counter).increment(1);
                 debug!("{label} stream idle timeout (write side): {stream_id}");
                 break;
             };
             match tokio::time::timeout(remaining, data_rx.recv()).await {
                 Ok(Some(msg)) => {
-                    touch(&write_clock);
+                    progress.touch();
                     if matches!(msg.stream_type, FrameType::Close) {
                         break;
                     }
@@ -270,6 +305,7 @@ pub async fn pump_tcp_stream<R, W, T>(
 )]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
@@ -279,6 +315,11 @@ mod tests {
         data: StdMutex<Vec<Bytes>>,
         closes: StdMutex<Vec<String>>,
         unregisters: StdMutex<Vec<String>>,
+        /// Mirrors the dispatch contract: a clone of the response channel's
+        /// sender, dropped on `unregister_stream`, so "unregister cuts frame
+        /// delivery" is exercised in unit tests too — the write half exits
+        /// via its natural `Ok(None)` once the test's own senders are gone.
+        response_tx: StdMutex<Option<mpsc::Sender<TunnelData>>>,
     }
 
     impl MockTarget {
@@ -290,6 +331,10 @@ mod tests {
         }
         fn unregister_events(&self) -> Vec<String> {
             self.unregisters.lock().unwrap().clone()
+        }
+        /// Arms the dispatch-contract mirror with a clone of the sender.
+        fn mirror_dispatch_channel(&self, tx: &mpsc::Sender<TunnelData>) {
+            *self.response_tx.lock().unwrap() = Some(tx.clone());
         }
     }
 
@@ -305,6 +350,8 @@ mod tests {
         }
         async fn unregister_stream(&self, stream_id: &str) {
             self.unregisters.lock().unwrap().push(stream_id.to_string());
+            // Dispatch contract: cut frame delivery for this stream.
+            *self.response_tx.lock().unwrap() = None;
         }
     }
 
@@ -359,6 +406,11 @@ mod tests {
         let target = MockTarget::default();
         tx.send(td(FrameType::Data, b"resp-1")).await.unwrap();
         tx.send(td(FrameType::Data, b"resp-2")).await.unwrap();
+        target.mirror_dispatch_channel(&tx);
+        // The backend finished responding: dropping the test-side sender lets
+        // the write half exit via its natural `Ok(None)` after the drain,
+        // instead of riding the idle budget to expiry.
+        drop(tx);
 
         peer.write_all(b"req").await.unwrap();
         peer.shutdown().await.unwrap();
@@ -434,6 +486,7 @@ mod tests {
         let (rd, wr) = tokio::io::split(sock);
         let (tx, rx) = mpsc::channel(8);
         let target = Arc::new(MockTarget::default());
+        target.mirror_dispatch_channel(&tx);
 
         let mut cfg = test_cfg();
         cfg.idle_timeout = Duration::from_millis(100);
@@ -457,10 +510,11 @@ mod tests {
         });
 
         // Mid-run probe at 3× the idle budget with response frames flowing:
-        // the stream must show NO teardown traces. (The mock's unregister
-        // does not close the response channel the way real dispatch does, so
-        // pump-return timing alone would not reproduce the production
-        // teardown coupling — assert on the teardown evidence itself.)
+        // the stream must show NO teardown traces. Teardown evidence — not
+        // pump-return timing — stays the decisive assertion even with the
+        // mock mirroring the dispatch channel-cut contract: the feeder's
+        // live sender keeps the channel open, so a buggy early unregister
+        // would not by itself end the pump; only the traces reveal it.
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             target.unregister_events().is_empty() && target.close_calls().is_empty(),

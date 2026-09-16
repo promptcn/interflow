@@ -238,6 +238,35 @@ async fn handle_connection(ctx: AcceptContext, conn: quinn::Connection) {
         });
     }
 
+    // Transport-stats sampler (twin of the egress-side sampler in core
+    // tunnel/quic.rs): the CC forensics anchor for the 2026-09-16 quic
+    // egress-stall case file — cumulative counters, diff adjacent samples.
+    {
+        let conn_stats = conn.clone();
+        let agent_stats = agent_id.clone();
+        ctx.tasks.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = conn_stats.closed() => break,
+                    _ = tick.tick() => {}
+                }
+                let p = &conn_stats.stats().path;
+                debug!(
+                    agent = %agent_stats,
+                    cwnd = p.cwnd,
+                    rtt_us = p.rtt.as_micros(),
+                    sent_packets = p.sent_packets,
+                    lost_packets = p.lost_packets,
+                    congestion_events = p.congestion_events,
+                    black_holes = p.black_holes_detected,
+                    "QUIC transport stats"
+                );
+            }
+        });
+    }
+
     // Traffic stream loop
     loop {
         let (tx, rx) = match conn.accept_bi().await {

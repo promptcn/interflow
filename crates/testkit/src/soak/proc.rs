@@ -67,7 +67,10 @@ pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) ->
         },
         audit: Default::default(),
         logging: LoggingConfig {
-            level: "info".to_string(),
+            // Own-crate debug on top of info: the QUIC transport-stats sampler
+            // (CC forensics anchor, 2026-09-16 quic-stall case file) logs at
+            // debug — soak is the diagnostic context where it must appear.
+            level: "info,interflow_core=debug,interflow_mesh=debug".to_string(),
             format: interflow_mesh::config::LogFormat::Plain,
         },
         quic: HubQuicConfig {
@@ -187,7 +190,10 @@ fn base_agent_config(
             hub_cert_fingerprint: None,
         }),
         logging: LoggingConfig {
-            level: "info".to_string(),
+            // Own-crate debug on top of info: the QUIC transport-stats sampler
+            // (CC forensics anchor, 2026-09-16 quic-stall case file) logs at
+            // debug — soak is the diagnostic context where it must appear.
+            level: "info,interflow_core=debug,interflow_mesh=debug".to_string(),
             format: interflow_mesh::config::LogFormat::Plain,
         },
     }

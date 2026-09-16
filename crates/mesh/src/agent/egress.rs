@@ -60,7 +60,7 @@ use interflow_core::security::EventRateLimiter;
 use interflow_core::tunnel::{AgentTunnel, IncomingStream, TunnelData};
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -74,6 +74,72 @@ use tracing::{debug, error, info, warn};
 /// plane), the read side kills the stream rather than hang — fd release
 /// takes priority over the last in-flight segment of data.
 const RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Session-level send-path stall threshold: send **demand** exists yet
+/// nothing has gotten through for this long ⇒ the session (not the
+/// individual stream) is declared wedged and torn down for reconnect.
+///
+/// The unit that actually failed is the session: when the whole send path
+/// stalls, letting the per-stream guard above execute N streams one by one
+/// is slower and noisier than failing the session once (design note from
+/// the 2026-09-16 quic egress-stall case file). 3× the per-stream timeout
+/// keeps the escalation strictly behind per-stream protection.
+const SESSION_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Session-wide send-path health: two lock-free clocks (same pattern as the
+/// pump's `SharedProgress`) — last send **attempt** (demand) vs last send
+/// **success**. Starvation is only declared when demand outlives success; an
+/// idle session with no sends is healthy by definition.
+///
+/// Only the response-**data** send path participates: the Close-echo path
+/// deliberately abandons its 1s sends during teardown ("expected during
+/// session teardown") and must not count as unfulfilled demand.
+struct SendPathHealth {
+    /// `tokio::time::Instant` keeps paused-clock unit tests exact.
+    epoch: tokio::time::Instant,
+    last_attempt_us: AtomicU64,
+    last_success_us: AtomicU64,
+}
+
+impl SendPathHealth {
+    fn new() -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+            last_attempt_us: AtomicU64::new(0),
+            last_success_us: AtomicU64::new(0),
+        }
+    }
+
+    fn note_attempt(&self) {
+        self.last_attempt_us
+            .store(self.elapsed_us(), Ordering::Release);
+    }
+
+    fn note_success(&self) {
+        self.last_success_us
+            .store(self.elapsed_us(), Ordering::Release);
+    }
+
+    /// How long send demand has existed without a single success; `None`
+    /// when healthy (no pending demand, or successes keep flowing).
+    fn demand_starved_for(&self) -> Option<Duration> {
+        let last_attempt = self.last_attempt_us.load(Ordering::Acquire);
+        let last_success = self.last_success_us.load(Ordering::Acquire);
+        if last_attempt <= last_success {
+            return None; // every demand has been met
+        }
+        Some(Duration::from_micros(
+            self.elapsed_us().saturating_sub(last_success),
+        ))
+    }
+
+    #[allow(clippy::cast_possible_truncation)] // wraps after ~585k years; the epoch is per-session
+    fn elapsed_us(&self) -> u64 {
+        tokio::time::Instant::now()
+            .checked_duration_since(self.epoch)
+            .map_or(0, |d| d.as_micros() as u64)
+    }
+}
 
 /// Bounded wait for the wind-down Close notification: the wind-down path
 /// (including session teardown) never hangs on a full-channel send; on
@@ -331,8 +397,30 @@ impl EgressHandler {
         let mut command_rx = self.command_rx;
         let mut incoming = self.incoming;
 
+        // Session-wide send-path health (see SendPathHealth): evaluated on a
+        // 1s cadence in the main loop — no cross-task signaling needed.
+        let send_health = Arc::new(SendPathHealth::new());
+        let mut health_tick = tokio::time::interval(Duration::from_secs(1));
+        health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
+                // Session-level send-path health: demand present but nothing
+                // getting through past SESSION_SEND_STALL_TIMEOUT ⇒ fail the
+                // session once and reconnect, instead of letting the
+                // per-stream 10s guard execute streams one by one.
+                _ = health_tick.tick() => {
+                    if let Some(starved) = send_health.demand_starved_for()
+                        && starved >= SESSION_SEND_STALL_TIMEOUT
+                    {
+                        error!(
+                            "Egress send path starved for {starved:?} (demand present, no success) — failing session for reconnect"
+                        );
+                        return Err(InterflowError::connection(
+                            "egress send path starved session-wide (send stall)".to_string(),
+                        ));
+                    }
+                }
                 // Handle rule add/remove commands (all with an
                 // acknowledgment; the store persists first, then memory)
                 cmd_opt = async {
@@ -384,6 +472,7 @@ impl EgressHandler {
                             &runtime,
                             &session,
                             &tracker,
+                            &send_health,
                         )
                         .await;
                     } else {
@@ -408,6 +497,7 @@ impl EgressHandler {
     /// function (inline rejection and forwarder wind-down) funnels uniquely
     /// into [`Self::finish`] for the decrement, so increment-first balances
     /// on every path.
+    #[allow(clippy::too_many_arguments)] // session-scoped plumbing (tunnel/rules/security/policy/runtime/session/tracker)
     async fn handle_incoming_stream(
         stream: IncomingStream,
         tunnel: &AgentTunnel,
@@ -417,6 +507,7 @@ impl EgressHandler {
         runtime: &Arc<EgressRuntime>,
         session: &CancellationToken,
         tracker: &TaskTracker,
+        send_health: &Arc<SendPathHealth>,
     ) {
         let IncomingStream { open, frames } = stream;
         let stream_id = open.stream_id.clone();
@@ -540,6 +631,7 @@ impl EgressHandler {
                     policy.connect_timeout,
                     Arc::clone(runtime),
                     session.clone(),
+                    Arc::clone(send_health),
                 ));
             }
             StreamProto::Udp => {
@@ -557,6 +649,7 @@ impl EgressHandler {
                     Arc::clone(runtime),
                     session.clone(),
                     tracker,
+                    Arc::clone(send_health),
                 );
             }
         }
@@ -590,6 +683,7 @@ impl EgressHandler {
         connect_timeout: Duration,
         runtime: Arc<EgressRuntime>,
         session: CancellationToken,
+        send_health: Arc<SendPathHealth>,
     ) {
         // 1. Resolve-then-check-then-connect: tokio::net::lookup_host
         //    resolves (IP literals trigger no DNS) -> filter out
@@ -704,6 +798,7 @@ impl EgressHandler {
             let stream_id = stream_id.clone();
             let cancel = cancel.clone();
             let session = session.clone();
+            let send_health = Arc::clone(&send_health);
             let mut read_half = read_half;
             async move {
                 // 1 MiB cap: exceeding it triggers backpressure (stop
@@ -750,13 +845,18 @@ impl EgressHandler {
                                 // hang when the upstream channel is
                                 // full/stalled (otherwise the fd lingers
                                 // inside a blocked send — leak path #2)
+                                // Session send-path health: a frame to deliver
+                                // is demand; the success note clears it.
+                                send_health.note_attempt();
                                 match tokio::time::timeout(
                                     RESPONSE_SEND_TIMEOUT,
                                     tunnel.send_data_response(&stream_id, data),
                                 )
                                 .await
                                 {
-                                    Ok(Ok(())) => {}
+                                    Ok(Ok(())) => {
+                                        send_health.note_success();
+                                    }
                                     Ok(Err(e)) => {
                                         error!("Failed to send to hub: {}", e);
                                         break BackendExit::UpstreamSick;
@@ -969,6 +1069,7 @@ impl EgressHandler {
         runtime: Arc<EgressRuntime>,
         session: CancellationToken,
         tracker: &TaskTracker,
+        send_health: Arc<SendPathHealth>,
     ) {
         tracker.spawn(async move {
             let resolved =
@@ -1109,6 +1210,7 @@ impl EgressHandler {
                 let tunnel = tunnel.clone();
                 let stream_id = stream_id.clone();
                 let token = stream_token.clone();
+                let send_health = Arc::clone(&send_health);
                 async move {
                     let mut buf = vec![0u8; UDP_RECV_BUF];
                     loop {
@@ -1124,13 +1226,16 @@ impl EgressHandler {
                                         continue;
                                     }
                                     let data = Bytes::copy_from_slice(&buf[..n]);
+                                    send_health.note_attempt();
                                     match tokio::time::timeout(
                                         RESPONSE_SEND_TIMEOUT,
                                         tunnel.send_data_response(&stream_id, data),
                                     )
                                     .await
                                     {
-                                        Ok(Ok(())) => {}
+                                        Ok(Ok(())) => {
+                                            send_health.note_success();
+                                        }
                                         Ok(Err(e)) => {
                                             error!("UDP send to hub failed: {e}");
                                             break;
@@ -1307,6 +1412,35 @@ fn poisoned<T>(e: std::sync::PoisonError<T>) -> T {
 mod tests {
     use super::*;
     use crate::config::SecurityConfig;
+
+    /// Idle session (no send demand ever) is healthy — the supervisor must
+    /// not trip on a quiet session.
+    #[test]
+    fn send_path_health_idle_is_healthy() {
+        let h = SendPathHealth::new();
+        assert_eq!(h.demand_starved_for(), None);
+    }
+
+    /// Demand met by a success is healthy; unmet demand starves at the rate
+    /// real time advances (paused clock: exactly the slept duration).
+    #[tokio::test(start_paused = true)]
+    async fn send_path_health_starves_only_unmet_demand() {
+        let h = SendPathHealth::new();
+        h.note_attempt();
+        h.note_success();
+        assert_eq!(h.demand_starved_for(), None);
+
+        // A new attempt with no success: starvation grows with time.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        h.note_attempt();
+        assert_eq!(h.demand_starved_for(), Some(Duration::from_secs(5)));
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert_eq!(h.demand_starved_for(), Some(Duration::from_secs(30)));
+
+        // Late success clears the starvation.
+        h.note_success();
+        assert_eq!(h.demand_starved_for(), None);
+    }
 
     #[test]
     fn test_is_target_allowed() {

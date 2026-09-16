@@ -56,7 +56,7 @@
 use crate::backend::{
     CHUNK_HEADER, chunk_instant, decode_chunk, sse_backend, verify_chunk_payload,
 };
-use crate::impair::{DropPattern, ImpairConfig, TcpImpairProxy, UdpImpairProxy};
+use crate::impair::{DropPattern, ImpairConfig, ImpairKind, TcpImpairProxy, UdpImpairProxy};
 use crate::metrics::{LatencyStats, fmt_ms, latency_stats};
 use crate::soak::phases::{PhaseTimeline, SerializedSpan, run_phases};
 use crate::soak::proc::{
@@ -120,6 +120,11 @@ pub struct SoakArgs {
     /// TCP withhold duration in ms (h2 lost-segment retransmit recovery model)
     #[arg(long, default_value_t = 100)]
     withhold_ms: u64,
+
+    /// UDP impair-proxy delay-line capacity in datagrams per direction (overflow tail-drops
+    /// and fails the scenario as a harness fault — 2026-09-16 quic-stall case file)
+    #[arg(long, default_value_t = 8192)]
+    impair_queue_capacity: usize,
 
     /// Phase cycle length in seconds (tail is the silent window)
     #[arg(long, default_value_t = 300)]
@@ -358,6 +363,23 @@ struct HeartbeatSummary {
     pong_total: u64,
 }
 
+/// Impairment-harness self-health: UDP delay-line depth/overflow accounting
+/// (2026-09-16 quic-stall case file — the decisive observable separating a
+/// harness bottleneck from a product-side quinn stall).
+#[derive(Serialize, Default)]
+struct HarnessSummary {
+    /// Delay-line high-water mark, data direction (egress→hub), datagrams.
+    udp_data_high_water: usize,
+    /// Tail-dropped datagrams, data direction (harness fault).
+    udp_data_overflow: u64,
+    /// Delay-line high-water mark, return direction (hub→egress).
+    udp_return_high_water: usize,
+    /// Tail-dropped datagrams, return direction (harness fault).
+    udp_return_overflow: u64,
+    /// Configured line capacity per direction (0 = no UDP proxy in this scenario).
+    udp_queue_capacity: usize,
+}
+
 #[derive(Serialize)]
 struct TransportResult {
     transport: String,
@@ -375,6 +397,7 @@ struct TransportResult {
     rss: Vec<RssSummary>,
     heartbeat: HeartbeatSummary,
     churn: ChurnSummary,
+    harness: HarnessSummary,
     assertions: Vec<AssertionOut>,
 }
 
@@ -394,6 +417,7 @@ fn failed_result(name: &str, args: &SoakArgs, err: String) -> TransportResult {
         rss: Vec::new(),
         heartbeat: HeartbeatSummary::default(),
         churn: ChurnSummary::default(),
+        harness: HarnessSummary::default(),
         assertions: Vec::new(),
     }
 }
@@ -809,8 +833,13 @@ fn analyze_stream(
                 return false; // expected pause from the periodic silent window
             }
             // An impairment event inside the gap window (counting from 500ms before) = expected HOL
-            // from injected loss/withholding
+            // from injected loss/withholding. Harness-fault overflow drops are deliberately
+            // excluded: a delay line that tail-dropped must not masquerade as injected loss
+            // and silently flatter the product (it fails `harness_delay_line_no_overflow`).
             let explained_by_impair = impair_events.iter().any(|e| {
+                if matches!(e.kind, ImpairKind::QueueOverflowDropped { .. }) {
+                    return false;
+                }
                 let lo = prev.checked_sub(Duration::from_millis(500));
                 e.at <= next && lo.is_none_or(|l| e.at >= l)
             });
@@ -910,6 +939,7 @@ async fn run_scenario(
             DropPattern::Rate(f64::from(args.loss_pct) / 100.0)
         },
         withhold: Duration::from_millis(args.withhold_ms),
+        queue_capacity: args.impair_queue_capacity,
         seed: args.seed + transport_id(transport),
     };
     let tcp_proxy = if transport == TransportKind::H2 {
@@ -1261,6 +1291,17 @@ async fn run_scenario(
         (_, Some(p)) => p.events(),
         _ => Vec::new(),
     };
+    // Delay-line health (fetched before shutdown; the harness red-flag source)
+    let harness = udp_proxy.as_ref().map_or(HarnessSummary::default(), |p| {
+        let (data, ret, capacity) = p.delay_stats();
+        HarnessSummary {
+            udp_data_high_water: data.high_water,
+            udp_data_overflow: data.overflow_dropped,
+            udp_return_high_water: ret.high_water,
+            udp_return_overflow: ret.overflow_dropped,
+            udp_queue_capacity: capacity,
+        }
+    });
     let _ = liveness.await;
 
     // Final metrics snapshot before shutdown (the most authoritative closing counts)
@@ -1623,6 +1664,31 @@ async fn run_scenario(
         );
     }
 
+    // 9. Harness self-health: the UDP impairment proxy's delay lines must not
+    //    overflow — an overflow tail-drop is a harness fault that, if mistaken
+    //    for injected loss, would silently flatter the product under test, so
+    //    it fails the scenario outright. The h2 TCP proxy has no delay line
+    //    (serial virtual-clock model): vacuously green, noted as such.
+    let harness_ok = harness.udp_data_overflow == 0 && harness.udp_return_overflow == 0;
+    push_assert(
+        &mut assertions,
+        &mut pass,
+        "harness_delay_line_no_overflow",
+        harness_ok,
+        if transport == TransportKind::Quic {
+            format!(
+                "udp delay lines capacity {}: high-water {}/{} datagrams (data/return), overflow drops {}/{}",
+                harness.udp_queue_capacity,
+                harness.udp_data_high_water,
+                harness.udp_return_high_water,
+                harness.udp_data_overflow,
+                harness.udp_return_overflow,
+            )
+        } else {
+            "tcp impairment proxy uses the serial virtual-clock model (no delay line)".to_string()
+        },
+    );
+
     let chunks_verified: usize = stream_stats.iter().map(|s| s.chunks).sum();
     TransportResult {
         transport: name.to_string(),
@@ -1637,6 +1703,7 @@ async fn run_scenario(
         streams_detail: stream_stats,
         max_gap_ms,
         rss: rss_summaries,
+        harness,
         heartbeat: HeartbeatSummary {
             samples: metrics_series.samples.len(),
             misses: metrics_series.misses,

@@ -75,10 +75,12 @@ clap = { version = "4.6", features = ["derive"] }
 chrono = "0.4"
 
 [dev-dependencies]
-# Shared test/bench harness (dev-dependency cycle: testkit depends on mesh, officially
+# Shared test/bench harness (dev-dependency cycle: testkit depends on mesh,
 # supported by cargo, same pattern as tokio/tokio-test; testkit stays out of the
 # production dependency graph)
 interflow-testkit = { path = "../testkit", version = "0.1" }
+# paused-clock unit tests (egress send-path health)
+tokio = { version = "1.52", features = ["test-util"] }
 # bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion
 # when creating streams at high frequency)
 libc = "0.2"

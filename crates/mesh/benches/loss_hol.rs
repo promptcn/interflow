@@ -375,6 +375,7 @@ async fn run_scenario(
         drop: DropPattern::Rate(f64::from(loss_pct) / 100.0),
         withhold: Duration::from_millis(args.withhold_ms),
         seed,
+        ..ImpairConfig::default()
     };
     let tcp_proxy = if transport == TransportKind::H2 {
         Some(
@@ -559,7 +560,13 @@ async fn run_scenario(
     for e in &events {
         let recovery = match e.kind {
             interflow_testkit::impair::ImpairKind::Withheld { for_duration } => for_duration,
-            interflow_testkit::impair::ImpairKind::Dropped => Duration::from_millis(args.rtt_ms),
+            // For loss recovery a drop is a drop either way (QUIC retransmits
+            // regardless of who dropped it); overflow should not occur at the
+            // default capacity — if it ever does, the soak gate flags it.
+            interflow_testkit::impair::ImpairKind::Dropped
+            | interflow_testkit::impair::ImpairKind::QueueOverflowDropped { .. } => {
+                Duration::from_millis(args.rtt_ms)
+            }
         };
         let win_start = e.at.checked_sub(Duration::from_millis(50));
         let win_end = e.at + recovery + Duration::from_millis(150);

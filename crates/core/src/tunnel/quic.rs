@@ -49,6 +49,12 @@ pub const QUIC_ALPN: &str = "interflow";
 
 /// KeepAlive interval (frp default).
 const KEEPALIVE: Duration = Duration::from_secs(10);
+
+/// Transport-stats sampling interval (cheap snapshot; always on). The CC
+/// forensics anchor for the 2026-09-16 quic egress-stall case file: cwnd
+/// collapse / loss bursts / black holes show up in these logs with no
+/// extra tooling. Counters are cumulative — diff adjacent samples.
+const STATS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 /// Idle timeout (frp default).
 const IDLE_TIMEOUT_MS: u32 = 30_000;
 /// Per-stream write-command channel capacity (backpressure threshold).
@@ -476,6 +482,33 @@ impl QuicTunnel {
                 tokio::select! {
                     () = shutdown2.cancelled() => {}
                     () = datagram_read_loop(conn2, dispatch2) => {}
+                }
+            });
+        }
+
+        // Transport-stats sampler (see STATS_SAMPLE_INTERVAL)
+        {
+            let conn_stats = conn.clone();
+            let shutdown_stats = shutdown.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(STATS_SAMPLE_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        () = shutdown_stats.cancelled() => break,
+                        _ = tick.tick() => {}
+                    }
+                    let s = conn_stats.stats();
+                    let p = &s.path;
+                    debug!(
+                        cwnd = p.cwnd,
+                        rtt_us = p.rtt.as_micros(),
+                        sent_packets = p.sent_packets,
+                        lost_packets = p.lost_packets,
+                        congestion_events = p.congestion_events,
+                        black_holes = p.black_holes_detected,
+                        "QUIC transport stats"
+                    );
                 }
             });
         }
