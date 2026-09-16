@@ -37,10 +37,13 @@
 //!    first-half median → final value must grow by ≤ the bound — in-session
 //!    orphaned streams (lost close notification / never notifying the peer)
 //!    surface directly here;
-//! 8. **Sweep-notification canary**: when there is ≥1 eviction wave and churn
-//!    has traffic, the hub's `interflow_hub_sweep_peer_notified_total` must be
-//!    ≥1 (regression sentinel for sweeps that clear the table without
-//!    notifying the peer, on the production /metrics path).
+//! 8. **Sweep-notification canary** (poll-plane/h2 only): when there is ≥1
+//!    eviction wave and churn has traffic, the hub's
+//!    `interflow_hub_sweep_peer_notified_total` must be ≥1 (regression
+//!    sentinel for sweeps that clear the table without notifying the peer, on
+//!    the production /metrics path). A relay-plane (QUIC) peer is torn down by
+//!    the table-entry drop and never increments this counter, so the QUIC
+//!    scenario skips the canary by design.
 //!
 //! Run: `just soak [-- args]`; smoke: `just soak -- --quick`.
 
@@ -1581,19 +1584,32 @@ async fn run_scenario(
         ),
     }
 
-    // 8. Sweep-notification canary (production /metrics path): eviction waves must produce peer notifications
+    // 8. Sweep-notification canary (production /metrics path): eviction waves must produce peer notifications.
+    //    Poll-plane (h2) peers only: a relay-plane (QUIC) peer is torn down by
+    //    the table-entry drop itself and never touches this counter, so the
+    //    canary is meaningful on the h2 scenario alone.
     if churn_waves_final >= 1 && churn_successes_final >= 10 {
-        let notified = sweep_notified_final.unwrap_or(0);
-        push_assert(
-            &mut assertions,
-            &mut pass,
-            "sweep_peer_notified",
-            notified >= 1,
-            format!(
-                "eviction waves {} × churn {} streams → sweep peer notifications {} (regression sentinel for sweep clearing state without notifying peers)",
-                churn_waves_final, churn_successes_final, notified
-            ),
-        );
+        if transport == TransportKind::H2 {
+            let notified = sweep_notified_final.unwrap_or(0);
+            push_assert(
+                &mut assertions,
+                &mut pass,
+                "sweep_peer_notified",
+                notified >= 1,
+                format!(
+                    "eviction waves {} × churn {} streams → sweep peer notifications {} (regression sentinel for sweep clearing state without notifying peers)",
+                    churn_waves_final, churn_successes_final, notified
+                ),
+            );
+        } else {
+            push_assert(
+                &mut assertions,
+                &mut pass,
+                "sweep_peer_notified",
+                true,
+                "relay-plane (QUIC) sweep teardown is carried by the table-entry drop, not the control-channel notification this counter tracks — poll-plane-only canary, skipped".to_string(),
+            );
+        }
     } else {
         push_assert(
             &mut assertions,

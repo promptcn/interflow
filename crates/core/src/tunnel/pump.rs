@@ -37,10 +37,24 @@ use crate::tunnel::AgentTunnel;
 use crate::tunnel::transport::TunnelData;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+/// Remaining wait until the shared idle budget expires, or `None` when it
+/// already has (no progress on either direction for `budget`).
+fn shared_remaining(clock: &Mutex<tokio::time::Instant>, budget: Duration) -> Option<Duration> {
+    let last = *clock.lock().unwrap();
+    let elapsed = tokio::time::Instant::now().checked_duration_since(last)?;
+    budget.checked_sub(elapsed).filter(|d| !d.is_zero())
+}
+
+/// Marks progress on one direction, extending both halves' deadlines.
+fn touch(clock: &Mutex<tokio::time::Instant>) {
+    *clock.lock().unwrap() = tokio::time::Instant::now();
+}
 
 /// The minimal peer-operation surface needed by a tunnel stream pump.
 ///
@@ -81,8 +95,11 @@ impl StreamPumpTarget for AgentTunnel {
 /// Pump parameters: liveness deadlines + metric counter names (the caller
 /// passes existing names so monitoring dashboards see no change).
 pub struct PumpConfig {
-    /// One-way idle deadline: no data on the read side / no frames on the
-    /// write side for this long closes out the whole stream.
+    /// Shared idle budget: the stream is closed only when NO direction carries
+    /// bytes (read side) or frames (write side) for this long — activity on
+    /// either side resets both halves' deadlines. A receive-only push stream
+    /// (SSE-style consumer that never transmits) therefore survives as long as
+    /// the server keeps sending.
     pub idle_timeout: Duration,
     /// Client write-stall deadline: writing one frame to the socket for
     /// longer than this abandons the connection.
@@ -120,6 +137,16 @@ pub async fn pump_tcp_stream<R, W, T>(
 {
     let label = cfg.log_label;
 
+    // Shared idle clock: the instant either direction last made progress.
+    // Each half waits only until the budget since that instant elapses and
+    // then re-derives its remaining wait, so the peer direction's traffic
+    // extends its deadline (the fix for the one-way-idle teardown the soak
+    // gate caught on 2026-09-16: receive-only streams died at exactly
+    // idle_timeout of stream age no matter how much response data flowed).
+    let last_activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
+    let read_clock = Arc::clone(&last_activity);
+    let write_clock = Arc::clone(&last_activity);
+
     // Read half: socket → tunnel (request direction).
     let read_half = async {
         let mut rd = rd;
@@ -131,9 +158,15 @@ pub async fn pump_tcp_stream<R, W, T>(
             if buf.capacity() < 4096 {
                 buf.reserve(16 * 1024);
             }
-            match tokio::time::timeout(cfg.idle_timeout, rd.read_buf(&mut buf)).await {
+            let Some(remaining) = shared_remaining(&read_clock, cfg.idle_timeout) else {
+                metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                debug!("{label} stream idle timeout (read side): {stream_id}");
+                break;
+            };
+            match tokio::time::timeout(remaining, rd.read_buf(&mut buf)).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(_)) => {
+                    touch(&read_clock);
                     let chunk = buf.split().freeze();
                     if let Err(e) = target.send_data(stream_id, chunk).await {
                         warn!("{label} failed to send data: {e}");
@@ -144,11 +177,10 @@ pub async fn pump_tcp_stream<R, W, T>(
                     warn!("{label} failed to read socket: {e}");
                     break;
                 }
-                Err(_) => {
-                    metrics::counter!(cfg.idle_timeout_counter).increment(1);
-                    debug!("{label} stream idle timeout (read side): {stream_id}");
-                    break;
-                }
+                // Own deadline hit: loop and re-derive from the shared clock —
+                // either the write side extended it, or the next iteration's
+                // `shared_remaining` expires the stream.
+                Err(_) => {}
             }
         }
         // Client direction closed/errored: notify the peer of stream
@@ -160,8 +192,14 @@ pub async fn pump_tcp_stream<R, W, T>(
     let write_half = async {
         let mut wr = wr;
         loop {
-            match tokio::time::timeout(cfg.idle_timeout, data_rx.recv()).await {
+            let Some(remaining) = shared_remaining(&write_clock, cfg.idle_timeout) else {
+                metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                debug!("{label} stream idle timeout (write side): {stream_id}");
+                break;
+            };
+            match tokio::time::timeout(remaining, data_rx.recv()).await {
                 Ok(Some(msg)) => {
+                    touch(&write_clock);
                     if matches!(msg.stream_type, FrameType::Close) {
                         break;
                     }
@@ -186,11 +224,8 @@ pub async fn pump_tcp_stream<R, W, T>(
                 }
                 // Channel closed = dispatch poisoning / peer teardown / stream already unregistered
                 Ok(None) => break,
-                Err(_) => {
-                    metrics::counter!(cfg.idle_timeout_counter).increment(1);
-                    debug!("{label} stream idle timeout (write side): {stream_id}");
-                    break;
-                }
+                // Own deadline hit: re-derive from the shared clock next loop.
+                Err(_) => {}
             }
         }
     };
@@ -382,6 +417,89 @@ mod tests {
 
         pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
 
+        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+    }
+
+    /// Regression (caught by the soak gate's first full-duration run,
+    /// 2026-09-16): a receive-only stream — the client never transmits a
+    /// single byte, like an SSE/token-stream consumer — must survive beyond
+    /// `idle_timeout` while the tunnel keeps delivering response frames.
+    /// Pre-fix semantics gave each half its own timer, so the read side
+    /// expired at exactly idle_timeout of stream age regardless of
+    /// response-direction traffic (killing every push-style stream at 300s
+    /// under production defaults).
+    #[tokio::test(start_paused = true)]
+    async fn one_way_response_traffic_keeps_stream_alive_beyond_idle() {
+        let (sock, _peer_quiet) = duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(sock);
+        let (tx, rx) = mpsc::channel(8);
+        let target = Arc::new(MockTarget::default());
+
+        let mut cfg = test_cfg();
+        cfg.idle_timeout = Duration::from_millis(100);
+
+        // 20 frames × 25ms = 500ms of response-direction activity, then the
+        // channel closes (the pump's natural end via Ok(None)).
+        let feeder = tokio::spawn(async move {
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                if tx.send(td(FrameType::Data, b"tick")).await.is_err() {
+                    break;
+                }
+            }
+            drop(tx);
+        });
+
+        let started = tokio::time::Instant::now();
+        let t = Arc::clone(&target);
+        let pump = tokio::spawn(async move {
+            pump_tcp_stream(rd, wr, rx, &*t, "s1", &cfg).await;
+        });
+
+        // Mid-run probe at 3× the idle budget with response frames flowing:
+        // the stream must show NO teardown traces. (The mock's unregister
+        // does not close the response channel the way real dispatch does, so
+        // pump-return timing alone would not reproduce the production
+        // teardown coupling — assert on the teardown evidence itself.)
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            target.unregister_events().is_empty() && target.close_calls().is_empty(),
+            "one-way idle tore down an actively served push stream mid-run"
+        );
+
+        pump.await.unwrap();
+        let elapsed = started.elapsed();
+        feeder.await.unwrap();
+
+        assert!(
+            elapsed >= Duration::from_millis(450),
+            "pump died after {elapsed:?} — one-way idle tore down an actively served push stream"
+        );
+        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+    }
+
+    /// The shared budget still expires: with no traffic in either direction
+    /// the stream is torn down at the idle deadline (anti-zombie semantics,
+    /// unchanged by the shared-clock fix).
+    #[tokio::test(start_paused = true)]
+    async fn both_directions_silent_expires_shared_idle() {
+        let (sock, _peer) = duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(sock);
+        let (tx, rx) = mpsc::channel(8); // held open, deliberately silent
+        let target = MockTarget::default();
+
+        let mut cfg = test_cfg();
+        cfg.idle_timeout = Duration::from_millis(120);
+
+        let started = tokio::time::Instant::now();
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &cfg).await;
+        let elapsed = started.elapsed();
+        drop(tx);
+
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed <= Duration::from_millis(250),
+            "idle teardown fired at {elapsed:?}, expected ~120ms"
+        );
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
     }
 }
