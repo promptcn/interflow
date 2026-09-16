@@ -32,12 +32,14 @@
     unused_mut
 )]
 use bytes::Bytes;
+use interflow_core::error::InterflowError;
 use interflow_core::protocol::StreamProto;
+use interflow_core::protocol::frame::FrameType;
 use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::config::EgressRule;
 use interflow_testkit::{
-    acl, agent_config, echo_server, hub_config, pick_ephemeral_port, spawn_agent,
-    spawn_agent_registered, spawn_hub, wait_agent_connected,
+    acl, agent_config, echo_server, hub_config, pick_ephemeral_port, spawn_agent_registered,
+    spawn_hub, wait_agent_connected,
 };
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -72,6 +74,17 @@ async fn facade_round_trip(
             .await
             .expect("echo frame within deadline")
             .expect("stream channel must stay open until the echo completes");
+        if frame.stream_type == FrameType::Close {
+            // A peer-side rejection (e.g. "Target agent not registered")
+            // surfaces as a Close frame on the return channel — surface it
+            // as an error with the reason instead of appending its payload
+            // bytes to the echo.
+            let reason = String::from_utf8_lossy(&frame.data);
+            tunnel.unregister_stream(&sid).await;
+            return Err(InterflowError::connection(format!(
+                "stream closed by the peer before the echo completed: {reason}"
+            )));
+        }
         got.extend_from_slice(&frame.data);
     }
     let _ = tunnel.send_close(&sid).await;
@@ -89,7 +102,8 @@ async fn facade_rides_across_session_rebuild() {
     let acls = vec![acl("front", "egress")];
     let hub = spawn_hub(hub_config(hub_port, acls.clone())).await;
 
-    // 2. Egress agent serving the echo backend
+    // 2. Egress agent serving the echo backend (waited to Connected: the
+    //    first round trip must not race its registration)
     let mut egress_cfg = agent_config("egress", hub_port);
     egress_cfg.egress = vec![EgressRule {
         name: "echo".to_string(),
@@ -97,7 +111,7 @@ async fn facade_rides_across_session_rebuild() {
         target_protocol: StreamProto::Tcp,
         udp_idle_timeout_secs: None,
     }];
-    let _egress = spawn_agent(egress_cfg);
+    let egress = spawn_agent_registered(egress_cfg).await;
 
     // 3. Supervised front agent — the embedder shape (what edge does):
     //    start() + the facade from the handle.
@@ -143,12 +157,21 @@ async fn facade_rides_across_session_rebuild() {
         probe_start.elapsed()
     );
 
-    // 7. Hub back on the same port; the supervisor re-registers on its own
+    // 7. Hub back on the same port; BOTH supervisors re-register on their
+    //    own — waiting only for the front is not enough: the egress agent
+    //    reconnects on its own backoff, and an Open routed to a
+    //    not-yet-registered target is (correctly) rejected with a CLOSE
+    //    ("Target agent not registered") — the CI flake this wait removes.
     let _hub2 = spawn_hub(hub_config(hub_port, acls)).await;
     assert!(
         wait_agent_connected(&front, Duration::from_secs(30)).await,
         "front agent should re-register after the hub returns (state: {:?})",
         front.state()
+    );
+    assert!(
+        wait_agent_connected(&egress, Duration::from_secs(30)).await,
+        "egress agent should re-register after the hub returns (state: {:?})",
+        egress.state()
     );
 
     // 8. The SAME facade round-trips again — the essence of the fix
@@ -159,6 +182,7 @@ async fn facade_rides_across_session_rebuild() {
     assert_eq!(got2, payload2);
 
     front.shutdown_graceful().await.expect("front shutdown");
+    egress.shutdown_graceful().await.expect("egress shutdown");
 }
 
 /// During the gap the facade's register path is also bounded (a sealed
