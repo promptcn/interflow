@@ -1,6 +1,7 @@
 //! Tauri invoke commands: profile read/write + tunnel start/stop + state/log queries.
 
 use crate::SharedState;
+use interflow_expose::TransportKind;
 use interflow_expose::client::ExposeArgs;
 use interflow_expose::profile::{self, Profile};
 use interflow_mesh::agent::AgentState;
@@ -42,6 +43,10 @@ pub struct TunnelConfig {
     pub auth_token: String,
     pub agent_id: String,
     pub ca_path: Option<String>,
+    /// Transport toward the hub; absent = h2 (the default).
+    pub transport: Option<TransportKind>,
+    /// Hub QUIC address; absent = derived from the hub URL's host:port.
+    pub hub_quic_addr: Option<String>,
 }
 
 #[tauri::command]
@@ -77,6 +82,8 @@ pub async fn start_tunnel(
         auth_token: config.auth_token,
         agent_id: config.agent_id,
         ca_path: config.ca_path.filter(|s| !s.is_empty()),
+        transport: config.transport.unwrap_or_default(),
+        hub_quic_addr: config.hub_quic_addr.filter(|s| !s.is_empty()),
     };
 
     let manager = {

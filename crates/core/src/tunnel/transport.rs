@@ -178,8 +178,13 @@ pub trait TunnelTransport: Send + Sync + 'static {
     /// Closes the stream (request direction).
     async fn send_close(&self, stream_id: &str) -> Result<()>;
 
-    /// Closes the stream (response direction).
-    async fn send_close_response(&self, stream_id: &str) -> Result<()>;
+    /// Closes the stream (response direction). `reason` travels in the
+    /// Close frame payload as a short machine token (e.g. `connect_failed`;
+    /// empty = ordinary close) so the far end can distinguish backend
+    /// failures from normal teardown (2026-09-16 reason-propagation
+    /// hardening). A pre-2026-09-16 peer ignores the payload — backward
+    /// compatible on the wire.
+    async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()>;
 
     /// Registers the dedicated inbound channel for a response-direction stream (ingress return path / expose edge). Re-registering overwrites the old channel.
     async fn register_stream(&self, stream_id: String) -> mpsc::Receiver<TunnelData>;

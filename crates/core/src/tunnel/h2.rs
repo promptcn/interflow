@@ -723,9 +723,15 @@ impl TunnelTransport for H2Tunnel {
             .await
     }
 
-    async fn send_close_response(&self, stream_id: &str) -> Result<()> {
-        self.send_frame(FrameType::Close, 0, stream_id, RESPONSE_SOURCE, b"")
-            .await
+    async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()> {
+        self.send_frame(
+            FrameType::Close,
+            0,
+            stream_id,
+            RESPONSE_SOURCE,
+            reason.as_bytes(),
+        )
+        .await
     }
 
     async fn register_stream(&self, stream_id: String) -> tokio::sync::mpsc::Receiver<TunnelData> {

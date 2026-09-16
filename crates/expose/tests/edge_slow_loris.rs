@@ -23,6 +23,7 @@
 )]
 use interflow_expose::client::ExposeArgs;
 use interflow_expose::edge::EdgeArgs;
+use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -108,9 +109,14 @@ remote_addr = "{backend_addr}"
         routes_path: routes_path.to_string_lossy().into_owned(),
         agent_token: "test-token".into(),
         hub_tls: None,
+        quic_listen: None,
         audit_path,
         new_conn_rate_per_ip_per_minute: 0,
         stream_idle_timeout_secs,
+        route_breaker_enabled: true,
+        route_breaker_failure_threshold: 10,
+        route_breaker_window_secs: 60,
+        route_breaker_cooldown_secs: 30,
     };
     tokio::task::spawn(interflow_expose::edge::run(edge_args));
 
@@ -119,7 +125,7 @@ remote_addr = "{backend_addr}"
         .expect("edge listener should start within 5s");
     wait_for_tcp(hub_listen, Duration::from_secs(5))
         .await
-        .expect("hub should start within 5s");
+        .expect("edge hub should start within 5s");
 
     let client_args = ExposeArgs {
         local_ports: vec![backend_addr.port()],
@@ -127,6 +133,8 @@ remote_addr = "{backend_addr}"
         auth_token: "test-token".into(),
         agent_id: "expose-test".into(),
         ca_path: None,
+        transport: TransportKind::H2,
+        hub_quic_addr: None,
     };
     tokio::task::spawn(async move { interflow_expose::client::start(&client_args)?.join().await });
     tokio::time::sleep(Duration::from_millis(500)).await;

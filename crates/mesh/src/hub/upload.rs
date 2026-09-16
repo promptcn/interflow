@@ -225,7 +225,8 @@ impl HubService {
                 }
             }
             FrameType::Close => {
-                self.frame_close(agent_id, &frame.stream_id, direction)
+                let reason = crate::hub::control::close_reason_of(&frame.payload);
+                self.frame_close(agent_id, &frame.stream_id, direction, &reason)
                     .await;
             }
             // Other control frames (Hello/Ping/Error etc.) do not travel on
@@ -318,7 +319,7 @@ fn upload_end_stream(
         move |cx: &mut Context<'_>| -> Poll<Option<std::result::Result<HttpFrame<Bytes>, InterflowError>>> {
             match Pin::new(&mut end_rx).poll(cx) {
                 // Ready (signal arrived or sender dropped) → body ends;
-            // Pending → stays open
+                // Pending → stays open
                 Poll::Ready(_) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             }

@@ -10,3 +10,8 @@ pub mod client;
 pub mod edge;
 pub mod init;
 pub mod profile;
+
+// Re-exported: it appears in this crate's public API (`ExposeArgs.transport`,
+// `Profile.transport`), so downstream users should not need the mesh crate
+// just to name the type.
+pub use interflow_mesh::config::TransportKind;

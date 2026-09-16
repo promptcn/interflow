@@ -303,6 +303,10 @@ async fn spawn_stack() -> (
         max_incoming_streams: 256,
         max_stream_opens_per_sec: 100,
         stream_open_burst: 256,
+        egress_target_breaker_enabled: true,
+        egress_target_breaker_failure_threshold: 5,
+        egress_target_breaker_window_secs: 10,
+        egress_target_breaker_cooldown_secs: 30,
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()
@@ -349,6 +353,10 @@ async fn spawn_stack() -> (
         max_incoming_streams: 256,
         max_stream_opens_per_sec: 100,
         stream_open_burst: 256,
+        egress_target_breaker_enabled: true,
+        egress_target_breaker_failure_threshold: 5,
+        egress_target_breaker_window_secs: 10,
+        egress_target_breaker_cooldown_secs: 30,
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()

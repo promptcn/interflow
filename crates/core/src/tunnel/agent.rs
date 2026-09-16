@@ -141,8 +141,10 @@ impl AgentTunnel {
         self.inner.send_close(stream_id).await
     }
 
-    /// Sends a close signal to the hub (response direction).
-    pub async fn send_close_response(&self, stream_id: &str) -> Result<()> {
-        self.inner.send_close_response(stream_id).await
+    /// Sends a close signal to the hub (response direction). `reason`
+    /// travels in the Close payload (empty = ordinary close); see
+    /// [`TunnelTransport::send_close_response`].
+    pub async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()> {
+        self.inner.send_close_response(stream_id, reason).await
     }
 }

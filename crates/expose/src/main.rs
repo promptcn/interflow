@@ -7,11 +7,12 @@
 //! - `interflow-expose init` — interactive wizard: generate certificates / config / profile
 //! - `interflow-expose version` — version information
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use interflow_core::config::paths::absolutize;
 use interflow_expose::client::{self, ExposeArgs};
 use interflow_expose::edge::{self, DEFAULT_STREAM_IDLE_TIMEOUT_SECS, EdgeArgs, EdgeHubTls};
 use interflow_expose::{init, profile};
+use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -45,6 +46,16 @@ enum Commands {
         /// Trusted hub CA path (only effective for https; overrides profile).
         #[arg(long)]
         ca_path: Option<String>,
+        /// Transport toward the hub: `h2` (default, works wherever TCP egress
+        /// is allowed) or `quic` (opt-in upgrade; requires UDP egress and a
+        /// TLS trust anchor — `--ca-path` or the system CA).
+        #[arg(long, value_enum)]
+        transport: Option<CliTransport>,
+        /// Hub QUIC address (`host:port`); overrides profile. Omitted: derived
+        /// from the hub URL's host:port (valid when the edge's QUIC listener
+        /// shares the hub TCP port number).
+        #[arg(long)]
+        hub_quic_addr: Option<String>,
         /// Merge these arguments into profile.toml; next time plain `expose <port>` suffices.
         #[arg(long)]
         save: bool,
@@ -69,6 +80,12 @@ enum Commands {
         /// Hub TLS private key.
         #[arg(long)]
         hub_key: Option<String>,
+        /// QUIC listen address for the embedded hub (e.g. `0.0.0.0:16666`):
+        /// enables the QUIC transport for expose clients. The UDP port is
+        /// exposed directly (nginx does not carry it) and requires
+        /// `--hub-cert`/`--hub-key` (QUIC mandates TLS).
+        #[arg(long)]
+        quic_listen: Option<SocketAddr>,
         /// Audit log JSONL path (omit to disable auditing).
         #[arg(long)]
         audit_path: Option<String>,
@@ -84,6 +101,21 @@ enum Commands {
             value_parser = clap::value_parser!(u64).range(1..)
         )]
         stream_idle_timeout_secs: u64,
+        /// Route-level circuit breaker: backend-failure closes (within a window)
+        /// trip a route; tripped routes are closed at the edge without an Open
+        /// through the tunnel until a recovery probe succeeds.
+        /// (disable with --route-breaker-enabled=false)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        route_breaker_enabled: bool,
+        /// Route breaker: failures within the window required to trip a route.
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
+        route_breaker_failure_threshold: u32,
+        /// Route breaker: sliding window (seconds) for counting failures.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+        route_breaker_window_secs: u64,
+        /// Route breaker: cooldown (seconds) before one recovery probe is admitted.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        route_breaker_cooldown_secs: u64,
     },
     /// Interactive wizard: generate certificates / config / profile
     Init,
@@ -125,6 +157,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             token,
             agent_id,
             ca_path,
+            transport,
+            hub_quic_addr,
             save,
         } => {
             let p = profile::load()?;
@@ -135,6 +169,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or_else(|| "missing --token or profile.auth_token".to_string())?;
             let agent_id = pick("agent_id", agent_id, p.agent_id.as_deref())
                 .unwrap_or_else(client::default_agent_id);
+            // CLI flag > profile > h2 default
+            let transport = transport
+                .map(TransportKind::from)
+                .or(p.transport)
+                .unwrap_or_default();
+            // CLI flag > profile; None stays dynamic (derived from hub_url at
+            // config-assembly time, so a hub port change tracks the hub_url)
+            let hub_quic_addr = pick("hub_quic_addr", hub_quic_addr, p.hub_quic_addr.as_deref());
             // A relative --ca-path means "relative to the current directory"
             // for this run; absolutize it once so --save persists a value
             // that keeps working from any directory.
@@ -142,10 +184,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(ca) => Some(absolutize(Path::new(&ca))?.display().to_string()),
                 None => None,
             };
-            // Fail fast on an https hub with a missing CA instead of dying
-            // mid-connect (profile-internal relative paths anchor to the
-            // profile directory, CLI flags to the CWD).
-            if hub_url.starts_with("https")
+            // Fail fast on a TLS-requiring transport with a missing CA
+            // instead of dying mid-connect (profile-internal relative paths
+            // anchor to the profile directory, CLI flags to the CWD). QUIC
+            // mandates TLS just like an https hub URL.
+            if (hub_url.starts_with("https") || transport == TransportKind::Quic)
                 && let Some(ca) = &ca_path
                 && !Path::new(ca).exists()
             {
@@ -153,6 +196,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if save {
+                // Persist the resolved transport (writing Some(H2) on an
+                // explicit override is what makes --save faithfully revert a
+                // quic profile); hub_quic_addr persists only explicit values.
                 let new_profile = profile::Profile {
                     hub_url: Some(hub_url.clone()),
                     auth_token: Some(auth_token.clone()),
@@ -163,6 +209,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         Some(ports.clone())
                     },
+                    transport: Some(transport),
+                    hub_quic_addr: hub_quic_addr.clone(),
                 };
                 if let Err(e) = profile::save(&new_profile) {
                     tracing::warn!("failed to write profile (does not affect this run): {e}");
@@ -175,6 +223,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 auth_token,
                 agent_id,
                 ca_path,
+                transport,
+                hub_quic_addr,
             };
 
             let mut handle = client::start(&args)?;
@@ -236,9 +286,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             token,
             hub_cert,
             hub_key,
+            quic_listen,
             audit_path,
             new_conn_rate_per_ip_per_minute,
             stream_idle_timeout_secs,
+            route_breaker_enabled,
+            route_breaker_failure_threshold,
+            route_breaker_window_secs,
+            route_breaker_cooldown_secs,
         } => {
             let hub_tls = match (hub_cert, hub_key) {
                 (Some(cert_path), Some(key_path)) => Some(EdgeHubTls {
@@ -259,9 +314,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 routes_path: routes,
                 agent_token: token,
                 hub_tls,
+                quic_listen,
                 audit_path,
                 new_conn_rate_per_ip_per_minute,
                 stream_idle_timeout_secs,
+                route_breaker_enabled,
+                route_breaker_failure_threshold,
+                route_breaker_window_secs,
+                route_breaker_cooldown_secs,
             };
             edge::run(args).await?;
         }
@@ -287,5 +347,25 @@ fn pick(name: &str, cli: Option<String>, from_profile: Option<&str>) -> Option<S
     } else {
         tracing::debug!("argument {name} not provided (not set on CLI or in profile)");
         None
+    }
+}
+
+/// CLI-facing transport choice; maps 1:1 onto the agent config's
+/// [`TransportKind`] (clap needs its own `ValueEnum`).
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliTransport {
+    /// HTTP/2 long-lived streams (default; works wherever TCP egress works).
+    H2,
+    /// QUIC native streams (opt-in; eliminates TCP head-of-line blocking,
+    /// requires UDP egress and TLS).
+    Quic,
+}
+
+impl From<CliTransport> for TransportKind {
+    fn from(v: CliTransport) -> Self {
+        match v {
+            CliTransport::H2 => Self::H2,
+            CliTransport::Quic => Self::Quic,
+        }
     }
 }

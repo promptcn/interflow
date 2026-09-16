@@ -3,6 +3,13 @@ members = ["crates/core", "crates/expose", "crates/mesh", "crates/testkit", "src
 resolver = "2"
 
 # ============================================================================
+# Shared dependencies — declared once here; members inherit with `foo.workspace = true`
+# ============================================================================
+[workspace.dependencies]
+tokio = { version = "1.53", features = ["full"] }
+tokio-util = "0.7.19"
+
+# ============================================================================
 # Lints — applied uniformly via [workspace.lints]; sub-crates inherit with `[lints] workspace = true`
 # ============================================================================
 # Design intent:

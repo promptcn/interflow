@@ -1,6 +1,6 @@
 [package]
 name = "interflow-core"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 description = "HTTP/2 tunnel primitives shared by interflow-expose and interflow-mesh"
@@ -15,7 +15,7 @@ workspace = true
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.52", features = ["full"] }
+tokio = { workspace = true }
 
 # HTTP/2
 hyper = { version = "1.10", features = ["full", "http2"] }
@@ -63,12 +63,12 @@ hex = "0.4"
 
 # Security: per-IP token-bucket rate limiting
 governor = "0.10.4"
-tokio-util = "0.7.19"
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
 # Paused clock (start_paused) for unit tests to deterministically verify the INCOMING_SEND_TIMEOUT path
-tokio = { version = "1.52", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 # ============================================================================
 # Benchmarks (criterion)

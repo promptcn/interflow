@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { Transport } from "../api";
 
 interface Props {
   disabled: boolean;
@@ -12,6 +13,10 @@ interface Props {
   setAgentId: (v: string) => void;
   caPath: string;
   setCaPath: (v: string) => void;
+  transport: Transport;
+  setTransport: (v: Transport) => void;
+  hubQuicAddr: string;
+  setHubQuicAddr: (v: string) => void;
   profileLoaded: boolean;
   onGenerateAgentId: () => Promise<void>;
   onSaveProfile: () => Promise<void>;
@@ -120,6 +125,40 @@ export default function ConfigForm(p: Props) {
           Browse
         </button>
       </div>
+
+      <div className="row">
+        <label>Transport</label>
+        <div className="transport-toggle">
+          <button
+            className={p.transport === "h2" ? "selected" : ""}
+            disabled={p.disabled}
+            onClick={() => p.setTransport("h2")}
+            title="HTTP/2 long-lived streams — works wherever TCP egress is allowed"
+          >
+            h2
+          </button>
+          <button
+            className={p.transport === "quic" ? "selected" : ""}
+            disabled={p.disabled}
+            onClick={() => p.setTransport("quic")}
+            title="QUIC native streams — no TCP head-of-line blocking; needs UDP egress and TLS"
+          >
+            QUIC
+          </button>
+        </div>
+      </div>
+
+      {p.transport === "quic" && (
+        <div className="row">
+          <label>Hub QUIC address</label>
+          <input
+            disabled={p.disabled}
+            value={p.hubQuicAddr}
+            onChange={(e) => p.setHubQuicAddr(e.target.value)}
+            placeholder="(optional) host:port — empty derives it from the hub URL"
+          />
+        </div>
+      )}
 
       <div className="row">
         <label />

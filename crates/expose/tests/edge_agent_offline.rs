@@ -94,9 +94,14 @@ remote_addr = "127.0.0.1:9"
         routes_path: routes_path.to_string_lossy().into_owned(),
         agent_token: "test-token".into(),
         hub_tls: None,
+        quic_listen: None,
         audit_path: None,
         new_conn_rate_per_ip_per_minute: 0,
         stream_idle_timeout_secs: 300,
+        route_breaker_enabled: true,
+        route_breaker_failure_threshold: 10,
+        route_breaker_window_secs: 60,
+        route_breaker_cooldown_secs: 30,
     };
     let edge_handle = tokio::task::spawn(run(edge_args));
 

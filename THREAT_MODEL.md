@@ -115,11 +115,19 @@ defenses are resource-shape defenses:
   concurrency cap, plus a **global concurrent-connection cap**
   (`ConnTracker`, `crates/core/src/security/conn_limit.rs`).
 - **L4 passthrough**: beyond the bounded Host peek the edge parses no HTTP —
-  request content is carried untouched and is the backend's concern, not the
-  edge's. This keeps the edge's own parser surface near zero.
+  request content is carried untouched and is the backend's concern, not
+  the edge's. This keeps the edge's own parser surface near zero.
 - **Stream idle budget**: a stream silent in both directions for
   `--stream-idle-timeout-secs` (default 300, refuses 0) is closed — the
   same budget bounds how long any single public connection can pin memory.
+- **QUIC plane (opt-in)**: with `--quic-listen` the embedded hub opens a
+  public QUIC listener for expose clients. It is the same hardening as the
+  mesh hub's QUIC face — TLS is mandatory (the listener refuses to start
+  without `--hub-cert`/`--hub-key`), agent registration authenticates the
+  static token with a constant-time compare at the Hello frame, and
+  handshake failures / idle connections are counted and evicted — so the
+  added public surface inherits §4.1 rather than introducing a new trust
+  path. The nginx-fronted HTTP/1 surface above is unaffected either way.
 
 ### 4.3 Reaching a mesh ingress listener directly
 

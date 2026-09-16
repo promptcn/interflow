@@ -29,18 +29,28 @@
 //! structurally no await can hang
 //! (docs/bug/2026-09-14-egress-fd-leak-session-rebuild.md).
 //!
-//! Open-flood resource defenses (2026-09-12 backlog: open-flood DoS surface):
+//! Open-flood resource defenses (2026-09-12 backlog: open-flood DoS surface;
+//! hardened 2026-09-16 with per-target isolation — see
+//! `docs/bug/2026-09-16-egress-global-rate-limit-starvation.md`):
 //!
+//! - **per-target circuit breaker** (`egress_target_breaker_*`): connect
+//!   -phase failures are counted per backend target in a sliding window; a
+//!   tripped target is rejected pre-dial **without consuming the open-rate
+//!   budget**, so one dead target's retry storm cannot starve healthy
+//!   targets (the 2026-09-16 case: an edge route to a dead local port plus
+//!   a public retry loop took down every healthy route on the agent);
 //! - **stream-open rate limit** (`max_stream_opens_per_sec`): open/close
 //!   churn can stay forever below the concurrency cap while every Open still
 //!   triggers resolve + connect against a real backend — the rate limit keeps
 //!   sustained churn within budget, preventing the agent from becoming a
-//!   connection-flood reflection surface aimed at the internal network;
+//!   connection-flood reflection surface aimed at the internal network.
+//!   Charged only for opens that pass the cheap gates and will actually
+//!   reach the dial path;
 //! - **local concurrent stream cap** (`max_incoming_streams`): a second gate
 //!   beyond the hub's `max_streams_per_agent`; even with a hub config slip
 //!   the agent itself still has a ceiling;
 //! - **dial timeouts** (resolve/connect): black-hole addresses no longer hold
-//!   slots for the OS default ~75s. All three rejections reply Close so the
+//!   slots for the OS default ~75s. All rejections reply Close so the
 //!   source fails fast, and bump the
 //!   `interflow_agent_open_dropped_total{reason}` counter.
 //!
@@ -52,6 +62,7 @@
 use crate::agent::control::{ControlOpError, EgressCommand};
 use crate::agent::ingress_udp::UDP_RECV_BUF;
 use crate::agent::rules::RuleStore;
+use crate::agent::target_breaker::{BreakerConfig, BreakerDecision, TargetBreakers};
 use crate::config::{AgentConfig, EgressRule, SecurityConfig};
 use bytes::{Bytes, BytesMut};
 use interflow_core::error::{InterflowError, Result};
@@ -209,10 +220,22 @@ pub struct EgressRuntime {
     /// Stream-open rate limit (None = disabled); the budget gate against the
     /// churn reflection surface.
     open_rate_limiter: Option<EventRateLimiter>,
+    /// Per-target connect-phase circuit breaker (None = disabled). The
+    /// isolation gate: a dead target's retry storm is rejected pre-dial and
+    /// without consuming the shared open-rate budget above, so healthy
+    /// targets keep their full budget (2026-09-16 starvation case file).
+    breakers: Option<Arc<TargetBreakers>>,
 }
 
 impl EgressRuntime {
     pub fn from_config(config: &AgentConfig) -> Self {
+        let breakers = config.egress_target_breaker_enabled.then(|| {
+            Arc::new(TargetBreakers::new(BreakerConfig {
+                failure_threshold: config.egress_target_breaker_failure_threshold.max(1),
+                window: Duration::from_secs(config.egress_target_breaker_window_secs.max(1)),
+                cooldown: Duration::from_secs(config.egress_target_breaker_cooldown_secs.max(1)),
+            }))
+        });
         Self {
             max_incoming_streams: config.max_incoming_streams,
             active: AtomicUsize::new(0),
@@ -220,6 +243,7 @@ impl EgressRuntime {
                 config.max_stream_opens_per_sec,
                 config.stream_open_burst,
             ),
+            breakers,
         }
     }
 }
@@ -270,6 +294,9 @@ enum CloseReason {
     DispatchPoison,
     /// Stream-open rate limit.
     RateLimited,
+    /// Per-target circuit breaker OPEN (connect-phase failures clustered on
+    /// this target; rejected pre-dial without consuming the open budget).
+    TargetCircuitOpen,
     /// Local concurrent stream cap.
     LocalLimit,
     /// UDP forwarder idle timeout.
@@ -290,6 +317,7 @@ impl CloseReason {
             Self::BackendClosed => "backend_closed",
             Self::DispatchPoison => "dispatch_poison",
             Self::RateLimited => "rate_limited",
+            Self::TargetCircuitOpen => "target_circuit_open",
             Self::LocalLimit => "local_limit",
             Self::UdpIdle => "udp_idle",
             Self::SessionClosed => "session_closed",
@@ -486,11 +514,22 @@ impl EgressHandler {
         }
     }
 
-    /// Taking over a single new stream: pass the flood-line defenses first
-    /// (rate -> local concurrency); the rejection paths complete inline and
-    /// echo Close so the source fails fast; a passing path spawns an
-    /// independent forwarder (holding the session token) via the session
-    /// tracker, and the main loop immediately returns to waiting.
+    /// Taking over a single new stream. Gate order is load-bearing (the
+    /// 2026-09-16 starvation case file): **cheap, target-aware rejections
+    /// run first and consume no shared budget** —
+    ///
+    /// 1. target resolution + security + per-target breaker (pure in-memory;
+    ///    a tripped or denied open costs nothing),
+    /// 2. stream-open rate limit (charged only for opens that will actually
+    ///    reach the dial path, matching the limiter's reflection-surface
+    ///    threat model — a flood of garbage opens can no longer drain the
+    ///    budget that healthy targets share),
+    /// 3. local concurrency cap.
+    ///
+    /// Every rejection path completes inline and echoes Close so the source
+    /// fails fast; a passing path spawns an independent forwarder (holding
+    /// the session token) via the session tracker, and the main loop
+    /// immediately returns to waiting.
     ///
     /// The active count is always incremented at the head: the main loop
     /// consumes single-threaded (no check race), and every exit path of this
@@ -514,56 +553,6 @@ impl EgressHandler {
         let prev_active = runtime.active.fetch_add(1, Ordering::Relaxed);
         metrics::gauge!("interflow_agent_incoming_streams_active").increment(1.0);
         Self::warn_high_water(runtime, prev_active + 1);
-
-        // C: stream-open rate limit (churn reflection-surface budget;
-        // agent-level bucket, accumulated across sessions)
-        if let Some(limiter) = &runtime.open_rate_limiter
-            && !limiter.check()
-        {
-            metrics::counter!(
-                "interflow_agent_open_dropped_total",
-                "reason" => CloseReason::RateLimited.as_str()
-            )
-            .increment(1);
-            warn!(
-                "stream open rate limit exceeded, rejecting new stream: stream_id={}, source={}",
-                stream_id, open.source
-            );
-            Self::finish(
-                tunnel,
-                &stream_id,
-                CloseReason::RateLimited,
-                true,
-                &runtime.active,
-            )
-            .await;
-            return;
-        }
-
-        // B: local concurrent stream cap (a second gate beyond the hub
-        // quota; agent-level count)
-        if runtime.max_incoming_streams > 0
-            && runtime.active.load(Ordering::Relaxed) > runtime.max_incoming_streams
-        {
-            metrics::counter!(
-                "interflow_agent_open_dropped_total",
-                "reason" => CloseReason::LocalLimit.as_str()
-            )
-            .increment(1);
-            warn!(
-                "local concurrent stream limit ({}) reached, rejecting new stream: stream_id={}, source={}",
-                runtime.max_incoming_streams, stream_id, open.source
-            );
-            Self::finish(
-                tunnel,
-                &stream_id,
-                CloseReason::LocalLimit,
-                true,
-                &runtime.active,
-            )
-            .await;
-            return;
-        }
 
         let proto = StreamProto::from_frame_flags(open.flags);
 
@@ -608,6 +597,86 @@ impl EgressHandler {
                 tunnel,
                 &stream_id,
                 CloseReason::SecurityDenied,
+                true,
+                &runtime.active,
+            )
+            .await;
+            return;
+        }
+
+        // Isolation gate: a target whose connect-phase failures clustered
+        // within the window is tripped OPEN — reject pre-dial, without
+        // consuming the shared open-rate budget (one dead target's retry
+        // storm must not starve healthy targets; per-stream rejections stay
+        // at debug, the trip/recovery transitions log once in the table).
+        if let Some(breakers) = &runtime.breakers
+            && breakers.check(&target) == BreakerDecision::Reject
+        {
+            metrics::counter!(
+                "interflow_agent_open_dropped_total",
+                "reason" => CloseReason::TargetCircuitOpen.as_str()
+            )
+            .increment(1);
+            debug!(
+                "target circuit open, rejecting stream without dial: stream_id={}, target={}, source={}",
+                stream_id, target, open.source
+            );
+            Self::finish(
+                tunnel,
+                &stream_id,
+                CloseReason::TargetCircuitOpen,
+                true,
+                &runtime.active,
+            )
+            .await;
+            return;
+        }
+
+        // Stream-open rate limit (churn reflection-surface budget;
+        // agent-level bucket, accumulated across sessions). Charged only now
+        // — everything above this line rejects without doing (or paying for)
+        // dial work.
+        if let Some(limiter) = &runtime.open_rate_limiter
+            && !limiter.check()
+        {
+            metrics::counter!(
+                "interflow_agent_open_dropped_total",
+                "reason" => CloseReason::RateLimited.as_str()
+            )
+            .increment(1);
+            warn!(
+                "stream open rate limit exceeded, rejecting new stream: stream_id={}, source={}",
+                stream_id, open.source
+            );
+            Self::finish(
+                tunnel,
+                &stream_id,
+                CloseReason::RateLimited,
+                true,
+                &runtime.active,
+            )
+            .await;
+            return;
+        }
+
+        // Local concurrent stream cap (a second gate beyond the hub
+        // quota; agent-level count)
+        if runtime.max_incoming_streams > 0
+            && runtime.active.load(Ordering::Relaxed) > runtime.max_incoming_streams
+        {
+            metrics::counter!(
+                "interflow_agent_open_dropped_total",
+                "reason" => CloseReason::LocalLimit.as_str()
+            )
+            .increment(1);
+            warn!(
+                "local concurrent stream limit ({}) reached, rejecting new stream: stream_id={}, source={}",
+                runtime.max_incoming_streams, stream_id, open.source
+            );
+            Self::finish(
+                tunnel,
+                &stream_id,
+                CloseReason::LocalLimit,
                 true,
                 &runtime.active,
             )
@@ -698,6 +767,9 @@ impl EgressHandler {
             Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
             Ok(Err(e)) => {
                 error!("Failed to resolve target address {}: {}", target_addr, e);
+                if let Some(b) = &runtime.breakers {
+                    b.note_failure(&target_addr);
+                }
                 Self::finish(
                     &tunnel,
                     &stream_id,
@@ -713,6 +785,9 @@ impl EgressHandler {
                     "Target address resolution timed out {}: exceeded {:?}, killing stream",
                     target_addr, resolve_timeout
                 );
+                if let Some(b) = &runtime.breakers {
+                    b.note_failure(&target_addr);
+                }
                 Self::finish(
                     &tunnel,
                     &stream_id,
@@ -752,6 +827,9 @@ impl EgressHandler {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 error!("Failed to connect to target {}: {}", target_addr, e);
+                if let Some(b) = &runtime.breakers {
+                    b.note_failure(&target_addr);
+                }
                 Self::finish(
                     &tunnel,
                     &stream_id,
@@ -767,6 +845,9 @@ impl EgressHandler {
                     "Connect to target timed out {}: exceeded {:?} (black-hole address?), killing stream and releasing slot",
                     target_addr, connect_timeout
                 );
+                if let Some(b) = &runtime.breakers {
+                    b.note_failure(&target_addr);
+                }
                 Self::finish(
                     &tunnel,
                     &stream_id,
@@ -778,6 +859,9 @@ impl EgressHandler {
                 return;
             }
         };
+        if let Some(b) = &runtime.breakers {
+            b.note_success(&target_addr);
+        }
         info!(
             "Backend connection established: {} -> {}",
             stream_id, target_addr
@@ -1010,6 +1094,10 @@ impl EgressHandler {
     /// request-direction channel, and decrementing the agent-level active
     /// stream count (paired with the increment at the head of
     /// `handle_incoming_stream`; every exit path funnels uniquely here).
+    ///
+    /// The echoed Close carries `reason` in its payload (empty for ordinary
+    /// closes) so the far end — hub/edge — can distinguish backend failures
+    /// from normal teardown (route-level negative caching, 2026-09-16).
     async fn finish(
         tunnel: &AgentTunnel,
         stream_id: &str,
@@ -1022,8 +1110,11 @@ impl EgressHandler {
         active.fetch_sub(1, Ordering::Relaxed);
         metrics::gauge!("interflow_agent_incoming_streams_active").decrement(1.0);
         if echo_close {
-            match tokio::time::timeout(CLOSE_NOTIFY_TIMEOUT, tunnel.send_close_response(stream_id))
-                .await
+            match tokio::time::timeout(
+                CLOSE_NOTIFY_TIMEOUT,
+                tunnel.send_close_response(stream_id, reason.as_str()),
+            )
+            .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
@@ -1079,6 +1170,9 @@ impl EgressHandler {
                     Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
                     Ok(Err(e)) => {
                         error!("Failed to resolve UDP target address {}: {}", target_addr, e);
+                        if let Some(b) = &runtime.breakers {
+                            b.note_failure(&target_addr);
+                        }
                         Self::finish(
                             &tunnel,
                             &stream_id,
@@ -1094,6 +1188,9 @@ impl EgressHandler {
                             "UDP target address resolution timed out {}: exceeded {:?}, killing stream",
                             target_addr, resolve_timeout
                         );
+                        if let Some(b) = &runtime.breakers {
+                            b.note_failure(&target_addr);
+                        }
                         Self::finish(
                             &tunnel,
                             &stream_id,
@@ -1145,6 +1242,9 @@ impl EgressHandler {
             };
             if let Err(e) = socket.connect(sa).await {
                 error!("UDP connect failed {target_addr}: {e}");
+                if let Some(b) = &runtime.breakers {
+                    b.note_failure(&target_addr);
+                }
                 Self::finish(
                     &tunnel,
                     &stream_id,
@@ -1154,6 +1254,9 @@ impl EgressHandler {
                 )
                 .await;
                 return;
+            }
+            if let Some(b) = &runtime.breakers {
+                b.note_success(&target_addr);
             }
             let socket = Arc::new(socket);
             let last_active = Arc::new(std::sync::Mutex::new(Instant::now()));

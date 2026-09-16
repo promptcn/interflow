@@ -26,6 +26,14 @@ pub struct ExposeArgs {
     pub agent_id: String,
     /// Trusted CA path (required when the hub uses a self-signed cert; None uses the system CA).
     pub ca_path: Option<String>,
+    /// Transport toward the hub (h2 default; quic eliminates TCP head-of-line
+    /// blocking but requires UDP egress).
+    pub transport: TransportKind,
+    /// Hub QUIC address (`host:port`). `None` derives it from `hub_url`'s
+    /// host:port at config-assembly time (valid when the edge runs the QUIC
+    /// listener on the same port number as its hub TCP listener — the
+    /// dual-stack default).
+    pub hub_quic_addr: Option<String>,
 }
 
 /// Derives the default agent_id: `expose-<hostname>-<random 4 bytes>`.
@@ -93,17 +101,38 @@ pub fn start(args: &ExposeArgs) -> Result<AgentHandle, interflow_core::error::In
     let cfg = build_config(args)?;
     raise_nofile_limit();
     tracing::info!(
-        "expose client starting (build {}): local 127.0.0.1:{:?} → hub {} (agent_id={})",
+        "expose client starting (build {}): local 127.0.0.1:{:?} → hub {} (transport={}, agent_id={})",
         BUILD_TAG,
         args.local_ports,
         args.hub_url,
+        match args.transport {
+            TransportKind::H2 => "h2",
+            TransportKind::Quic => "quic",
+        },
         args.agent_id
     );
     Ok(AgentClient::new(cfg)?.start())
 }
 
 fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error::InterflowError> {
-    let tls = if args.hub_url.starts_with("https://") {
+    // Only meaningful for quic; h2 never dials it, so h2 configs stay clean.
+    let hub_quic_addr = if args.transport == TransportKind::Quic {
+        let addr = resolve_hub_quic_addr(&args.hub_url, args.hub_quic_addr.as_deref());
+        if addr.is_none() {
+            return Err(interflow_core::error::InterflowError::config(
+                "transport = \"quic\" requires a hub QUIC address: pass --hub-quic-addr \
+                 (host:port) or use a hub URL carrying an explicit port",
+            ));
+        }
+        addr
+    } else {
+        None
+    };
+
+    // QUIC mandates TLS end-to-end: without a [tls] section the agent's QUIC
+    // path pins an all-zero fingerprint and the handshake can never succeed.
+    // For h2, TLS still follows the https:// scheme as before.
+    let tls = if args.hub_url.starts_with("https://") || args.transport == TransportKind::Quic {
         Some(TlsConfig {
             enabled: true,
             ca_path: args.ca_path.clone(),
@@ -134,8 +163,8 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
         agent: AgentInfo {
             id: args.agent_id.clone(),
             hub_url: args.hub_url.clone(),
-            transport: TransportKind::H2,
-            hub_quic_addr: None,
+            transport: args.transport,
+            hub_quic_addr,
             auth_token: Some(args.auth_token.clone()),
             connect_timeout_secs: 15,
             poll_idle_timeout_secs: None,
@@ -148,6 +177,10 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
         max_incoming_streams: 256,
         max_stream_opens_per_sec: 100,
         stream_open_burst: 256,
+        egress_target_breaker_enabled: true,
+        egress_target_breaker_failure_threshold: 5,
+        egress_target_breaker_window_secs: 10,
+        egress_target_breaker_cooldown_secs: 30,
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()
@@ -156,4 +189,124 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
         tls,
         logging: LoggingConfig::default(),
     })
+}
+
+/// Resolve the hub QUIC address: an explicit value wins; otherwise derive it
+/// from the hub URL's authority — but only when the URL carries an explicit
+/// port (implicit 80/443 would almost never be the tunnel's QUIC port, so we
+/// decline instead of guessing). Derivation matches the edge-side default
+/// where the QUIC listener shares the hub TCP port number (TCP and UDP are
+/// independent protocols and can bind the same port).
+fn resolve_hub_quic_addr(hub_url: &str, explicit: Option<&str>) -> Option<String> {
+    if let Some(addr) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(addr.to_string());
+    }
+    let authority = hub_url
+        .strip_prefix("https://")
+        .or_else(|| hub_url.strip_prefix("http://"))
+        .unwrap_or(hub_url);
+    let authority = authority.split('/').next().unwrap_or(authority);
+    // `host:port` (IPv6 hosts keep their brackets in the authority); a port
+    // is mandatory for derivation.
+    let port = authority.rsplit_once(':')?.1;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(authority.to_string())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn args(transport: TransportKind, hub_url: &str, hub_quic_addr: Option<&str>) -> ExposeArgs {
+        ExposeArgs {
+            local_ports: vec![3000],
+            hub_url: hub_url.to_string(),
+            auth_token: "t".into(),
+            agent_id: "a".into(),
+            ca_path: None,
+            transport,
+            hub_quic_addr: hub_quic_addr.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resolve_hub_quic_addr_derives_from_explicit_port() {
+        assert_eq!(
+            resolve_hub_quic_addr("http://hub.example.com:16666", None),
+            Some("hub.example.com:16666".into())
+        );
+        assert_eq!(
+            resolve_hub_quic_addr("https://hub.example.com:6666/some/path", None),
+            Some("hub.example.com:6666".into())
+        );
+        // IPv6 authority keeps its brackets (accepted by connect_quic_inner)
+        assert_eq!(
+            resolve_hub_quic_addr("http://[2001:db8::1]:16666", None),
+            Some("[2001:db8::1]:16666".into())
+        );
+    }
+
+    #[test]
+    fn resolve_hub_quic_addr_declines_portless_urls() {
+        // Implicit 80/443 is not a tunnel port guess we are willing to make
+        assert_eq!(resolve_hub_quic_addr("http://hub.example.com", None), None);
+        assert_eq!(resolve_hub_quic_addr("https://hub.example.com", None), None);
+    }
+
+    #[test]
+    fn resolve_hub_quic_addr_explicit_wins_over_derivation() {
+        assert_eq!(
+            resolve_hub_quic_addr(
+                "http://hub.example.com:16666",
+                Some("edge.example.com:6667")
+            ),
+            Some("edge.example.com:6667".into())
+        );
+        // Blank explicit values fall through to derivation instead of
+        // poisoning the config with an empty address
+        assert_eq!(
+            resolve_hub_quic_addr("http://hub.example.com:16666", Some("  ")),
+            Some("hub.example.com:16666".into())
+        );
+    }
+
+    #[test]
+    fn build_config_quic_requires_derivable_addr() {
+        let err =
+            build_config(&args(TransportKind::Quic, "http://hub.example.com", None)).unwrap_err();
+        assert!(
+            err.to_string().contains("quic"),
+            "error should name the quic requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn build_config_quic_forces_tls_regardless_of_scheme() {
+        // QUIC mandates TLS even over a plain http:// hub URL
+        let cfg = build_config(&args(
+            TransportKind::Quic,
+            "http://hub.example.com:16666",
+            None,
+        ))
+        .unwrap();
+        assert!(cfg.tls.is_some(), "quic must assemble a [tls] section");
+        assert_eq!(cfg.agent.transport, TransportKind::Quic);
+        assert_eq!(
+            cfg.agent.hub_quic_addr.as_deref(),
+            Some("hub.example.com:16666")
+        );
+
+        // h2 keeps the scheme-driven behavior: plain http stays TLS-less
+        let cfg = build_config(&args(
+            TransportKind::H2,
+            "http://hub.example.com:16666",
+            None,
+        ))
+        .unwrap();
+        assert!(cfg.tls.is_none());
+        assert_eq!(cfg.agent.hub_quic_addr, None);
+    }
 }

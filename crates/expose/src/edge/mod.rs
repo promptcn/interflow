@@ -6,7 +6,12 @@
 //! 3. Inject the tunnel into [`EdgeListener`] (listens on the public listen_addr), routing by Host to the target agent
 //!
 //! Public request path: client → nginx (TLS) → edge listener → tunnel (loopback HTTP/2)
-//! → hub → remote expose client (egress agent) → local service.
+//! → hub → remote expose client (egress agent, h2 or QUIC) → local service.
+//!
+//! With `quic_listen` set, the embedded hub additionally accepts expose
+//! clients over QUIC (one QUIC stream per tunnel stream). The edge's own
+//! dial stays on h2: the hub relays across transports (h2 source ↔ quic
+//! target), so enabling QUIC requires no change in the EdgeListener path.
 
 pub mod host_router;
 pub mod listener;
@@ -22,8 +27,8 @@ use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::agent::client::AgentClient;
 use interflow_mesh::config::{
     AGENT_CONFIG_VERSION, AclConfig, AgentTlsConfig as TlsConfig, AuthConfig, AuthMode,
-    ControlConfig, HUB_CONFIG_VERSION, HubConfig, HubSecurityConfig, LoggingConfig, SecurityConfig,
-    ServerConfig, StaticTokenConfig,
+    ControlConfig, HUB_CONFIG_VERSION, HubConfig, HubQuicConfig, HubSecurityConfig, LoggingConfig,
+    SecurityConfig, ServerConfig, StaticTokenConfig,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -47,7 +52,20 @@ pub struct EdgeArgs {
     /// Agent token (both edge itself and remote expose clients register with the hub using this token).
     pub agent_token: String,
     /// Optional: hub TLS certificate (if nginx already terminates TLS, edge needs no TLS of its own).
+    ///
+    /// When [`EdgeArgs::quic_listen`] is set, the certificate additionally
+    /// serves the QUIC plane presented to public expose clients: its SAN must
+    /// cover the hostname clients dial in `hub_quic_addr`, and clients must
+    /// trust its issuer (public CA, or a CA distributed via `ca_path`).
     pub hub_tls: Option<EdgeHubTls>,
+    /// Optional: QUIC listen address for the embedded hub (e.g.
+    /// `0.0.0.0:16666`). `Some` enables the QUIC transport for expose
+    /// clients; requires [`EdgeArgs::hub_tls`] (QUIC mandates TLS).
+    ///
+    /// Must be a publicly reachable address — unlike `hub_listen_addr`
+    /// (loopback behind nginx TCP proxying), QUIC datagrams cannot ride the
+    /// nginx HTTP path; the UDP port is exposed directly.
+    pub quic_listen: Option<SocketAddr>,
     /// Optional: audit log JSONL path. None disables auditing.
     pub audit_path: Option<String>,
     /// Per-IP new-connection limit per minute; 0 = unlimited. Default 30.
@@ -57,6 +75,19 @@ pub struct EdgeArgs {
     /// budget: "an upper bound on surviving without bytes in either direction";
     /// must be ≤ nginx `proxy_read_timeout`.
     pub stream_idle_timeout_secs: u64,
+    /// Route-level circuit breaker master switch: agent close reasons
+    /// (`connect_failed` / `target_circuit_open`) are counted per host; a
+    /// tripped route's new public connections are closed immediately after
+    /// the Host lookup — **without** an Open through the tunnel — until a
+    /// recovery probe succeeds (2026-09-16 reason-propagation hardening).
+    pub route_breaker_enabled: bool,
+    /// Backend-failure closes within the window required to trip a route.
+    pub route_breaker_failure_threshold: u32,
+    /// Sliding window (seconds) for counting backend-failure closes per route.
+    pub route_breaker_window_secs: u64,
+    /// Cooldown (seconds) a tripped route stays OPEN before one recovery
+    /// probe connection is admitted.
+    pub route_breaker_cooldown_secs: u64,
 }
 
 impl Default for EdgeArgs {
@@ -67,9 +98,14 @@ impl Default for EdgeArgs {
             routes_path: String::new(),
             agent_token: String::new(),
             hub_tls: None,
+            quic_listen: None,
             audit_path: None,
             new_conn_rate_per_ip_per_minute: 30,
             stream_idle_timeout_secs: DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+            route_breaker_enabled: true,
+            route_breaker_failure_threshold: 10,
+            route_breaker_window_secs: 60,
+            route_breaker_cooldown_secs: 30,
         }
     }
 }
@@ -84,6 +120,16 @@ pub struct EdgeHubTls {
 
 /// Start Edge: spawn hub + dial + run the listener. Blocks the caller.
 pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
+    // 0. QUIC plane prerequisites, before any listener binds: the hub's QUIC
+    //    listener reuses the [tls] certificate set (QUIC mandates TLS), so
+    //    fail fast with a pointed message instead of dying mid-startup inside
+    //    the hub task.
+    if args.quic_listen.is_some() && args.hub_tls.is_none() {
+        return Err(interflow_core::error::InterflowError::config(
+            "enabling the QUIC listener requires --hub-cert and --hub-key (QUIC mandates TLS)",
+        ));
+    }
+
     // 1. Load the routing table
     let router = Arc::new(HostRouter::load(&args.routes_path)?);
     if router.is_empty() {
@@ -175,6 +221,15 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
     //    data plane dies, fail as a whole — once the hub is dead every tunnel
     //    dial from the listener fails, and continuing to serve would only
     //    produce black-hole connections.
+    let route_breaker = args.route_breaker_enabled.then(|| {
+        std::sync::Arc::new(interflow_mesh::agent::target_breaker::TargetBreakers::new(
+            interflow_mesh::agent::target_breaker::BreakerConfig {
+                failure_threshold: args.route_breaker_failure_threshold.max(1),
+                window: Duration::from_secs(args.route_breaker_window_secs.max(1)),
+                cooldown: Duration::from_secs(args.route_breaker_cooldown_secs.max(1)),
+            },
+        ))
+    });
     let listener = EdgeListener {
         listen_addr: args.listen_addr,
         router,
@@ -184,6 +239,7 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
         conn_tracker,
         rate_limiter,
         audit,
+        route_breaker,
     };
     let listener_task = listener.run();
     tokio::pin!(listener_task);
@@ -245,11 +301,19 @@ fn build_hub_config(args: &EdgeArgs, audit_cfg: &AuditConfig) -> HubConfig {
         metrics: Default::default(),
         audit: audit_cfg.clone(),
         logging: LoggingConfig::default(),
-        quic: Default::default(),
+        quic: HubQuicConfig {
+            enabled: args.quic_listen.is_some(),
+            listen_addr: args.quic_listen,
+            ..HubQuicConfig::default()
+        },
     }
 }
 
 /// Build edge's own agent config: dial the local hub with the `edge` id.
+///
+/// The self-dial stays on h2 regardless of `quic_listen`: it is a loopback
+/// connection (no WAN loss to recover from), and the hub relays across
+/// transports, so a QUIC expose client is reachable from this h2 tunnel.
 ///
 /// When TLS is enabled it uses cert pinning: read `hub_tls.cert_path`, compute the
 /// SHA256 fingerprint and fill it into `hub_cert_fingerprint`;
@@ -293,6 +357,10 @@ fn build_edge_agent_config(
         max_incoming_streams: 256,
         max_stream_opens_per_sec: 100,
         stream_open_burst: 256,
+        egress_target_breaker_enabled: true,
+        egress_target_breaker_failure_threshold: 5,
+        egress_target_breaker_window_secs: 10,
+        egress_target_breaker_cooldown_secs: 30,
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()

@@ -13,19 +13,33 @@
 //! - Per-IP + global connection caps (reusing `ConnTracker`) so a single IP cannot exhaust us
 //! - Unmatched routes are closed silently (no 404), not leaking that the edge is alive
 //! - `extract_host` rejects duplicate Host headers, validates characters, and enforces a length limit to prevent header injection
-//! - `TCP_NODELAY` immediately after accept to reduce small-packet latency
+//! - TCP_NODELAY immediately after accept to reduce small-packet latency
+//! - Route-level circuit breaker (2026-09-16): a route whose backend keeps
+//!   failing (agent close reasons `connect_failed`/`target_circuit_open`
+//!   within a window) is tripped — new public connections are closed right
+//!   after the Host lookup, **without** an Open through the tunnel, until a
+//!   recovery probe succeeds. One dead route's public retry loop therefore
+//!   stops at the internet edge instead of flooding hub + agent.
 
 use crate::edge::host_router::HostRouter;
 use interflow_core::protocol::StreamProto;
 use interflow_core::security::{AuditKind, AuditSink, AuthRateLimiter, ConnTracker};
 use interflow_core::tunnel::AgentTunnel;
 use interflow_core::tunnel::pump::{PumpConfig, pump_tcp_stream};
+use interflow_mesh::agent::target_breaker::{BreakerDecision, TargetBreakers};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
+
+/// Agent close reasons that count as backend-down evidence for the route
+/// breaker (`CloseReason::as_str()` tokens from the egress forwarder).
+const ROUTE_FAILURE_REASONS: [&str; 2] = ["connect_failed", "target_circuit_open"];
+/// Agent close reasons that count as backend-up evidence (a normal
+/// backend EOF means the dial and the conversation both worked).
+const ROUTE_SUCCESS_REASONS: [&str; 1] = ["backend_closed"];
 
 /// Maximum number of bytes read per connection while looking for the Host
 /// header (HTTP/1.x request headers are typically < 8KB).
@@ -61,6 +75,10 @@ pub struct EdgeListener {
     pub rate_limiter: Option<Arc<AuthRateLimiter>>,
     /// Audit sink (connection denials and other events).
     pub audit: AuditSink,
+    /// Route-level circuit breaker (None = disabled): keyed by host, fed by
+    /// agent close reasons, stops dead-route retry loops at the internet
+    /// edge (no Open through the tunnel while tripped).
+    pub route_breaker: Option<Arc<TargetBreakers>>,
 }
 
 impl EdgeListener {
@@ -80,6 +98,7 @@ impl EdgeListener {
         let conn_tracker = self.conn_tracker;
         let rate_limiter = self.rate_limiter;
         let audit = self.audit;
+        let route_breaker = self.route_breaker;
 
         loop {
             let (stream, addr) = listener.accept().await?;
@@ -124,6 +143,7 @@ impl EdgeListener {
             let router = router.clone();
             let tunnel = tunnel.clone();
             let audit = audit.clone();
+            let route_breaker = route_breaker.clone();
 
             tokio::spawn(async move {
                 let _guard = guard;
@@ -135,6 +155,7 @@ impl EdgeListener {
                     host_peek_timeout,
                     stream_idle_timeout,
                     &audit,
+                    route_breaker.as_ref(),
                 )
                 .await
                 {
@@ -146,7 +167,9 @@ impl EdgeListener {
 }
 
 /// Handles a single public connection: peek the first bytes for Host → look
-/// up the route → open a stream → bidirectional pump.
+/// up the route → (route breaker gate) → open a stream → bidirectional
+/// pump → feed the close reason back into the route breaker.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut socket: TcpStream,
     peer: SocketAddr,
@@ -155,6 +178,7 @@ async fn handle_connection(
     host_peek_timeout: Duration,
     stream_idle_timeout: Duration,
     audit: &AuditSink,
+    route_breaker: Option<&Arc<TargetBreakers>>,
 ) -> interflow_core::error::Result<()> {
     use interflow_core::error::InterflowError;
     // TCP_NODELAY: disable Nagle to reduce small-packet latency (notable for echo / ping-pong workloads)
@@ -217,6 +241,27 @@ async fn handle_connection(
         route.agent_id, route.remote_addr
     );
 
+    // Route-level breaker gate: a tripped route is closed right here — no
+    // register, no Open, no tunnel round trip. Same public behavior as an
+    // agent-side rejection (fast zero-byte close; the fronting nginx
+    // surfaces 502), but the storm stops at the internet edge.
+    if let Some(breaker) = route_breaker
+        && breaker.check(&host) == BreakerDecision::Reject
+    {
+        metrics::counter!("interflow_edge_route_breaker_rejected").increment(1);
+        audit.record(
+            AuditKind::StreamDenied {
+                stream_id: String::new(),
+                source: peer.ip().to_string(),
+                reason: format!("route_circuit_open: {host}"),
+            },
+            None,
+            Some(peer.to_string()),
+        );
+        debug!("route circuit open, closing without tunnel open: host={host} peer={peer}");
+        return Ok(());
+    }
+
     let stream_id = uuid::Uuid::new_v4().to_string();
     let data_rx = tunnel.register_stream(stream_id.clone()).await;
 
@@ -251,6 +296,15 @@ async fn handle_connection(
     // timeout); if the read half exits first, unregister first then flush the
     // buffer. The JoinHandle double-poll panic class is structurally excluded
     // (docs/bug/2026-09-13-select-branch-double-await-joinhandle-panic.md).
+    //
+    // The oneshot captures the peer Close's reason token (empty = no Close
+    // observed / ordinary close) to feed the route breaker.
+    let (close_reason_tx, close_reason_rx) = if route_breaker.is_some() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let (rd, wr) = socket.into_split();
     pump_tcp_stream(
         rd,
@@ -265,8 +319,24 @@ async fn handle_connection(
             write_stall_counter: "interflow_edge_client_write_stall",
             log_label: "edge",
         },
+        close_reason_tx,
     )
     .await;
+
+    // Feed the route breaker from the close reason: backend-down tokens
+    // count as failures, a normal backend EOF proves reachability (clears a
+    // tripped route), everything else (client-side aborts, rate limits,
+    // ordinary closes) is neutral.
+    if let Some(breaker) = route_breaker
+        && let Some(rx) = close_reason_rx
+    {
+        let reason = rx.await.unwrap_or_default();
+        if ROUTE_FAILURE_REASONS.contains(&reason.as_str()) {
+            breaker.note_failure(&host);
+        } else if ROUTE_SUCCESS_REASONS.contains(&reason.as_str()) {
+            breaker.note_success(&host);
+        }
+    }
 
     Ok(())
 }

@@ -641,11 +641,11 @@ impl TunnelTransport for QuicTunnel {
     }
 
     async fn send_close(&self, stream_id: &str) -> Result<()> {
-        self.close_stream(stream_id).await
+        self.close_stream(stream_id, "").await
     }
 
-    async fn send_close_response(&self, stream_id: &str) -> Result<()> {
-        self.close_stream(stream_id).await
+    async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()> {
+        self.close_stream(stream_id, reason).await
     }
 
     async fn register_stream(&self, stream_id: String) -> mpsc::Receiver<TunnelData> {
@@ -742,8 +742,10 @@ impl QuicTunnel {
             .await
     }
 
-    /// Closes the stream: writes the Close frame + FIN and removes the handle (idempotent).
-    async fn close_stream(&self, stream_id: &str) -> Result<()> {
+    /// Closes the stream: writes the Close frame (payload = `reason`, a
+    /// short machine token; empty = ordinary close) + FIN and removes the
+    /// handle (idempotent).
+    async fn close_stream(&self, stream_id: &str, reason: &str) -> Result<()> {
         let Some(handle) = self
             .streams
             .lock()
@@ -756,7 +758,13 @@ impl QuicTunnel {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(stream_id);
-        let buf = encode_frame_bytes(FrameType::Close, 0, stream_id, &self.agent_id, b"")?;
+        let buf = encode_frame_bytes(
+            FrameType::Close,
+            0,
+            stream_id,
+            &self.agent_id,
+            reason.as_bytes(),
+        )?;
         // The write task FINs automatically after receiving the CloseFrame
         let _ = handle.tx.send(WriteCmd::CloseFrame(buf)).await;
         Ok(())

@@ -1,6 +1,6 @@
 [package]
 name = "interflow-mesh"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 description = "Site-to-site TCP tunnel: any TCP traffic between two private networks via a public hub"
@@ -18,8 +18,8 @@ path = "src/main.rs"
 interflow-core = { path = "../core", version = "0.1" }
 
 # Async runtime
-tokio = { version = "1.52", features = ["full"] }
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 socket2 = "0.6"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
 
@@ -80,7 +80,7 @@ chrono = "0.4"
 # production dependency graph)
 interflow-testkit = { path = "../testkit", version = "0.1" }
 # paused-clock unit tests (egress send-path health)
-tokio = { version = "1.52", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 # bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion
 # when creating streams at high frequency)
 libc = "0.2"

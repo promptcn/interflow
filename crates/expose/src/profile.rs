@@ -12,6 +12,7 @@
 //! process working directory.
 
 use interflow_core::config::paths::anchor;
+use interflow_mesh::config::TransportKind;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,16 @@ pub struct Profile {
     pub ca_path: Option<String>,
     /// Local ports used last time (for GUI form prefill).
     pub local_ports: Option<Vec<u16>>,
+    /// Transport toward the hub: `h2` (default) or `quic`.
+    ///
+    /// QUIC needs UDP egress to the hub and TLS on every connection
+    /// (`ca_path` or the system CA); the hub-side QUIC listener must be
+    /// enabled on the edge (`--quic-listen`).
+    pub transport: Option<TransportKind>,
+    /// Hub QUIC address (`host:port`). `None` derives it at runtime from
+    /// `hub_url`'s host:port — valid when the edge's QUIC listener shares
+    /// the hub TCP port number (the dual-stack default).
+    pub hub_quic_addr: Option<String>,
 }
 
 /// Returns the profile file path (the parent directory is created on demand).

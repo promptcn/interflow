@@ -341,6 +341,9 @@ impl IngressHandler {
                 write_stall_counter: "interflow_ingress_client_write_stall",
                 log_label: "ingress",
             },
+            // The mesh ingress has no consumer for the peer's close reason
+            // (no route-level negative caching on this plane).
+            None,
         )
         .await;
 

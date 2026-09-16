@@ -286,6 +286,28 @@ pub fn validate_agent(cfg: &AgentConfig) -> Result<(), ConfigErrorList> {
         }
     }
 
+    // per-target breaker validation
+    if cfg.egress_target_breaker_enabled {
+        if cfg.egress_target_breaker_failure_threshold == 0 {
+            errs.push(ConfigError::Invalid(
+                "egress_target_breaker_failure_threshold must be greater than 0 when the breaker is enabled"
+                    .to_string(),
+            ));
+        }
+        if cfg.egress_target_breaker_window_secs == 0 {
+            errs.push(ConfigError::Invalid(
+                "egress_target_breaker_window_secs must be greater than 0 when the breaker is enabled"
+                    .to_string(),
+            ));
+        }
+        if cfg.egress_target_breaker_cooldown_secs == 0 {
+            errs.push(ConfigError::Invalid(
+                "egress_target_breaker_cooldown_secs must be greater than 0 when the breaker is enabled"
+                    .to_string(),
+            ));
+        }
+    }
+
     // transport = "quic" requires hub_quic_addr
     if matches!(cfg.agent.transport, crate::config::TransportKind::Quic) {
         let addr_ok = cfg

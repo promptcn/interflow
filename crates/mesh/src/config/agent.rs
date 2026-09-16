@@ -74,6 +74,30 @@ pub struct AgentConfig {
     /// stream-creation spike passes in one go. Defaults to 256.
     #[serde(default = "default_stream_open_burst")]
     pub stream_open_burst: u32,
+    /// Per-target circuit breaker master switch. When enabled, connect-phase
+    /// failures (resolve/connect) are counted per backend target; once a
+    /// target exceeds the failure threshold within the window, it is tripped
+    /// OPEN and subsequent Opens to it are rejected pre-dial — without
+    /// consuming the shared open-rate budget — so one dead target's retry
+    /// storm cannot starve healthy targets sharing the same budget.
+    ///
+    /// Breaker state is agent-level and survives session rebuilds (same
+    /// rationale as the rate limiter). Defaults to true.
+    #[serde(default = "default_egress_target_breaker_enabled")]
+    pub egress_target_breaker_enabled: bool,
+    /// Failures within the sliding window required to trip a target's breaker.
+    #[serde(default = "default_egress_target_breaker_failure_threshold")]
+    pub egress_target_breaker_failure_threshold: u32,
+    /// Sliding window (seconds) for counting connect-phase failures per
+    /// target. Window-counting (not consecutive-counting) so a flapping
+    /// backend failing every other attempt still trips.
+    #[serde(default = "default_egress_target_breaker_window_secs")]
+    pub egress_target_breaker_window_secs: u64,
+    /// Cooldown (seconds) a tripped target stays OPEN before one HALF_OPEN
+    /// probe is allowed through; a probe that succeeds closes the breaker
+    /// (self-healing), one that fails re-arms it.
+    #[serde(default = "default_egress_target_breaker_cooldown_secs")]
+    pub egress_target_breaker_cooldown_secs: u64,
     /// Control API.
     #[serde(default)]
     pub control: ControlConfig,
@@ -366,6 +390,22 @@ const fn default_stream_open_burst() -> u32 {
     256
 }
 
+const fn default_egress_target_breaker_enabled() -> bool {
+    true
+}
+
+const fn default_egress_target_breaker_failure_threshold() -> u32 {
+    5
+}
+
+const fn default_egress_target_breaker_window_secs() -> u64 {
+    10
+}
+
+const fn default_egress_target_breaker_cooldown_secs() -> u64 {
+    30
+}
+
 #[cfg(test)]
 #[allow(
     clippy::panic,
@@ -417,6 +457,10 @@ hub_url = "http://hub"
         assert_eq!(cfg.max_incoming_streams, 256);
         assert_eq!(cfg.max_stream_opens_per_sec, 100);
         assert_eq!(cfg.stream_open_burst, 256);
+        assert!(cfg.egress_target_breaker_enabled);
+        assert_eq!(cfg.egress_target_breaker_failure_threshold, 5);
+        assert_eq!(cfg.egress_target_breaker_window_secs, 10);
+        assert_eq!(cfg.egress_target_breaker_cooldown_secs, 30);
 
         // Explicit overrides (fields with 0 = disabled semantics)
         let toml_str = r#"
@@ -426,6 +470,10 @@ egress_connect_timeout_secs = 3
 max_incoming_streams = 0
 max_stream_opens_per_sec = 0
 stream_open_burst = 8
+egress_target_breaker_enabled = false
+egress_target_breaker_failure_threshold = 9
+egress_target_breaker_window_secs = 20
+egress_target_breaker_cooldown_secs = 60
 
 [agent]
 id = "x"
@@ -437,6 +485,10 @@ hub_url = "http://hub"
         assert_eq!(cfg.max_incoming_streams, 0);
         assert_eq!(cfg.max_stream_opens_per_sec, 0);
         assert_eq!(cfg.stream_open_burst, 8);
+        assert!(!cfg.egress_target_breaker_enabled);
+        assert_eq!(cfg.egress_target_breaker_failure_threshold, 9);
+        assert_eq!(cfg.egress_target_breaker_window_secs, 20);
+        assert_eq!(cfg.egress_target_breaker_cooldown_secs, 60);
     }
 
     #[test]

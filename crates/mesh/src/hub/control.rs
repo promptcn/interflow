@@ -165,6 +165,22 @@ pub(crate) fn close_frame(stream_id: &str, reason: &str) -> TunnelData {
     }
 }
 
+/// Defensive extraction of the close reason from an agent→hub Close payload.
+///
+/// The reason is a short machine token emitted by the egress forwarder
+/// (`CloseReason::as_str()`, e.g. `connect_failed`); empty = ordinary
+/// close. A pre-2026-09-16 agent sends an empty payload. Anything odd-shaped
+/// (a hostile agent) is pruned to a bounded `[A-Za-z0-9_.-]` token before it
+/// is embedded into the downstream `CLOSE:{sid}:{reason}` convention.
+pub(crate) fn close_reason_of(payload: &[u8]) -> String {
+    String::from_utf8_lossy(payload)
+        .chars()
+        .take_while(|c| *c != ':')
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(64)
+        .collect()
+}
+
 /// Delivers one lifecycle notification frame (Open / `_close_`) to an h2
 /// (poll) agent via the control channel with guaranteed delivery.
 ///
@@ -201,7 +217,9 @@ pub(crate) async fn deliver_close_via_control(
 }
 
 /// `_close_` with response-direction semantics (backend EOF): data-channel
-/// FIFO first, falling back to the control channel on stall.
+/// FIFO first, falling back to the control channel on stall. `reason`
+/// (empty = ordinary close) rides in the payload so the receiving end can
+/// distinguish backend failures from normal teardown.
 ///
 /// Queued response tail bytes are still deliverable to the visitor — under
 /// normal congestion the Close queues after the data (`send().await` waits
@@ -212,6 +230,7 @@ pub(crate) async fn deliver_response_close(
     agents: &SharedAgents,
     agent_id: &str,
     stream_id: &str,
+    reason: &str,
 ) -> bool {
     let Some(ch) = lookup_channels(agents, agent_id).await else {
         debug!(
@@ -221,7 +240,7 @@ pub(crate) async fn deliver_response_close(
     };
     let sent = tokio::time::timeout(
         RESPONSE_CLOSE_FIFO_TIMEOUT,
-        ch.data_tx.send(close_frame(stream_id, "")),
+        ch.data_tx.send(close_frame(stream_id, reason)),
     )
     .await;
     // FIFO preserved: under normal congestion the Close succeeds by queueing
@@ -235,7 +254,7 @@ pub(crate) async fn deliver_response_close(
     warn!(
         "agent {agent_id} data channel stalled/closed, response close falling back to control channel: stream_id={stream_id}"
     );
-    control_send(agents, agent_id, &ch, close_frame(stream_id, "")).await
+    control_send(agents, agent_id, &ch, close_frame(stream_id, reason)).await
 }
 
 #[cfg(test)]

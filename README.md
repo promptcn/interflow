@@ -35,7 +35,7 @@ Like ngrok, it exposes a local port under a public domain — but with a fixed d
      │ proxy_pass http://127.0.0.1:8443
      ▼
   interflow-expose edge              ← single process: HubServer + EdgeListener (consolidated)
-     │ HTTP/2 tunnel
+     │ HTTP/2 tunnel (or QUIC — see "QUIC transport" below)
      ▼
 [local machine]
   interflow-expose expose 3000       ← single command: egress agent + auto configuration
@@ -77,6 +77,7 @@ interflow-expose expose 3000
 - **The edge is a consolidated component**, not a "hub + ingress bundle": the HTTP/1 listener and the tunnel server cooperate directly on the same event loop — public request → peek the first 8 KB for the `Host` header → route-table lookup → open a tunnel stream to the target egress agent → pass the byte stream through
 - **Nginx terminates TLS**; the edge sees the plaintext HTTP/1 arriving from nginx `proxy_pass`
 - **L4 passthrough**: the edge does not parse the full HTTP protocol — it only peeks the Host header for routing; the remaining byte stream crosses the tunnel untouched, and the backend service (a local HTTP server / SSH / any TCP service) parses it itself
+- **h2 tunnel by default, QUIC opt-in**: the expose client↔edge leg can switch to QUIC (`--transport quic` on the client, `--quic-listen` on the edge — see [QUIC transport](#quic-transport-optional-coexists-with-h2-as-a-dual-stack)); nginx stays on the public path either way, since the QUIC UDP port is dialed directly
 
 ### Deployment notes: long silent windows and SSE
 
@@ -170,6 +171,10 @@ Safe defaults (a differentiator neither frp nor rathole ships): a 65507-byte rea
 
 With `[quic]` enabled on the hub and `transport = "quic"` selected on the agent, tunnel streams run directly on QUIC native streams (custom frames written raw — eliminating single-TCP-connection head-of-line blocking and the "one HTTP exchange per frame on the upstream"); UDP sessions additionally take the QUIC DATAGRAM (RFC 9221) fast path — small packets travel unreliably and unordered straight to the peer, so packet loss no longer HOLs the whole connection (neither frp nor rathole does this). ACL / stream limits / heartbeat eviction / mTLS / cert-pin keep identical semantics across both transports, and cross-transport interop is supported (h2 agent ↔ quic agent).
 
+Positioning of the pair: **h2 is the default and fallback-safe transport** — it connects wherever TCP egress is allowed; **QUIC is an opt-in upgrade** — pick it when the agent's network allows UDP egress (many corporate egress policies block UDP). The choice is static per-agent config with no automatic fallback between the two, which is exactly why h2 stays the default.
+
+Both scenarios support it. In the mesh scenario:
+
 ```toml
 # hub
 [quic]
@@ -182,6 +187,26 @@ datagram_enabled = true   # DATAGRAM fast path for UDP sessions (on by default)
 transport = "quic"        # default "h2"
 hub_quic_addr = "hub.example.com:6667"
 ```
+
+In the expose scenario there is no toml — the same plane is wired through CLI flags:
+
+```bash
+# Public server: edge opens an extra QUIC listener for expose clients.
+# The UDP port bypasses nginx (open it on the firewall) and requires the
+# hub certificate (--hub-cert/--hub-key): QUIC mandates TLS, and the cert's
+# SAN must cover the hostname clients dial.
+interflow-expose edge \
+  --quic-listen 0.0.0.0:16666 \
+  --hub-cert ./certs/hub.crt --hub-key ./certs/hub.key \
+  ... # --listen/--hub-listen/--routes/--token as usual
+
+# Local machine: the client dials QUIC instead of h2. The QUIC address can
+# stay implicit — with --hub-quic-addr omitted it derives from the hub URL's
+# host:port, which matches the edge's same-port dual-stack default above.
+interflow-expose expose 3000 --transport quic
+```
+
+The edge's own dial to its embedded hub stays on h2 — the hub relays across transports (h2 edge tunnel ↔ quic expose client), verified e2e in `crates/expose/tests/e2e_expose_quic.rs`. `interflow-expose init` offers the QUIC options in its wizard, and the GUI exposes a transport toggle.
 
 ---
 
@@ -210,7 +235,7 @@ One-line positioning: **frp is the most feature-complete bundle with the largest
 
 - **frp**: P2P hole punching (xtcp, relay-free direct connection), aggressive KCP transport, client plugins (protocol conversion / static files / socks5 egress), L7 vhost routing, proxy load balancing and health checks, OIDC, a web dashboard, and the largest community and third-party ecosystem.
 - **rathole**: a ~574 KiB embedded minimal build (a dropbear-class presence on routers / OpenWrt), the minimal-configuration mindset of certificate-free Noise; its "one connection per stream" model naturally has no cross-stream head-of-line blocking on TCP.
-- **interflow's known boundaries**: h2 mode has cross-stream TCP head-of-line blocking (solved by the QUIC transport; h2 is positioned as the compatibility path); the expose scenario does not support UDP yet (fully supported in the mesh scenario); community size and third-party ecosystem start from zero.
+- **interflow's known boundaries**: h2 mode has cross-stream TCP head-of-line blocking (solved by the QUIC transport; h2 remains the default — deployable wherever TCP egress works — while QUIC is an opt-in upgrade that requires UDP egress); the expose scenario does not support UDP yet (fully supported in the mesh scenario); community size and third-party ecosystem start from zero.
 
 ### Explicitly out of scope (product decisions, not missing capability)
 

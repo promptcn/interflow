@@ -556,9 +556,18 @@ impl HubService {
     }
 
     /// Frame-level Close handling: notify the peer, remove the active
-    /// stream, release the slot.
-    pub(crate) async fn frame_close(&self, agent_id: &str, stream_id: &str, direction: Direction) {
-        debug!("Stream closed: stream_id={stream_id}");
+    /// stream, release the slot. `reason` (from the agent's Close payload)
+    /// is forwarded to the peer's `_close_` notification so the far end can
+    /// react to backend failures (edge route-level negative caching,
+    /// 2026-09-16).
+    pub(crate) async fn frame_close(
+        &self,
+        agent_id: &str,
+        stream_id: &str,
+        direction: Direction,
+        reason: &str,
+    ) {
+        debug!("Stream closed: stream_id={stream_id}, reason={reason}");
 
         // Look up the stream info and decide which peer to notify
         // (directional authorization: request direction must be the source,
@@ -616,14 +625,19 @@ impl HubService {
         //   peer's fd takes priority (overtaking queued data is the correct
         //   semantic here).
         if direction == Direction::Response {
-            crate::hub::control::deliver_response_close(&self.agents, &notify_agent, stream_id)
-                .await;
+            crate::hub::control::deliver_response_close(
+                &self.agents,
+                &notify_agent,
+                stream_id,
+                reason,
+            )
+            .await;
         } else {
             crate::hub::control::deliver_close_via_control(
                 &self.agents,
                 &notify_agent,
                 stream_id,
-                "",
+                reason,
             )
             .await;
         }

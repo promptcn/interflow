@@ -189,3 +189,14 @@ button.primary {
 .log-line.warn .log-level {
   color: #ff9f0a;
 }
+
+.transport-toggle {
+  display: flex;
+  gap: 6px;
+}
+
+.transport-toggle button.selected {
+  background: rgba(52, 199, 89, 0.2);
+  border-color: #34c759;
+  font-weight: 600;
+}

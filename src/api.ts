@@ -1,11 +1,16 @@
 // Tauri API wrapper: types aligned with the Rust-side serde definitions.
 
+/// Transport toward the hub (serialized form of the Rust `TransportKind`).
+export type Transport = "h2" | "quic";
+
 export interface Profile {
   hub_url: string | null;
   auth_token: string | null;
   agent_id: string | null;
   ca_path: string | null;
   local_ports?: number[] | null;
+  transport?: Transport | null;
+  hub_quic_addr?: string | null;
 }
 
 export interface TunnelConfig {
@@ -14,6 +19,8 @@ export interface TunnelConfig {
   auth_token: string;
   agent_id: string;
   ca_path: string | null;
+  transport?: Transport | null;
+  hub_quic_addr?: string | null;
 }
 
 export type TunnelState =

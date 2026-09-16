@@ -156,10 +156,17 @@ pub struct PumpConfig {
 /// via `register_stream` first). On return, the whole stream has been closed
 /// out and unregistered.
 ///
+/// `close_reason`: when `Some`, the write half reports the reason token
+/// carried by the peer's Close notification (`CLOSE:{sid}:{reason}` payload;
+/// empty string = ordinary close / no Close observed, e.g. the client side
+/// disconnected first) — the hook the expose edge uses for route-level
+/// negative caching (2026-09-16 reason propagation).
+///
 /// Cancellation safety: this future may be cancelled at any time by an outer
 /// select/drop — the socket half and channel half are released in place on
 /// drop, losing at most one in-flight data frame (the stream was being torn
 /// down anyway).
+#[allow(clippy::too_many_arguments)]
 pub async fn pump_tcp_stream<R, W, T>(
     rd: R,
     wr: W,
@@ -167,6 +174,7 @@ pub async fn pump_tcp_stream<R, W, T>(
     target: &T,
     stream_id: &str,
     cfg: &PumpConfig,
+    close_reason: Option<tokio::sync::oneshot::Sender<String>>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -224,6 +232,7 @@ pub async fn pump_tcp_stream<R, W, T>(
     };
 
     // Write half: tunnel → socket (response direction).
+    let mut close_reason_tx = close_reason;
     let write_half = async {
         let mut wr = wr;
         loop {
@@ -236,6 +245,13 @@ pub async fn pump_tcp_stream<R, W, T>(
                 Ok(Some(msg)) => {
                     progress.touch();
                     if matches!(msg.stream_type, FrameType::Close) {
+                        if let Some(tx) = close_reason_tx.take() {
+                            // Dropping without send also communicates "no
+                            // reason" (receiver treats Err as empty), but
+                            // sending "" keeps the channel semantics
+                            // unambiguous.
+                            let _ = tx.send(parse_close_reason(stream_id, &msg.data));
+                        }
                         break;
                     }
                     if !msg.data.is_empty() {
@@ -294,6 +310,19 @@ pub async fn pump_tcp_stream<R, W, T>(
             (&mut write_half).await;
         }
     }
+}
+
+/// Extracts the reason token from a `_close_` notification payload.
+///
+/// The hub emits `CLOSE:{sid}:{reason}` (empty reason = ordinary close);
+/// anything that does not carry this prefix (a late/foreign frame) is
+/// treated as reason-less.
+fn parse_close_reason(stream_id: &str, data: &[u8]) -> String {
+    let prefix = format!("CLOSE:{stream_id}:");
+    String::from_utf8_lossy(data)
+        .strip_prefix(&prefix)
+        .unwrap_or("")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -387,7 +416,7 @@ mod tests {
         let target = MockTarget::default();
         tx.send(td(FrameType::Close, b"")).await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
 
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
         // After the pump returns the write half is dropped: the client reads EOF
@@ -415,7 +444,7 @@ mod tests {
         peer.write_all(b"req").await.unwrap();
         peer.shutdown().await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
 
         assert_eq!(target.sent_data(), vec![Bytes::from_static(b"req")]);
         assert_eq!(target.close_calls(), vec!["s1".to_string()]);
@@ -437,7 +466,7 @@ mod tests {
         // write_all hangs → stall timeout
         tx.send(td(FrameType::Data, &[7u8; 64])).await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
 
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
     }
@@ -452,7 +481,7 @@ mod tests {
         drop(tx);
         let target = MockTarget::default();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
 
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
     }
@@ -467,7 +496,7 @@ mod tests {
         let target = MockTarget::default();
         tx.send(td(FrameType::Data, b"x")).await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
 
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
     }
@@ -506,7 +535,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let t = Arc::clone(&target);
         let pump = tokio::spawn(async move {
-            pump_tcp_stream(rd, wr, rx, &*t, "s1", &cfg).await;
+            pump_tcp_stream(rd, wr, rx, &*t, "s1", &cfg, None).await;
         });
 
         // Mid-run probe at 3× the idle budget with response frames flowing:
@@ -546,7 +575,7 @@ mod tests {
         cfg.idle_timeout = Duration::from_millis(120);
 
         let started = tokio::time::Instant::now();
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &cfg).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &cfg, None).await;
         let elapsed = started.elapsed();
         drop(tx);
 

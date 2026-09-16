@@ -1,6 +1,6 @@
 [package]
 name = "interflow-expose"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 description = "Ngrok-style tunnel: public hostname → local service"
@@ -19,7 +19,7 @@ interflow-core = { path = "../core", version = "0.1" }
 interflow-mesh = { path = "../mesh", version = "0.1" }
 
 # Async runtime
-tokio = { version = "1.52", features = ["full"] }
+tokio = { workspace = true }
 
 # HTTP/1 listener (for the edge)
 hyper = { version = "1.10", features = ["full", "http1"] }
@@ -59,7 +59,7 @@ metrics = "0.24.6"
 
 # Hot reload: atomic route-table replacement + graceful task utilities
 arc-swap = "1"
-tokio-util = "0.7.19"
+tokio-util = { workspace = true }
 
 # Raise the fd soft limit (unix only)
 [target.'cfg(unix)'.dependencies]
@@ -76,6 +76,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 x509-parser = "0.18"
 tempfile = "3"
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
+# Shared test harness (certs for the QUIC e2e stack; production graph unaffected)
+interflow-testkit = { path = "../testkit", version = "0.1" }
+# e2e assertions on metrics counters (in-process recorder installed for direct snapshot reads)
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 [[bench]]
 name = "expose_rps"

@@ -49,6 +49,23 @@ fn run_public_server_wizard() -> Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(generate_token);
 
+    // QUIC plane (opt-in): one QUIC stream per tunnel stream — eliminates TCP
+    // head-of-line blocking. The UDP port bypasses nginx entirely, so the
+    // listen address must be publicly reachable.
+    let quic_enabled = prompt_yes_no("Enable the QUIC listener for expose clients?", false)?;
+    let quic_listen = if quic_enabled {
+        let default_addr = format!("0.0.0.0:{internal_hub_port}");
+        let addr = prompt(&format!(
+            "QUIC listen address (default {default_addr}; same port number as the hub keeps the dual-stack default)"
+        ))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_addr);
+        Some(addr)
+    } else {
+        None
+    };
+
     let cert_dir = PathBuf::from(
         prompt("Certificate output directory (default ./certs)")
             .ok()
@@ -97,13 +114,31 @@ remote_addr = "127.0.0.1:3000"     # listen address of the local service
     println!("    --listen 0.0.0.0:{public_listen_port} \\");
     println!("    --hub-listen 127.0.0.1:{internal_hub_port} \\");
     println!("    --routes {routes_path} \\");
-    println!("    --token {agent_token}");
+    // Keep the shell continuation alive when QUIC flags follow.
+    println!(
+        "    --token {agent_token}{}",
+        if quic_enabled { " \\" } else { "" }
+    );
+    // QUIC additions: the [tls] set serves both the h2 hub plane and the QUIC
+    // plane (SAN = the hub domain, so clients dialing hub_quic_addr verify it).
+    if let Some(addr) = quic_listen.as_deref() {
+        println!("    --hub-cert {} \\", certs.hub_cert);
+        println!("    --hub-key {} \\", certs.hub_key);
+        println!("    --quic-listen {addr}");
+        println!(
+            "\n(QUIC plane: open the UDP port on the firewall — nginx does not carry it. \
+             The certificate's SAN covers {hub_domain}.)"
+        );
+    }
     println!("\nGive this command to the local machine (exposing port 3000):");
     println!("  interflow-expose expose 3000 \\");
     println!("    --hub http://<public-domain>:{internal_hub_port} \\");
     println!("    --token {agent_token} \\");
     println!("    --agent-id expose-myapp \\");
     println!("    --ca-path {}", certs.ca_cert);
+    if quic_enabled {
+        println!("    --transport quic");
+    }
 
     Ok(())
 }
@@ -127,12 +162,27 @@ fn run_local_machine_wizard() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty());
 
+    // QUIC transport (opt-in): the edge must have its QUIC listener enabled.
+    // The QUIC address stays unset so it derives from the hub URL's host:port
+    // (the edge dual-stack default); an explicit value can be added to the
+    // profile later if the edge uses a dedicated QUIC port.
+    let transport = if prompt_yes_no(
+        "Use the QUIC transport toward the hub? (edge must have its QUIC listener enabled)",
+        false,
+    )? {
+        Some(interflow_mesh::config::TransportKind::Quic)
+    } else {
+        None
+    };
+
     let profile = Profile {
         hub_url: Some(hub_url),
         auth_token: Some(token),
         agent_id: Some(agent_id),
         ca_path,
         local_ports: None,
+        transport,
+        hub_quic_addr: None,
     };
     save_profile(&profile)
         .map_err(|e| InterflowError::config("failed to write profile").with_source(e))?;
@@ -149,6 +199,17 @@ fn prompt(label: &str) -> Result<String> {
     let mut line = String::new();
     stdin.lock().read_line(&mut line)?;
     Ok(line.trim().to_string())
+}
+
+/// Yes/no prompt: empty input takes the default (mirroring the wizard's
+/// "[y/N]"-style conventions; anything not starting with y/Y counts as no).
+fn prompt_yes_no(label: &str, default: bool) -> Result<bool> {
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    let answer = prompt(&format!("{label} {hint}"))?;
+    if answer.is_empty() {
+        return Ok(default);
+    }
+    Ok(answer.starts_with('y') || answer.starts_with('Y'))
 }
 
 /// Nginx reverse-proxy snippet. The SSE trio (`proxy_http_version` /

@@ -23,6 +23,7 @@
 )]
 use interflow_expose::client::ExposeArgs;
 use interflow_expose::edge::{EdgeArgs, HostRouter, Route, RoutesConfig};
+use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -149,9 +150,14 @@ remote_addr = "{echo_addr}"
         routes_path: routes_path.to_string_lossy().into_owned(),
         agent_token: "test-token".into(),
         hub_tls: None,
+        quic_listen: None,
         audit_path: None,
         new_conn_rate_per_ip_per_minute: 0,
         stream_idle_timeout_secs: 300,
+        route_breaker_enabled: true,
+        route_breaker_failure_threshold: 10,
+        route_breaker_window_secs: 60,
+        route_breaker_cooldown_secs: 30,
     };
     let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_args));
 
@@ -171,6 +177,8 @@ remote_addr = "{echo_addr}"
         auth_token: "test-token".into(),
         agent_id: "expose-test".into(),
         ca_path: None,
+        transport: TransportKind::H2,
+        hub_quic_addr: None,
     };
     let client_handle =
         tokio::task::spawn(

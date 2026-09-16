@@ -867,7 +867,7 @@ async fn datagram_relay_loop(core: HubCore, conn: quinn::Connection, agent_id: S
                     .get(&stream_id)
                     .is_some_and(|st| st.target_agent == agent_id)
             };
-            teardown_stream(&core, &stream_id, sender_is_target).await;
+            teardown_stream(&core, &stream_id, sender_is_target, "").await;
         }
         metrics::counter!("interflow_quic_datagrams_relayed").increment(1);
     }
@@ -891,7 +891,12 @@ async fn datagram_relay_loop(core: HubCore, conn: quinn::Connection, agent_id: S
 /// the target agent, notified via the control channel with guaranteed
 /// delivery (the source end is dead; releasing the peer's fd takes
 /// priority).
-pub(crate) async fn teardown_stream(core: &HubCore, stream_id: &str, response_dir: bool) {
+pub(crate) async fn teardown_stream(
+    core: &HubCore,
+    stream_id: &str,
+    response_dir: bool,
+    reason: &str,
+) {
     let removed = {
         let mut streams = core.active_streams.write().await;
         streams.remove(stream_id)
@@ -921,14 +926,19 @@ pub(crate) async fn teardown_stream(core: &HubCore, stream_id: &str, response_di
         };
         if !peer.is_empty() && !face.is_relay() {
             if response_dir {
-                let _ = crate::hub::control::deliver_response_close(&core.agents, &peer, stream_id)
-                    .await;
+                let _ = crate::hub::control::deliver_response_close(
+                    &core.agents,
+                    &peer,
+                    stream_id,
+                    reason,
+                )
+                .await;
             } else {
                 let _ = crate::hub::control::deliver_close_via_control(
                     &core.agents,
                     &peer,
                     stream_id,
-                    "",
+                    reason,
                 )
                 .await;
             }
@@ -1209,7 +1219,7 @@ async fn relay_reader(
     // cut) — close out as a close (termination contract: the poll-plane peer
     // is notified by teardown_stream, with direction following this read
     // pump's directional semantics)
-    teardown_stream(&core, stream_id, response_dir).await;
+    teardown_stream(&core, stream_id, response_dir, "").await;
 }
 
 /// Decodes and dispatches all complete frames in `buf`; returns true when
@@ -1264,8 +1274,10 @@ async fn process_frames(
             // channel was full, leaving the peer's fd lingering for the
             // whole session); the quic peer is informed by the entry drop
             // triggering the writer task to write the outstanding Close +
-            // FIN.
-            teardown_stream(core, stream_id, response_dir).await;
+            // FIN. The Close payload carries the egress close reason
+            // (empty = ordinary close) and is forwarded to the poll peer.
+            let reason = crate::hub::control::close_reason_of(&frame.payload);
+            teardown_stream(core, stream_id, response_dir, &reason).await;
             return true;
         }
 
@@ -1294,7 +1306,7 @@ async fn process_frames(
             // response_dir pump is the source agent, using response-FIFO
             // priority; the peer of a request-direction pump is the target
             // agent, with guaranteed delivery via the control channel)
-            teardown_stream(core, stream_id, response_dir).await;
+            teardown_stream(core, stream_id, response_dir, "").await;
             return true;
         }
         metrics::counter!("interflow_hub_frames_rx", "type" => "data").increment(1);
