@@ -197,8 +197,7 @@ keepalive_timeout_secs = 10
 the same `[transport.h2]` / `[transport.quic]` knobs with the same defaults,
 because QUIC negotiates the idle timeout as the endpoints' *minimum* —
 raising only one side silently does nothing. Tuning one link means changing
-both sides together. Full field reference (incl. defaults and the SIGHUP
-reload contract): `docs/config-reference.md`.
+both sides together.
 
 In the expose scenario there is no toml — the same plane is wired through CLI flags:
 
@@ -302,7 +301,7 @@ just init          # run the expose init wizard
 - **Rust 2024** + Tokio
 - **Dual transport stack**: long-lived HTTP/2 streams (hyper 1.x: `/stream/up` upstream + `/poll` downstream mirrored streaming) and QUIC (quinn 0.11: one QUIC stream per tunnel stream + RFC 9221 DATAGRAM), both sharing the same custom frame protocol
 - **rustls** (no openssl; mTLS / cert pinning / SHA256 fingerprint verification)
-- **TOML** configuration (schema v3, `deny_unknown_fields` guards against typos; defaults single-sourced in code — see `docs/config-reference.md`, field list CI-guarded)
+- **TOML** configuration (schema v3, `deny_unknown_fields` guards against typos; defaults single-sourced in code)
 - **Tracing** + Prometheus metrics
 - **Strict lints**: `deny(unsafe_code)`, `deny(panic)`, `warn(pedantic + nursery)`
 
