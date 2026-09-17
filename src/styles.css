@@ -164,6 +164,13 @@ button.primary {
   word-break: break-all;
 }
 
+.log-ts {
+  flex-shrink: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  opacity: 0.55;
+}
+
 .log-level {
   width: 44px;
   flex-shrink: 0;

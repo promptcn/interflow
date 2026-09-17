@@ -2,6 +2,8 @@
 //!
 //! - [`transport`]: the [`TunnelTransport`] trait, direction sentinels, and
 //!   the inbound dispatcher
+//! - [`chunking`]: h2 body chunk hygiene (the wire-safe chunking policy for
+//!   every long-lived h2 tunnel body; see the 2026-09-17 GOAWAY churn bug)
 //! - [`h2`]: the HTTP/2 backend (streaming `POST /stream/up` uplink +
 //!   `GET /poll` downlink)
 //! - [`agent`]: the [`AgentTunnel`] facade (consumers program against it)
@@ -11,12 +13,15 @@
 //!   expose edge / mesh ingress)
 
 pub mod agent;
+pub mod chunking;
 pub mod h2;
 pub mod negotiation;
 pub mod pump;
 pub mod quic;
 pub mod session_tasks;
 pub mod transport;
+
+pub use chunking::ChunkHygiene;
 
 pub use agent::{AgentTunnel, DEFAULT_REQUEST_ESTABLISH_TIMEOUT, H2Liveness, SessionSlot};
 pub use h2::{H2RequestBody, empty_request_body};

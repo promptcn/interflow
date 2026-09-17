@@ -8,11 +8,13 @@
 //! - `interflow-expose version` — version information
 
 use clap::{Parser, Subcommand, ValueEnum};
+use interflow_core::config::LoggingConfig;
 use interflow_core::config::paths::absolutize;
+use interflow_core::telemetry::LogFormat;
 use interflow_expose::client::{self, ExposeArgs};
 use interflow_expose::edge::{
     self, DEFAULT_AGENT_RECOVERY_TIMEOUT_SECS, DEFAULT_STREAM_IDLE_TIMEOUT_SECS, EdgeArgs,
-    EdgeHubTls,
+    EdgeHubTls, RoutesConfig,
 };
 use interflow_expose::{init, profile};
 use interflow_mesh::config::TransportKind;
@@ -24,6 +26,17 @@ use std::path::Path;
 #[command(name = "interflow-expose")]
 #[command(about = "Ngrok-style public domain → local service", long_about = None)]
 struct Cli {
+    /// Initial log level: a tracing filter directive (e.g. `debug` or
+    /// `info,interflow_mesh=debug`). Overrides the `[logging]` section of
+    /// routes.toml (edge) at startup; the default is `info`. On SIGHUP the
+    /// file's `[logging]` (when present) takes over again.
+    #[arg(
+        long,
+        global = true,
+        value_name = "FILTER",
+        value_parser = parse_log_level
+    )]
+    log_level: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -139,8 +152,17 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Logging init (info level by default)
-    interflow_core::telemetry::init_logging("info", interflow_core::telemetry::LogFormat::Plain);
+    let cli = Cli::parse();
+
+    // Logging init: explicit --log-level > routes.toml [logging] (edge) > "info".
+    // Runs after Cli::parse so the flag can join the precedence chain; clap
+    // prints its own errors to stderr before any subscriber exists.
+    let file_logging = match &cli.command {
+        Commands::Edge { routes, .. } => read_routes_logging(routes),
+        _ => None,
+    };
+    let (level, format) = resolve_logging(cli.log_level.as_deref(), file_logging);
+    interflow_core::telemetry::init_logging(&level, format);
 
     // Route panics through tracing: the default hook only writes to stderr,
     // and you cannot tell why the agent died.
@@ -161,8 +183,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or("<non-string panic payload>");
         tracing::error!(panic.location = %loc, panic.payload = %payload, "process panic");
     }));
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Expose {
@@ -363,6 +383,82 @@ fn pick(name: &str, cli: Option<String>, from_profile: Option<&str>) -> Option<S
     } else {
         tracing::debug!("argument {name} not provided (not set on CLI or in profile)");
         None
+    }
+}
+
+/// clap value parser for `--log-level`: reject a mistyped filter at parse
+/// time (exit 2 with a pointed error) instead of silently running at `info`.
+fn parse_log_level(s: &str) -> Result<String, String> {
+    interflow_core::telemetry::validate_log_filter(s)?;
+    Ok(s.to_string())
+}
+
+/// Startup precedence: an explicit `--log-level` flag beats routes.toml's
+/// `[logging]` section, which beats the built-in `info` default. The flag is
+/// a full logging override (level + plain format, the CLI context); the file
+/// section — when present — also owns the format and reasserts its level on
+/// every later SIGHUP reload.
+fn resolve_logging(flag: Option<&str>, file: Option<LoggingConfig>) -> (String, LogFormat) {
+    if let Some(level) = flag {
+        return (level.to_string(), LogFormat::Plain);
+    }
+    file.map_or_else(
+        || ("info".to_string(), LogFormat::Plain),
+        |l| (l.level, l.format),
+    )
+}
+
+/// Best-effort pre-read of routes.toml's `[logging]` section for startup
+/// precedence. A missing/broken file returns None (falls back to
+/// `--log-level`/`info`); `edge::run` re-loads the same file and turns real
+/// errors into hard startup failures, so this path only needs to warn.
+fn read_routes_logging(routes_path: &str) -> Option<LoggingConfig> {
+    match RoutesConfig::load(routes_path) {
+        Ok(cfg) => cfg.logging,
+        Err(e) => {
+            eprintln!("warning: cannot read {routes_path} for the [logging] section: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_logging(level: &str, format: LogFormat) -> LoggingConfig {
+        LoggingConfig {
+            level: level.to_string(),
+            format,
+        }
+    }
+
+    #[test]
+    fn resolve_logging_flag_beats_file_beats_default() {
+        // Explicit flag wins over the file, with plain format.
+        assert_eq!(
+            resolve_logging(Some("debug"), Some(file_logging("trace", LogFormat::Json))),
+            ("debug".to_string(), LogFormat::Plain)
+        );
+        // No flag: the file section owns level + format.
+        assert_eq!(
+            resolve_logging(
+                None,
+                Some(file_logging("info,interflow_mesh=debug", LogFormat::Json))
+            ),
+            (
+                "info,interflow_mesh=debug".to_string(),
+                interflow_core::telemetry::LogFormat::Json
+            )
+        );
+        // Neither: built-in default.
+        assert_eq!(
+            resolve_logging(None, None),
+            (
+                "info".to_string(),
+                interflow_core::telemetry::LogFormat::Plain
+            )
+        );
     }
 }
 

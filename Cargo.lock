@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-expose"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2450,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-gui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "interflow-expose",
  "interflow-mesh",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-mesh"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -2512,7 +2512,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-testkit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "clap",

@@ -85,12 +85,13 @@ async fn wait_for_tcp(addr: SocketAddr, timeout: Duration) -> std::io::Result<()
 async fn host_router_routes_by_host() {
     let echo_addr = spawn_echo().await;
 
-    let router = Arc::new(HostRouter::from_config(RoutesConfig {
+    let router = Arc::new(HostRouter::from_config(&RoutesConfig {
         routes: vec![Route {
             host: "test.local".into(),
             agent_id: "expose-test".into(),
             remote_addr: echo_addr,
         }],
+        logging: None,
     }));
 
     assert_eq!(router.len(), 1);

@@ -28,7 +28,7 @@
     dead_code,
     unused_mut
 )]
-use interflow_expose::edge::HostRouter;
+use interflow_expose::edge::{HostRouter, RoutesConfig};
 use interflow_expose::profile;
 use std::path::{Path, PathBuf};
 
@@ -97,4 +97,30 @@ fn public_routes_toml_loads_non_empty() {
         assert!(router.lookup(host).is_some(), "route for {host} missing");
     }
     assert!(router.lookup("unknown.example.com").is_none());
+}
+
+#[test]
+fn public_routes_toml_logging_section_round_trips() {
+    let base = workspace_root().join("examples/reverse-tunnel-public");
+    // The shipped example documents [logging] as comments only; an operator
+    // uncommenting it must get the documented behavior: same schema as the
+    // hub's [logging], hot-reloadable level, section entirely optional.
+    let cfg = RoutesConfig::load(base.join("routes.toml").display().to_string().as_str())
+        .expect("routes.toml should load");
+    assert_eq!(cfg.logging, None, "commented-out example must stay inert");
+
+    let uncommented = r#"
+[[routes]]
+host = "app.example.com"
+agent_id = "expose-myapp"
+remote_addr = "127.0.0.1:3000"
+
+[logging]
+level = "info,interflow_mesh=debug"
+format = "json"
+"#;
+    let cfg: RoutesConfig = toml::from_str(uncommented).expect("active [logging] should parse");
+    let logging = cfg.logging.expect("[logging] present");
+    assert_eq!(logging.level, "info,interflow_mesh=debug");
+    assert_eq!(logging.format, interflow_core::telemetry::LogFormat::Json);
 }

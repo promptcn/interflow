@@ -12,7 +12,9 @@ export default function LogView({ logs }: { logs: LogLine[] }) {
 
   const copy = async () => {
     try {
-      const text = logs.map((l) => `${l.level} [${l.target}] ${l.message}`).join("\n");
+      const text = logs
+        .map((l) => `${l.ts} ${l.level} [${l.target}] ${l.message}`)
+        .join("\n");
       await writeText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
@@ -31,6 +33,7 @@ export default function LogView({ logs }: { logs: LogLine[] }) {
       <div className="log-view">
         {logs.map((line, i) => (
           <div key={i} className={`log-line ${line.level.toLowerCase()}`}>
+            <span className="log-ts">{line.ts}</span>
             <span className="log-level">{line.level}</span>
             <span className="log-target">{line.target}</span>
             <span className="log-msg">{line.message}</span>

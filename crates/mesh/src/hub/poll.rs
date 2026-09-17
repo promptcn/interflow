@@ -6,6 +6,7 @@ use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use interflow_core::error::Result;
+use interflow_core::tunnel::ChunkHygiene;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -110,7 +111,12 @@ impl HubService {
             self.handles(),
             agent_id.to_string(),
         );
-        let body = BodyExt::boxed(StreamBody::new(stream));
+        // ChunkHygiene enforces the h2 body chunking invariants (no empty
+        // non-final chunks, small chunks coalesced to ≥256B — see
+        // interflow_core::tunnel::chunking): body chunk boundaries become h2
+        // DATA frames, and h2 ≥0.4.16 GOAWAYs connections whose peer emits
+        // pathological frame shapes (the 2026-09-17 heartbeat-churn bug).
+        let body = BodyExt::boxed(StreamBody::new(ChunkHygiene::new(stream)));
 
         let response = Response::builder()
             .status(StatusCode::OK)

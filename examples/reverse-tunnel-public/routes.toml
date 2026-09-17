@@ -6,6 +6,10 @@
 # - remote_addr: the target the LAN expose agent dials (where the local
 #   service actually listens)
 #
+# Optional [logging] section (same schema as hub.toml): when present, SIGHUP
+# hot-reloads `level`; a `format` change needs a restart. Absent = logging
+# stays at --log-level/info and SIGHUP leaves it untouched.
+#
 # Schema: crates/expose/src/edge/host_router.rs (deny_unknown_fields)
 
 [[routes]]
@@ -18,3 +22,8 @@ remote_addr = "127.0.0.1:8080"
 host = "tts.example.com"
 agent_id = "desktop"
 remote_addr = "127.0.0.1:8000"
+
+# [logging]
+# Diagnostic preset for the 2026-09-17 session-churn hunt: mesh at debug,
+# everything else at info.
+# level = "info,interflow_mesh=debug"

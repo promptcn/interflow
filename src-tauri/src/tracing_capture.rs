@@ -93,7 +93,7 @@ impl<S: Subscriber> Layer<S> for GuiLogLayer {
             return;
         }
         self.send(LogLine {
-            ts: chrono_like_now(),
+            ts: rfc3339_now(),
             level: level_name(*event.metadata().level()),
             target: event.metadata().target().to_string(),
             message: visitor.message,
@@ -111,12 +111,19 @@ fn level_name(level: Level) -> String {
     }
 }
 
-/// RFC3339-style UTC time (avoids pulling in chrono: std formats second-level precision).
-fn chrono_like_now() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!(r"{}", now.as_secs())
+/// RFC3339 UTC timestamp, byte-identical to the CLI/journal fmt timer
+/// (tracing_subscriber's default `SystemTime` timer): `2026-09-17T03:31:59.123456Z`.
+/// Sharing the formatter is what lets GUI lines correlate with hub-side
+/// journalctl lines at microsecond precision. No new dependency — `SystemTime`
+/// is the fmt layer's default timer.
+fn rfc3339_now() -> String {
+    use tracing_subscriber::fmt::format::Writer;
+    use tracing_subscriber::fmt::time::FormatTime;
+    let mut buf = String::new();
+    // `Writer::new` borrows the buffer as the same `fmt::Write` sink the fmt
+    // layer passes its default timer in normal CLI/journal logging.
+    let _ = tracing_subscriber::fmt::time::SystemTime.format_time(&mut Writer::new(&mut buf));
+    buf
 }
 
 /// Initialize the global subscriber: only the GUI capture layer is attached.
@@ -138,5 +145,37 @@ pub async fn pump(app: AppHandle, mut rx: tokio::sync::mpsc::Receiver<LogLine>) 
             guard.logs.push(line.clone());
         }
         let _ = app.emit("log", &line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The timestamp must be the exact RFC3339 UTC shape the CLI/journal
+    /// timer emits (`2026-09-17T03:31:59.123456Z`, 27 bytes), so GUI lines
+    /// correlate with journalctl lines at microsecond precision.
+    #[test]
+    fn rfc3339_now_matches_journal_timer_shape() {
+        let ts = rfc3339_now();
+        let b = ts.as_bytes();
+        assert_eq!(b.len(), 27, "unexpected length: {ts:?}");
+        let separators = [
+            (4usize, b'-'),
+            (7, b'-'),
+            (10, b'T'),
+            (13, b':'),
+            (16, b':'),
+            (19, b'.'),
+            (26, b'Z'),
+        ];
+        for (i, c) in separators {
+            assert_eq!(b[i], c, "unexpected byte at {i}: {ts:?}");
+        }
+        for (i, &c) in b.iter().enumerate() {
+            if !separators.iter().any(|(j, _)| *j == i) {
+                assert!(c.is_ascii_digit(), "expected digit at {i}: {ts:?}");
+            }
+        }
     }
 }

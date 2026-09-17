@@ -85,11 +85,18 @@ fn run_public_server_wizard() -> Result<()> {
     let routes_template = format!(
         r#"# Edge routing table: each public domain → agent_id of the remote expose client + local service address
 # On the local machine, run `interflow-expose expose <port> --agent-id <id>` with the matching agent_id
+#
+# Optional [logging] section (same schema as hub.toml): when present, SIGHUP
+# hot-reloads `level` (e.g. "info,interflow_mesh=debug" to chase hub-side
+# session rebuilds); a `format` change needs a restart.
 
 [[routes]]
 host = "{hub_domain}"
 agent_id = "expose-myapp"          # agent_id used by the local expose
 remote_addr = "127.0.0.1:3000"     # listen address of the local service
+
+# [logging]
+# level = "info"
 "#,
     );
     std::fs::write(routes_path, routes_template).map_err(|e| {

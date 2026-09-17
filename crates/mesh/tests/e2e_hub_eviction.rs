@@ -31,7 +31,11 @@
 //!   6. Heartbeat contract: the hub's Ping is indeed delivered via the poll
 //!      channel; answering Pong as agreed keeps the agent alive long-term;
 //!   7. Real AgentClient integration: with heartbeats enabled the agent stays
-//!      stably Connected (the tunnel layer answers automatically).
+//!      stably Connected (the tunnel layer answers automatically);
+//!   8. h2 empty-DATA-frame budget (2026-09-17 churn bug): the poll body of a
+//!      Pong-answering agent must survive far past 100 heartbeat cycles —
+//!      h2 ≥0.4.16 GOAWAYs a connection after 100 cumulative empty non-final
+//!      DATA frames, and each pre-fix heartbeat Ping carried one.
 
 #![allow(
     clippy::all,
@@ -716,4 +720,79 @@ async fn real_agent_survives_aggressive_heartbeat() {
         handle.state()
     );
     handle.shutdown_graceful().await.expect("shutdown");
+}
+
+/// Scenario 8 (2026-09-17 h2 empty-DATA-frame bomb, compressed in time): the
+/// hub's poll response used to split every frame into a header chunk plus a
+/// payload chunk; with the heartbeat Ping's empty payload that second chunk
+/// became a real (empty, non-final) h2 DATA frame — hyper forwards zero-length
+/// chunks straight through. h2 ≥0.4.16 counts cumulative empty non-final DATA
+/// frames with a hard cap of 100 and no release path, so the 101st Ping
+/// GOAWAY'd the whole connection (`too_many_data_frames`) — in production at
+/// 15s cadence this was the deterministic 25:14.1 session churn
+/// (docs/bug/2026-09-17-h2-data-frame-budget-goaway-churn.md).
+///
+/// With a 1s heartbeat the same counter trips at ~101s; a Pong-answering
+/// poll surviving ~110 cycles proves the bomb is defused (the hub's
+/// ChunkHygiene body adapter no longer emits empty chunks). Pre-fix, this
+/// test dies with the exact production signature: poll body read error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn poll_survives_empty_data_frame_budget_past_100_heartbeats() {
+    let port = pick_ephemeral_port();
+    let hb = HeartbeatConfig {
+        enabled: true,
+        interval_secs: 1,
+        max_missed: 3,
+    };
+    let _hub = spawn_hub(hub_config_tuned(port, vec![], security(30, 30), hb)).await;
+
+    let mut agent = connect(port).await;
+    assert_eq!(register(&mut agent, "bomb-probe").await, 200);
+    let (up_tx, _up_resp) = open_upload(&mut agent, "bomb-probe").await;
+    let resp = poll(&mut agent, "bomb-probe").await;
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.into_body();
+
+    // 112s at 1s cadence ≈ 110 cycles: comfortably past the 100-empty-frame
+    // cap where the pre-fix connection died.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(112);
+    let mut buf = BytesMut::new();
+    let mut pings = 0usize;
+    let ended = loop {
+        if tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        match tokio::time::timeout_at(deadline, body.frame()).await {
+            Err(_) => break false,
+            Ok(None) => break true,
+            Ok(Some(Err(_))) => break true,
+            Ok(Some(Ok(frame))) => {
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                buf.extend_from_slice(&data);
+                while let DecodeOutcome::Ok(f) = decode_frame(&mut buf) {
+                    if matches!(f.frame_type, FrameType::Ping) {
+                        pings += 1;
+                        send_uplink_pong(&up_tx, "bomb-probe").await;
+                    }
+                }
+            }
+        }
+    };
+    assert!(
+        !ended,
+        "poll must survive past 100 heartbeat cycles \
+         (pre-fix: GOAWAY too_many_data_frames on the 101st empty DATA frame)"
+    );
+    assert!(
+        pings >= 105,
+        "expected ≥105 heartbeat Pings within 112s at 1s cadence, got {pings}"
+    );
+
+    let agents = list_agents(&mut agent).await;
+    assert!(
+        agents.contains(&"bomb-probe".to_string()),
+        "the Pong-answering agent must still be registered after 100+ cycles"
+    );
 }

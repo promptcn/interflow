@@ -78,7 +78,7 @@ export default function App() {
         console.error("Failed to auto-save profile:", e);
       }
     } catch (e) {
-      setLogs((prev) => [...prev, { ts: String(Date.now() / 1000 | 0), level: "ERROR", target: "gui", message: String(e) }]);
+      setLogs((prev) => [...prev, { ts: new Date().toISOString(), level: "ERROR", target: "gui", message: String(e) }]);
     }
   };
 

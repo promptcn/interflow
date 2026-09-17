@@ -264,7 +264,7 @@ One-line positioning: **frp is the most feature-complete bundle with the largest
 # Build the whole workspace
 cargo build --workspace
 
-# Tests (core 92 + mesh 180 + expose 59 = 331 cases: unit + e2e,
+# Tests (core 101 + mesh 181 + expose 62 = 344 cases: unit + e2e,
 # including adversarial and resilience scenarios such as silent-link
 # recovery / slow backends / Open floods / disconnect self-healing,
 # plus config-invariant locks: liveness-chain derivations, negotiation

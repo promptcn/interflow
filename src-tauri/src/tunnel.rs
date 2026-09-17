@@ -109,29 +109,23 @@ impl TunnelManager {
                         connected_since = None;
                     }
                     emit_state(&app, &state);
-                    match rx.changed().await {
-                        Ok(()) => continue,
-                        // The supervisor ended and dropped the watch sender.
-                        Err(_) => {
-                            let final_state = rx.borrow().clone();
-                            if matches!(
-                                final_state,
-                                AgentState::Stopped | AgentState::Failed { .. }
-                            ) {
-                                emit_state(&app, &final_state);
-                                return; // legitimate end — nothing to recover
-                            }
-                            // Spawned as its own task to break the future
-                            // recursion (listener → restart → start_internal
-                            // → listener): a recursive async chain cannot
-                            // prove `Send` for the spawn bound.
-                            let manager2 = manager.clone();
-                            let app2 = app.clone();
-                            tauri::async_runtime::spawn(async move {
-                                manager2.restart_after_supervisor_death(&app2).await;
-                            });
-                            return;
+                    // The supervisor ended and dropped the watch sender.
+                    if rx.changed().await.is_err() {
+                        let final_state = rx.borrow().clone();
+                        if matches!(final_state, AgentState::Stopped | AgentState::Failed { .. }) {
+                            emit_state(&app, &final_state);
+                            return; // legitimate end — nothing to recover
                         }
+                        // Spawned as its own task to break the future
+                        // recursion (listener → restart → start_internal
+                        // → listener): a recursive async chain cannot
+                        // prove `Send` for the spawn bound.
+                        let manager2 = manager.clone();
+                        let app2 = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            manager2.restart_after_supervisor_death(&app2).await;
+                        });
+                        return;
                     }
                 }
             });

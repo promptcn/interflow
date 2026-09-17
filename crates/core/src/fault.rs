@@ -119,13 +119,19 @@ pub fn clear_hook() {
     *slot = None;
 }
 
+/// Consults the installed hook; no hook installed means continue.
+#[cfg(feature = "fault-injection")]
 fn action(point: FaultPoint) -> FaultAction {
-    #[cfg(feature = "fault-injection")]
     if let Some(hook) = HOOK.read().expect("fault hook lock poisoned").as_ref() {
         return hook(point);
     }
-    #[cfg(not(feature = "fault-injection"))]
-    let _ = point;
+    FaultAction::Continue
+}
+
+/// Feature-off build: no hook can even be installed, so every call point
+/// continues. `const` so call sites fold away entirely at compile time.
+#[cfg(not(feature = "fault-injection"))]
+const fn action(_point: FaultPoint) -> FaultAction {
     FaultAction::Continue
 }
 

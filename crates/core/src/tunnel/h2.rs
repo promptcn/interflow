@@ -29,6 +29,7 @@
 use crate::error::{InterflowError, Result};
 use crate::protocol::{FrameType, StreamProto, frame as wire};
 use crate::tunnel::agent::H2Liveness;
+use crate::tunnel::chunking::ChunkHygiene;
 use crate::tunnel::session_tasks::{Beat, SessionTasks, beat_interval};
 use crate::tunnel::transport::{RESPONSE_SOURCE, TunnelData, TunnelDispatch, TunnelTransport};
 use async_trait::async_trait;
@@ -307,7 +308,7 @@ impl H2Tunnel {
                 let (tx, rx) = mpsc::channel(UPLOAD_CHANNEL_CAP);
                 (Some(tx), rx)
             };
-            let body = StreamBody::new(upload_body_stream(rx)).boxed();
+            let body = StreamBody::new(ChunkHygiene::new(upload_body_stream(rx))).boxed();
 
             let mut builder = Request::builder()
                 .method("POST")
@@ -710,7 +711,10 @@ impl H2Tunnel {
 ///
 /// Each `Bytes` is yielded as one DATA chunk; frame boundaries are
 /// guaranteed by the caller (header and payload are enqueued adjacently, see
-/// [`H2Tunnel::send_data_frame`]).
+/// [`H2Tunnel::send_data_frame`]). The caller wraps this in
+/// [`ChunkHygiene`], which may coalesce adjacent chunks into one larger DATA
+/// frame — harmless: the hub-side reader accumulates body bytes and decodes
+/// frames incrementally, so DATA frame boundaries carry no semantics.
 fn upload_body_stream(
     mut rx: mpsc::Receiver<Bytes>,
 ) -> impl futures::Stream<Item = std::result::Result<Frame<Bytes>, InterflowError>> {

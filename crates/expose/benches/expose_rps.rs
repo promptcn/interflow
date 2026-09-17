@@ -117,6 +117,7 @@ mod setup {
                 agent_id: "expose-test".into(),
                 remote_addr: echo_addr,
             }],
+            logging: None,
         };
         let routes_path = std::env::temp_dir().join(format!(
             "interflow_bench_routes_{}.toml",
