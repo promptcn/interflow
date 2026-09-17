@@ -86,6 +86,51 @@ impl HubLimits {
     }
 }
 
+/// Capacity (in frames) of the per-agent hub→agent channel — the poll
+/// downlink, the QUIC relay, and channel rebuilds all use it. When full,
+/// senders wait in a bounded fashion, propagating backpressure upstream.
+pub(crate) const HUB_CHANNEL_CAP: usize = 256;
+
+/// Tries to acquire a stream slot for `agent`. Returns true on success;
+/// returns false without incrementing when over `max`. `max = 0` means
+/// unlimited. The lock is held only briefly (check-and-increment,
+/// nanosecond scale), never across an await. Shared by the h2 plane
+/// (`frame_open`) and the QUIC relay.
+pub(crate) fn try_acquire_stream_slot(
+    counts: &SharedStreamCounts,
+    agent: &str,
+    max: usize,
+) -> bool {
+    if max == 0 {
+        return true;
+    }
+    let mut map = counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = map.entry(agent.to_string()).or_insert(0);
+    if *entry >= max {
+        false
+    } else {
+        *entry += 1;
+        true
+    }
+}
+
+/// Releases one stream slot for `agent` (the counterpart of
+/// [`try_acquire_stream_slot`]). Removes the key when the count reaches
+/// zero to prevent unbounded HashMap growth.
+pub(crate) fn release_stream_slot(counts: &SharedStreamCounts, agent: &str) {
+    let mut map = counts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = map.get_mut(agent) {
+        *entry = entry.saturating_sub(1);
+        if *entry == 0 {
+            map.remove(agent);
+        }
+    }
+}
+
 /// Core state for stream routing: the minimal set needed by the
 /// dispatch/cleanup primitives shared by the h2 plane and the QUIC plane.
 ///
@@ -205,6 +250,72 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
+    /// Creates a fresh session with new channels (generation 0). `quic`
+    /// carries the relay connection when registration arrives over QUIC.
+    pub fn new(quic: Option<Arc<QuicAgentConn>>) -> Self {
+        let (tx, rx) = mpsc::channel(HUB_CHANNEL_CAP);
+        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+        Self {
+            tx,
+            ctrl_tx,
+            ctrl_backlog: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            rx: Some(rx),
+            ctrl_rx: Some(ctrl_rx),
+            generation: 0,
+            last_pong: Instant::now(),
+            poll_waker: Arc::new(std::sync::Mutex::new(None)),
+            up_lease: None,
+            quic,
+        }
+    }
+
+    /// Installs fresh channels into an existing entry — the
+    /// replace-in-place re-registration protocol (h2 and QUIC registration
+    /// preemption alike): advances the generation, refreshes liveness,
+    /// wakes the suspended poll body, invalidates the upload lease, and
+    /// overwrites the QUIC handle (`None` when an h2 registration
+    /// preempts a QUIC session; the old relay closes itself out via its
+    /// connection-lost watcher).
+    ///
+    /// Replacing in place (rather than overwriting the whole Arc) is
+    /// required: the old poll connection's RxStream holds the old Arc, and
+    /// Drop identifies a stale rx via the generation comparison — replacing
+    /// the whole Arc would make the comparison always hit the old Arc.
+    pub fn install_channels(&mut self, quic: Option<Arc<QuicAgentConn>>) {
+        let (tx, rx) = mpsc::channel(HUB_CHANNEL_CAP);
+        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+        self.tx = tx;
+        self.ctrl_tx = ctrl_tx;
+        self.rx = Some(rx);
+        self.ctrl_rx = Some(ctrl_rx);
+        self.ctrl_backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.generation += 1;
+        self.last_pong = Instant::now();
+        self.quic = quic;
+        self.wake_poll();
+        if let Some(lease) = self.up_lease.take() {
+            lease.cancel();
+        }
+    }
+
+    /// Severs the session — eviction step one: an RxStream still hanging on
+    /// some poll connection ends its response via the generation
+    /// self-check; dropping rx closes the data channel so every sender
+    /// blocked in `send().await` unblocks immediately; dropping ctrl_rx
+    /// closes the control channel (subsequent lifecycle notifications fail
+    /// immediately instead of queueing for a consumer that no longer
+    /// exists); the upload lease cancellation ends the upload reader's
+    /// response so the agent rebuilds.
+    pub fn terminate(&mut self) {
+        self.rx = None;
+        self.ctrl_rx = None;
+        self.generation += 1;
+        self.wake_poll();
+        if let Some(lease) = self.up_lease.take() {
+            lease.cancel();
+        }
+    }
+
     /// Wakes the suspended poll body (urging it to self-check and end after
     /// a generation advance). Synchronous, non-blocking.
     pub fn wake_poll(&self) {

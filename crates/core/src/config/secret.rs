@@ -4,7 +4,7 @@
 //! parses the TOML. File references enforce 0600 permissions (Unix).
 //!
 //! Relative `@file:` references anchor to `base` (the config file's
-//! directory) when provided; `None` preserves legacy CWD resolution.
+//! directory).
 
 use crate::error::{InterflowError, Result};
 use std::path::{Path, PathBuf};
@@ -16,12 +16,11 @@ use std::path::{Path, PathBuf};
 /// - `"${VAR}"` → read from env; error if unset
 /// - `"${VAR:-default}"` → read from env; use `default` if unset
 /// - `"@file:path"` → read the file content and trim trailing whitespace;
-///   Unix enforces 0600; a relative `path` resolves against `base` when
-///   provided
+///   Unix enforces 0600; a relative `path` resolves against `base`
 ///
 /// Any other form is returned as-is (a plain string). `base` only affects
 /// `@file:` references; environment lookups ignore it.
-pub fn resolve(value: &str, base: Option<&Path>) -> Result<String> {
+pub fn resolve(value: &str, base: &Path) -> Result<String> {
     if let Some(rest) = value.strip_prefix("@file:") {
         return resolve_file(rest, base);
     }
@@ -50,39 +49,64 @@ pub fn resolve(value: &str, base: Option<&Path>) -> Result<String> {
     Ok(value.to_string())
 }
 
-fn resolve_file(path: &str, base: Option<&Path>) -> Result<String> {
-    let resolved = match base {
-        Some(b) if !Path::new(path).is_absolute() => b.join(path),
-        _ => PathBuf::from(path),
+fn resolve_file(path: &str, base: &Path) -> Result<String> {
+    let resolved = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        base.join(path)
     };
     let display = resolved.display().to_string();
-    check_secret_file_perms(&display)?;
+    check_secret_file_perms(&display, Strictness::Strict)?;
     let content = std::fs::read_to_string(&resolved).map_err(|e| {
         InterflowError::config(format!("failed to read secret file {display}: {e}"))
     })?;
     Ok(content.trim_end().to_string())
 }
 
+/// Validation strictness for secret material file permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Strictness {
+    /// Private key / secret: any group/other permission bit is an error.
+    Strict,
+    /// Certificate: overly broad permissions only warn.
+    Lenient,
+}
+
+/// Validates secret material (key / secret / certificate) file permissions on
+/// Unix to avoid leaks. Single implementation shared by `@file:` secret
+/// resolution and TLS material loading.
 #[cfg(unix)]
-fn check_secret_file_perms(path: &str) -> Result<()> {
+pub(crate) fn check_secret_file_perms(path: &str, strictness: Strictness) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let meta = std::fs::metadata(path).map_err(|e| {
         InterflowError::config(format!("failed to read file metadata for {path}: {e}"))
     })?;
     let mode = meta.permissions().mode();
+    // 0o077 mask: group/other must not have any permission bits
     let leak = mode & 0o077;
-    if leak != 0 {
-        // Display-only permission mask: the full st_mode value includes file type bits (e.g. 0100644)
-        let perm = mode & 0o777;
-        return Err(InterflowError::config(format!(
-            "secret file {path} has overly broad permissions (mode={perm:o}); 600 required. Run chmod 600 {path}"
-        )));
+    if leak == 0 {
+        return Ok(());
     }
-    Ok(())
+    // Display-only permission mask: the full st_mode value includes file type
+    // bits (e.g. 0100644); printing it directly yields a confusing
+    // "mode=100644" that does not match the suggested value (2026-09-13 bug
+    // doc §3, for reference)
+    let perm = mode & 0o777;
+    match strictness {
+        Strictness::Strict => Err(InterflowError::config(format!(
+            "file {path} has overly broad permissions (mode={perm:o}); 600 required (owner read/write only). Run chmod 600 {path}"
+        ))),
+        Strictness::Lenient => {
+            tracing::warn!(
+                "certificate file {path} has overly broad permissions (mode={perm:o}), chmod 644 recommended"
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(not(unix))]
-fn check_secret_file_perms(_path: &str) -> Result<()> {
+pub(crate) fn check_secret_file_perms(_path: &str, _strictness: Strictness) -> Result<()> {
     Ok(())
 }
 
@@ -92,7 +116,7 @@ pub fn is_indirection(s: &str) -> bool {
 }
 
 /// Convenience function: resolves `value` if it is a reference; returns it as-is otherwise.
-pub fn maybe_resolve(value: &str, base: Option<&Path>) -> Result<String> {
+pub fn maybe_resolve(value: &str, base: &Path) -> Result<String> {
     if is_indirection(value) {
         resolve(value, base)
     } else {
@@ -108,7 +132,7 @@ mod tests {
 
     #[test]
     fn literal_passes_through() {
-        assert_eq!(resolve("hello", None).unwrap(), "hello");
+        assert_eq!(resolve("hello", Path::new("")).unwrap(), "hello");
     }
 
     #[test]
@@ -117,7 +141,10 @@ mod tests {
         unsafe {
             std::env::set_var("INTERFLOW_TEST_SECRET", "abc123");
         }
-        assert_eq!(resolve("${INTERFLOW_TEST_SECRET}", None).unwrap(), "abc123");
+        assert_eq!(
+            resolve("${INTERFLOW_TEST_SECRET}", Path::new("")).unwrap(),
+            "abc123"
+        );
         unsafe {
             std::env::remove_var("INTERFLOW_TEST_SECRET");
         }
@@ -130,7 +157,7 @@ mod tests {
             std::env::remove_var("INTERFLOW_UNSET_VAR_XYZ");
         }
         assert_eq!(
-            resolve("${INTERFLOW_UNSET_VAR_XYZ:-fallback}", None).unwrap(),
+            resolve("${INTERFLOW_UNSET_VAR_XYZ:-fallback}", Path::new("")).unwrap(),
             "fallback"
         );
     }
@@ -141,7 +168,7 @@ mod tests {
         unsafe {
             std::env::remove_var("INTERFLOW_UNSET_VAR_XYZ");
         }
-        assert!(resolve("${INTERFLOW_UNSET_VAR_XYZ}", None).is_err());
+        assert!(resolve("${INTERFLOW_UNSET_VAR_XYZ}", Path::new("")).is_err());
     }
 
     #[test]
@@ -160,7 +187,7 @@ mod tests {
             std::fs::set_permissions(&path, perms).unwrap();
         }
         let spec = format!("@file:{}", path.display());
-        assert_eq!(resolve(&spec, None).unwrap(), "file-secret-value");
+        assert_eq!(resolve(&spec, Path::new("")).unwrap(), "file-secret-value");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -179,7 +206,7 @@ mod tests {
         std::fs::set_permissions(&path, perms).unwrap();
         let spec = format!("@file:{}", path.display());
         assert!(
-            resolve(&spec, None).is_err(),
+            resolve(&spec, Path::new("")).is_err(),
             "should reject 0644 secret file"
         );
         let _ = std::fs::remove_file(&path);
@@ -202,13 +229,10 @@ mod tests {
             std::fs::set_permissions(&path, perms).unwrap();
         }
         // Relative reference resolves against the config dir, not the CWD.
-        assert_eq!(
-            resolve("@file:token", Some(&dir)).unwrap(),
-            "anchored-secret"
-        );
+        assert_eq!(resolve("@file:token", &dir).unwrap(), "anchored-secret");
         // Absolute reference is untouched by base.
         let spec = format!("@file:{}", path.display());
-        assert_eq!(resolve(&spec, Some(&dir)).unwrap(), "anchored-secret");
+        assert_eq!(resolve(&spec, &dir).unwrap(), "anchored-secret");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

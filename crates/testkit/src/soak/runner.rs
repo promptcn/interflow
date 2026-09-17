@@ -130,6 +130,16 @@ pub struct SoakArgs {
     #[arg(long, default_value_t = 300)]
     cycle_secs: u64,
 
+    /// Agent fault-injection plan (INTERFLOW_FAULT_PLAN syntax, e.g.
+    /// `H2UploadLoopAfterEstablish=panic*3,H2UploadLoopStall=stall`); fires
+    /// inside the real agent subprocesses. The soak's liveness + stall-bound
+    /// assertions then verify self-healing under those faults. Requires the
+    /// mesh binaries to be built with the fault-injection feature (`just
+    /// soak` does); a set plan in a feature-less build makes the agents
+    /// fail fast at startup.
+    #[arg(long)]
+    fault_plan: Option<String>,
+
     /// Silent window length at each cycle tail in seconds (must be < idle budget; streams must survive it)
     #[arg(long, default_value_t = 30)]
     silence_secs: u64,
@@ -679,6 +689,7 @@ async fn churn_eviction_waves(
     every: Duration,
     cancel: CancellationToken,
     waves: Arc<std::sync::atomic::AtomicU64>,
+    fault_env: Vec<(String, String)>,
 ) {
     loop {
         tokio::select! {
@@ -691,8 +702,18 @@ async fn churn_eviction_waves(
             if g.kill_and_wait().await.is_err() {
                 continue;
             }
-            let Ok(replacement) = spawn_mesh(&mesh_bin, "agent", &config_path, &log_path, "churn")
-            else {
+            let fault_env_ref: Vec<(&str, &str)> = fault_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let Ok(replacement) = spawn_mesh(
+                &mesh_bin,
+                "agent",
+                &config_path,
+                &log_path,
+                "churn",
+                &fault_env_ref,
+            ) else {
                 continue;
             };
             *g = replacement;
@@ -988,20 +1009,32 @@ async fn run_scenario(
     }
 
     let mut procs: Vec<Arc<Mutex<MeshProcess>>> = Vec::new();
+    let fault_env: Vec<(String, String)> = args
+        .fault_plan
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(|p| vec![("INTERFLOW_FAULT_PLAN".to_string(), p.to_string())])
+        .unwrap_or_default();
+    let fault_env_ref: Vec<(&str, &str)> = fault_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let spawn_one = |subcmd: &'static str,
                      cfg_file: &'static str,
                      log_file: &'static str,
-                     pname: &'static str| {
+                     pname: &'static str,
+                     extra_env: &[(&str, &str)]| {
         spawn_mesh(
             mesh_bin,
             subcmd,
             &scenario_dir.join(cfg_file),
             &logs_dir.join(log_file),
             pname,
+            extra_env,
         )
     };
     let startup: Result<(), String> = async {
-        let hub = spawn_one("hub", "hub.toml", "hub.log", "hub")?;
+        let hub = spawn_one("hub", "hub.toml", "hub.log", "hub", &[])?;
         procs.push(Arc::new(Mutex::new(hub)));
         wait_for_tcp(hub_addr, Duration::from_secs(30))
             .await
@@ -1009,9 +1042,9 @@ async fn run_scenario(
         wait_for_tcp(metrics_addr, Duration::from_secs(20))
             .await
             .map_err(|e| format!("hub metrics not ready: {e}"))?;
-        let egress = spawn_one("agent", "egress.toml", "egress.log", "egress")?;
+        let egress = spawn_one("agent", "egress.toml", "egress.log", "egress", &[])?;
         procs.push(Arc::new(Mutex::new(egress)));
-        let ingress = spawn_one("agent", "ingress.toml", "ingress.log", "ingress")?;
+        let ingress = spawn_one("agent", "ingress.toml", "ingress.log", "ingress", &[])?;
         procs.push(Arc::new(Mutex::new(ingress)));
         wait_for_tcp(ingress_addr, Duration::from_secs(60))
             .await
@@ -1101,6 +1134,7 @@ async fn run_scenario(
         &churn_config_path,
         &logs_dir.join("churn.log"),
         "churn",
+        &fault_env_ref,
     ) {
         Ok(c) => Arc::new(Mutex::new(c)),
         Err(e) => {
@@ -1226,6 +1260,7 @@ async fn run_scenario(
         Duration::from_secs(args.churn_restart_every_secs.max(10)),
         cancel.clone(),
         Arc::clone(&churn_waves),
+        fault_env,
     ));
 
     let mut set = JoinSet::new();

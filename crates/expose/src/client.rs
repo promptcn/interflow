@@ -8,11 +8,11 @@
 use interflow_core::protocol::StreamProto;
 use interflow_mesh::agent::{AgentClient, AgentHandle};
 use interflow_mesh::config::{
-    AGENT_CONFIG_VERSION, AgentConfig, AgentInfo, AgentTlsConfig as TlsConfig, ControlConfig,
-    EgressRule, LoggingConfig, SecurityConfig, TransportKind,
+    AgentConfig, AgentInfo, AgentTlsConfig as TlsConfig, ControlConfig, EgressRule, TransportKind,
 };
 
 /// Arguments needed to build the expose client.
+#[derive(Clone)]
 pub struct ExposeArgs {
     /// Local service ports (e.g. 3000); when routing by host, edge names the concrete
     /// remote_addr in the Open frame. The list is non-empty; each port maps to one
@@ -159,36 +159,21 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
     }
 
     Ok(AgentConfig {
-        config_version: AGENT_CONFIG_VERSION,
         agent: AgentInfo {
             id: args.agent_id.clone(),
             hub_url: args.hub_url.clone(),
             transport: args.transport,
             hub_quic_addr,
             auth_token: Some(args.auth_token.clone()),
-            connect_timeout_secs: 15,
-            poll_idle_timeout_secs: None,
-            request_establish_timeout_secs: None,
+            ..AgentInfo::default()
         },
-        ingress: vec![],
         egress,
-        egress_backend_write_timeout_secs: 10,
-        egress_resolve_timeout_secs: 5,
-        egress_connect_timeout_secs: 5,
-        max_incoming_streams: 256,
-        max_stream_opens_per_sec: 100,
-        stream_open_burst: 256,
-        egress_target_breaker_enabled: true,
-        egress_target_breaker_failure_threshold: 5,
-        egress_target_breaker_window_secs: 10,
-        egress_target_breaker_cooldown_secs: 30,
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()
         },
-        security: SecurityConfig::default(),
         tls,
-        logging: LoggingConfig::default(),
+        ..AgentConfig::default()
     })
 }
 

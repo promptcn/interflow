@@ -119,17 +119,6 @@ async fn poll(snd: &mut SendRequest<H2RequestBody>, id: &str) -> Response<hyper:
     snd.send_request(req).await.expect("poll")
 }
 
-async fn post_pong(snd: &mut SendRequest<H2RequestBody>, id: &str) -> hyper::StatusCode {
-    snd.ready().await.expect("ready");
-    let req = Request::builder()
-        .method("POST")
-        .uri("/pong")
-        .header("x-agent-id", id)
-        .body(interflow_core::tunnel::empty_request_body())
-        .unwrap();
-    snd.send_request(req).await.expect("pong").status()
-}
-
 async fn list_agents(snd: &mut SendRequest<H2RequestBody>) -> Vec<String> {
     snd.ready().await.expect("ready");
     let req = Request::builder()
@@ -353,11 +342,16 @@ async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
 
     let mut a = connect(port).await;
     assert_eq!(register(&mut a, "wedge").await, 200);
-    let (_up_tx, up_resp) = open_upload_ok(&mut a, "wedge").await;
+    let (up_tx, up_resp) = open_upload_ok(&mut a, "wedge").await;
     let mut up_body = up_resp.into_body();
 
-    // Confirm heartbeat capability, then go silent → eviction
-    assert_eq!(post_pong(&mut a, "wedge").await, 204);
+    // One data-plane Pong (uplink frame) proves the heartbeat reply path,
+    // then go silent → eviction
+    {
+        let mut pong = BytesMut::new();
+        encode_frame(FrameType::Pong, 0, "", "wedge", &[], &mut pong);
+        up_tx.send(pong.freeze()).await.expect("send pong");
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         if !list_agents(&mut a).await.contains(&"wedge".to_string()) {

@@ -50,13 +50,13 @@ use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_mesh::config::{EgressRule, IngressRule};
 use interflow_testkit::{
-    agent_config, echo_server, hub_config, pick_ephemeral_port, spawn_agent, spawn_hub,
+    agent_config, echo_server, hub_config,
+    metrics_harness::eventually, metrics_harness::init_tracing, metrics_harness::metrics_handle,
+    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_agent, spawn_hub,
     wait_for_tcp,
 };
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -70,62 +70,6 @@ const LONG_DEADLINE: Duration = Duration::from_secs(25);
 // metrics: install an in-process recorder and read snapshots directly
 // (installed once, shared by all tests)
 // ---------------------------------------------------------------------------
-
-static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
-
-/// Initialize tracing according to RUST_LOG (silent if unset; idempotent on
-/// repeated calls).
-fn init_tracing() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        if std::env::var("RUST_LOG").is_ok() {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-                .with_test_writer()
-                .try_init();
-        }
-    });
-}
-
-fn metrics_handle() -> &'static PrometheusHandle {
-    METRICS.get_or_init(|| {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        // First installation; ignore if already installed (impossible —
-        // OnceLock guarantees single execution)
-        let _ = metrics::set_global_recorder(recorder);
-        handle
-    })
-}
-
-/// Read a counter snapshot: sum all exposition lines starting with
-/// `metric_prefix` (including labeled variants).
-fn counter_value(metric_prefix: &str) -> u64 {
-    let text = metrics_handle().render();
-    text.lines()
-        .filter_map(|line| line.split_once(' '))
-        .filter(|(k, _)| k.starts_with(metric_prefix))
-        .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
-        .sum()
-}
-
-/// Poll until the counter reaches the lower bound; panic on timeout.
-async fn wait_counter_at_least(metric_prefix: &str, min: u64, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let v = counter_value(metric_prefix);
-        if v >= min {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for metric {metric_prefix} >= {min}, current {v} (snapshot:\n{})",
-                metrics_handle().render()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Test backends and bare-tunnel injection scaffolding
@@ -219,8 +163,10 @@ async fn connect_tunnel(
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         None,
-        tokio_util::sync::CancellationToken::new(),
-        interflow_core::tunnel::H2Liveness::LEGACY,
+        &interflow_core::tunnel::session_tasks::SessionTasks::new(
+            tokio_util::sync::CancellationToken::new(),
+        ),
+        interflow_core::tunnel::H2Liveness::HEARTBEAT_DISABLED,
     )
     .expect("tunnel");
     (tunnel, conn.conn_handle)
@@ -294,20 +240,6 @@ async fn start_stack(write_timeout: u64) -> (u16, SocketAddr, AgentTunnel) {
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;
     (hub_port, echo_addr, inj)
-}
-
-/// Poll-assert that a condition holds within the time limit.
-async fn eventually<F: Fn() -> bool>(cond: F, timeout: Duration, what: &str) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if cond() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("timed out waiting for {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -4,13 +4,24 @@
 //! section is required — either provide credentials or set an explicit
 //! `allow_anonymous = true` (see [`validate`] for details).
 
+use interflow_core::config::params::liveness::HeartbeatCadence;
+use interflow_core::config::params::transport::{
+    DEFAULT_QUIC_IDLE_TIMEOUT_MS, DEFAULT_QUIC_KEEPALIVE_INTERVAL,
+};
 use interflow_core::config::{AuditConfig, LoggingConfig};
+use interflow_core::tunnel::negotiation::HeartbeatAd;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 
 /// Current configuration schema version.
-pub const HUB_CONFIG_VERSION: u32 = 2;
+///
+/// v3 (2026-09-16, config-governance step 4): removed the dead `routes`
+/// static-routing table (zero runtime references since dynamic
+/// registration); moved `[quic]` into `[transport.quic]` and added
+/// `[transport.h2]` (endpoint-symmetric keepalive, previously hard-coded);
+/// `tls.min_version` now actually enforced (previously silently ignored).
+pub const HUB_CONFIG_VERSION: u32 = 3;
 
 /// Hub configuration root structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,10 +47,13 @@ pub struct HubConfig {
     /// hub→agent application-layer heartbeat (Ping/Pong).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
-    /// Static routing table (leave empty to enable dynamic routing: ingress
-    /// agents self-register on connect).
+    /// Transport-layer tuning, shared schema shape with the agent
+    /// (`[transport.h2]` / `[transport.quic]`) — both endpoints of a link
+    /// expose the same knobs so there is no per-side tuning that silently
+    /// cannot take effect (QUIC negotiates the idle timeout as the
+    /// endpoints' minimum; raising only one side does nothing).
     #[serde(default)]
-    pub routes: HashMap<String, String>,
+    pub transport: HubTransportConfig,
     /// Prometheus metrics export.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -49,15 +63,29 @@ pub struct HubConfig {
     /// Logging configuration.
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+/// Hub-side transport tuning: h2 keepalive plus the QUIC listener section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[derive(Default)]
+pub struct HubTransportConfig {
+    /// h2 (TCP) transport tuning.
+    #[serde(default)]
+    pub h2: H2TransportConfig,
     /// QUIC transport listener (optional; coexists with the TCP h2 dual
     /// stack).
     #[serde(default)]
     pub quic: HubQuicConfig,
 }
 
+// h2 keepalive tuning lives in [`crate::config::transport`] (one schema,
+// one default source, shared with the agent).
+pub use crate::config::transport::H2TransportConfig;
+
 /// QUIC transport configuration (backlog §6.4; starting points follow the frp
 /// defaults).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HubQuicConfig {
     /// Whether the QUIC listener is enabled. Defaults to `false`.
@@ -91,11 +119,16 @@ pub struct HubQuicConfig {
 
 impl Default for HubQuicConfig {
     fn default() -> Self {
+        // QUIC transport values follow the shared transport profile (single
+        // source with the agent endpoint — QUIC negotiates the idle timeout
+        // as the endpoints' minimum, so both sides must agree by
+        // construction, not by copied literals).
         Self {
             enabled: false,
             listen_addr: None,
-            max_idle_timeout_ms: 30_000,
-            keepalive_interval_ms: 10_000,
+            max_idle_timeout_ms: DEFAULT_QUIC_IDLE_TIMEOUT_MS,
+            keepalive_interval_ms: u32::try_from(DEFAULT_QUIC_KEEPALIVE_INTERVAL.as_millis())
+                .unwrap_or(30_000),
             max_concurrent_bidi_streams: 4096,
             datagram_enabled: true,
         }
@@ -127,9 +160,15 @@ pub struct HubSecurityConfig {
     pub channel_send_timeout_secs: u64,
     /// Grace period in seconds that an agent entry survives after its poll
     /// connection drops; it is evicted if no new /poll arrives within the
-    /// grace period. Defaults to 30. A healthy agent's poll reconnect backoff
-    /// tops out at 5s, so the grace period easily tolerates transient
-    /// disconnects.
+    /// grace period. Defaults to 30.
+    ///
+    /// Invariant (validated in [`crate::config::validate`]): the grace must
+    /// be at least the supervisor's reconnect-backoff cap (`BACKOFF_CAP`,
+    /// 30s) — a healthy agent riding out its worst-case backoff stays
+    /// registered. A grace under a full backoff + connect attempt is still
+    /// recoverable (the next `/poll` implicitly re-registers), but costs an
+    /// avoidable eviction + orphan-stream sweep; the validator makes that
+    /// trade-off an explicit operator decision instead of an accident.
     pub poll_grace_secs: u64,
 }
 
@@ -149,7 +188,7 @@ impl Default for HubSecurityConfig {
 /// hub→agent application-layer heartbeat configuration.
 ///
 /// The hub periodically dispatches Ping frames to the agent's poll channel and
-/// the agent answers via `POST /pong`. The heartbeat covers cases that
+/// the agent answers via an uplink Pong frame. The heartbeat covers cases that
 /// transport-layer keepalive cannot detect (e.g. the agent's application layer
 /// is wedged while the connection stays alive).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,10 +206,32 @@ pub struct HeartbeatConfig {
 
 impl Default for HeartbeatConfig {
     fn default() -> Self {
+        // The cadence is the root of the whole liveness derivation chain
+        // (see core `config::params::liveness`); this default IS the
+        // canonical `HeartbeatCadence::DEFAULT`.
+        let cadence = HeartbeatCadence::DEFAULT;
         Self {
             enabled: true,
-            interval_secs: 15,
-            max_missed: 4,
+            interval_secs: cadence.interval_secs,
+            max_missed: cadence.max_missed,
+        }
+    }
+}
+
+impl From<&HeartbeatConfig> for HeartbeatCadence {
+    fn from(cfg: &HeartbeatConfig) -> Self {
+        Self {
+            interval_secs: cfg.interval_secs,
+            max_missed: cfg.max_missed,
+        }
+    }
+}
+
+impl From<&HeartbeatConfig> for HeartbeatAd {
+    fn from(cfg: &HeartbeatConfig) -> Self {
+        Self {
+            interval_secs: cfg.interval_secs,
+            max_missed: cfg.max_missed,
         }
     }
 }
@@ -264,20 +325,16 @@ pub struct TlsConfig {
     pub cert_path: String,
     /// Server private key PEM path (must be 0600).
     pub key_path: String,
-    /// Minimum TLS version. Defaults to "1.2".
+    /// Minimum TLS version. Defaults to "1.2". Enforced via rustls
+    /// protocol-version selection (wired through every server-config
+    /// builder since schema v3 — before that the value parsed but never
+    /// reached rustls).
     #[serde(default = "default_tls_min_version")]
-    pub min_version: TlsVersion,
+    pub min_version: interflow_core::tls::TlsMinVersion,
 }
 
-/// TLS version enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TlsVersion {
-    /// TLS 1.2
-    #[serde(rename = "1.2")]
-    V1_2,
-    /// TLS 1.3
-    #[serde(rename = "1.3")]
-    V1_3,
+const fn default_tls_min_version() -> interflow_core::tls::TlsMinVersion {
+    interflow_core::tls::TlsMinVersion::V1_2
 }
 
 /// ACL configuration wrapper. The `[[acl.rules]]` list.
@@ -345,10 +402,6 @@ const fn default_rate_limit_per_minute() -> u32 {
     30
 }
 
-const fn default_tls_min_version() -> TlsVersion {
-    TlsVersion::V1_2
-}
-
 fn default_metrics_addr() -> SocketAddr {
     "127.0.0.1:9100"
         .parse()
@@ -372,7 +425,7 @@ mod tests {
     #[test]
     fn acl_rules_round_trip() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -392,7 +445,7 @@ source = "ingress-02"
 target = "egress-02"
 "#;
         let config: HubConfig = toml::from_str(toml_str).expect("parse");
-        assert_eq!(config.config_version, 2);
+        assert_eq!(config.config_version, 3);
         assert_eq!(config.acl.rules.len(), 2);
         assert!(config.acl.rules.contains(&AclRule {
             source: "ingress-01".to_string(),
@@ -403,7 +456,7 @@ target = "egress-02"
     #[test]
     fn empty_acl_when_no_rules() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -420,7 +473,7 @@ allow_anonymous = true
     #[test]
     fn deny_unknown_fields_rejects_typo() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -447,7 +500,7 @@ litsten_addr = "oops"
         assert_eq!(d.max_missed, 4);
 
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -476,7 +529,7 @@ max_missed = 1
     #[test]
     fn heartbeat_section_absent_uses_defaults() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -494,7 +547,7 @@ allow_anonymous = true
     #[test]
     fn security_stream_caps_parse_from_toml() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -515,7 +568,7 @@ max_streams_total = 128
     #[test]
     fn security_stream_caps_default_when_absent() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [server]
 listen_addr = "127.0.0.1:8080"

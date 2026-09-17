@@ -44,11 +44,12 @@ use interflow_core::protocol::{FrameType, StreamProto};
 use interflow_core::security::AuditKind;
 use interflow_core::tunnel::FrameSource;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AuthMode;
+use interflow_core::tunnel::negotiation::{HeartbeatAd, RegisterResponse};
 
 /// Relay channel capacity (same as the poll channel).
 const RELAY_CHANNEL_CAP: usize = 256;
@@ -67,16 +68,9 @@ async fn conn_for_datagram(core: &HubCore, agent_id: &str) -> Option<quinn::Conn
 
 /// Whether the hub enables the DATAGRAM fast path.
 async fn quinn_caps_enabled(ctx: &AcceptContext) -> bool {
-    ctx.config.read().await.quic.datagram_enabled
+    ctx.config.read().await.transport.quic.datagram_enabled
 }
 
-/// Decodes the Hello payload: (caps, token).
-fn decode_hello_payload(payload: &[u8]) -> (u8, String) {
-    match payload.split_first() {
-        Some((caps, token)) => (*caps, String::from_utf8_lossy(token).to_string()),
-        None => (0, String::new()),
-    }
-}
 /// Read chunk size for traffic streams.
 const READ_CHUNK: usize = 64 * 1024;
 
@@ -86,7 +80,7 @@ pub(crate) async fn spawn_quic_listener(ctx: AcceptContext) -> Result<()> {
     let (quic_cfg, tls_cfg, auth_mode, tcp_listen) = {
         let cfg = ctx.config.read().await;
         (
-            cfg.quic.clone(),
+            cfg.transport.quic.clone(),
             cfg.tls.clone(),
             cfg.auth.mode,
             cfg.server.listen_addr,
@@ -98,7 +92,7 @@ pub(crate) async fn spawn_quic_listener(ctx: AcceptContext) -> Result<()> {
 
     let Some(tls) = tls_cfg else {
         return Err(InterflowError::config(
-            "[quic] enabled = true requires certificates from [tls] (QUIC mandates TLS)"
+            "[transport.quic] enabled = true requires certificates from [tls] (QUIC mandates TLS)"
                 .to_string(),
         ));
     };
@@ -110,10 +104,19 @@ pub(crate) async fn spawn_quic_listener(ctx: AcceptContext) -> Result<()> {
         }
         _ => None,
     };
+    let min_version = {
+        let cfg = ctx.config.read().await;
+        cfg.tls
+            .as_ref()
+            .map_or_else(interflow_core::tls::TlsMinVersion::default, |t| {
+                t.min_version
+            })
+    };
     let mut server_tls = interflow_core::tls::build_rustls_server_config(
         &tls.cert_path,
         &tls.key_path,
         client_ca.as_deref(),
+        min_version,
     )?;
     server_tls.alpn_protocols = vec![interflow_core::tunnel::quic::QUIC_ALPN.as_bytes().to_vec()];
 
@@ -338,10 +341,21 @@ async fn register_quic_agent(
     peer: &str,
 ) -> Option<(String, Arc<RwLock<AgentSession>>)> {
     let mut buf = BytesMut::with_capacity(256);
-    let hello = read_first_frame(&mut control_rx, &mut buf)
-        .await
-        .ok()
-        .flatten()?;
+    // Bounded wait for the agent's Hello: an established connection that
+    // never speaks must not pin a registration task until the QUIC idle
+    // timeout catches it. The budget mirrors the agent's own registration
+    // bound (the shared establish default).
+    let hello = if let Ok(r) = tokio::time::timeout(
+        interflow_core::tunnel::DEFAULT_REQUEST_ESTABLISH_TIMEOUT,
+        read_first_frame(&mut control_rx, &mut buf),
+    )
+    .await
+    {
+        r.ok().flatten()
+    } else {
+        warn!("QUIC registration stalled: no Hello within the establish deadline ({peer})");
+        None
+    }?;
 
     if !matches!(hello.frame_type, FrameType::Hello) {
         warn!("QUIC first frame is not Hello ({peer})");
@@ -362,7 +376,7 @@ async fn register_quic_agent(
             cfg.auth.static_token.as_ref().and_then(|s| s.agent.clone()),
         )
     };
-    let (hello_caps, token) = decode_hello_payload(&hello.payload);
+    let (hello_caps, token) = interflow_core::tunnel::quic::decode_hello_payload(&hello.payload);
     let agent_datagram_cap = quinn_caps_enabled(ctx).await
         && (hello_caps & interflow_core::tunnel::quic::CAP_DATAGRAM != 0);
     match auth_mode {
@@ -400,41 +414,18 @@ async fn register_quic_agent(
 
     // Register (reuses registration semantics: replace in place + sweep
     // orphan streams + absolute-value gauge)
-    let (tx, rx) = mpsc::channel(RELAY_CHANNEL_CAP);
-    let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-    let ctrl_backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let state_arc = {
         let mut agents = ctx.agents.write().await;
         if let Some(existing) = agents.get(&agent_id) {
-            let mut state = existing.write().await;
-            state.tx = tx;
-            state.ctrl_tx = ctrl_tx;
-            state.rx = Some(rx);
-            state.ctrl_rx = Some(ctrl_rx);
-            state.ctrl_backlog = ctrl_backlog;
-            state.generation += 1;
-            state.last_pong = Instant::now();
-            state.quic = Some(quic_conn.clone());
-            state.wake_poll();
-            // The old h2 session's upload lease is invalidated together
-            // with the generation (same semantics as h2 register preemption)
-            if let Some(lease) = state.up_lease.take() {
-                lease.cancel();
-            }
+            // QUIC registration overwrites an h2 session (same preemption
+            // semantics, mirrored)
+            existing
+                .write()
+                .await
+                .install_channels(Some(quic_conn.clone()));
             existing.clone()
         } else {
-            let arc = Arc::new(RwLock::new(AgentSession {
-                tx,
-                ctrl_tx,
-                ctrl_backlog,
-                rx: Some(rx),
-                ctrl_rx: Some(ctrl_rx),
-                generation: 0,
-                last_pong: Instant::now(),
-                poll_waker: Arc::new(std::sync::Mutex::new(None)),
-                up_lease: None,
-                quic: Some(quic_conn.clone()),
-            }));
+            let arc = Arc::new(RwLock::new(AgentSession::new(Some(quic_conn.clone()))));
             agents.insert(agent_id.clone(), arc.clone());
             arc
         }
@@ -455,14 +446,34 @@ async fn register_quic_agent(
     )
     .await;
 
-    // HelloAck (payload's first byte = hub capability bits)
+    // HelloAck payload: `[caps u8][capability JSON]` — the same capability
+    // declaration the h2 register response body carries (heartbeat cadence
+    // for the agent-side stall derivation). QUIC Pongs ride the control
+    // stream, so there is nothing transport-specific to declare.
     let hub_caps = if quinn_caps_enabled(ctx).await {
         interflow_core::tunnel::quic::CAP_DATAGRAM
     } else {
         0
     };
-    let mut ack = BytesMut::with_capacity(32);
-    wire::encode_frame(FrameType::HelloAck, 0, "", "hub", &[hub_caps], &mut ack);
+    let capability = {
+        let cfg = ctx.config.read().await;
+        RegisterResponse {
+            heartbeat: cfg
+                .heartbeat
+                .enabled
+                .then_some(HeartbeatAd::from(&cfg.heartbeat)),
+        }
+    };
+    let payload = match interflow_core::tunnel::quic::encode_helloack_payload(hub_caps, &capability)
+    {
+        Ok(payload) => payload,
+        Err(e) => {
+            warn!("QUIC capability declaration encode failed agent={agent_id}: {e}");
+            return None;
+        }
+    };
+    let mut ack = BytesMut::with_capacity(64);
+    wire::encode_frame(FrameType::HelloAck, 0, "", "hub", &payload, &mut ack);
     {
         let mut control = quic_conn.control.lock().await;
         if control.write_all(&ack).await.is_err() {
@@ -560,7 +571,9 @@ fn spawn_quic_heartbeat(
                 // Connection reference promptly — otherwise the quinn driver
                 // and the UDP socket have to wait for the next polling cycle)
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(30)) => continue,
+                    () = tokio::time::sleep(
+                        interflow_core::config::params::liveness::HEARTBEAT_DISABLED_POLL,
+                    ) => continue,
                     _ = &mut death_watch => return,
                 }
             }
@@ -580,7 +593,13 @@ fn spawn_quic_heartbeat(
                 }
             }
 
-            let deadline = Duration::from_secs(interval_secs * u64::from(max_missed + 1));
+            // The eviction dead line — the canonical derivation, identical
+            // to the h2 heartbeat loop (single source: core params).
+            let deadline = interflow_core::config::params::liveness::HeartbeatCadence {
+                interval_secs,
+                max_missed,
+            }
+            .dead_line();
             let dead = {
                 let st = state.read().await;
                 st.last_pong.elapsed() > deadline
@@ -645,25 +664,9 @@ async fn relay_stream_writer(
         }
     }
     // Outstanding Close + FIN (double Close is idempotent: the agent side's
-    // first Close triggers cleanup).
-    // source must use the `_close_` sentinel: tagging an agent name would
-    // make the source agent's dispatch drop it as a late request-direction
-    // frame, leaving the client connection silently hung (reproduced in the
-    // 2026-09-13 soak-test guardrail).
-    let mut close = BytesMut::with_capacity(64);
-    if wire::encode_frame(
-        FrameType::Close,
-        0,
-        &stream_id,
-        FrameSource::Close.as_str(),
-        b"",
-        &mut close,
-    )
-    .is_some()
-    {
-        let _ = tx.write_all(&close).await;
-    }
-    let _ = tx.finish();
+    // first Close triggers cleanup); the sentinel-source rationale lives on
+    // [`write_close_frame`].
+    write_close_frame(tx, &stream_id).await;
 }
 
 /// Opens a relay stream to a quic target agent and writes the Open frame;
@@ -1029,7 +1032,13 @@ async fn handle_quic_stream(
         write_close_frame(tx, &stream_id).await;
         return Ok(());
     }
-    if max_per_agent > 0 && !acquire_slot(&core.stream_counts, &source_agent, max_per_agent) {
+    if max_per_agent > 0
+        && !crate::hub::state::try_acquire_stream_slot(
+            &core.stream_counts,
+            &source_agent,
+            max_per_agent,
+        )
+    {
         metrics::counter!("interflow_hub_stream_limit_denied", "scope" => "per_agent").increment(1);
         write_close_frame(tx, &stream_id).await;
         return Ok(());
@@ -1042,7 +1051,7 @@ async fn handle_quic_stream(
         agents.get(&target_agent).cloned()
     };
     let Some(target_state) = target_state else {
-        release_slot(&core.stream_counts, &source_agent);
+        crate::hub::state::release_stream_slot(&core.stream_counts, &source_agent);
         write_close_frame(tx, &stream_id).await;
         return Ok(());
     };
@@ -1077,7 +1086,7 @@ async fn handle_quic_stream(
                 Ok(()) => None, // goes via lookup_tx / poll
                 Err(e) => {
                     warn!("QUIC Open notification failed target={target_agent}: {e:?}");
-                    release_slot(&core.stream_counts, &source_agent);
+                    crate::hub::state::release_stream_slot(&core.stream_counts, &source_agent);
                     write_close_frame(tx, &stream_id).await;
                     return Ok(());
                 }
@@ -1337,32 +1346,4 @@ async fn write_close_frame(mut tx: quinn::SendStream, stream_id: &str) {
         let _ = tx.write_all(&buf).await;
     }
     let _ = tx.finish();
-}
-
-/// Acquires a stream slot (same semantics as
-/// `HubService::try_acquire_stream_slot` in routing.rs).
-fn acquire_slot(counts: &crate::hub::state::SharedStreamCounts, agent: &str, max: usize) -> bool {
-    let mut map = counts
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = map.entry(agent.to_string()).or_insert(0);
-    if *entry >= max {
-        false
-    } else {
-        *entry += 1;
-        true
-    }
-}
-
-/// Releases a stream slot.
-fn release_slot(counts: &crate::hub::state::SharedStreamCounts, agent: &str) {
-    let mut map = counts
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(entry) = map.get_mut(agent) {
-        *entry = entry.saturating_sub(1);
-        if *entry == 0 {
-            map.remove(agent);
-        }
-    }
 }

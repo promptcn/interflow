@@ -24,9 +24,7 @@
 use interflow_core::protocol::{FrameType, StreamProto};
 use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::agent::AgentClient;
-use interflow_mesh::config::{
-    AGENT_CONFIG_VERSION, AgentConfig, AgentInfo, HubSecurityConfig, TransportKind,
-};
+use interflow_mesh::config::{AgentConfig, AgentInfo, HubSecurityConfig};
 use interflow_testkit::{hub_config, pick_ephemeral_port, spawn_hub};
 use tokio::sync::mpsc;
 
@@ -43,39 +41,21 @@ async fn start_hub(security: HubSecurityConfig) -> u16 {
 /// registration + sending send_open).
 fn minimal_agent(hub_port: u16, id: &str) -> AgentConfig {
     AgentConfig {
-        config_version: AGENT_CONFIG_VERSION,
         agent: AgentInfo {
             id: id.to_string(),
             hub_url: format!("http://127.0.0.1:{hub_port}"),
-            transport: TransportKind::H2,
-            hub_quic_addr: None,
-            auth_token: None,
             connect_timeout_secs: 5,
-            poll_idle_timeout_secs: None,
-            request_establish_timeout_secs: None,
+            ..AgentInfo::default()
         },
-        ingress: vec![],
-        egress: vec![],
-        egress_backend_write_timeout_secs: 10,
-        egress_resolve_timeout_secs: 5,
-        egress_connect_timeout_secs: 5,
-        max_incoming_streams: 256,
-        max_stream_opens_per_sec: 100,
-        stream_open_burst: 256,
-        egress_target_breaker_enabled: true,
-        egress_target_breaker_failure_threshold: 5,
-        egress_target_breaker_window_secs: 10,
-        egress_target_breaker_cooldown_secs: 30,
         control: interflow_mesh::config::ControlConfig {
             enabled: false,
             ..interflow_mesh::config::ControlConfig::default()
         },
-        security: interflow_mesh::config::SecurityConfig::default(),
-        tls: None,
         logging: interflow_mesh::config::LoggingConfig {
             level: "warn".to_string(),
             format: interflow_mesh::config::LogFormat::Plain,
         },
+        ..AgentConfig::default()
     }
 }
 
@@ -95,8 +75,10 @@ async fn connect_tunnel(
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         None,
-        tokio_util::sync::CancellationToken::new(),
-        interflow_core::tunnel::H2Liveness::LEGACY,
+        &interflow_core::tunnel::session_tasks::SessionTasks::new(
+            tokio_util::sync::CancellationToken::new(),
+        ),
+        interflow_core::tunnel::H2Liveness::HEARTBEAT_DISABLED,
     )
     .expect("tunnel");
     (tunnel, conn.conn_handle)

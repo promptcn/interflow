@@ -107,6 +107,12 @@ async fn main() -> interflow_core::error::Result<()> {
             let agent_config = load_agent_config(&config_path)?;
             telemetry::init_logging(&agent_config.logging.level, agent_config.logging.format);
 
+            // Soak-gate fault plan (INTERFLOW_FAULT_PLAN): no-op in release
+            // builds (feature off — a set plan then logs a warning); see
+            // interflow-core's fault module. Installed before anything runs
+            // so early-supervise faults fire too.
+            interflow_core::fault::install_from_env("INTERFLOW_FAULT_PLAN");
+
             tracing::info!("Starting agent: {}", agent_config.agent.id);
 
             let mut agent =

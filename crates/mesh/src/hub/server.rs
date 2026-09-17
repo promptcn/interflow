@@ -81,11 +81,16 @@ impl HubServer {
                         &tls_config.cert_path,
                         &tls_config.key_path,
                         &mtls_cfg.ca_path,
+                        tls_config.min_version,
                     )?)
                 }
                 AuthMode::StaticToken | AuthMode::Anonymous => {
                     info!("TLS enabled (no client cert verification)");
-                    build_tls_acceptor(&tls_config.cert_path, &tls_config.key_path)?
+                    build_tls_acceptor(
+                        &tls_config.cert_path,
+                        &tls_config.key_path,
+                        tls_config.min_version,
+                    )?
                 }
             }
         } else {
@@ -111,8 +116,10 @@ impl HubServer {
         })
     }
 
-    /// Runs until an error occurs (compatibility entry point). Equivalent to
-    /// [`Self::run_until`] with a shutdown signal that never fires.
+    /// Runs until the server dies (error or task end) — the embedding entry
+    /// point (e.g. the expose edge), where hub death is a whole-process
+    /// failure and no graceful shutdown exists. Equivalent to
+    /// [`Self::run_until`] with a token that never fires.
     pub async fn run(self) -> Result<()> {
         self.run_until(tokio_util::sync::CancellationToken::new())
             .await

@@ -5,6 +5,7 @@
 //! requires an explicit `allow_remote = true` (foot-gun protection).
 
 use interflow_core::config::LoggingConfig;
+use interflow_core::config::params::BreakerPolicy;
 use interflow_core::protocol::StreamProto;
 use interflow_core::security::{ByteRateLimiter, UdpIngressLimiter};
 use serde::{Deserialize, Serialize};
@@ -13,10 +14,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Current configuration schema version.
-pub const AGENT_CONFIG_VERSION: u32 = 2;
+///
+/// v3 (2026-09-16, config-governance step 4): added the `[transport]`
+/// section (`[transport.h2]` / `[transport.quic]`, endpoint-symmetric with
+/// the hub) — previously these transport-layer values were hard-coded per
+/// endpoint and the hub-side QUIC knobs could not take effect against the
+/// agent's constants.
+pub const AGENT_CONFIG_VERSION: u32 = 3;
 
 /// Agent configuration root structure.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Schema version; must equal [`AGENT_CONFIG_VERSION`].
@@ -107,9 +114,78 @@ pub struct AgentConfig {
     /// TLS client configuration (optional).
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// Transport-layer tuning, endpoint-symmetric with the hub's
+    /// `[transport]` (see [`crate::config::transport`]).
+    #[serde(default)]
+    pub transport: AgentTransportConfig,
     /// Logging.
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+/// Agent-side transport tuning: h2 keepalive plus the QUIC endpoint
+/// parameters.
+///
+/// Same knobs, same defaults as the hub side (the QUIC idle timeout is
+/// negotiated as the endpoints' minimum — tune both sides together).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[derive(Default)]
+pub struct AgentTransportConfig {
+    /// h2 transport tuning.
+    #[serde(default)]
+    pub h2: crate::config::transport::H2TransportConfig,
+    /// QUIC transport tuning.
+    #[serde(default)]
+    pub quic: crate::config::transport::AgentQuicConfig,
+}
+
+impl Default for AgentConfig {
+    /// Production defaults — the single source every embedder (mesh CLI,
+    /// expose client, expose edge self-dial, testkit) composes from via
+    /// `AgentConfig::for_identity` + field overrides. The serde default
+    /// fns below delegate to the same values, so TOML partial defaults and
+    /// programmatic defaults can never drift apart.
+    fn default() -> Self {
+        Self {
+            config_version: AGENT_CONFIG_VERSION,
+            agent: AgentInfo::default(),
+            ingress: Vec::new(),
+            egress: Vec::new(),
+            egress_backend_write_timeout_secs: default_egress_backend_write_timeout_secs(),
+            egress_resolve_timeout_secs: default_egress_resolve_timeout_secs(),
+            egress_connect_timeout_secs: default_egress_connect_timeout_secs(),
+            max_incoming_streams: default_max_incoming_streams(),
+            max_stream_opens_per_sec: default_max_stream_opens_per_sec(),
+            stream_open_burst: default_stream_open_burst(),
+            egress_target_breaker_enabled: default_egress_target_breaker_enabled(),
+            egress_target_breaker_failure_threshold:
+                default_egress_target_breaker_failure_threshold(),
+            egress_target_breaker_window_secs: default_egress_target_breaker_window_secs(),
+            egress_target_breaker_cooldown_secs: default_egress_target_breaker_cooldown_secs(),
+            control: ControlConfig::default(),
+            security: SecurityConfig::default(),
+            tls: None,
+            transport: AgentTransportConfig::default(),
+            logging: LoggingConfig::default(),
+        }
+    }
+}
+
+impl AgentConfig {
+    /// Production-default config for the given identity. Identity is the
+    /// only part without a default (an agent is meaningless without it);
+    /// everything else starts from [`AgentConfig::default`].
+    pub fn for_identity(id: impl Into<String>, hub_url: impl Into<String>) -> Self {
+        Self {
+            agent: AgentInfo {
+                id: id.into(),
+                hub_url: hub_url.into(),
+                ..AgentInfo::default()
+            },
+            ..Self::default()
+        }
+    }
 }
 
 /// Transport used toward the hub.
@@ -125,7 +201,7 @@ pub enum TransportKind {
 }
 
 /// Basic agent information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentInfo {
     /// Agent ID (used for hub registration; must match ACL references).
@@ -183,10 +259,42 @@ pub struct AgentInfo {
     /// default; `Some(n ≥ 1)` pins a value (tests, unusually slow links).
     #[serde(default)]
     pub request_establish_timeout_secs: Option<u64>,
+    /// Session-critical task stall heartbeat timeout (seconds): a task that
+    /// stops proving liveness for this long is judged *wedged* (alive but
+    /// not progressing — the failure class the death contract cannot see,
+    /// because a wedged task keeps its channels open and sends buffer as
+    /// fake successes) and the session is rebuilt.
+    ///
+    /// Defaults to `None` = derived per transport from the hub-advertised
+    /// heartbeat cadence (h2 and QUIC negotiate the same declaration; the
+    /// fixed fallback applies only to disabled heartbeat).
+    /// `Some(0)` disables stall supervision (death-only); `Some(n ≥ 1)`
+    /// pins a value (tests, unusually slow links).
+    #[serde(default)]
+    pub task_stall_timeout_secs: Option<u64>,
+}
+
+impl Default for AgentInfo {
+    /// Identity-less defaults: `id` / `hub_url` are empty and MUST be
+    /// filled (see [`AgentConfig::for_identity`]); every tunable carries
+    /// its production default so struct-update syntax stays exhaustive.
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            hub_url: String::new(),
+            transport: TransportKind::default(),
+            hub_quic_addr: None,
+            auth_token: None,
+            connect_timeout_secs: default_connect_timeout_secs(),
+            poll_idle_timeout_secs: None,
+            request_establish_timeout_secs: None,
+            task_stall_timeout_secs: None,
+        }
+    }
 }
 
 /// Ingress rule: local listener → forwarded to a remote agent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IngressRule {
     /// Rule name (unique identifier, used for add/remove via the control API).
@@ -251,7 +359,7 @@ impl IngressRule {
 }
 
 /// Egress rule: remote request → forwarded to a local backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressRule {
     /// Rule name.
@@ -280,7 +388,7 @@ impl EgressRule {
 }
 
 /// Egress allowlist configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Allowed `host:port` / CIDR list; by default only loopback is allowed.
@@ -289,7 +397,7 @@ pub struct SecurityConfig {
 }
 
 /// Control API configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlConfig {
     /// Whether the control API is enabled.
@@ -320,7 +428,7 @@ impl Default for ControlConfig {
 }
 
 /// TLS client configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Whether TLS is enabled.
@@ -405,16 +513,18 @@ const fn default_egress_target_breaker_enabled() -> bool {
     true
 }
 
+// The breaker default trio delegates to the canonical policy (single
+// source; the JSON wire format of the policy rationale lives there).
 const fn default_egress_target_breaker_failure_threshold() -> u32 {
-    5
+    BreakerPolicy::EGRESS_DEFAULT.failure_threshold
 }
 
 const fn default_egress_target_breaker_window_secs() -> u64 {
-    10
+    BreakerPolicy::EGRESS_DEFAULT.failure_window.as_secs()
 }
 
 const fn default_egress_target_breaker_cooldown_secs() -> u64 {
-    30
+    BreakerPolicy::EGRESS_DEFAULT.cooldown.as_secs()
 }
 
 #[cfg(test)]
@@ -428,9 +538,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_v2_parses_with_optional_sections() {
+    fn agent_parses_with_optional_sections() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [agent]
 id = "test-agent"
@@ -447,7 +557,7 @@ listen_addr = "127.0.0.1:3001"
 target_agent = "agent-2"
 "#;
         let cfg: AgentConfig = toml::from_str(toml_str).expect("parse");
-        assert_eq!(cfg.config_version, 2);
+        assert_eq!(cfg.config_version, 3);
         assert_eq!(cfg.agent.id, "test-agent");
         assert_eq!(cfg.ingress.len(), 1);
     }
@@ -456,7 +566,7 @@ target_agent = "agent-2"
     fn open_flood_guard_fields_default_and_override() {
         // Defaults
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [agent]
 id = "x"
@@ -475,7 +585,7 @@ hub_url = "http://hub"
 
         // Explicit overrides (fields with 0 = disabled semantics)
         let toml_str = r#"
-config_version = 2
+config_version = 3
 egress_resolve_timeout_secs = 2
 egress_connect_timeout_secs = 3
 max_incoming_streams = 0
@@ -503,9 +613,9 @@ hub_url = "http://hub"
     }
 
     #[test]
-    fn agent_v2_rejects_unknown_field() {
+    fn agent_rejects_unknown_field() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [agent]
 id = "x"
@@ -519,7 +629,7 @@ totaly_misspelled = true
     #[test]
     fn ingress_udp_fields_parse_with_defaults() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [agent]
 id = "x"
@@ -549,7 +659,7 @@ remote_addr = "10.0.0.1:53"
     #[test]
     fn ingress_tcp_default_protocol_and_idle() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [agent]
 id = "x"
@@ -569,7 +679,7 @@ target_agent = "eg"
     #[test]
     fn ingress_udp_overrides_parse() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [agent]
 id = "x"
@@ -596,7 +706,7 @@ udp_egress_bytes_per_sec = 0
     #[test]
     fn invalid_listen_protocol_rejected() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [agent]
 id = "x"
@@ -615,7 +725,7 @@ target_agent = "eg"
     #[test]
     fn egress_udp_fields_parse() {
         let toml_str = r#"
-config_version = 2
+config_version = 3
 
 [agent]
 id = "x"
@@ -640,5 +750,30 @@ udp_idle_timeout_secs = 30
             udp_idle_timeout_secs: None,
         };
         assert_eq!(rule2.effective_udp_idle_timeout(), Duration::from_mins(1));
+    }
+
+    /// Single-source contract: a TOML file with only the required identity
+    /// fields parses into exactly `AgentConfig::for_identity` — the serde
+    /// default fns and the `Default` impls cannot drift apart.
+    #[test]
+    fn serde_partial_defaults_match_programmatic_default() {
+        let toml_str = r#"
+config_version = 3
+
+[agent]
+id = "test-agent"
+hub_url = "https://hub.example.com:6666"
+"#;
+        let parsed: AgentConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            parsed,
+            AgentConfig::for_identity("test-agent", "https://hub.example.com:6666")
+        );
+
+        // The breaker trio comes from the canonical policy.
+        let d = AgentConfig::default();
+        assert_eq!(d.egress_target_breaker_failure_threshold, 5);
+        assert_eq!(d.egress_target_breaker_window_secs, 10);
+        assert_eq!(d.egress_target_breaker_cooldown_secs, 30);
     }
 }

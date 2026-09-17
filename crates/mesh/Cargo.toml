@@ -1,6 +1,6 @@
 [package]
 name = "interflow-mesh"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Site-to-site TCP tunnel: any TCP traffic between two private networks via a public hub"
@@ -14,8 +14,14 @@ path = "src/lib.rs"
 name = "interflow-mesh"
 path = "src/main.rs"
 
+[features]
+# Soak-gate fault injection in the real binaries (see interflow-core's
+# src/fault.rs); off by default — production builds compile every call
+# point to a no-op.
+fault-injection = ["interflow-core/fault-injection"]
+
 [dependencies]
-interflow-core = { path = "../core", version = "0.1" }
+interflow-core = { path = "../core", version = "0.2" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -78,7 +84,7 @@ chrono = "0.4"
 # Shared test/bench harness (dev-dependency cycle: testkit depends on mesh,
 # supported by cargo, same pattern as tokio/tokio-test; testkit stays out of the
 # production dependency graph)
-interflow-testkit = { path = "../testkit", version = "0.1" }
+interflow-testkit = { path = "../testkit", version = "0.2", features = ["fault-injection"] }
 # paused-clock unit tests (egress send-path health)
 tokio = { workspace = true, features = ["test-util"] }
 # bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion

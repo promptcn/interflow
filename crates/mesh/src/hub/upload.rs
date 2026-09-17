@@ -23,7 +23,7 @@
 //! end the entire upload stream.
 
 use crate::hub::routing::{Direction, valid_agent_id, valid_stream_id, valid_target_addr};
-use crate::hub::service::{HubService, text_response};
+use crate::hub::service::{HubService, agent_id_of, bind_connection_identity, text_response};
 use crate::hub::state::{AgentSession, HubResponseBody};
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, StreamBody};
@@ -52,29 +52,16 @@ impl HubService {
         &self,
         req: Request<Incoming>,
     ) -> Result<Response<HubResponseBody>> {
-        let agent_id = req
-            .headers()
-            .get("x-agent-id")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| InterflowError::config("missing agent-id".to_string()))?
-            .to_string();
+        // Owned: `req` is consumed below (`into_body`) while `agent_id`
+        // outlives the whole streaming read.
+        let agent_id = agent_id_of(&req)?.to_string();
         let agent_id = agent_id.as_str();
 
         // Identity binding check (the same gate as /poll)
+        if let Err(resp) =
+            bind_connection_identity(&self.connection_identity, agent_id, "upload").await
         {
-            let mut identity = self.connection_identity.write().await;
-            if let Some(existing_id) = &*identity {
-                if existing_id != agent_id {
-                    warn!(
-                        "identity mismatch: connection is bound to {}, but upload attempt is from {agent_id}",
-                        existing_id
-                    );
-                    return Ok(text_response(StatusCode::FORBIDDEN, "Identity mismatch"));
-                }
-            } else {
-                *identity = Some(agent_id.to_string());
-                debug!("Connection bound to identity (upload): {agent_id}");
-            }
+            return Ok(resp);
         }
 
         // Take the AgentSession (outer read lock is very short-lived);

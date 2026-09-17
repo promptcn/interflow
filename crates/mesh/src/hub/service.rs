@@ -24,6 +24,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use tracing::{debug, warn};
 
 use tokio::sync::RwLock;
 
@@ -209,21 +210,49 @@ impl Service<Request<Incoming>> for HubService {
 
             match (req.method(), path.as_str()) {
                 (&Method::POST, "/register") => {
-                    let agent_id = req
-                        .headers()
-                        .get("x-agent-id")
-                        .and_then(|v| v.to_str().ok())
-                        .ok_or_else(|| InterflowError::config("missing agent-id".to_string()))?;
-                    svc.handle_register(agent_id.to_string()).await
+                    let agent_id = agent_id_of(&req)?.to_string();
+                    svc.handle_register(agent_id).await
                 }
                 (&Method::POST, "/stream/up") => svc.handle_stream_up(req).await,
                 (&Method::GET, "/poll") => svc.handle_poll(req).await,
-                (&Method::POST, "/pong") => svc.handle_pong(req).await,
                 (&Method::GET, "/agents") => svc.handle_list_agents().await,
                 _ => Ok(text_response(StatusCode::NOT_FOUND, "Not Found")),
             }
         })
     }
+}
+
+/// Extracts the `x-agent-id` header — the per-request agent identity on
+/// every tunnel endpoint. A missing/garbled header is a protocol violation
+/// by the peer, not operator configuration debt.
+pub(crate) fn agent_id_of(req: &Request<Incoming>) -> interflow_core::error::Result<&str> {
+    req.headers()
+        .get("x-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| InterflowError::protocol("missing agent-id".to_string()))
+}
+
+/// Verifies (or, on first use, establishes) the connection↔agent identity
+/// binding shared by the per-connection handlers (`/poll`, `/stream/up`).
+/// `Ok` = bound or matching; `Err(response)` = the rejection to reply with.
+pub(crate) async fn bind_connection_identity(
+    identity: &RwLock<Option<String>>,
+    agent_id: &str,
+    op: &str,
+) -> std::result::Result<(), Response<HubResponseBody>> {
+    let mut identity = identity.write().await;
+    if let Some(existing_id) = &*identity {
+        if existing_id != agent_id {
+            warn!(
+                "identity mismatch: connection is bound to {existing_id}, but {op} attempt is for {agent_id}"
+            );
+            return Err(text_response(StatusCode::FORBIDDEN, "Identity mismatch"));
+        }
+    } else {
+        *identity = Some(agent_id.to_string());
+        debug!("Connection bound to identity ({op}): {agent_id}");
+    }
+    Ok(())
 }
 
 /// Validates the `Authorization: Bearer <token>` header with constant-time

@@ -12,12 +12,11 @@
 //!    rebuilds the whole session (real hub + forced 2s watchdog; a fake hub
 //!    reproduces the incident shape "Ping once then stall" and asserts self-
 //!    healing);
-//! 2. **Pong travels the upload data stream**: after capability negotiation
-//!    succeeds, heartbeat replies return via /stream/up; one heartbeat cycle
-//!    exercises both data paths;
-//! 3. **Legacy compatibility**: an old hub's plain-text registration response
-//!    → the agent falls back to the POST /pong endpoint, and the watchdog
-//!    uses a fixed fallback value (bidirectional version-skew compatibility);
+//! 2. **Pong travels the upload data stream**: heartbeat replies return via
+//!    /stream/up; one heartbeat cycle exercises both data paths;
+//! 3. **Paired-deployment strictness**: a register response whose capability
+//!    declaration fails to parse is a registration failure — the supervisor
+//!    keeps retrying, the agent never reaches Connected;
 //! 4. **Metric visibility**: heartbeat Ping/Pong counters grow with traffic
 //!    (the direct countermeasure to the journal falling silent for 7.5h in
 //!    the incident).
@@ -45,7 +44,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use interflow_core::error::InterflowError;
 use interflow_core::protocol::frame::{DecodeOutcome, FrameType, encode_frame};
 use interflow_core::tunnel::PING_SOURCE;
-use interflow_mesh::agent::AgentState;
+use interflow_mesh::agent::{AgentClient, AgentState};
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
 use interflow_testkit::{
     agent_config, hub_config_tuned, pick_ephemeral_port, spawn_agent_registered, spawn_hub,
@@ -136,11 +135,10 @@ async fn forced_watchdog_rebuilds_session_on_real_hub() {
 /// Capability mode of the fake hub.
 #[derive(Clone, Copy, PartialEq)]
 enum FakeMode {
-    /// JSON capability declaration (new hub): pong_via_upload + heartbeat
-    /// cadence.
+    /// JSON capability declaration: heartbeat cadence.
     Modern,
-    /// Plain-text "Registered" (old hub).
-    Legacy,
+    /// Plain-text "Registered" — an unparseable declaration.
+    PlainText,
 }
 
 /// Fake-hub counters.
@@ -149,8 +147,6 @@ struct FakeCounts {
     registers: AtomicUsize,
     /// Pong frames received in the /stream/up frame stream (data-plane Pong).
     pongs_upload: AtomicUsize,
-    /// Replies received on the POST /pong endpoint (legacy path).
-    pongs_endpoint: AtomicUsize,
 }
 
 struct FakeHub {
@@ -228,18 +224,18 @@ impl Service<Request<Incoming>> for FakeHubSvc {
                     counts.registers.fetch_add(1, Ordering::SeqCst);
                     match mode {
                         FakeMode::Modern => {
-                            // Isomorphic with the new hub's registration
+                            // Isomorphic with the hub's registration
                             // response (heartbeat 1s/2missed, but the test
-                            // overrides the negotiated value with a fixed 1s
+                            // overrides the derived value with a fixed 1s
                             // watchdog)
-                            let caps = r#"{"pong_via_upload":true,"heartbeat":{"interval_secs":1,"max_missed":2}}"#;
+                            let caps = r#"{"heartbeat":{"interval_secs":1,"max_missed":2}}"#;
                             Response::builder()
                                 .status(StatusCode::OK)
                                 .header(CONTENT_TYPE, "application/json")
                                 .body(full_body(caps))
                                 .unwrap()
                         }
-                        FakeMode::Legacy => Response::builder()
+                        FakeMode::PlainText => Response::builder()
                             .status(StatusCode::OK)
                             .body(full_body("Registered"))
                             .unwrap(),
@@ -305,13 +301,6 @@ impl Service<Request<Incoming>> for FakeHubSvc {
                         .body(hanging_body())
                         .unwrap()
                 }
-                ("POST", "/pong") => {
-                    counts.pongs_endpoint.fetch_add(1, Ordering::SeqCst);
-                    Response::builder()
-                        .status(StatusCode::NO_CONTENT)
-                        .body(full_body(Bytes::new()))
-                        .unwrap()
-                }
                 _ => Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(full_body("not found"))
@@ -362,15 +351,10 @@ async fn pinged_then_stalled_poll_stream_triggers_session_rebuild() {
 
     let registers = fake.counts.registers.load(Ordering::SeqCst);
     let pongs_upload = fake.counts.pongs_upload.load(Ordering::SeqCst);
-    let pongs_endpoint = fake.counts.pongs_endpoint.load(Ordering::SeqCst);
 
     assert!(
         pongs_upload >= 1,
-        "once negotiation succeeds, Pongs should return via the upload data stream (actual {pongs_upload})"
-    );
-    assert_eq!(
-        pongs_endpoint, 0,
-        "with the upload available, the /pong endpoint should not be used as a fallback (actual {pongs_endpoint})"
+        "heartbeat Pongs should return via the upload data stream (actual {pongs_upload})"
     );
     assert!(
         registers >= 2,
@@ -395,41 +379,36 @@ async fn pinged_then_stalled_poll_stream_triggers_session_rebuild() {
 }
 
 // ---------------------------------------------------------------------------
-// T4: legacy compatibility — an old hub's plain-text registration response →
-// Pong goes to the /pong endpoint
+// T4: paired-deployment strictness — a register response whose capability
+// declaration does not parse is a registration failure (no legacy fallback)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn legacy_hub_falls_back_to_endpoint_pong() {
-    let fake = spawn_fake_hub(FakeMode::Legacy).await;
+async fn unparseable_register_body_fails_registration() {
+    let fake = spawn_fake_hub(FakeMode::PlainText).await;
 
-    let mut cfg = agent_config("stall-legacy", fake.addr.port());
+    let mut cfg = agent_config("stall-plaintext", fake.addr.port());
     cfg.agent.hub_url = format!("http://{}", fake.addr);
-    // Explicitly disable the watchdog: the legacy fallback value of 120s
-    // should not trigger a rebuild within the test window; this also verifies
-    // that the override config takes effect (Some(0) = disabled)
-    cfg.agent.poll_idle_timeout_secs = Some(0);
-    let agent = spawn_agent_registered(cfg).await;
+    let agent = AgentClient::new(cfg).expect("client build").start();
 
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     let registers = fake.counts.registers.load(Ordering::SeqCst);
     let pongs_upload = fake.counts.pongs_upload.load(Ordering::SeqCst);
-    let pongs_endpoint = fake.counts.pongs_endpoint.load(Ordering::SeqCst);
 
     assert!(
-        pongs_endpoint >= 1,
-        "under an old hub (plain-text response), Pong should fall back to the /pong endpoint (actual {pongs_endpoint})"
+        registers >= 2,
+        "an unparseable declaration must fail registration and keep the supervisor retrying (registrations {registers} < 2)"
+    );
+    assert!(
+        !matches!(agent.state(), AgentState::Connected { .. }),
+        "the agent must never reach Connected against a hub whose declaration does not parse (state {:?})",
+        agent.state()
     );
     assert_eq!(
         pongs_upload, 0,
-        "upload Pong frames should not be sent without negotiation"
+        "no session means no uplink Pong frames (actual {pongs_upload})"
     );
-    assert_eq!(
-        registers, 1,
-        "the session should not be rebuilt with the watchdog disabled ({registers} registrations)"
-    );
-    assert!(matches!(agent.state(), AgentState::Connected { .. }));
 
     agent.shutdown_graceful().await.expect("agent shutdown");
 }

@@ -28,11 +28,17 @@
     dead_code,
     unused_mut
 )]
+use interflow_core::fault::FaultPoint;
 use interflow_expose::edge::{wait_initial_registration, watch_agent_health};
 use interflow_mesh::agent::AgentClient;
+use interflow_testkit::fault::{self, FaultPlan};
 use interflow_testkit::{agent_config, pick_ephemeral_port, spawn_agent_registered, spawn_hub};
 use std::time::Duration;
 use tokio::net::TcpListener;
+
+// The fault hook is process-global: keep this binary's fault-injected case
+// from interleaving with the others (cargo test runs cases in parallel).
+static FAULT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Accepts TCP connections and then goes silent forever (no bytes either
 /// way): a connect+register against it hangs until the establish timeout.
@@ -55,6 +61,7 @@ async fn spawn_black_hole() -> std::net::SocketAddr {
 /// silent — exactly the "recovery wedged" class the outer watch exists for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wedged_supervisor_trips_the_watch() {
+    let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let black_hole = spawn_black_hole().await;
     let mut cfg = agent_config("wedged", black_hole.port());
     cfg.agent.hub_url = format!("http://{black_hole}");
@@ -89,6 +96,7 @@ async fn wedged_supervisor_trips_the_watch() {
 /// within its timeout instead of hanging edge startup forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wedged_first_registration_fails_startup_boundedly() {
+    let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let black_hole = spawn_black_hole().await;
     let mut cfg = agent_config("wedged-startup", black_hole.port());
     cfg.agent.hub_url = format!("http://{black_hole}");
@@ -117,6 +125,7 @@ async fn wedged_first_registration_fails_startup_boundedly() {
 /// trip (restart churn would not help; this is normal operation).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn struggling_but_alive_supervisor_never_trips_the_watch() {
+    let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // A port with nothing listening: every attempt fails fast.
     let dead_port = pick_ephemeral_port();
     let mut cfg = agent_config("struggling", dead_port);
@@ -143,6 +152,7 @@ async fn struggling_but_alive_supervisor_never_trips_the_watch() {
 /// Healthy shape: Connected state, the watch stays silent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn healthy_agent_never_trips_the_watch() {
+    let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let hub_port = pick_ephemeral_port();
     let _hub = spawn_hub(interflow_testkit::hub_config(hub_port, vec![])).await;
     let agent = spawn_agent_registered(agent_config("healthy", hub_port)).await;
@@ -158,4 +168,50 @@ async fn healthy_agent_never_trips_the_watch() {
     );
 
     agent.shutdown_graceful().await.expect("agent shutdown");
+}
+
+/// Dead-supervisor shape (2026-09-16 panic-containment hardening): a panic
+/// in the supervisor's OWN frame is the outermost in-process layer — the
+/// state stream ends with a final state that is neither Stopped nor Failed.
+/// The watch must treat the stream end as death and trip immediately (the
+/// process exits, systemd restarts) — not spin on it, not stay silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dead_supervisor_trips_the_watch_via_stream_end() {
+    let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    fault::clear();
+
+    let hub_port = pick_ephemeral_port();
+    let _hub = spawn_hub(interflow_testkit::hub_config(hub_port, vec![])).await;
+
+    let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::AgentSuperviseLoopTick));
+    let mut cfg = agent_config("doomed-supervisor", hub_port);
+    cfg.agent.connect_timeout_secs = 2;
+    let agent = AgentClient::new(cfg).unwrap().start();
+
+    let started = std::time::Instant::now();
+    let reason = tokio::time::timeout(
+        Duration::from_secs(10),
+        watch_agent_health(&agent, Duration::from_secs(60)),
+    )
+    .await
+    .expect("watch must trip on a dead supervisor")
+    .to_string();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a dead supervisor must trip the watch immediately, took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        reason.contains("state channel closed"),
+        "trip reason should name the stream-end death shape, got: {reason}"
+    );
+    assert!(
+        faults.fired(FaultPoint::AgentSuperviseLoopTick),
+        "the supervisor fault must have fired (guards against a vacuous green)"
+    );
+
+    fault::clear();
+    // shutdown_graceful on a dead supervisor surfaces the JoinError — the
+    // documented contract; tolerating it here is the point.
+    assert!(agent.shutdown_graceful().await.is_err());
 }

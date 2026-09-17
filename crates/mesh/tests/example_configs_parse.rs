@@ -29,7 +29,9 @@
     dead_code,
     unused_mut
 )]
-use interflow_mesh::config::{load_agent_config, load_hub_config};
+use interflow_mesh::config::{
+    AGENT_CONFIG_VERSION, HUB_CONFIG_VERSION, load_agent_config, load_hub_config,
+};
 use std::path::{Path, PathBuf};
 
 /// The mesh crate root (`crates/mesh/`).
@@ -60,7 +62,7 @@ fn root_hub_toml_loads() {
     }
     let path = manifest_root().join("examples/hub.toml");
     let cfg = load_hub_config(&path).expect("hub.toml should load");
-    assert_eq!(cfg.config_version, 2);
+    assert_eq!(cfg.config_version, 3);
     assert!(!cfg.auth.allow_anonymous);
     // Path-anchoring invariant: cert paths come back absolute, pointing at
     // the config's own certs/ (crates/mesh/examples/certs/), not the CWD.
@@ -83,7 +85,7 @@ fn root_agent1_toml_loads() {
     }
     let path = manifest_root().join("examples/agent-1.toml");
     let cfg = load_agent_config(&path).expect("agent-1.toml should load");
-    assert_eq!(cfg.config_version, 2);
+    assert_eq!(cfg.config_version, 3);
     assert_eq!(cfg.agent.id, "agent-1");
     assert!(cfg.control.enabled);
 }
@@ -113,9 +115,9 @@ fn private_scenario_tomls_load() {
 
     let mut failures = Vec::new();
     match load_hub_config(base.join("hub.toml")) {
-        Ok(cfg) if cfg.config_version == 2 => {}
+        Ok(cfg) if cfg.config_version == HUB_CONFIG_VERSION => {}
         Ok(cfg) => failures.push(format!(
-            "hub.toml: config_version != 2 ({})",
+            "hub.toml: config_version != {HUB_CONFIG_VERSION} ({})",
             cfg.config_version
         )),
         Err(e) => failures.push(format!("hub.toml: {e}")),
@@ -136,9 +138,9 @@ fn private_scenario_tomls_load() {
             .and_then(|n| n.to_str())
             .unwrap_or("<non-utf8>");
         match load_agent_config(path) {
-            Ok(cfg) if cfg.config_version == 2 => {}
+            Ok(cfg) if cfg.config_version == AGENT_CONFIG_VERSION => {}
             Ok(cfg) => failures.push(format!(
-                "{name}: config_version != 2 ({})",
+                "{name}: config_version != {AGENT_CONFIG_VERSION} ({})",
                 cfg.config_version
             )),
             Err(e) => failures.push(format!("{name}: {e}")),
@@ -176,11 +178,10 @@ fn reject_missing_auth() {
         acl: AclConfig::default(),
         security: HubSecurityConfig::default(),
         heartbeat: Default::default(),
-        routes: Default::default(),
         metrics: Default::default(),
         audit: Default::default(),
         logging: LoggingConfig::default(),
-        quic: Default::default(),
+        transport: Default::default(),
     };
     let err = interflow_mesh::config::validate_hub(&cfg).expect_err("should reject");
     assert!(

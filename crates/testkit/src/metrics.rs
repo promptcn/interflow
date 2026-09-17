@@ -40,7 +40,7 @@ pub fn latency_stats(mut samples: Vec<u64>) -> LatencyStats {
 /// Nearest-rank percentile: `sorted[(ceil(p*n)-1)]`.
 /// Panics on an empty ascending-sorted input — callers use the [`latency_stats`]
 /// wrapper instead.
-pub fn percentile(sorted: &[u64], p: f64) -> u64 {
+fn percentile(sorted: &[u64], p: f64) -> u64 {
     assert!(!sorted.is_empty(), "percentile of empty");
     let n = sorted.len();
     let rank = ((p * n as f64).ceil() as usize).clamp(1, n);

@@ -32,9 +32,9 @@ use interflow_core::config::AuditConfig;
 use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker};
 use interflow_mesh::agent::client::AgentClient;
 use interflow_mesh::config::{
-    AGENT_CONFIG_VERSION, AclConfig, AgentTlsConfig as TlsConfig, AuthConfig, AuthMode,
-    ControlConfig, HUB_CONFIG_VERSION, HubConfig, HubQuicConfig, HubSecurityConfig, LoggingConfig,
-    SecurityConfig, ServerConfig, StaticTokenConfig,
+    AclConfig, AgentTlsConfig as TlsConfig, AuthConfig, AuthMode, ControlConfig,
+    HUB_CONFIG_VERSION, HubConfig, HubQuicConfig, HubSecurityConfig, LoggingConfig, ServerConfig,
+    StaticTokenConfig,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -50,12 +50,36 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 /// Default outer health-watch timeout over the internal agent, in seconds.
 /// Source of the CLI `--agent-recovery-timeout-secs` default.
 ///
-/// Sized above the hub's 75s eviction grace and the supervisor's 30s backoff
-/// cap combined: an agent struggling to reconnect inside this window is
-/// normal operation (no restart churn), while true supervisor silence beyond
-/// it means the recovery path itself is broken (the 2026-09-16 incident
-/// class) and only a process restart can help.
-pub const DEFAULT_AGENT_RECOVERY_TIMEOUT_SECS: u64 = 120;
+/// DERIVED, not hand-picked: the hub eviction dead line (75s at the default
+/// cadence) + the supervisor's 30s backoff cap + one connect attempt (15s) —
+/// see `interflow_core::config::params::liveness::recovery_budget`. An agent
+/// struggling to reconnect inside this window is normal operation (no
+/// restart churn), while true supervisor silence beyond it means the
+/// recovery path itself is broken (the 2026-09-16 incident class) and only a
+/// process restart can help.
+pub const DEFAULT_AGENT_RECOVERY_TIMEOUT_SECS: u64 =
+    interflow_core::config::params::liveness::recovery_budget(
+        &interflow_core::config::params::liveness::HeartbeatCadence::DEFAULT,
+    )
+    .as_secs();
+
+/// The effective recovery-watch timeout: 0/nonsense is floored to 1s, and an
+/// explicit override below the structural budget draws a loud warning — a
+/// struggling-but-healthy agent would be restarted in a loop.
+fn agent_recovery_timeout(args: &EdgeArgs) -> Duration {
+    let secs = args.agent_recovery_timeout_secs.max(1);
+    let budget = interflow_core::config::params::liveness::recovery_budget(
+        &interflow_core::config::params::liveness::HeartbeatCadence::DEFAULT,
+    );
+    if Duration::from_secs(secs) < budget {
+        tracing::warn!(
+            effective = secs,
+            structural_budget_secs = budget.as_secs(),
+            "--agent-recovery-timeout-secs is below the eviction+backoff budget;              a struggling internal agent will be restart-churned"
+        );
+    }
+    Duration::from_secs(secs)
+}
 
 /// Edge startup arguments.
 pub struct EdgeArgs {
@@ -247,9 +271,10 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
     //    failure.
     let route_breaker = args.route_breaker_enabled.then(|| {
         std::sync::Arc::new(interflow_mesh::agent::target_breaker::TargetBreakers::new(
-            interflow_mesh::agent::target_breaker::BreakerConfig {
+            interflow_mesh::agent::target_breaker::BreakerKind::Route,
+            interflow_core::config::params::BreakerPolicy {
                 failure_threshold: args.route_breaker_failure_threshold.max(1),
-                window: Duration::from_secs(args.route_breaker_window_secs.max(1)),
+                failure_window: Duration::from_secs(args.route_breaker_window_secs.max(1)),
                 cooldown: Duration::from_secs(args.route_breaker_cooldown_secs.max(1)),
             },
         ))
@@ -267,10 +292,7 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
     };
     let listener_task = listener.run();
     tokio::pin!(listener_task);
-    let agent_health = watch_agent_health(
-        &agent,
-        Duration::from_secs(args.agent_recovery_timeout_secs.max(1)),
-    );
+    let agent_health = watch_agent_health(&agent, agent_recovery_timeout(&args));
     tokio::pin!(agent_health);
     tokio::select! {
         res = &mut listener_task => Ok(res?),
@@ -370,15 +392,22 @@ pub async fn watch_agent_health(
             other => {
                 // Non-connected with a re-armed window: any further state
                 // change (the supervisor cycling) re-arms it again; only
-                // total silence trips.
-                if tokio::time::timeout(recovery_timeout, rx.changed())
-                    .await
-                    .is_err()
-                {
-                    return format!(
-                        "agent stayed in {other:?} with no state change for over \
-                         {recovery_timeout:?} — supervisor recovery presumed wedged"
-                    );
+                // total silence trips. A stream END here (changed()
+                // erroring rather than timing out) is a dead supervisor —
+                // before the 2026-09-16 hardening this branch spun on it
+                // in a hot loop instead of tripping the recovery.
+                match tokio::time::timeout(recovery_timeout, rx.changed()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
+                        return "agent state channel closed while not Connected — supervisor died"
+                            .to_string();
+                    }
+                    Err(_) => {
+                        return format!(
+                            "agent stayed in {other:?} with no state change for over \
+                             {recovery_timeout:?} — supervisor recovery presumed wedged"
+                        );
+                    }
                 }
             }
         }
@@ -412,19 +441,21 @@ fn build_hub_config(args: &EdgeArgs, audit_cfg: &AuditConfig) -> HubConfig {
                 enabled: true,
                 cert_path: t.cert_path.clone(),
                 key_path: t.key_path.clone(),
-                min_version: interflow_mesh::config::TlsVersion::V1_2,
+                min_version: interflow_core::tls::TlsMinVersion::V1_2,
             }),
         acl: AclConfig::default(),
         security: Default::default(),
         heartbeat: Default::default(),
-        routes: Default::default(),
         metrics: Default::default(),
         audit: audit_cfg.clone(),
         logging: LoggingConfig::default(),
-        quic: HubQuicConfig {
-            enabled: args.quic_listen.is_some(),
-            listen_addr: args.quic_listen,
-            ..HubQuicConfig::default()
+        transport: interflow_mesh::config::HubTransportConfig {
+            quic: HubQuicConfig {
+                enabled: args.quic_listen.is_some(),
+                listen_addr: args.quic_listen,
+                ..HubQuicConfig::default()
+            },
+            ..interflow_mesh::config::HubTransportConfig::default()
         },
     }
 }
@@ -459,36 +490,18 @@ fn build_edge_agent_config(
     };
 
     Ok(interflow_mesh::config::AgentConfig {
-        config_version: AGENT_CONFIG_VERSION,
         agent: interflow_mesh::config::AgentInfo {
             id: "edge".into(),
             hub_url: hub_url.to_string(),
-            transport: Default::default(),
-            hub_quic_addr: None,
             auth_token: Some(args.agent_token.clone()),
-            connect_timeout_secs: 15,
-            poll_idle_timeout_secs: None,
-            request_establish_timeout_secs: None,
+            ..interflow_mesh::config::AgentInfo::default()
         },
-        ingress: vec![],
-        egress: vec![],
-        egress_backend_write_timeout_secs: 10,
-        egress_resolve_timeout_secs: 5,
-        egress_connect_timeout_secs: 5,
-        max_incoming_streams: 256,
-        max_stream_opens_per_sec: 100,
-        stream_open_burst: 256,
-        egress_target_breaker_enabled: true,
-        egress_target_breaker_failure_threshold: 5,
-        egress_target_breaker_window_secs: 10,
-        egress_target_breaker_cooldown_secs: 30,
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()
         },
-        security: SecurityConfig::default(),
         tls,
-        logging: LoggingConfig::default(),
+        ..interflow_mesh::config::AgentConfig::default()
     })
 }
 

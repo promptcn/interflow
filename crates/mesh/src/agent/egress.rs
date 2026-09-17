@@ -62,14 +62,14 @@
 use crate::agent::control::{ControlOpError, EgressCommand};
 use crate::agent::ingress_udp::UDP_RECV_BUF;
 use crate::agent::rules::RuleStore;
-use crate::agent::target_breaker::{BreakerConfig, BreakerDecision, TargetBreakers};
+use crate::agent::target_breaker::{BreakerDecision, BreakerKind, TargetBreakers};
 use crate::config::{AgentConfig, EgressRule, SecurityConfig};
 use bytes::{Bytes, BytesMut};
+use interflow_core::config::params::BreakerPolicy;
 use interflow_core::error::{InterflowError, Result};
-use interflow_core::protocol::{FrameType, StreamProto};
+use interflow_core::protocol::{CloseReason, FrameType, StreamProto};
 use interflow_core::security::EventRateLimiter;
 use interflow_core::tunnel::{AgentTunnel, IncomingStream, TunnelData};
-use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -189,14 +189,24 @@ pub struct EgressPolicy {
     connect_timeout: Duration,
 }
 
-impl EgressPolicy {
-    pub fn from_config(config: &AgentConfig) -> Self {
+impl From<&AgentConfig> for EgressPolicy {
+    fn from(config: &AgentConfig) -> Self {
         Self {
-            backend_write_timeout: Duration::from_secs(
-                config.egress_backend_write_timeout_secs.max(1),
-            ),
-            resolve_timeout: Duration::from_secs(config.egress_resolve_timeout_secs.max(1)),
-            connect_timeout: Duration::from_secs(config.egress_connect_timeout_secs.max(1)),
+            // 0 is rejected at validation time (validate_agent) — no
+            // silent runtime clamping.
+            backend_write_timeout: Duration::from_secs(config.egress_backend_write_timeout_secs),
+            resolve_timeout: Duration::from_secs(config.egress_resolve_timeout_secs),
+            connect_timeout: Duration::from_secs(config.egress_connect_timeout_secs),
+        }
+    }
+}
+
+impl From<&AgentConfig> for BreakerPolicy {
+    fn from(config: &AgentConfig) -> Self {
+        Self {
+            failure_threshold: config.egress_target_breaker_failure_threshold,
+            failure_window: Duration::from_secs(config.egress_target_breaker_window_secs),
+            cooldown: Duration::from_secs(config.egress_target_breaker_cooldown_secs),
         }
     }
 }
@@ -230,11 +240,10 @@ pub struct EgressRuntime {
 impl EgressRuntime {
     pub fn from_config(config: &AgentConfig) -> Self {
         let breakers = config.egress_target_breaker_enabled.then(|| {
-            Arc::new(TargetBreakers::new(BreakerConfig {
-                failure_threshold: config.egress_target_breaker_failure_threshold.max(1),
-                window: Duration::from_secs(config.egress_target_breaker_window_secs.max(1)),
-                cooldown: Duration::from_secs(config.egress_target_breaker_cooldown_secs.max(1)),
-            }))
+            Arc::new(TargetBreakers::new(
+                BreakerKind::Egress,
+                BreakerPolicy::from(config),
+            ))
         });
         Self {
             max_incoming_streams: config.max_incoming_streams,
@@ -271,64 +280,6 @@ pub struct EgressHandler {
     /// Request-direction new-stream events (handed over by dispatch,
     /// take-once).
     incoming: mpsc::Receiver<IncomingStream>,
-}
-
-/// Forwarder exit reason (the reason tag of
-/// `interflow_egress_stream_closed_total`; the open-drop counter
-/// `interflow_agent_open_dropped_total` reuses the same values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CloseReason {
-    /// No matching egress rule.
-    NoTarget,
-    /// Denied by security policy (allowed_targets / SSRF blocklist).
-    SecurityDenied,
-    /// Dialing the backend failed (resolve / connect / handshake).
-    ConnectFailed,
-    /// Close frame from the peer (normal close, no echo).
-    CloseFrame,
-    /// Backend write timeout.
-    BackendWriteTimeout,
-    /// Backend connection closed / EOF.
-    BackendClosed,
-    /// Dispatch poisoned (consumer stalled past its timeout).
-    DispatchPoison,
-    /// Stream-open rate limit.
-    RateLimited,
-    /// Per-target circuit breaker OPEN (connect-phase failures clustered on
-    /// this target; rejected pre-dial without consuming the open budget).
-    TargetCircuitOpen,
-    /// Local concurrent stream cap.
-    LocalLimit,
-    /// UDP forwarder idle timeout.
-    UdpIdle,
-    /// Session end (token cancelled): no Close echo (the tunnel is dead);
-    /// local release only.
-    SessionClosed,
-}
-
-impl CloseReason {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::NoTarget => "no_target",
-            Self::SecurityDenied => "security_denied",
-            Self::ConnectFailed => "connect_failed",
-            Self::CloseFrame => "close_frame",
-            Self::BackendWriteTimeout => "backend_write_timeout",
-            Self::BackendClosed => "backend_closed",
-            Self::DispatchPoison => "dispatch_poison",
-            Self::RateLimited => "rate_limited",
-            Self::TargetCircuitOpen => "target_circuit_open",
-            Self::LocalLimit => "local_limit",
-            Self::UdpIdle => "udp_idle",
-            Self::SessionClosed => "session_closed",
-        }
-    }
-}
-
-impl fmt::Display for CloseReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// Exit categories of the read task (backend -> hub): the basis on which the
@@ -614,7 +565,7 @@ impl EgressHandler {
         {
             metrics::counter!(
                 "interflow_agent_open_dropped_total",
-                "reason" => CloseReason::TargetCircuitOpen.as_str()
+                "reason" => CloseReason::TargetCircuitOpen.to_string()
             )
             .increment(1);
             debug!(
@@ -641,7 +592,7 @@ impl EgressHandler {
         {
             metrics::counter!(
                 "interflow_agent_open_dropped_total",
-                "reason" => CloseReason::RateLimited.as_str()
+                "reason" => CloseReason::RateLimited.to_string()
             )
             .increment(1);
             warn!(
@@ -666,7 +617,7 @@ impl EgressHandler {
         {
             metrics::counter!(
                 "interflow_agent_open_dropped_total",
-                "reason" => CloseReason::LocalLimit.as_str()
+                "reason" => CloseReason::LocalLimit.to_string()
             )
             .increment(1);
             warn!(
@@ -1105,7 +1056,7 @@ impl EgressHandler {
         echo_close: bool,
         active: &AtomicUsize,
     ) {
-        metrics::counter!("interflow_egress_stream_closed_total", "reason" => reason.as_str())
+        metrics::counter!("interflow_egress_stream_closed_total", "reason" => reason.to_string())
             .increment(1);
         active.fetch_sub(1, Ordering::Relaxed);
         metrics::gauge!("interflow_agent_incoming_streams_active").decrement(1.0);
@@ -1288,7 +1239,7 @@ impl EgressHandler {
                                         }
                                         metrics::counter!("interflow_udp_egress_datagrams_tx")
                                             .increment(1);
-                                        *last_active.lock().unwrap_or_else(poisoned) = Instant::now();
+                                        *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                                     }
                                     FrameType::Close => {
                                         peer_closed.store(true, Ordering::Relaxed);
@@ -1353,7 +1304,7 @@ impl EgressHandler {
                                     }
                                     metrics::counter!("interflow_udp_egress_datagrams_rx")
                                         .increment(1);
-                                    *last_active.lock().unwrap_or_else(poisoned) = Instant::now();
+                                    *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                                 }
                                 Err(e) => {
                                     warn!("UDP recv from backend error: {e}");
@@ -1378,7 +1329,7 @@ impl EgressHandler {
                 Session,
             }
             let deadline = tokio::time::Instant::from_std(
-                *last_active.lock().unwrap_or_else(poisoned) + idle_timeout,
+                *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) + idle_timeout,
             );
             let mut read_task = read_task;
             let mut write_task = write_task;
@@ -1499,10 +1450,6 @@ impl EgressHandler {
         }
         false
     }
-}
-
-fn poisoned<T>(e: std::sync::PoisonError<T>) -> T {
-    e.into_inner()
 }
 
 #[cfg(test)]

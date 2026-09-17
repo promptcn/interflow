@@ -7,11 +7,12 @@
 
 use crate::certs::TestCerts;
 use interflow_core::protocol::StreamProto;
+use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
-    AGENT_CONFIG_VERSION, AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig,
-    AuthMode, ControlConfig, EgressRule, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig,
-    HubQuicConfig, HubSecurityConfig, HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig,
-    SecurityConfig, ServerConfig, TlsVersion, TransportKind,
+    AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, AuthMode,
+    ControlConfig, EgressRule, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig, HubQuicConfig,
+    HubSecurityConfig, HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig, ServerConfig,
+    TransportKind,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -39,7 +40,7 @@ pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) ->
             enabled: true,
             cert_path: certs.server_cert_path().display().to_string(),
             key_path: certs.server_key_path().display().to_string(),
-            min_version: TlsVersion::V1_3,
+            min_version: TlsMinVersion::V1_3,
         }),
         acl: AclConfig {
             rules: vec![
@@ -59,7 +60,6 @@ pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) ->
         },
         security: HubSecurityConfig::default(),
         heartbeat: HeartbeatConfig::default(),
-        routes: Default::default(),
         metrics: MetricsConfig {
             enabled: true,
             listen_addr: metrics,
@@ -73,10 +73,13 @@ pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) ->
             level: "info,interflow_core=debug,interflow_mesh=debug".to_string(),
             format: interflow_mesh::config::LogFormat::Plain,
         },
-        quic: HubQuicConfig {
-            enabled: true,
-            listen_addr: None,
-            ..HubQuicConfig::default()
+        transport: interflow_mesh::config::HubTransportConfig {
+            quic: HubQuicConfig {
+                enabled: true,
+                listen_addr: None,
+                ..HubQuicConfig::default()
+            },
+            ..interflow_mesh::config::HubTransportConfig::default()
         },
     }
 }
@@ -159,34 +162,19 @@ fn base_agent_config(
     certs: &TestCerts,
 ) -> AgentConfig {
     AgentConfig {
-        config_version: AGENT_CONFIG_VERSION,
         agent: AgentInfo {
             id: id.to_string(),
             hub_url: format!("http://{hub_endpoint}"),
             transport,
             hub_quic_addr: (transport == TransportKind::Quic).then(|| hub_endpoint.to_string()),
-            auth_token: None,
-            connect_timeout_secs: 10, // handshake retransmit headroom under packet loss
-            poll_idle_timeout_secs: None, // derived from the negotiation (105s watchdog) — gate criterion
-            request_establish_timeout_secs: None,
+            // handshake retransmit headroom under packet loss
+            connect_timeout_secs: 10,
+            ..AgentInfo::default()
         },
-        ingress: vec![],
-        egress: vec![],
-        egress_backend_write_timeout_secs: 10,
-        egress_resolve_timeout_secs: 5,
-        egress_connect_timeout_secs: 5,
-        max_incoming_streams: 256,
-        max_stream_opens_per_sec: 100,
-        stream_open_burst: 256,
-        egress_target_breaker_enabled: true,
-        egress_target_breaker_failure_threshold: 5,
-        egress_target_breaker_window_secs: 10,
-        egress_target_breaker_cooldown_secs: 30,
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()
         },
-        security: SecurityConfig::default(),
         tls: Some(AgentTlsConfig {
             enabled: true,
             ca_path: Some(certs.ca_path().display().to_string()),
@@ -201,6 +189,7 @@ fn base_agent_config(
             level: "info,interflow_core=debug,interflow_mesh=debug".to_string(),
             format: interflow_mesh::config::LogFormat::Plain,
         },
+        ..AgentConfig::default()
     }
 }
 
@@ -225,12 +214,15 @@ pub struct MeshProcess {
 }
 
 /// Spawn a mesh subprocess; stdout/stderr are appended to `log_path`.
+/// `extra_env` is applied on top of the inherited environment (the fault
+/// plan var for agent fault-injection phases).
 pub fn spawn_mesh(
     bin: &Path,
     subcommand: &str,
     config_path: &Path,
     log_path: &Path,
     name: &'static str,
+    extra_env: &[(&str, &str)],
 ) -> Result<MeshProcess, String> {
     let open = || {
         std::fs::OpenOptions::new()
@@ -238,10 +230,12 @@ pub fn spawn_mesh(
             .append(true)
             .open(log_path)
     };
-    let child = Command::new(bin)
-        .arg(subcommand)
-        .arg("--config")
-        .arg(config_path)
+    let mut cmd = Command::new(bin);
+    cmd.arg(subcommand).arg("--config").arg(config_path);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(
             open().map_err(|e| format!("open log: {e}"))?,
@@ -390,7 +384,7 @@ mod tests {
         assert_eq!(loaded.metrics.listen_addr, metrics);
         assert!(loaded.metrics.enabled);
         assert!(loaded.tls.as_ref().is_some_and(|t| t.enabled));
-        assert!(loaded.quic.enabled);
+        assert!(loaded.transport.quic.enabled);
         assert!(loaded.heartbeat.enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -103,7 +103,7 @@ fn apply_edit(path: &Path, edit: &RuleEdit) -> Result<()> {
     let original = std::fs::read_to_string(path)?;
     let mut doc: toml_edit::DocumentMut = original
         .parse()
-        .map_err(|e| InterflowError::config(format!("config file parse failed: {e}")))?;
+        .map_err(|e| InterflowError::config("config file parse failed").with_source(e))?;
 
     let section = edit.section();
     match edit {
@@ -127,7 +127,7 @@ fn apply_edit(path: &Path, edit: &RuleEdit) -> Result<()> {
 /// order).
 fn rule_as_table<T: Serialize>(rule: &T) -> Result<toml_edit::Table> {
     let doc = toml_edit::ser::to_document(rule)
-        .map_err(|e| InterflowError::config(format!("rule serialization failed: {e}")))?;
+        .map_err(|e| InterflowError::config("rule serialization failed").with_source(e))?;
     let mut table = toml_edit::Table::new();
     for (key, item) in doc.iter() {
         table.insert(key, item.clone());

@@ -20,7 +20,9 @@ use tracing::{error, info, warn};
 /// closes it) — without this upper bound the write task would hang forever
 /// in `write_all`, and the poison signal (channel closed) would never be
 /// consumed.
-const CLIENT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+// Single-sourced with the expose edge listener (core transport profile).
+const CLIENT_WRITE_STALL_TIMEOUT: Duration =
+    interflow_core::config::params::DEFAULT_CLIENT_WRITE_STALL_TIMEOUT;
 
 /// Global concurrent-connection cap per ingress rule. Combined with
 /// ulimit -n, guards against a connection flood exhausting the scheduler
@@ -160,7 +162,7 @@ impl IngressHandler {
                 // Compensation: the store's memory was untouched (the
                 // persist-first step failed); restart the listener from the
                 // original rule
-                match self.store.get_ingress(name).await {
+                match self.store.find_ingress(name).await {
                     Some(rule) => {
                         if let Err(e2) = self.start_listener(rule).await {
                             error!(
@@ -341,9 +343,6 @@ impl IngressHandler {
                 write_stall_counter: "interflow_ingress_client_write_stall",
                 log_label: "ingress",
             },
-            // The mesh ingress has no consumer for the peer's close reason
-            // (no route-level negative caching on this plane).
-            None,
         )
         .await;
 

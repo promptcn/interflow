@@ -90,6 +90,10 @@ pub(crate) async fn handle_connection(
         guard.clone()
     };
 
+    // Per-connection snapshot of the transport tuning (hot-reload friendly:
+    // a SIGHUP applies to connections accepted afterwards).
+    let h2_transport = ctx.config.read().await.transport.h2.clone();
+
     if let Some(acceptor) = acceptor {
         match acceptor.accept(stream).await {
             Ok(tls_stream) => {
@@ -101,7 +105,7 @@ pub(crate) async fn handle_connection(
                     *guard = Some(cn);
                 }
 
-                let conn = h2_builder().serve_connection(
+                let conn = h2_builder(&h2_transport).serve_connection(
                     TokioIo::new(tls_stream),
                     HubService::new(ctx.clone(), addr, connection_identity),
                 );
@@ -113,7 +117,7 @@ pub(crate) async fn handle_connection(
             }
         }
     } else {
-        let conn = h2_builder().serve_connection(
+        let conn = h2_builder(&h2_transport).serve_connection(
             TokioIo::new(stream),
             HubService::new(ctx.clone(), addr, connection_identity),
         );
@@ -122,15 +126,22 @@ pub(crate) async fn handle_connection(
     Ok(())
 }
 
-/// Common parameters for serving an h2 connection (shared by the TLS/plain branches).
-fn h2_builder() -> http2::Builder<TokioExecutor> {
+/// Common parameters for serving an h2 connection (shared by the TLS/plain
+/// branches). The keepalive pair comes from `[transport.h2]` — the same
+/// schema and defaults the agent side uses (endpoint-symmetric since schema
+/// v3; previously hard-coded and asymmetric, 10s/20s here vs 5s/10s there).
+fn h2_builder(transport: &crate::config::H2TransportConfig) -> http2::Builder<TokioExecutor> {
     let mut builder = http2::Builder::new(TokioExecutor::new());
     builder
         .timer(TokioTimer::new())
-        .keep_alive_interval(std::time::Duration::from_secs(10))
-        .keep_alive_timeout(std::time::Duration::from_secs(20))
-        .initial_stream_window_size(crate::hub::H2_INITIAL_STREAM_WINDOW)
-        .initial_connection_window_size(crate::hub::H2_INITIAL_CONNECTION_WINDOW);
+        .keep_alive_interval(transport.keepalive_interval())
+        .keep_alive_timeout(transport.keepalive_timeout())
+        .initial_stream_window_size(
+            interflow_core::config::params::transport::DEFAULT_H2_STREAM_WINDOW,
+        )
+        .initial_connection_window_size(
+            interflow_core::config::params::transport::DEFAULT_H2_CONNECTION_WINDOW,
+        );
     builder
 }
 

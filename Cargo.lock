@@ -2376,7 +2376,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-core"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2391,6 +2391,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "quinn",
+ "rcgen",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -2410,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-expose"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2449,7 +2450,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-gui"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "interflow-expose",
  "interflow-mesh",
@@ -2468,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-mesh"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2511,12 +2512,14 @@ dependencies = [
 
 [[package]]
 name = "interflow-testkit"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
  "interflow-core",
  "interflow-mesh",
+ "metrics",
+ "metrics-exporter-prometheus",
  "rand 0.9.5",
  "rcgen",
  "serde",
@@ -2524,6 +2527,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

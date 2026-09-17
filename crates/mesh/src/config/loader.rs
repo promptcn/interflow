@@ -27,7 +27,7 @@ pub fn load_hub_config<P: AsRef<Path>>(path: P) -> Result<HubConfig> {
         .map_err(|e| InterflowError::config(format!("cannot read config file: {e}")))?;
 
     let mut config: HubConfig = toml::from_str(&content)
-        .map_err(|e| InterflowError::config(format!("config parse error: {e}")))?;
+        .map_err(|e| InterflowError::config("config parse error").with_source(e))?;
 
     let base = config_base_dir(&cfg_path);
     resolve_hub_secrets(&mut config, &base)?;
@@ -46,7 +46,7 @@ pub fn load_agent_config<P: AsRef<Path>>(path: P) -> Result<AgentConfig> {
         .map_err(|e| InterflowError::config(format!("cannot read config file: {e}")))?;
 
     let mut config: AgentConfig = toml::from_str(&content)
-        .map_err(|e| InterflowError::config(format!("config parse error: {e}")))?;
+        .map_err(|e| InterflowError::config("config parse error").with_source(e))?;
 
     let base = config_base_dir(&cfg_path);
     resolve_agent_secrets(&mut config, &base)?;
@@ -86,28 +86,39 @@ fn normalize_agent(cfg: &mut AgentConfig) {
     }
 }
 
+/// Applies a fallible transform to `field`'s inner value when present
+/// (secret expansion); `None` passes through unchanged.
+fn try_map_opt<T>(field: &mut Option<T>, f: impl FnOnce(&T) -> Result<T>) -> Result<()> {
+    if let Some(v) = field.as_ref() {
+        *field = Some(f(v)?);
+    }
+    Ok(())
+}
+
+/// Applies an infallible transform to `field`'s inner value when present
+/// (path anchoring); `None` passes through unchanged.
+fn map_opt<T>(field: &mut Option<T>, f: impl FnOnce(&T) -> T) {
+    if let Some(v) = field.as_ref() {
+        *field = Some(f(v));
+    }
+}
+
 /// Expands all `${ENV}` / `@file:` references in the hub configuration's
 /// secret / path fields. Relative `@file:` references resolve against the
 /// config file's directory.
 fn resolve_hub_secrets(cfg: &mut HubConfig, base: &Path) -> Result<()> {
     if let Some(static_token) = cfg.auth.static_token.as_mut() {
-        if let Some(token) = static_token.agent.take() {
-            static_token.agent = Some(maybe_resolve(&token, Some(base))?);
-        }
-        if let Some(token) = static_token.admin.take() {
-            static_token.admin = Some(maybe_resolve(&token, Some(base))?);
-        }
+        try_map_opt(&mut static_token.agent, |t| maybe_resolve(t, base))?;
+        try_map_opt(&mut static_token.admin, |t| maybe_resolve(t, base))?;
     }
     if let Some(mtls) = cfg.auth.mtls.as_mut() {
-        mtls.ca_path = maybe_resolve(&mtls.ca_path, Some(base))?;
+        mtls.ca_path = maybe_resolve(&mtls.ca_path, base)?;
     }
     if let Some(tls) = cfg.tls.as_mut() {
-        tls.cert_path = maybe_resolve(&tls.cert_path, Some(base))?;
-        tls.key_path = maybe_resolve(&tls.key_path, Some(base))?;
+        tls.cert_path = maybe_resolve(&tls.cert_path, base)?;
+        tls.key_path = maybe_resolve(&tls.key_path, base)?;
     }
-    if let Some(path) = cfg.audit.path.take() {
-        cfg.audit.path = Some(maybe_resolve(&path, Some(base))?);
-    }
+    try_map_opt(&mut cfg.audit.path, |p| maybe_resolve(p, base))?;
     Ok(())
 }
 
@@ -122,31 +133,19 @@ fn anchor_hub_paths(cfg: &mut HubConfig, base: &Path) {
         tls.cert_path = anchor(base, &tls.cert_path);
         tls.key_path = anchor(base, &tls.key_path);
     }
-    if let Some(path) = cfg.audit.path.take() {
-        cfg.audit.path = Some(anchor(base, &path));
-    }
+    map_opt(&mut cfg.audit.path, |p| anchor(base, p));
 }
 
 /// Expands all `${ENV}` / `@file:` references in the agent configuration's
 /// secret / path fields. Relative `@file:` references resolve against the
 /// config file's directory.
 fn resolve_agent_secrets(cfg: &mut AgentConfig, base: &Path) -> Result<()> {
-    if let Some(token) = cfg.agent.auth_token.take() {
-        cfg.agent.auth_token = Some(maybe_resolve(&token, Some(base))?);
-    }
-    if let Some(token) = cfg.control.auth_token.take() {
-        cfg.control.auth_token = Some(maybe_resolve(&token, Some(base))?);
-    }
+    try_map_opt(&mut cfg.agent.auth_token, |t| maybe_resolve(t, base))?;
+    try_map_opt(&mut cfg.control.auth_token, |t| maybe_resolve(t, base))?;
     if let Some(tls) = cfg.tls.as_mut() {
-        if let Some(p) = tls.ca_path.take() {
-            tls.ca_path = Some(maybe_resolve(&p, Some(base))?);
-        }
-        if let Some(p) = tls.client_cert_path.take() {
-            tls.client_cert_path = Some(maybe_resolve(&p, Some(base))?);
-        }
-        if let Some(p) = tls.client_key_path.take() {
-            tls.client_key_path = Some(maybe_resolve(&p, Some(base))?);
-        }
+        try_map_opt(&mut tls.ca_path, |p| maybe_resolve(p, base))?;
+        try_map_opt(&mut tls.client_cert_path, |p| maybe_resolve(p, base))?;
+        try_map_opt(&mut tls.client_key_path, |p| maybe_resolve(p, base))?;
     }
     Ok(())
 }
@@ -154,15 +153,9 @@ fn resolve_agent_secrets(cfg: &mut AgentConfig, base: &Path) -> Result<()> {
 /// Agent-side equivalent of [`anchor_hub_paths`].
 fn anchor_agent_paths(cfg: &mut AgentConfig, base: &Path) {
     if let Some(tls) = cfg.tls.as_mut() {
-        if let Some(p) = tls.ca_path.take() {
-            tls.ca_path = Some(anchor(base, &p));
-        }
-        if let Some(p) = tls.client_cert_path.take() {
-            tls.client_cert_path = Some(anchor(base, &p));
-        }
-        if let Some(p) = tls.client_key_path.take() {
-            tls.client_key_path = Some(anchor(base, &p));
-        }
+        map_opt(&mut tls.ca_path, |p| anchor(base, p));
+        map_opt(&mut tls.client_cert_path, |p| anchor(base, p));
+        map_opt(&mut tls.client_key_path, |p| anchor(base, p));
     }
 }
 
@@ -181,7 +174,7 @@ mod tests {
             std::fs::write(certs.join(name), b"dummy").unwrap();
         }
         let toml = r#"
-config_version = 2
+config_version = 3
 
 [server]
 listen_addr = "127.0.0.1:16666"
@@ -250,7 +243,7 @@ path = "./audit.jsonl"
         std::fs::create_dir_all(&certs).unwrap();
         std::fs::write(certs.join("ca.crt"), b"dummy").unwrap();
         let toml = r#"
-config_version = 2
+config_version = 3
 
 [agent]
 id = "agent-x"

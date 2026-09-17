@@ -29,18 +29,6 @@ pub mod service;
 pub mod state;
 pub mod upload;
 
-/// Initial h2 stream flow-control window (set symmetrically on the agent client
-/// and the hub server).
-///
-/// hyper's default 64KiB stream window turns single-stream throughput for
-/// streamed upload/download into a window bottleneck (BDP-bound); 2MiB covers
-/// a bandwidth-delay product on the order of ~300Mbps@50ms.
-/// Introduced 2026-09-12 with upload streaming (`/stream/up`).
-pub const H2_INITIAL_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
-/// Initial h2 connection flow-control window (introduced in the same batch as
-/// [`H2_INITIAL_STREAM_WINDOW`]).
-pub const H2_INITIAL_CONNECTION_WINDOW: u32 = 4 * 1024 * 1024;
-
 pub use server::HubServer;
 pub use state::{
     ActiveStream, AgentSession, HubCore, HubHandles, HubLimits, QuicAgentConn, SharedActiveStreams,

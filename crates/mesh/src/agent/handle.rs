@@ -63,6 +63,7 @@ pub struct AgentHandle {
 }
 
 /// Context used inside the supervisor to emit state/events.
+#[derive(Clone)]
 pub(crate) struct EventSink {
     pub(crate) state_tx: watch::Sender<AgentState>,
     pub(crate) event_tx: mpsc::Sender<AgentEvent>,
@@ -122,6 +123,21 @@ impl AgentHandle {
         self.state_rx.clone()
     }
 
+    /// Whether the supervisor task has ended (for any reason).
+    ///
+    /// The embedder dead-supervisor contract: the state watch stream ending
+    /// (`changed()` erroring) means the supervisor is gone; the final
+    /// state tells which case it was —
+    /// - `Stopped` / `Failed { .. }`: a legitimate end (user shutdown /
+    ///   fatal config); no recovery action.
+    /// - anything else (typically frozen at `Connecting`/`Reconnecting`):
+    ///   the supervisor died unexpectedly — the embedder owns recovery
+    ///   (GUI: bounded auto-restart per [`SupervisorRestartPolicy`];
+    ///   edge: process exit for systemd).
+    pub fn is_finished(&self) -> bool {
+        self.join.is_finished()
+    }
+
     /// Event-stream receiving end (single consumer: the CLI event pump /
     /// GUI event pump).
     ///
@@ -161,21 +177,25 @@ impl AgentHandle {
     }
 }
 
-/// Exponential backoff + full jitter, capped at 30s. After the n-th
-/// consecutive failure, sleep `rand(1..=min(2^n, 30))` seconds.
+/// Exponential backoff + full jitter, capped at [`BACKOFF_CAP`] (30s,
+/// single-sourced in core params — the hub's `poll_grace_secs` validation
+/// and the edge recovery budget are derived against the same constant).
+/// After the n-th consecutive failure, sleep `rand(1..=min(2^n, 30))`
+/// seconds.
 ///
 /// "Consecutive" is maintained by the supervisor: `attempt` resets to 1
 /// whenever a session was established before ending, and only grows while
 /// connection attempts keep failing outright (see `AgentClient::supervise`).
 pub(crate) fn backoff_duration(attempt: u32) -> Duration {
-    let cap_secs: u64 = 30;
+    use interflow_core::config::params::liveness::{BACKOFF_CAP, BACKOFF_FLOOR};
+    let cap_secs = BACKOFF_CAP.as_secs();
     let exp = attempt.min(6); // 2^6 = 64 > 30; anything larger is capped anyway
-    let max = cap_secs.min(1_u64 << exp).max(1);
+    let max = cap_secs.min(1_u64 << exp).max(BACKOFF_FLOOR.as_secs());
     // Use the top 64 bits of a v4 UUID as the random source (v4 is itself
     // random); the modulo result is < max <= 30, so no truncation risk.
     #[allow(clippy::cast_possible_truncation)]
     let rand = (uuid::Uuid::new_v4().as_u128() % u128::from(max)) as u64;
-    Duration::from_secs(rand.max(1))
+    Duration::from_secs(rand.max(BACKOFF_FLOOR.as_secs()))
 }
 
 #[cfg(test)]

@@ -5,11 +5,12 @@
 
 use crate::certs::TestCerts;
 use interflow_core::protocol::StreamProto;
+use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
-    AGENT_CONFIG_VERSION, AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig,
-    AuthMode, ControlConfig, EgressRule, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig,
-    HubQuicConfig, HubSecurityConfig, HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig,
-    SecurityConfig, ServerConfig, StaticTokenConfig, TlsVersion, TransportKind,
+    AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, AuthMode,
+    ControlConfig, EgressRule, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig, HubQuicConfig,
+    HubSecurityConfig, HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig, ServerConfig,
+    StaticTokenConfig, TransportKind,
 };
 use std::net::SocketAddr;
 
@@ -59,11 +60,10 @@ pub fn hub_config_tuned(
         },
         security,
         heartbeat,
-        routes: Default::default(),
         metrics: MetricsConfig::default(),
         audit: Default::default(),
         logging: LoggingConfig::default(),
-        quic: Default::default(),
+        transport: Default::default(),
     }
 }
 
@@ -94,11 +94,10 @@ pub fn hub_config_with_token(
         acl: AclConfig::default(),
         security: HubSecurityConfig::default(),
         heartbeat: HeartbeatConfig::default(),
-        routes: Default::default(),
         metrics: MetricsConfig::default(),
         audit: Default::default(),
         logging: LoggingConfig::default(),
-        quic: Default::default(),
+        transport: Default::default(),
     }
 }
 
@@ -110,9 +109,9 @@ pub fn hub_quic_config(listen_port: u16, certs: &TestCerts, acl_rules: Vec<AclRu
         enabled: true,
         cert_path: certs.server_cert_path().display().to_string(),
         key_path: certs.server_key_path().display().to_string(),
-        min_version: TlsVersion::V1_3,
+        min_version: TlsMinVersion::V1_3,
     });
-    cfg.quic = HubQuicConfig {
+    cfg.transport.quic = HubQuicConfig {
         enabled: true,
         // Default: same port as TCP (TCP/UDP coexist independently)
         listen_addr: None,
@@ -132,39 +131,23 @@ pub fn unlock_stream_limits(cfg: &mut HubConfig) {
 /// Build a minimal startable agent config (h2, anonymous, warn-level logs).
 pub fn agent_config(id: &str, hub_port: u16) -> AgentConfig {
     AgentConfig {
-        config_version: AGENT_CONFIG_VERSION,
         agent: AgentInfo {
             id: id.to_string(),
             hub_url: format!("http://127.0.0.1:{hub_port}"),
-            transport: TransportKind::H2,
-            hub_quic_addr: None,
-            auth_token: None,
+            // Test-only override: a shorter connect budget keeps failure
+            // cases at second scale (production default is 15s).
             connect_timeout_secs: 5,
-            poll_idle_timeout_secs: None,
-            request_establish_timeout_secs: None,
+            ..AgentInfo::default()
         },
-        ingress: vec![],
-        egress: vec![],
-        egress_backend_write_timeout_secs: 10,
-        egress_resolve_timeout_secs: 5,
-        egress_connect_timeout_secs: 5,
-        max_incoming_streams: 256,
-        max_stream_opens_per_sec: 100,
-        stream_open_burst: 256,
-        egress_target_breaker_enabled: true,
-        egress_target_breaker_failure_threshold: 5,
-        egress_target_breaker_window_secs: 10,
-        egress_target_breaker_cooldown_secs: 30,
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()
         },
-        security: SecurityConfig::default(),
-        tls: None,
         logging: LoggingConfig {
             level: "warn".to_string(), // reduce log noise by default in tests
             format: interflow_mesh::config::LogFormat::Plain,
         },
+        ..AgentConfig::default()
     }
 }
 

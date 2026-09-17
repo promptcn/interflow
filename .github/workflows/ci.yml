@@ -44,6 +44,9 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast
 
+      - name: config-reference drift check
+        run: python3 scripts/check_config_reference.py
+
   gui:
     name: gui (tauri)
     runs-on: ubuntu-24.04

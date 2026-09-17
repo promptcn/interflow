@@ -1,6 +1,6 @@
-# Agent-1 configuration (v2)
+# Agent-1 configuration (v3)
 
-config_version = 2
+config_version = 3
 
 [agent]
 id = "agent-1"
@@ -11,6 +11,18 @@ auth_token = "${INTERFLOW_AGENT_TOKEN:-dev-only-agent-token}"
 [tls]
 enabled = true
 ca_path = "certs/ca.crt"
+
+# Transport-layer tuning — the SAME schema the hub exposes
+# ([transport.h2] / [transport.quic]); both ends of a link share the same
+# defaults. QUIC negotiates the idle timeout as the endpoints' minimum, so
+# raise both sides together (one side alone has no effect).
+# [transport.h2]
+# keepalive_interval_secs = 5
+# keepalive_timeout_secs = 10
+#
+# [transport.quic]
+# max_idle_timeout_ms = 30000
+# keepalive_interval_ms = 10000
 
 [control]
 enabled = true

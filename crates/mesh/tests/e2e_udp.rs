@@ -21,47 +21,15 @@
     dead_code,
     unused_mut
 )]
-use interflow_core::protocol::StreamProto;
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_mesh::config::{EgressRule, HeartbeatConfig, HubSecurityConfig, IngressRule};
 use interflow_testkit::{
     acl, agent_config, hub_config, hub_config_tuned, pick_ephemeral_port, spawn_agent, spawn_hub,
-    spawn_udp_echo, spawn_udp_echo_first_delayed, udp_client, udp_echo_round_trip,
-    udp_round_trip_once,
+    spawn_udp_echo, spawn_udp_echo_first_delayed, udp_client, udp_echo_round_trip, udp_egress_rule,
+    udp_ingress_rule, udp_round_trip_once,
 };
 use std::net::SocketAddr;
 use std::time::Duration;
-
-/// Build a UDP egress rule.
-fn udp_egress_rule(name: &str, target: SocketAddr) -> EgressRule {
-    EgressRule {
-        name: name.to_string(),
-        target_addr: target,
-        target_protocol: StreamProto::Udp,
-        udp_idle_timeout_secs: None,
-    }
-}
-
-/// Build a UDP ingress rule (default rate-limit parameters + optional
-/// overrides).
-fn udp_ingress_rule(
-    name: &str,
-    listen: SocketAddr,
-    target_agent: &str,
-    remote: Option<SocketAddr>,
-) -> IngressRule {
-    IngressRule {
-        name: name.to_string(),
-        listen_addr: listen,
-        listen_protocol: StreamProto::Udp,
-        target_agent: target_agent.to_string(),
-        remote_addr: remote.map(|a| a.to_string()),
-        idle_timeout_secs: None,
-        udp_per_ip_pps: 0,
-        udp_per_ip_bytes_per_sec: 0,
-        udp_egress_bytes_per_sec: 0,
-    }
-}
 
 fn random_payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 31 % 251) as u8).collect()

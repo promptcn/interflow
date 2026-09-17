@@ -45,7 +45,6 @@ const invoker = async <T>(cmd: string, args?: Record<string, unknown>): Promise<
 export const api = {
   loadProfile: () => invoker<Profile>("load_profile"),
   saveProfile: (profile: Profile) => invoker<void>("save_profile", { profile }),
-  profilePath: () => invoker<string>("profile_path"),
   generateAgentId: () => invoker<string>("generate_agent_id"),
   startTunnel: (config: TunnelConfig) => invoker<void>("start_tunnel", { config }),
   stopTunnel: () => invoker<void>("stop_tunnel"),

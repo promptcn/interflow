@@ -24,16 +24,17 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 
 pub mod backend;
 pub mod certs;
 pub mod config;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 pub mod impair;
 pub mod metrics;
+pub mod metrics_harness;
 pub mod soak;
 pub mod stack;
 

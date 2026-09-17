@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod hub;
 pub mod loader;
+pub mod transport;
 pub mod validate;
 
 pub use agent::{
@@ -11,10 +12,11 @@ pub use agent::{
 };
 pub use hub::{
     AclConfig, AclRule, AuthConfig, AuthMode, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig,
-    HubQuicConfig, HubSecurityConfig, MetricsConfig, MtlsConfig, ServerConfig, StaticTokenConfig,
-    TlsConfig as HubTlsConfig, TlsVersion,
+    HubQuicConfig, HubSecurityConfig, HubTransportConfig, MetricsConfig, MtlsConfig, ServerConfig,
+    StaticTokenConfig, TlsConfig as HubTlsConfig,
 };
 pub use interflow_core::config::LoggingConfig;
 pub use interflow_core::telemetry::LogFormat;
 pub use loader::{load_agent_config, load_hub_config};
+pub use transport::{AgentQuicConfig, H2TransportConfig};
 pub use validate::{ConfigError, ConfigErrorList, validate_agent, validate_hub};

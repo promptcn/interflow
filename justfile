@@ -31,7 +31,7 @@ bench-loss:
 # soak long-run guardrail (real process topology: hub/agent binaries + impairment proxy + six assertions;
 # run several rounds nightly / before releases. Smoke test: `just soak -- --quick`; see --help for options)
 soak:
-    cargo build --release -p interflow-mesh
+    cargo build --release -p interflow-mesh --features fault-injection
     cargo run --release -p interflow-testkit --bin soak
 
 # Check dependencies for vulnerabilities

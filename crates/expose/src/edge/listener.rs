@@ -15,17 +15,24 @@
 //! - `extract_host` rejects duplicate Host headers, validates characters, and enforces a length limit to prevent header injection
 //! - TCP_NODELAY immediately after accept to reduce small-packet latency
 //! - Route-level circuit breaker (2026-09-16): a route whose backend keeps
-//!   failing (agent close reasons `connect_failed`/`target_circuit_open`
-//!   within a window) is tripped — new public connections are closed right
-//!   after the Host lookup, **without** an Open through the tunnel, until a
-//!   recovery probe succeeds. One dead route's public retry loop therefore
-//!   stops at the internet edge instead of flooding hub + agent.
+//!   failing (agent close reasons within a window) is tripped — new public
+//!   connections are closed right after the Host lookup, **without** an Open
+//!   through the tunnel, until a recovery probe succeeds. One dead route's
+//!   public retry loop therefore stops at the internet edge instead of
+//!   flooding hub + agent.
+//! - Probe accounting (2026-09-17): recovery evidence must not depend on the
+//!   peer Close reason's arrival timing — an HTTP/1.1 keepalive client hangs
+//!   up first and the `backend_closed` token structurally never lands
+//!   (docs/bug/2026-09-17-edge-route-breaker-stuck-open.md). A probe that
+//!   relayed response bytes to the client without a failure reason is
+//!   therefore itself recovery evidence, classified by [`route_evidence`]
+//!   from the pump's locally-observed [`StreamOutcome`].
 
 use crate::edge::host_router::HostRouter;
-use interflow_core::protocol::StreamProto;
+use interflow_core::protocol::{CloseReason, StreamProto};
 use interflow_core::security::{AuditKind, AuditSink, AuthRateLimiter, ConnTracker};
 use interflow_core::tunnel::AgentTunnel;
-use interflow_core::tunnel::pump::{PumpConfig, pump_tcp_stream};
+use interflow_core::tunnel::pump::{PumpConfig, StreamOutcome, pump_tcp_stream};
 use interflow_mesh::agent::target_breaker::{BreakerDecision, TargetBreakers};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,12 +41,53 @@ use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
-/// Agent close reasons that count as backend-down evidence for the route
-/// breaker (`CloseReason::as_str()` tokens from the egress forwarder).
-const ROUTE_FAILURE_REASONS: [&str; 2] = ["connect_failed", "target_circuit_open"];
-/// Agent close reasons that count as backend-up evidence (a normal
-/// backend EOF means the dial and the conversation both worked).
-const ROUTE_SUCCESS_REASONS: [&str; 1] = ["backend_closed"];
+/// What a finished public connection proves about its route's health — the
+/// single classification authority feeding the route breaker.
+///
+/// Direct evidence (`connect_failed` — the dial itself failed) re-arms;
+/// derivative evidence (`target_circuit_open` — the agent's own breaker
+/// reacted) counts toward tripping but must never extend an outage (the
+/// §3.3 interlock of the 2026-09-17 case file: two breaker layers feeding
+/// each other's cooldowns lock each other open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteEvidence {
+    /// Direct backend-down proof: counts toward tripping, re-arms an OPEN
+    /// entry.
+    Failure,
+    /// Derivative backend-down signal (the agent's breaker, not the
+    /// backend): counts toward tripping while CLOSED, never re-arms.
+    DerivativeFailure,
+    /// Backend-up proof: clears a tripped route.
+    Recovery,
+    /// Proves nothing (client aborts, ordinary closes, rate limits) — no
+    /// breaker transition.
+    Neutral,
+}
+
+/// Classifies one finished connection's [`StreamOutcome`] into
+/// [`RouteEvidence`].
+///
+/// `probe`: this connection was admitted as the OPEN breaker's recovery
+/// probe of the interval ([`BreakerDecision::Probe`]). The
+/// `probe && response_relayed` arm is the structural fix for the stuck-OPEN
+/// bug: response bytes reaching the client socket is observed **locally by
+/// the pump**, immune to the cross-hop race that loses the peer's Close
+/// reason — while a bare connect-and-abort (no bytes relayed) still proves
+/// nothing, so transient client noise cannot clear a tripped route.
+const fn route_evidence(outcome: &StreamOutcome, probe: bool) -> RouteEvidence {
+    match outcome.close_reason {
+        // The dial itself failed: direct backend-down evidence.
+        Some(CloseReason::ConnectFailed) => RouteEvidence::Failure,
+        // The agent's own breaker rejected pre-dial: derivative evidence.
+        Some(CloseReason::TargetCircuitOpen) => RouteEvidence::DerivativeFailure,
+        // A clean backend EOF proves the dial and the conversation both worked.
+        Some(CloseReason::BackendClosed) => RouteEvidence::Recovery,
+        // No failure token + a probe that actually served bytes: the backend
+        // dialed and answered through to the client.
+        _ if probe && outcome.response_relayed => RouteEvidence::Recovery,
+        _ => RouteEvidence::Neutral,
+    }
+}
 
 /// Maximum number of bytes read per connection while looking for the Host
 /// header (HTTP/1.x request headers are typically < 8KB).
@@ -51,7 +99,9 @@ const HOST_MAX_LEN: usize = 255;
 /// of the dispatch response direction (channel closed when full) — without this
 /// upper bound, the write task would hang forever in `write_all` and the poison
 /// signal (channel close) would never be consumed.
-const CLIENT_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+// Single-sourced with the mesh ingress response path (core transport profile).
+const CLIENT_WRITE_STALL_TIMEOUT: Duration =
+    interflow_core::config::params::DEFAULT_CLIENT_WRITE_STALL_TIMEOUT;
 
 /// Edge public (internet-facing) listener.
 pub struct EdgeListener {
@@ -244,10 +294,12 @@ async fn handle_connection(
     // Route-level breaker gate: a tripped route is closed right here — no
     // register, no Open, no tunnel round trip. Same public behavior as an
     // agent-side rejection (fast zero-byte close; the fronting nginx
-    // surfaces 502), but the storm stops at the internet edge.
-    if let Some(breaker) = route_breaker
-        && breaker.check(&host) == BreakerDecision::Reject
-    {
+    // surfaces 502), but the storm stops at the internet edge. The verdict
+    // also tells us whether an admitted connection is the OPEN breaker's
+    // recovery probe of the interval — its outcome, not just its close
+    // reason, is the recovery evidence (see route_evidence).
+    let route_decision = route_breaker.map(|b| b.check(&host));
+    if route_decision == Some(BreakerDecision::Reject) {
         metrics::counter!("interflow_edge_route_breaker_rejected").increment(1);
         audit.record(
             AuditKind::StreamDenied {
@@ -261,6 +313,7 @@ async fn handle_connection(
         debug!("route circuit open, closing without tunnel open: host={host} peer={peer}");
         return Ok(());
     }
+    let route_probe = route_decision == Some(BreakerDecision::Probe);
 
     let stream_id = uuid::Uuid::new_v4().to_string();
     let data_rx = tunnel.register_stream(stream_id.clone()).await;
@@ -297,16 +350,11 @@ async fn handle_connection(
     // buffer. The JoinHandle double-poll panic class is structurally excluded
     // (docs/bug/2026-09-13-select-branch-double-await-joinhandle-panic.md).
     //
-    // The oneshot captures the peer Close's reason token (empty = no Close
-    // observed / ordinary close) to feed the route breaker.
-    let (close_reason_tx, close_reason_rx) = if route_breaker.is_some() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
+    // The outcome carries the locally-observed facts (the peer Close reason
+    // when one arrived in time, and whether response bytes reached the
+    // client) — the route breaker's evidence base.
     let (rd, wr) = socket.into_split();
-    pump_tcp_stream(
+    let outcome = pump_tcp_stream(
         rd,
         wr,
         data_rx,
@@ -319,22 +367,20 @@ async fn handle_connection(
             write_stall_counter: "interflow_edge_client_write_stall",
             log_label: "edge",
         },
-        close_reason_tx,
     )
     .await;
 
-    // Feed the route breaker from the close reason: backend-down tokens
-    // count as failures, a normal backend EOF proves reachability (clears a
-    // tripped route), everything else (client-side aborts, rate limits,
-    // ordinary closes) is neutral.
-    if let Some(breaker) = route_breaker
-        && let Some(rx) = close_reason_rx
-    {
-        let reason = rx.await.unwrap_or_default();
-        if ROUTE_FAILURE_REASONS.contains(&reason.as_str()) {
-            breaker.note_failure(&host);
-        } else if ROUTE_SUCCESS_REASONS.contains(&reason.as_str()) {
-            breaker.note_success(&host);
+    // Feed the route breaker from the classified evidence: a failing dial
+    // counts (and re-arms), the agent's own breaker verdict counts without
+    // re-arming (derivative), recovery evidence clears a tripped route, and
+    // everything else (client-side aborts, rate limits, ordinary closes) is
+    // neutral.
+    if let Some(breaker) = route_breaker {
+        match route_evidence(&outcome, route_probe) {
+            RouteEvidence::Failure => breaker.note_failure(&host),
+            RouteEvidence::DerivativeFailure => breaker.note_soft_failure(&host),
+            RouteEvidence::Recovery => breaker.note_success(&host),
+            RouteEvidence::Neutral => {}
         }
     }
 
@@ -491,6 +537,78 @@ fn is_valid_host(s: &str) -> bool {
 )]
 mod tests {
     use super::*;
+
+    fn outcome(close_reason: Option<CloseReason>, response_relayed: bool) -> StreamOutcome {
+        StreamOutcome {
+            close_reason,
+            response_relayed,
+        }
+    }
+
+    /// The classification matrix feeding the route breaker — the contract
+    /// the 2026-09-17 stuck-OPEN fix is built on.
+    #[test]
+    fn route_evidence_matrix() {
+        use CloseReason::{
+            BackendClosed, CloseFrame, ConnectFailed, DispatchPoison, RateLimited,
+            TargetCircuitOpen,
+        };
+        // Direct failure re-arms; derivative failure never re-arms.
+        assert_eq!(
+            route_evidence(&outcome(Some(ConnectFailed), false), false),
+            RouteEvidence::Failure
+        );
+        assert_eq!(
+            route_evidence(&outcome(Some(TargetCircuitOpen), false), false),
+            RouteEvidence::DerivativeFailure
+        );
+        // A clean backend EOF is recovery regardless of probe status.
+        assert_eq!(
+            route_evidence(&outcome(Some(BackendClosed), false), false),
+            RouteEvidence::Recovery
+        );
+        // THE bug shape: keepalive client hung up first (no Close reason
+        // landed) but the probe relayed response bytes — locally observed,
+        // race-free recovery evidence.
+        assert_eq!(
+            route_evidence(&outcome(None, true), true),
+            RouteEvidence::Recovery
+        );
+        // The same shape on a non-probe connection proves nothing for a
+        // tripped route (the entry was tripped after this connection was
+        // admitted; stale liveness must not clear it).
+        assert_eq!(
+            route_evidence(&outcome(None, true), false),
+            RouteEvidence::Neutral
+        );
+        // A probe that never relayed bytes (bare connect-and-abort, or the
+        // agent's rate limiter dropping the Open) proves nothing.
+        assert_eq!(
+            route_evidence(&outcome(None, false), true),
+            RouteEvidence::Neutral
+        );
+        // Ordinary / unrelated closes stay neutral on both probe statuses.
+        assert_eq!(
+            route_evidence(&outcome(Some(CloseFrame), true), true),
+            RouteEvidence::Recovery, // CloseFrame without failure + served bytes on a probe
+        );
+        assert_eq!(
+            route_evidence(&outcome(Some(CloseFrame), false), false),
+            RouteEvidence::Neutral
+        );
+        assert_eq!(
+            route_evidence(&outcome(Some(RateLimited), false), true),
+            RouteEvidence::Neutral
+        );
+        // Post-connection pathologies with bytes already served: the backend
+        // dialed and answered — for route *reachability* that is recovery
+        // evidence, not a failure (mirrors the target breaker's
+        // connect-phase-only failure semantics).
+        assert_eq!(
+            route_evidence(&outcome(Some(DispatchPoison), true), true),
+            RouteEvidence::Recovery
+        );
+    }
 
     #[test]
     fn extract_host_basic() {

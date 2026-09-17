@@ -16,7 +16,7 @@
 
 use crate::config::AclRule;
 use crate::hub::service::HubService;
-use crate::hub::state::{SharedStreamCounts, StreamFace, TunnelData};
+use crate::hub::state::{StreamFace, TunnelData, release_stream_slot, try_acquire_stream_slot};
 use bytes::Bytes;
 use interflow_core::protocol::{FrameType, StreamProto};
 use interflow_core::security::AuditKind;
@@ -107,40 +107,6 @@ impl HubService {
         }
     }
 
-    /// Tries to acquire a stream slot for `agent`. Returns true on success;
-    /// returns false without incrementing when over `max`.
-    /// `max = 0` means unlimited. The lock is held only briefly
-    /// (check-and-increment, nanosecond scale), never across an await.
-    fn try_acquire_stream_slot(counts: &SharedStreamCounts, agent: &str, max: usize) -> bool {
-        if max == 0 {
-            return true;
-        }
-        let mut map = counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = map.entry(agent.to_string()).or_insert(0);
-        if *entry >= max {
-            false
-        } else {
-            *entry += 1;
-            true
-        }
-    }
-
-    /// Releases one stream slot for `agent`. Removes the key when the count
-    /// reaches zero to prevent unbounded HashMap growth.
-    fn release_stream_slot(counts: &SharedStreamCounts, agent: &str) {
-        let mut map = counts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = map.get_mut(agent) {
-            *entry = entry.saturating_sub(1);
-            if *entry == 0 {
-                map.remove(agent);
-            }
-        }
-    }
-
     /// Evicts by agent_id (entry point for runtime death signals such as
     /// send timeout). Captures the current entry's Arc and hands it to the
     /// unified eviction primitive; if the agent re-registers in the
@@ -227,7 +193,7 @@ impl HubService {
             }
         }
         if max_per_agent > 0
-            && !Self::try_acquire_stream_slot(&self.stream_counts, source_agent, max_per_agent)
+            && !try_acquire_stream_slot(&self.stream_counts, source_agent, max_per_agent)
         {
             metrics::counter!("interflow_hub_stream_limit_denied", "scope" => "per_agent")
                 .increment(1);
@@ -252,7 +218,7 @@ impl HubService {
         // count and succeed directly (existing semantics)
         if target_agent.is_empty() {
             if max_per_agent > 0 {
-                Self::release_stream_slot(&self.stream_counts, source_agent);
+                release_stream_slot(&self.stream_counts, source_agent);
             }
             return Ok(());
         }
@@ -298,7 +264,7 @@ impl HubService {
             .map_or(StreamFace::Poll, StreamFace::Relay);
         let datagram_ok = matches!(proto, StreamProto::Udp)
             && target_face.is_relay()
-            && self.config.read().await.quic.datagram_enabled;
+            && self.config.read().await.transport.quic.datagram_enabled;
         let stream = crate::hub::ActiveStream {
             source_agent: source_agent.to_string(),
             target_agent: target_agent.to_string(),
@@ -374,7 +340,7 @@ impl HubService {
                 }
             }
             if max_per_agent > 0 {
-                Self::release_stream_slot(&self.stream_counts, source_agent);
+                release_stream_slot(&self.stream_counts, source_agent);
             }
             self.audit.record(
                 AuditKind::StreamClosed {
@@ -601,7 +567,7 @@ impl HubService {
             let mut streams = self.active_streams.write().await;
             if streams.remove(stream_id).is_some() {
                 metrics::gauge!("interflow_hub_streams_active").decrement(1.0);
-                Self::release_stream_slot(&self.stream_counts, &owner_agent);
+                release_stream_slot(&self.stream_counts, &owner_agent);
                 self.audit.record(
                     AuditKind::StreamClosed {
                         stream_id: stream_id.to_string(),
@@ -678,6 +644,7 @@ impl HubService {
 )]
 mod tests {
     use super::*;
+    use crate::hub::state::SharedStreamCounts;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -709,11 +676,11 @@ mod tests {
     #[test]
     fn stream_slot_acquires_until_max_then_rejects() {
         let counts = make_counts();
-        assert!(HubService::try_acquire_stream_slot(&counts, "a1", 3));
-        assert!(HubService::try_acquire_stream_slot(&counts, "a1", 3));
-        assert!(HubService::try_acquire_stream_slot(&counts, "a1", 3));
+        assert!(try_acquire_stream_slot(&counts, "a1", 3));
+        assert!(try_acquire_stream_slot(&counts, "a1", 3));
+        assert!(try_acquire_stream_slot(&counts, "a1", 3));
         assert!(
-            !HubService::try_acquire_stream_slot(&counts, "a1", 3),
+            !try_acquire_stream_slot(&counts, "a1", 3),
             "4th acquire over cap must fail"
         );
     }
@@ -721,12 +688,12 @@ mod tests {
     #[test]
     fn stream_slot_release_allows_reacquire() {
         let counts = make_counts();
-        HubService::try_acquire_stream_slot(&counts, "a1", 2);
-        HubService::try_acquire_stream_slot(&counts, "a1", 2);
-        assert!(!HubService::try_acquire_stream_slot(&counts, "a1", 2));
-        HubService::release_stream_slot(&counts, "a1");
+        try_acquire_stream_slot(&counts, "a1", 2);
+        try_acquire_stream_slot(&counts, "a1", 2);
+        assert!(!try_acquire_stream_slot(&counts, "a1", 2));
+        release_stream_slot(&counts, "a1");
         assert!(
-            HubService::try_acquire_stream_slot(&counts, "a1", 2),
+            try_acquire_stream_slot(&counts, "a1", 2),
             "after release, slot should be available"
         );
     }
@@ -734,19 +701,19 @@ mod tests {
     #[test]
     fn stream_slot_per_agent_isolation() {
         let counts = make_counts();
-        HubService::try_acquire_stream_slot(&counts, "a1", 1);
+        try_acquire_stream_slot(&counts, "a1", 1);
         assert!(
-            HubService::try_acquire_stream_slot(&counts, "a2", 1),
+            try_acquire_stream_slot(&counts, "a2", 1),
             "different agent has independent budget"
         );
-        assert!(!HubService::try_acquire_stream_slot(&counts, "a1", 1));
+        assert!(!try_acquire_stream_slot(&counts, "a1", 1));
     }
 
     #[test]
     fn stream_slot_release_removes_zero_entry() {
         let counts = make_counts();
-        HubService::try_acquire_stream_slot(&counts, "a1", 5);
-        HubService::release_stream_slot(&counts, "a1");
+        try_acquire_stream_slot(&counts, "a1", 5);
+        release_stream_slot(&counts, "a1");
         assert!(
             counts.lock().unwrap().get("a1").is_none(),
             "counter entry should be removed at zero to prevent map growth"
@@ -757,7 +724,7 @@ mod tests {
     fn stream_slot_zero_max_means_unlimited() {
         let counts = make_counts();
         for _ in 0..1000 {
-            assert!(HubService::try_acquire_stream_slot(&counts, "a1", 0));
+            assert!(try_acquire_stream_slot(&counts, "a1", 0));
         }
     }
 }

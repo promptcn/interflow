@@ -1,6 +1,6 @@
 [package]
 name = "interflow-testkit"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Shared test/bench harness for interflow: stack assembly, certificates, impairment injection, metrics (dev-only, not in the production dependency graph)"
@@ -10,14 +10,20 @@ license = "MIT"
 name = "interflow_testkit"
 path = "src/lib.rs"
 
+[features]
+# Exposes fault::install (test plans over interflow-core's injection points;
+# see core's src/fault.rs). Enabled by the mesh/expose dev-dependencies so
+# every test build has it; never reaches production graphs.
+fault-injection = ["interflow-core/fault-injection"]
+
 # Entry point of the soak long-run guardrail (backlog §1.7): `cargo run --release -p interflow-testkit --bin soak`
 [[bin]]
 name = "soak"
 path = "src/bin/soak.rs"
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.1" }
-interflow-mesh = { path = "../mesh", version = "0.1" }
+interflow-core = { path = "../core", version = "0.2" }
+interflow-mesh = { path = "../mesh", version = "0.2" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -25,6 +31,12 @@ tokio-util = { workspace = true, features = ["rt"] }
 
 # Certificate generation (self-signed CA / server / client)
 rcgen = "0.14"
+
+# Metrics-snapshot assertion harness (same versions as mesh)
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1"
 
 # Seeded randomness for impairment injection (reproducible)
 rand = { version = "0.9", features = ["std_rng"] }

@@ -31,50 +31,11 @@
 use interflow_expose::client::ExposeArgs;
 use interflow_expose::edge::{EdgeArgs, run};
 use interflow_mesh::config::TransportKind;
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use interflow_testkit::metrics_harness::{counter_value, metrics_handle, wait_counter_at_least};
 use std::net::SocketAddr;
-use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-
-static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
-
-fn metrics_handle() -> &'static PrometheusHandle {
-    METRICS.get_or_init(|| {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _ = metrics::set_global_recorder(recorder);
-        handle
-    })
-}
-
-fn counter_value(metric_prefix: &str) -> u64 {
-    metrics_handle()
-        .render()
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .filter(|(k, _)| k.starts_with(metric_prefix))
-        .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
-        .sum()
-}
-
-async fn wait_counter_at_least(metric_prefix: &str, min: u64, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let v = counter_value(metric_prefix);
-        if v >= min {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for metric {metric_prefix} >= {min}, current {v} (snapshot:\n{})",
-                metrics_handle().render()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
 
 fn pick_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
@@ -151,16 +112,9 @@ remote_addr = "127.0.0.1:{dead}"
         hub_listen_addr: hub_listen,
         routes_path: routes_path.to_string_lossy().into_owned(),
         agent_token: "test-token".into(),
-        hub_tls: None,
-        quic_listen: None,
-        audit_path: None,
-        new_conn_rate_per_ip_per_minute: 0,
-        stream_idle_timeout_secs: 300,
-        route_breaker_enabled: true,
         route_breaker_failure_threshold: 3,
-        route_breaker_window_secs: 60,
-        route_breaker_cooldown_secs: 30,
         agent_recovery_timeout_secs: 120,
+        ..Default::default()
     };
     let edge_handle = tokio::task::spawn(run(edge_args));
     wait_for_tcp(hub_listen, Duration::from_secs(5))

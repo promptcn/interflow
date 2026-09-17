@@ -1,6 +1,6 @@
 [package]
 name = "interflow-core"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 description = "HTTP/2 tunnel primitives shared by interflow-expose and interflow-mesh"
@@ -9,6 +9,12 @@ license = "MIT"
 [lib]
 name = "interflow_core"
 path = "src/lib.rs"
+
+[features]
+# Deterministic fault injection for the self-healing tests/soak (see
+# src/fault.rs). Off by default: production builds compile every call point
+# to a no-op and cannot install a hook.
+fault-injection = []
 
 [lints]
 workspace = true
@@ -63,10 +69,13 @@ hex = "0.4"
 
 # Security: per-IP token-bucket rate limiting
 governor = "0.10.4"
-tokio-util = { workspace = true }
+# TaskTracker (session task supervision) requires the rt feature
+tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
+# Self-signed certificates for the TLS min-version handshake test
+rcgen = "0.14"
 # Paused clock (start_paused) for unit tests to deterministically verify the INCOMING_SEND_TIMEOUT path
 tokio = { workspace = true, features = ["test-util"] }
 

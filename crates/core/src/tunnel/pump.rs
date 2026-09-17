@@ -25,6 +25,15 @@
 //!   return before the socket is truly closed, so the caller's connection
 //!   accounting no longer misses the detached write-task window.
 //!
+//! Outcome reporting: the pump returns a [`StreamOutcome`] assembled from
+//! **local observation only** (did a peer Close frame reach the write half;
+//! were response bytes written to the client socket). This is deliberately
+//! race-free: whether the peer's Close *reason* arrives in time is itself a
+//! cross-hop race (an HTTP/1.1 keepalive client hangs up first, the hub tears
+//! the stream on our request-direction close, and the reason token never
+//! lands) — callers deriving health signals from the stream must not depend
+//! on that timing (docs/bug/2026-09-17-edge-route-breaker-stuck-open.md).
+//!
 //! For reference: the egress UDP pump (mesh/src/agent/egress.rs) must spawn
 //! (it shares last_active idle supervision etc., which is not isomorphic);
 //! its rule "a JoinHandle already polled by select must not be awaited
@@ -32,6 +41,7 @@
 //! correct paradigm for spawn-style supervision loops.
 
 use crate::error::Result;
+use crate::protocol::CloseReason;
 use crate::protocol::FrameType;
 use crate::tunnel::AgentTunnel;
 use crate::tunnel::transport::TunnelData;
@@ -149,6 +159,28 @@ pub struct PumpConfig {
     pub log_label: &'static str,
 }
 
+/// How one pumped stream ended, assembled from **local observation only** —
+/// immune to the cross-hop delivery race of the peer's Close reason token.
+///
+/// This is the health-evidence surface for callers like the expose edge route
+/// breaker: `response_relayed` proves the far side actually served bytes
+/// (observed by the write half writing them to the client socket), while
+/// `close_reason` carries the peer's explanation when one arrived in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamOutcome {
+    /// The peer's Close reason, when a Close frame reached the write half
+    /// before the stream closed out. `None` = no Close frame observed (the
+    /// HTTP/1.1 keepalive norm: the client hangs up first, the stream is torn
+    /// down on both sides, and any in-flight reason token is dropped);
+    /// `Some(CloseReason::CloseFrame)` = a close arrived without a reason.
+    pub close_reason: Option<CloseReason>,
+    /// Whether any response-direction payload was written to the client
+    /// socket. Distinguishes "the backend served data" from "the connection
+    /// merely closed without failure" — a bare connect-and-abort proves
+    /// nothing about route health.
+    pub response_relayed: bool,
+}
+
 /// Bidirectionally pumps one TCP tunnel stream.
 ///
 /// `rd`: the client socket read half; `wr`: the write half; `data_rx`: the
@@ -156,11 +188,9 @@ pub struct PumpConfig {
 /// via `register_stream` first). On return, the whole stream has been closed
 /// out and unregistered.
 ///
-/// `close_reason`: when `Some`, the write half reports the reason token
-/// carried by the peer's Close notification (`CLOSE:{sid}:{reason}` payload;
-/// empty string = ordinary close / no Close observed, e.g. the client side
-/// disconnected first) — the hook the expose edge uses for route-level
-/// negative caching (2026-09-16 reason propagation).
+/// Returns the locally-observed [`StreamOutcome`] (see the struct docs for
+/// why the outcome must not depend on the peer Close reason's arrival
+/// timing).
 ///
 /// Cancellation safety: this future may be cancelled at any time by an outer
 /// select/drop — the socket half and channel half are released in place on
@@ -174,8 +204,8 @@ pub async fn pump_tcp_stream<R, W, T>(
     target: &T,
     stream_id: &str,
     cfg: &PumpConfig,
-    close_reason: Option<tokio::sync::oneshot::Sender<String>>,
-) where
+) -> StreamOutcome
+where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
     T: StreamPumpTarget + ?Sized,
@@ -231,10 +261,14 @@ pub async fn pump_tcp_stream<R, W, T>(
         let _ = target.send_close(stream_id).await;
     };
 
-    // Write half: tunnel → socket (response direction).
-    let mut close_reason_tx = close_reason;
+    // Write half: tunnel → socket (response direction). Sole observer of
+    // both outcome facts, so it returns the StreamOutcome itself.
     let write_half = async {
         let mut wr = wr;
+        let mut outcome = StreamOutcome {
+            close_reason: None,
+            response_relayed: false,
+        };
         loop {
             let Some(remaining) = progress.remaining(cfg.idle_timeout) else {
                 metrics::counter!(cfg.idle_timeout_counter).increment(1);
@@ -245,20 +279,14 @@ pub async fn pump_tcp_stream<R, W, T>(
                 Ok(Some(msg)) => {
                     progress.touch();
                     if matches!(msg.stream_type, FrameType::Close) {
-                        if let Some(tx) = close_reason_tx.take() {
-                            // Dropping without send also communicates "no
-                            // reason" (receiver treats Err as empty), but
-                            // sending "" keeps the channel semantics
-                            // unambiguous.
-                            let _ = tx.send(parse_close_reason(stream_id, &msg.data));
-                        }
+                        outcome.close_reason = Some(parse_close_reason(stream_id, &msg.data));
                         break;
                     }
                     if !msg.data.is_empty() {
                         match tokio::time::timeout(cfg.write_stall_timeout, wr.write_all(&msg.data))
                             .await
                         {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(())) => outcome.response_relayed = true,
                             Ok(Err(e)) => {
                                 warn!("{label} failed to write socket: {e}");
                                 break;
@@ -279,16 +307,17 @@ pub async fn pump_tcp_stream<R, W, T>(
                 Err(_) => {}
             }
         }
+        outcome
     };
 
     tokio::pin!(read_half, write_half);
 
     enum HalfDone {
         Read,
-        Write,
+        Write(StreamOutcome),
     }
     let done = tokio::select! {
-        () = &mut write_half => HalfDone::Write,
+        out = &mut write_half => HalfDone::Write(out),
         () = &mut read_half => HalfDone::Read,
     };
 
@@ -296,8 +325,9 @@ pub async fn pump_tcp_stream<R, W, T>(
         // Write half exits first: the read half is no longer polled and is
         // dropped when this function returns (the half-open socket connection
         // is released with it). No JoinHandle, no close-out await ceremony.
-        HalfDone::Write => {
+        HalfDone::Write(outcome) => {
             target.unregister_stream(stream_id).await;
+            outcome
         }
         // Read half exits first (client EOF, TCP half-close): unregister
         // first to cut off dispatch delivery of new frames for this stream;
@@ -307,22 +337,21 @@ pub async fn pump_tcp_stream<R, W, T>(
         // returns Ready.
         HalfDone::Read => {
             target.unregister_stream(stream_id).await;
-            (&mut write_half).await;
+            (&mut write_half).await
         }
     }
 }
 
-/// Extracts the reason token from a `_close_` notification payload.
+/// Extracts the reason from a `_close_` notification payload.
 ///
 /// The hub emits `CLOSE:{sid}:{reason}` (empty reason = ordinary close);
 /// anything that does not carry this prefix (a late/foreign frame) is
-/// treated as reason-less.
-fn parse_close_reason(stream_id: &str, data: &[u8]) -> String {
+/// treated as a reason-less close.
+fn parse_close_reason(stream_id: &str, data: &[u8]) -> CloseReason {
     let prefix = format!("CLOSE:{stream_id}:");
     String::from_utf8_lossy(data)
         .strip_prefix(&prefix)
-        .unwrap_or("")
-        .to_string()
+        .map_or(CloseReason::CloseFrame, CloseReason::from_token)
 }
 
 #[cfg(test)]
@@ -405,23 +434,99 @@ mod tests {
     }
 
     /// Peer Close frame (hub rejecting the Open / peer teardown) → the pump
-    /// closes out + unregisters exactly once + the socket closes. A
-    /// unit-level reproduction of the agent-offline scenario (the production
-    /// trigger chain of the 2026-09-13 bug).
+    /// closes out + unregisters exactly once + the socket closes, and the
+    /// reason token is decoded into the outcome. A unit-level reproduction of
+    /// the agent-offline scenario (the production trigger chain of the
+    /// 2026-09-13 bug).
     #[tokio::test]
     async fn close_frame_ends_pump_and_unregisters_once() {
         let (sock, mut peer) = duplex(64 * 1024);
         let (rd, wr) = tokio::io::split(sock);
         let (tx, rx) = mpsc::channel(8);
         let target = MockTarget::default();
-        tx.send(td(FrameType::Close, b"")).await.unwrap();
+        tx.send(td(FrameType::Close, b"CLOSE:s1:connect_failed"))
+            .await
+            .unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
+        let outcome = pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
 
+        assert_eq!(outcome.close_reason, Some(CloseReason::ConnectFailed));
+        assert!(!outcome.response_relayed);
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
         // After the pump returns the write half is dropped: the client reads EOF
         let mut buf = [0u8; 1];
         assert_eq!(peer.read(&mut buf).await.unwrap(), 0);
+    }
+
+    /// A Close notification without a parsable reason payload decodes to the
+    /// ordinary reason-less close (`Some(CloseReason::CloseFrame)`), not None:
+    /// a close frame WAS observed.
+    #[tokio::test]
+    async fn reasonless_close_frame_decodes_to_closeframe() {
+        let (sock, _peer) = duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(sock);
+        let (tx, rx) = mpsc::channel(8);
+        let target = MockTarget::default();
+        tx.send(td(FrameType::Close, b"")).await.unwrap();
+
+        let outcome = pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+
+        assert_eq!(outcome.close_reason, Some(CloseReason::CloseFrame));
+        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+    }
+
+    /// Regression (the exact shape of the 2026-09-17 stuck-OPEN bug): an
+    /// HTTP/1.1 keepalive client hangs up first — the read half exits, the
+    /// stream is unregistered, and the peer's Close reason never lands (the
+    /// hub tears the stream on our request-direction close; nothing is in
+    /// flight). The pump must still report the locally-observed facts: no
+    /// close reason, but response bytes WERE relayed — the race-free evidence
+    /// the edge route breaker's probe accounting is built on.
+    #[tokio::test(start_paused = true)]
+    async fn client_first_close_reports_relayed_without_reason() {
+        let (sock, mut peer) = duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(sock);
+        let (tx, rx) = mpsc::channel(8);
+        let target = MockTarget::default();
+        tx.send(td(FrameType::Data, b"resp-1")).await.unwrap();
+        tx.send(td(FrameType::Data, b"resp-2")).await.unwrap();
+        target.mirror_dispatch_channel(&tx);
+        // The backend finished responding; no Close ever arrives.
+        drop(tx);
+
+        peer.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        peer.shutdown().await.unwrap();
+
+        let outcome = pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+
+        assert_eq!(outcome.close_reason, None);
+        assert!(
+            outcome.response_relayed,
+            "response bytes were written to the client before it hung up"
+        );
+    }
+
+    /// A bare connect-and-abort (client leaves before any response frame)
+    /// reports NO evidence: nothing relayed, no reason — callers must treat
+    /// it as neutral, not as recovery proof.
+    #[tokio::test(start_paused = true)]
+    async fn bare_connect_aborts_without_evidence() {
+        let (sock, mut peer) = duplex(64 * 1024);
+        let (rd, wr) = tokio::io::split(sock);
+        let (tx, rx) = mpsc::channel(8);
+        let target = MockTarget::default();
+        // Held open with no frames; the unregister cut ends the write half.
+        target.mirror_dispatch_channel(&tx);
+
+        peer.write_all(b"req").await.unwrap();
+        peer.shutdown().await.unwrap();
+
+        let outcome = pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+
+        assert_eq!(outcome.close_reason, None);
+        assert!(!outcome.response_relayed);
     }
 
     /// Client EOF (TCP half-close): read-side data goes to the tunnel +
@@ -444,7 +549,7 @@ mod tests {
         peer.write_all(b"req").await.unwrap();
         peer.shutdown().await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
 
         assert_eq!(target.sent_data(), vec![Bytes::from_static(b"req")]);
         assert_eq!(target.close_calls(), vec!["s1".to_string()]);
@@ -466,7 +571,7 @@ mod tests {
         // write_all hangs → stall timeout
         tx.send(td(FrameType::Data, &[7u8; 64])).await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
 
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
     }
@@ -481,7 +586,7 @@ mod tests {
         drop(tx);
         let target = MockTarget::default();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
 
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
     }
@@ -496,7 +601,7 @@ mod tests {
         let target = MockTarget::default();
         tx.send(td(FrameType::Data, b"x")).await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg(), None).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
 
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
     }
@@ -535,7 +640,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         let t = Arc::clone(&target);
         let pump = tokio::spawn(async move {
-            pump_tcp_stream(rd, wr, rx, &*t, "s1", &cfg, None).await;
+            pump_tcp_stream(rd, wr, rx, &*t, "s1", &cfg).await;
         });
 
         // Mid-run probe at 3× the idle budget with response frames flowing:
@@ -575,7 +680,7 @@ mod tests {
         cfg.idle_timeout = Duration::from_millis(120);
 
         let started = tokio::time::Instant::now();
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &cfg, None).await;
+        pump_tcp_stream(rd, wr, rx, &target, "s1", &cfg).await;
         let elapsed = started.elapsed();
         drop(tx);
 

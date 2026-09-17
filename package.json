@@ -1,6 +1,6 @@
 {
   "name": "interflow",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Interflow GUI (Tauri 2 + React): frontend and tooling for the expose desktop app.",
   "private": true,
   "scripts": {

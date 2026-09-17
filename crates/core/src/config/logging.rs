@@ -4,7 +4,7 @@ use crate::telemetry::LogFormat;
 use serde::{Deserialize, Serialize};
 
 /// Logging configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// tracing level filter expression (e.g. `info,interflow=debug`).

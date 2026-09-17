@@ -2,14 +2,13 @@
 
 use crate::hub::service::{HubService, json_response, text_response};
 use crate::hub::state::{AgentSession, HubResponseBody, SharedStreamCounts};
-use crate::negotiation::{HeartbeatAd, RegisterResponse};
 use hyper::{Response, StatusCode};
 use interflow_core::error::Result;
 use interflow_core::security::AuditKind;
+use interflow_core::tunnel::negotiation::{HeartbeatAd, RegisterResponse};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 impl HubService {
@@ -59,57 +58,25 @@ impl HubService {
             }
         }
 
-        let (tx, rx) = mpsc::channel(256);
-        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-        let ctrl_backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        // Single write lock: atomically insert or replace the channel in place.
-        // Replacing in place (rather than overwriting the whole Arc) is
-        // required: the old poll connection's RxStream holds the old Arc, and
-        // Drop identifies a stale rx via the generation comparison — replacing
-        // the whole Arc would make the comparison always hit the old Arc.
+        // Single write lock: atomically insert or replace the channel in
+        // place (see [`AgentSession::install_channels`] for why in place).
         let registered_count = {
             let mut agents = self.agents.write().await;
-            if let Some(existing) = agents.get(&agent_id) {
-                let mut state = existing.write().await;
-                state.tx = tx;
-                state.ctrl_tx = ctrl_tx;
-                state.rx = Some(rx);
-                state.ctrl_rx = Some(ctrl_rx);
-                state.ctrl_backlog = ctrl_backlog;
-                state.generation += 1;
-                state.last_pong = Instant::now();
-                // h2 re-registration overwrites the QUIC session (or vice
-                // versa): the old relay connection closes itself out via its
-                // connection-lost watcher
-                state.quic = None;
-                // Wake the old poll body: the generation has advanced, urging
-                // it to end and yield to the new connection
-                state.wake_poll();
-                // The upload lease is invalidated together with the
-                // generation: the old upload reader exits (its response body
-                // ends, the agent side is taken over by the new session),
-                // yielding to the new connection's upload
-                if let Some(lease) = state.up_lease.take() {
-                    lease.cancel();
+            match agents.get(&agent_id) {
+                Some(existing) => {
+                    // h2 registration overwrites a QUIC session: the old
+                    // relay connection closes itself out via its
+                    // connection-lost watcher
+                    existing.write().await.install_channels(None);
                 }
-                agents.len()
-            } else {
-                let arc = Arc::new(RwLock::new(AgentSession {
-                    tx,
-                    ctrl_tx,
-                    ctrl_backlog,
-                    rx: Some(rx),
-                    ctrl_rx: Some(ctrl_rx),
-                    generation: 0,
-                    last_pong: Instant::now(),
-                    poll_waker: Arc::new(std::sync::Mutex::new(None)),
-                    up_lease: None,
-                    quic: None,
-                }));
-                agents.insert(agent_id.clone(), arc);
-                agents.len()
+                None => {
+                    agents.insert(
+                        agent_id.clone(),
+                        Arc::new(RwLock::new(AgentSession::new(None))),
+                    );
+                }
             }
+            agents.len()
         };
         // Absolute value rather than increment: re-registration no longer
         // accumulates drift
@@ -139,24 +106,20 @@ impl HubService {
         );
 
         // Capability negotiation: the response body carries the hub's
-        // heartbeat cadence and upload Pong capability (old agents ignore the
-        // body and only look at the status; new agents parse it and enable
-        // the data-plane Pong + poll watchdog derivation, see
-        // crate::negotiation).
+        // heartbeat cadence; agents parse it and derive the poll watchdog /
+        // task-stall timeouts (see `interflow_core::tunnel::negotiation`).
         let caps = {
             let cfg = self.config.read().await;
             RegisterResponse {
-                pong_via_upload: true,
-                heartbeat: cfg.heartbeat.enabled.then_some(HeartbeatAd {
-                    interval_secs: cfg.heartbeat.interval_secs,
-                    max_missed: cfg.heartbeat.max_missed,
-                }),
+                heartbeat: cfg
+                    .heartbeat
+                    .enabled
+                    .then_some(HeartbeatAd::from(&cfg.heartbeat)),
             }
         };
         // Serializing a plain scalar struct cannot fail; if it somehow does,
-        // degrade to a minimal capability declaration
-        let body = serde_json::to_string(&caps)
-            .unwrap_or_else(|_| "{\"pong_via_upload\":true}".to_string());
+        // degrade to a minimal capability declaration (heartbeat disabled)
+        let body = serde_json::to_string(&caps).unwrap_or_else(|_| "{}".to_string());
         Ok(json_response(StatusCode::OK, body))
     }
 
@@ -174,20 +137,7 @@ impl HubService {
             "Agent {} not registered, implicitly re-registering",
             agent_id
         );
-        let (tx, rx) = mpsc::channel(256);
-        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-        let arc = Arc::new(RwLock::new(AgentSession {
-            tx,
-            ctrl_tx,
-            ctrl_backlog: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            rx: Some(rx),
-            ctrl_rx: Some(ctrl_rx),
-            generation: 0,
-            last_pong: Instant::now(),
-            poll_waker: Arc::new(std::sync::Mutex::new(None)),
-            up_lease: None,
-            quic: None,
-        }));
+        let arc = Arc::new(RwLock::new(AgentSession::new(None)));
         {
             let mut agents = self.agents.write().await;
             agents.insert(agent_id.to_string(), arc.clone());

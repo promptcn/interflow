@@ -1,6 +1,6 @@
-# Agent-2 configuration (v2)
+# Agent-2 configuration (v3)
 
-config_version = 2
+config_version = 3
 
 [agent]
 id = "agent-2"

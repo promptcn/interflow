@@ -132,34 +132,3 @@ pub async fn wait_agent_connected(handle: &AgentHandle, timeout: Duration) -> bo
     }
     matches!(handle.state(), AgentState::Connected { .. })
 }
-
-/// TCP echo round trip with retries: absorbs agent startup/registration/TLS handshake
-/// latency. Returns the first successful reply.
-pub async fn tcp_echo_with_retry(
-    addr: SocketAddr,
-    payload: &[u8],
-    overall_timeout: Duration,
-) -> std::io::Result<Vec<u8>> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let deadline = tokio::time::Instant::now() + overall_timeout;
-    loop {
-        let attempt = async {
-            let mut sock = TcpStream::connect(addr).await?;
-            sock.write_all(payload).await?;
-            sock.flush().await?;
-            let mut received = vec![0u8; payload.len()];
-            sock.read_exact(&mut received).await?;
-            Ok(received)
-        };
-        match attempt.await {
-            Ok(resp) => return Ok(resp),
-            Err(e) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(e);
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
-}

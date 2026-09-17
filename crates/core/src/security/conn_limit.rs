@@ -56,7 +56,13 @@ impl ConnTracker {
 
         // 2. Per-IP
         let ip_exceeded = if self.per_ip_limit > 0 {
-            let mut map = recover_poisoned(&self.inner);
+            // Poison recovery by into_inner: the counters' invariants hold
+            // by construction, so another thread's panic must not take the
+            // limiter down with it.
+            let mut map = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entry = map.entry(ip).or_insert(0);
             *entry += 1;
             if *entry > self.per_ip_limit {
@@ -86,7 +92,13 @@ impl ConnTracker {
     fn release(&self, ip: IpAddr) {
         self.total.fetch_sub(1, Ordering::AcqRel);
         if self.per_ip_limit > 0 {
-            let mut map = recover_poisoned(&self.inner);
+            // Poison recovery by into_inner: the counters' invariants hold
+            // by construction, so another thread's panic must not take the
+            // limiter down with it.
+            let mut map = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(entry) = map.get_mut(&ip) {
                 *entry = entry.saturating_sub(1);
                 if *entry == 0 {
@@ -100,12 +112,6 @@ impl ConnTracker {
     pub fn total(&self) -> usize {
         self.total.load(Ordering::Acquire)
     }
-}
-
-/// Extracts the inner data even when the lock is poisoned — the connection
-/// counter must not fail wholesale because another thread panicked.
-fn recover_poisoned<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Connection-slot RAII guard. Releases automatically on drop. Owned (holds

@@ -9,12 +9,12 @@
 use crate::error::{InterflowError, Result};
 use crate::protocol::StreamProto;
 use crate::tunnel::h2::{H2RequestBody, H2Tunnel};
+use crate::tunnel::session_tasks::SessionTasks;
 use crate::tunnel::transport::{IncomingStream, TunnelData, TunnelTransport};
 use bytes::Bytes;
 use hyper::client::conn::http2::SendRequest;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio_util::sync::CancellationToken;
 
 /// Default upper bound for establishing one tunnel request (`/poll` or
 /// `/stream/up`: send → response headers). Source of the
@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 /// death (docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md §4.2).
 pub const DEFAULT_REQUEST_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// h2 session liveness parameters (the product of hub registration capability negotiation; see the mesh `negotiation` module).
+/// h2 session liveness parameters (the product of hub registration capability negotiation; see the `negotiation` module).
 ///
 /// Data-plane heartbeat loop: the hub sends Ping over `/poll` (proving the
 /// hub→agent data plane) and the agent returns Pong over `/stream/up`
@@ -43,28 +43,46 @@ pub struct H2Liveness {
     /// trigger a whole-session rebuild.
     /// [`Duration::ZERO`] disables it.
     pub poll_watchdog: Duration,
-    /// Pong returns via `/stream/up` uplink frames (proving the agent→hub
-    /// data plane); `false` uses the `POST /pong` endpoint (legacy: only
-    /// proves the h2 connection layer is alive).
-    pub pong_via_upload: bool,
     /// Upper bound for establishing one tunnel request (`/poll` or
     /// `/stream/up`: send → response headers). Exceeding it is judged a dead
     /// request path — a form the receive-side watchdog can never observe,
     /// because it only starts once response headers arrive — and cancels
-    /// `shutdown` exactly like the watchdog does: the supervisor rebuilds the
-    /// session (for direct dialers, fail-fast).
+    /// `shutdown` exactly like the watchdog does: the supervisor rebuilds
+    /// the session (for direct dialers, fail-fast).
     ///
     /// Healthy hubs answer headers immediately; see
     /// [`DEFAULT_REQUEST_ESTABLISH_TIMEOUT`].
     pub establish_timeout: Duration,
+    /// Critical-task stall heartbeat timeout for the h2 loops (upload and
+    /// poll): a task that stops beating for this long is judged *wedged*
+    /// (alive but not progressing — the failure class the death contract
+    /// cannot see, because a wedged task keeps its channels open and sends
+    /// buffer as fake successes) and the session is rebuilt.
+    /// [`Duration::ZERO`] disables stall supervision (death-only).
+    ///
+    /// Derived from the negotiated heartbeat cadence
+    /// (`interval_secs * (max_missed + 1)` — never tolerate a wedged task
+    /// longer than the hub's own aging window) or pinned via the agent
+    /// config `task_stall_timeout_secs`.
+    pub task_stall_timeout: Duration,
+    /// Local concurrent-stream limit the dispatch event channel is sized
+    /// from (`max_incoming_streams`): a whole-table stream-creation burst
+    /// must pass the channel in one go. Not liveness per se — it rides this
+    /// struct because it flows the same negotiated-then-configurable path
+    /// into tunnel construction. 0 = the shared floor (see
+    /// `config::params::transport::incoming_channel_cap`).
+    pub incoming_streams_budget: usize,
 }
 
 impl H2Liveness {
-    /// Pre-negotiation behavior: no watchdog, Pong via the endpoint. The default for direct callers and existing tests.
-    pub const LEGACY: Self = Self {
+    /// Liveness when the hub advertises heartbeat disabled: no poll
+    /// watchdog (the poll stream is legitimately silent), the task-stall
+    /// fallback, and the default establish timeout.
+    pub const HEARTBEAT_DISABLED: Self = Self {
         poll_watchdog: Duration::ZERO,
-        pong_via_upload: false,
         establish_timeout: DEFAULT_REQUEST_ESTABLISH_TIMEOUT,
+        task_stall_timeout: Duration::from_secs(30),
+        incoming_streams_budget: 0,
     };
 }
 
@@ -85,12 +103,12 @@ impl AgentTunnel {
         hub_url: &str,
         sender: SendRequest<H2RequestBody>,
         auth_token: Option<String>,
-        shutdown: CancellationToken,
+        tasks: &SessionTasks,
         liveness: H2Liveness,
     ) -> Result<Self> {
         Ok(Self {
             inner: std::sync::Arc::new(H2Tunnel::new(
-                agent_id, hub_url, sender, auth_token, shutdown, liveness,
+                agent_id, hub_url, sender, auth_token, tasks, liveness,
             )),
         })
     }

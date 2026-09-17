@@ -1,13 +1,13 @@
 //! `/poll` handling: long-lived connection that streams `TunnelData` from hub → agent.
 
-use crate::hub::service::{HubService, text_response};
+use crate::hub::service::{HubService, agent_id_of, bind_connection_identity, text_response};
 use crate::hub::state::{HubResponseBody, RxStream};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
-use interflow_core::error::{InterflowError, Result};
+use interflow_core::error::Result;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 impl HubService {
     /// Handles a `/poll` long-polling request.
@@ -22,27 +22,13 @@ impl HubService {
         &self,
         req: Request<Incoming>,
     ) -> Result<Response<HubResponseBody>> {
-        let agent_id = req
-            .headers()
-            .get("x-agent-id")
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| InterflowError::config("missing agent-id".to_string()))?;
+        let agent_id = agent_id_of(&req)?;
 
         // Identity binding check
+        if let Err(resp) =
+            bind_connection_identity(&self.connection_identity, agent_id, "poll").await
         {
-            let mut identity = self.connection_identity.write().await;
-            if let Some(existing_id) = &*identity {
-                if existing_id != agent_id {
-                    warn!(
-                        "identity mismatch: connection is bound to {}, but poll attempt is for {}",
-                        existing_id, agent_id
-                    );
-                    return Ok(text_response(StatusCode::FORBIDDEN, "Identity mismatch"));
-                }
-            } else {
-                *identity = Some(agent_id.to_string());
-                debug!("Connection bound to identity (poll): {}", agent_id);
-            }
+            return Ok(resp);
         }
 
         // Take the AgentSession Arc (outer read lock is very short-lived)
@@ -83,6 +69,11 @@ impl HubService {
                     state.poll_waker.clone(),
                 )
             } else if state.tx.is_closed() {
+                // A deliberately narrower protocol than
+                // [`AgentSession::install_channels`]: the registration
+                // survives (liveness and QUIC handle untouched, the active
+                // upload lease keeps running) and the fresh rx is consumed
+                // by this very poll instead of being parked.
                 info!("Agent {} channel closed or lost, recreating", agent_id);
                 let (tx, rx) = mpsc::channel(256);
                 let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();

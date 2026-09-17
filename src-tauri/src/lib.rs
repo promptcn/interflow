@@ -65,7 +65,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::load_profile,
             commands::save_profile,
-            commands::profile_path,
             commands::generate_agent_id,
             commands::start_tunnel,
             commands::stop_tunnel,

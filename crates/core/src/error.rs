@@ -26,11 +26,7 @@ pub enum InterflowError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// HTTP construction error.
-    #[error("HTTP error: {0}")]
-    Http(#[from] http::Error),
-
-    /// Hyper runtime error.
+    /// Hyper runtime error (h2 handshake / request dispatch).
     #[error("Hyper error: {0}")]
     Hyper(#[from] hyper::Error),
 

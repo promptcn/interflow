@@ -10,6 +10,23 @@
 //! Opens to it are rejected **pre-dial and without consuming the shared open
 //! budget** — one target's pathology is no longer contagious.
 //!
+//! The same state machine is reused by the expose edge as a **route breaker**
+//! ([`BreakerKind::Route`], keyed by host, evidence = the close reasons
+//! relayed by the agent). One behavioral contract covers both uses:
+//!
+//! - [`TargetBreakers::check`] tells the caller **which** admission it got:
+//!   `Allow` (healthy), `Probe` (OPEN but the recovery probe of this
+//!   interval), or `Reject`. Callers that derive health from the admitted
+//!   stream's outcome (the edge route breaker) key their accounting off the
+//!   `Probe` verdict — see `route_evidence` in `expose::edge::listener`.
+//! - Failure evidence comes in two strengths. [`TargetBreakers::note_failure`]
+//!   is direct (the dial itself failed) and re-arms a tripped entry.
+//!   [`TargetBreakers::note_soft_failure`] is derivative (e.g. the edge
+//!   receiving the agent's `target_circuit_open`): it counts toward tripping
+//!   while CLOSED but never re-arms an OPEN entry — two breaker layers
+//!   feeding each other's cooldowns is an interlock, not isolation
+//!   (docs/bug/2026-09-17-edge-route-breaker-stuck-open.md §3.3).
+//!
 //! State machine (per target, agent-level, survives session rebuilds — same
 //! rationale as the rate limiter in [`super::egress::EgressRuntime`]):
 //!
@@ -19,7 +36,8 @@
 //!    ▲                                            │  cooldown elapses
 //!    │ probe succeeds (entry removed)             ▼
 //!    └──────────────────────── HALF_OPEN ◄── admit ≤1 probe / probe_interval
-//!                                             (probe fails ⇒ re-arm OPEN)
+//!                                             (probe fails ⇒ re-arm OPEN;
+//!                                              soft failure ⇒ no re-arm)
 //! ```
 //!
 //! Design notes:
@@ -42,6 +60,7 @@
 //!   pruned to the window at counting time; the table is hard-capped with a
 //!   closed-first, least-recently-touched eviction.
 
+use interflow_core::config::params::BreakerPolicy;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,30 +80,60 @@ const MAX_TRACKED_TARGETS: usize = 1024;
 /// full cooldown anyway.
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Which plane a breaker table guards: selects log wording and metric names
+/// so journal readers can tell an agent-side target trip from an edge-side
+/// route trip apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakerKind {
+    /// Agent egress: per-dial-target reachability (agent → backend).
+    Egress,
+    /// Expose edge: per-host route health (edge → route, evidence = relayed
+    /// close reasons).
+    Route,
+}
+
+impl BreakerKind {
+    /// Human wording for log lines ("target breaker tripped" vs "route
+    /// breaker tripped").
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Egress => "target breaker",
+            Self::Route => "route breaker",
+        }
+    }
+
+    /// The trip/recovery transition counter name. The egress name predates
+    /// the route reuse and is asserted by mesh e2e; the route name keeps
+    /// edge observability honest (an edge process must not emit
+    /// egress-named counters).
+    const fn transitions_metric(self) -> &'static str {
+        match self {
+            Self::Egress => "interflow_egress_target_breaker_transitions_total",
+            Self::Route => "interflow_edge_route_breaker_transitions_total",
+        }
+    }
+}
+
 /// Verdict for one Open against a target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerDecision {
     /// Healthy (or unseen) target — proceed to the budgeted gates.
     Allow,
+    /// Target OPEN, but this Open is the admitted recovery probe (cooldown
+    /// elapsed, ≤1 per `PROBE_INTERVAL`) — proceed, and report the outcome:
+    /// callers that derive health from the stream itself key their success
+    /// accounting off this verdict. Callers without outcome reporting treat
+    /// it exactly like [`BreakerDecision::Allow`].
+    Probe,
     /// Target tripped OPEN — reject pre-dial, without consuming budget.
     Reject,
-}
-
-/// Tuning parameters (mirrored from `AgentConfig`).
-#[derive(Debug, Clone, Copy)]
-pub struct BreakerConfig {
-    /// Connect failures within `window` required to trip OPEN.
-    pub failure_threshold: u32,
-    /// Sliding window for failure counting.
-    pub window: Duration,
-    /// How long a tripped target stays OPEN before probes are admitted.
-    pub cooldown: Duration,
 }
 
 /// Per-target breaker table. Agent-level (shared across sessions); held by
 /// [`super::egress::EgressRuntime`] next to the open-rate limiter.
 pub struct TargetBreakers {
-    cfg: BreakerConfig,
+    kind: BreakerKind,
+    cfg: BreakerPolicy,
     inner: Mutex<HashMap<String, BreakerEntry>>,
     /// Number of entries currently tripped (OPEN); feeds the
     /// `interflow_egress_target_breakers_open` gauge.
@@ -110,16 +159,19 @@ struct BreakerEntry {
 
 impl TargetBreakers {
     #[must_use]
-    pub fn new(cfg: BreakerConfig) -> Self {
+    pub fn new(kind: BreakerKind, cfg: BreakerPolicy) -> Self {
         Self {
+            kind,
             cfg,
             inner: Mutex::new(HashMap::new()),
             tripped: AtomicUsize::new(0),
         }
     }
 
-    /// Current number of tripped targets (gauge feed; also for tests).
-    pub fn tripped_count(&self) -> usize {
+    /// Current number of tripped targets (test-only accessor; no gauge is
+    /// wired to it).
+    #[cfg(test)]
+    fn tripped_count(&self) -> usize {
         self.tripped.load(Ordering::Relaxed)
     }
 
@@ -144,31 +196,51 @@ impl TargetBreakers {
         // the full cooldown.
         if now >= entry.last_probe + PROBE_INTERVAL {
             entry.last_probe = now;
-            debug!("target breaker admitting recovery probe: {target}");
-            BreakerDecision::Allow
+            debug!("{} admitting recovery probe: {target}", self.kind.label());
+            BreakerDecision::Probe
         } else {
             BreakerDecision::Reject
         }
     }
 
-    /// Record a connect-phase failure. The first failure for an unseen
-    /// target creates the entry (so `failure_threshold = 1` trips on the
-    /// very first failure).
+    /// Record a **direct** connect-phase failure (the dial itself failed).
+    /// The first failure for an unseen target creates the entry (so
+    /// `failure_threshold = 1` trips on the very first failure); a failure
+    /// reported while OPEN re-arms the full cooldown.
     pub fn note_failure(&self, target: &str) {
+        self.record_failure(target, false);
+    }
+
+    /// Record **derivative** failure evidence — not the backend failing, but
+    /// a peer protection reacting as if it had (the edge receiving the
+    /// agent's `target_circuit_open`). Counts toward tripping exactly like a
+    /// direct failure while CLOSED, but is a no-op while OPEN: second-hand
+    /// evidence must never extend an outage, or two breaker layers lock each
+    /// other open (the §3.3 interlock of
+    /// docs/bug/2026-09-17-edge-route-breaker-stuck-open.md).
+    pub fn note_soft_failure(&self, target: &str) {
+        self.record_failure(target, true);
+    }
+
+    /// Shared failure-recording body; `soft` only changes the OPEN-entry
+    /// branch (re-arm vs ignore).
+    fn record_failure(&self, target: &str, soft: bool) {
         let now = Instant::now();
         let mut inner = self.lock();
 
         if let Some(entry) = inner.get_mut(target) {
             entry.last_touch = now;
             if entry.open {
-                // Failure reported by a probe (or an Open that raced the
-                // trip): re-arm the full cooldown.
-                entry.deadline = now + self.cfg.cooldown;
-                debug!("target breaker re-armed: {target}");
+                if !soft {
+                    // Direct failure reported by a probe (or an Open that
+                    // raced the trip): re-arm the full cooldown.
+                    entry.deadline = now + self.cfg.cooldown;
+                    debug!("{} re-armed: {target}", self.kind.label());
+                }
                 return;
             }
             entry.failures.push_back(now);
-            Self::prune_window(entry, now, self.cfg.window);
+            Self::prune_window(entry, now, self.cfg.failure_window);
             if entry.failures.len() >= self.cfg.failure_threshold as usize {
                 self.trip(entry, target, now);
             }
@@ -184,7 +256,7 @@ impl TargetBreakers {
             // Evicting a tripped entry: it simply stops being tracked;
             // fresh failures will re-trip it.
             self.tripped.fetch_sub(1, Ordering::Relaxed);
-            debug!("target breaker table full, evicting {}", victim);
+            debug!("{} table full, evicting {}", self.kind.label(), victim);
         }
         let mut entry = BreakerEntry {
             open: false,
@@ -216,12 +288,11 @@ impl TargetBreakers {
         }
         inner.remove(target);
         self.tripped.fetch_sub(1, Ordering::Relaxed);
-        metrics::counter!(
-            "interflow_egress_target_breaker_transitions_total",
-            "state" => "closed"
-        )
-        .increment(1);
-        info!("target breaker recovered: {target} (probe succeeded)");
+        metrics::counter!(self.kind.transitions_metric(), "state" => "closed").increment(1);
+        info!(
+            "{} recovered: {target} (probe succeeded)",
+            self.kind.label()
+        );
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, BreakerEntry>> {
@@ -237,15 +308,12 @@ impl TargetBreakers {
         entry.deadline = now + self.cfg.cooldown;
         entry.last_probe = now;
         self.tripped.fetch_add(1, Ordering::Relaxed);
-        metrics::counter!(
-            "interflow_egress_target_breaker_transitions_total",
-            "state" => "open"
-        )
-        .increment(1);
+        metrics::counter!(self.kind.transitions_metric(), "state" => "open").increment(1);
         warn!(
-            "target breaker tripped: {target} ({} connect failures within {:?}; rejecting pre-dial for {:?})",
+            "{} tripped: {target} ({} connect failures within {:?}; rejecting pre-dial for {:?})",
+            self.kind.label(),
             entry.failures.len(),
-            self.cfg.window,
+            self.cfg.failure_window,
             self.cfg.cooldown
         );
     }
@@ -283,11 +351,14 @@ mod tests {
     use std::time::Duration;
 
     fn table(threshold: u32, window: Duration, cooldown: Duration) -> TargetBreakers {
-        TargetBreakers::new(BreakerConfig {
-            failure_threshold: threshold,
-            window,
-            cooldown,
-        })
+        TargetBreakers::new(
+            BreakerKind::Egress,
+            BreakerPolicy {
+                failure_threshold: threshold,
+                failure_window: window,
+                cooldown,
+            },
+        )
     }
 
     /// Threshold reached within the window trips; rejections follow.
@@ -335,8 +406,9 @@ mod tests {
         assert_eq!(t.check("flap"), BreakerDecision::Reject);
     }
 
-    /// After the cooldown elapses exactly one probe is admitted; its success
-    /// recovers the entry fully.
+    /// After the cooldown elapses exactly one probe is admitted (flagged as
+    /// `Probe`, not `Allow` — callers key their outcome accounting off the
+    /// verdict); its success recovers the entry fully.
     #[tokio::test(start_paused = true)]
     async fn cooldown_single_probe_then_recover() {
         let t = table(2, Duration::from_secs(10), Duration::from_secs(30));
@@ -346,7 +418,7 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(31)).await;
         // First open after cooldown = the probe.
-        assert_eq!(t.check("tgt"), BreakerDecision::Allow);
+        assert_eq!(t.check("tgt"), BreakerDecision::Probe);
         // A second open within PROBE_INTERVAL is rejected.
         assert_eq!(t.check("tgt"), BreakerDecision::Reject);
         // Probe succeeds → entry removed, fully re-admitted.
@@ -362,13 +434,45 @@ mod tests {
         t.note_failure("tgt");
         t.note_failure("tgt");
         tokio::time::advance(Duration::from_secs(31)).await;
-        assert_eq!(t.check("tgt"), BreakerDecision::Allow); // probe
+        assert_eq!(t.check("tgt"), BreakerDecision::Probe);
         t.note_failure("tgt"); // probe failed
         assert_eq!(t.check("tgt"), BreakerDecision::Reject);
         tokio::time::advance(Duration::from_secs(29)).await;
         assert_eq!(t.check("tgt"), BreakerDecision::Reject); // still within re-armed cooldown
         tokio::time::advance(Duration::from_secs(2)).await;
-        assert_eq!(t.check("tgt"), BreakerDecision::Allow); // next probe
+        assert_eq!(t.check("tgt"), BreakerDecision::Probe); // next probe
+    }
+
+    /// Soft (derivative) failure evidence: accumulates toward tripping while
+    /// CLOSED, but never re-arms an OPEN entry — second-hand evidence must
+    /// not extend an outage, or two breaker layers lock each other open.
+    #[tokio::test(start_paused = true)]
+    async fn soft_failure_trips_when_closed_but_never_re_arms() {
+        let t = table(2, Duration::from_secs(10), Duration::from_secs(30));
+        // While CLOSED it counts like a direct failure.
+        t.note_soft_failure("tgt");
+        assert_eq!(t.check("tgt"), BreakerDecision::Allow);
+        t.note_soft_failure("tgt");
+        assert_eq!(t.check("tgt"), BreakerDecision::Reject);
+        assert_eq!(t.tripped_count(), 1);
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(t.check("tgt"), BreakerDecision::Probe);
+        // The probe comes back with only derivative evidence (e.g. the
+        // agent-side breaker is still OPEN): it must NOT re-arm the cooldown…
+        t.note_soft_failure("tgt");
+        // …so past PROBE_INTERVAL the next probe is admitted, not locked out
+        // for another full cooldown.
+        tokio::time::advance(PROBE_INTERVAL + Duration::from_millis(1)).await;
+        assert_eq!(
+            t.check("tgt"),
+            BreakerDecision::Probe,
+            "soft failure must not re-arm an OPEN entry"
+        );
+        // Contrast: a direct failure on the probe does re-arm.
+        t.note_failure("tgt");
+        tokio::time::advance(PROBE_INTERVAL + Duration::from_millis(1)).await;
+        assert_eq!(t.check("tgt"), BreakerDecision::Reject);
     }
 
     /// threshold = 1 trips on the very first failure.
@@ -387,9 +491,9 @@ mod tests {
         t.note_failure("tgt");
         t.note_failure("tgt");
         tokio::time::advance(Duration::from_secs(31)).await;
-        assert_eq!(t.check("tgt"), BreakerDecision::Allow); // probe admitted, then lost
+        assert_eq!(t.check("tgt"), BreakerDecision::Probe); // probe admitted, then lost
         tokio::time::advance(PROBE_INTERVAL + Duration::from_millis(1)).await;
-        assert_eq!(t.check("tgt"), BreakerDecision::Allow); // re-probe admitted
+        assert_eq!(t.check("tgt"), BreakerDecision::Probe); // re-probe admitted
     }
 
     /// The hard cap evicts CLOSED entries first (cheapest loss), then the

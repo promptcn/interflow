@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod error;
+pub mod fault;
 pub mod protocol;
 pub mod security;
 pub mod telemetry;

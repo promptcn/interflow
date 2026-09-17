@@ -235,6 +235,66 @@ pub fn validate_hub(cfg: &HubConfig) -> Result<(), ConfigErrorList> {
         });
     }
 
+    // 8. heartbeat cadence sanity: an enabled heartbeat must actually tick.
+    //    (interval = 0 previously degraded into a silent 30s fallback poll —
+    //    indistinguishable from `enabled = false` in the config file.)
+    if cfg.heartbeat.enabled && cfg.heartbeat.interval_secs == 0 {
+        errs.push(ConfigError::Invalid(
+            "[heartbeat] interval_secs must be >= 1 when enabled; to disable heartbeats use \
+             enabled = false"
+                .to_string(),
+        ));
+    }
+
+    // 9. poll_grace must tolerate the agent supervisor's reconnect-backoff
+    //    cap (`BACKOFF_CAP`, single-sourced in core `config::params`): a
+    //    healthy agent riding out its worst-case backoff stays registered.
+    //    Going below it is a legitimate choice (evicted agents implicitly
+    //    re-register on their next /poll), but it must be deliberate.
+    if cfg.security.poll_grace_secs < interflow_core::config::params::BACKOFF_CAP.as_secs() {
+        errs.push(ConfigError::Invalid(format!(
+            "[security] poll_grace_secs ({}) is below the supervisor backoff cap ({}s): \
+             agents mid-backoff will be evicted (recoverable via implicit \
+             re-registration, at the cost of an orphan-stream sweep)",
+            cfg.security.poll_grace_secs,
+            interflow_core::config::params::BACKOFF_CAP.as_secs()
+        )));
+    }
+
+    // 10. transport-layer timing sanity: keepalive must be able to preempt
+    //     the idle timeout (QUIC) / outlast its own interval (h2). These are
+    //     the invariants the shared transport profile guarantees by default;
+    //     explicit config must not break them.
+    if cfg.transport.quic.enabled {
+        if cfg.transport.quic.max_idle_timeout_ms == 0
+            || cfg.transport.quic.keepalive_interval_ms == 0
+        {
+            errs.push(ConfigError::Invalid(
+                "[transport.quic] max_idle_timeout_ms and keepalive_interval_ms must be > 0"
+                    .to_string(),
+            ));
+        } else if u64::from(cfg.transport.quic.keepalive_interval_ms)
+            >= u64::from(cfg.transport.quic.max_idle_timeout_ms)
+        {
+            errs.push(ConfigError::Invalid(
+                "[transport.quic] keepalive_interval_ms must be < max_idle_timeout_ms \
+                 (otherwise keepalives cannot preempt the idle timeout)"
+                    .to_string(),
+            ));
+        }
+    }
+    if cfg.transport.h2.keepalive_interval_secs == 0 || cfg.transport.h2.keepalive_timeout_secs == 0
+    {
+        errs.push(ConfigError::Invalid(
+            "[transport.h2] keepalive_interval_secs and keepalive_timeout_secs must be > 0"
+                .to_string(),
+        ));
+    } else if cfg.transport.h2.keepalive_timeout_secs <= cfg.transport.h2.keepalive_interval_secs {
+        errs.push(ConfigError::Invalid(
+            "[transport.h2] keepalive_timeout_secs must be > keepalive_interval_secs".to_string(),
+        ));
+    }
+
     if errs.is_empty() {
         Ok(())
     } else {
@@ -284,6 +344,77 @@ pub fn validate_agent(cfg: &AgentConfig) -> Result<(), ConfigErrorList> {
                 rule.name
             )));
         }
+    }
+
+    // timeout-class zeros are rejected outright (zero-value semantics are
+    // reserved for limit-class knobs, where 0 = unlimited; a "0-second
+    // timeout" is never what anyone wants, and the runtime used to silently
+    // clamp it to 1s instead)
+    if cfg.agent.connect_timeout_secs == 0 {
+        errs.push(ConfigError::Invalid(
+            "[agent] connect_timeout_secs must be >= 1".to_string(),
+        ));
+    }
+    for (name, v) in [
+        (
+            "egress_backend_write_timeout_secs",
+            cfg.egress_backend_write_timeout_secs,
+        ),
+        (
+            "egress_resolve_timeout_secs",
+            cfg.egress_resolve_timeout_secs,
+        ),
+        (
+            "egress_connect_timeout_secs",
+            cfg.egress_connect_timeout_secs,
+        ),
+    ] {
+        if v == 0 {
+            errs.push(ConfigError::Invalid(format!(
+                "{name} must be >= 1 (0 is not a valid timeout; limit-class knobs are the \
+                 only ones where 0 means unlimited)"
+            )));
+        }
+    }
+    if cfg.agent.request_establish_timeout_secs == Some(0) {
+        errs.push(ConfigError::Invalid(
+            "[agent] request_establish_timeout_secs: omit the field to keep the default \
+             (0 is not a valid timeout)"
+                .to_string(),
+        ));
+    }
+    // (`poll_idle_timeout_secs = 0` and `task_stall_timeout_secs = 0` stay
+    // valid: they are the documented explicit "disable" escape hatches.)
+
+    // the open-rate burst bucket must absorb a whole-table stream-creation
+    // spike in one go (the same invariant the derived event-channel
+    // capacity enforces structurally in core)
+    if cfg.max_incoming_streams > 0
+        && cfg.max_stream_opens_per_sec > 0
+        && u64::from(cfg.stream_open_burst)
+            < u64::try_from(cfg.max_incoming_streams).unwrap_or(u64::MAX)
+    {
+        errs.push(ConfigError::Invalid(format!(
+            "stream_open_burst ({}) must be >= max_incoming_streams ({}): a legitimate \
+             whole-table creation spike must not trip the rate limiter",
+            cfg.stream_open_burst, cfg.max_incoming_streams
+        )));
+    }
+
+    // agent-side QUIC transport: same timing sanity as the hub's
+    // (keepalive must be able to preempt the negotiated-minimum idle
+    // timeout)
+    if matches!(cfg.agent.transport, crate::config::TransportKind::Quic)
+        && (cfg.transport.quic.max_idle_timeout_ms == 0
+            || cfg.transport.quic.keepalive_interval_ms == 0
+            || u64::from(cfg.transport.quic.keepalive_interval_ms)
+                >= u64::from(cfg.transport.quic.max_idle_timeout_ms))
+    {
+        errs.push(ConfigError::Invalid(
+            "[transport.quic] max_idle_timeout_ms and keepalive_interval_ms must be > 0 and \
+             keepalive_interval_ms < max_idle_timeout_ms"
+                .to_string(),
+        ));
     }
 
     // per-target breaker validation
@@ -400,11 +531,10 @@ mod tests {
             acl: AclConfig::default(),
             security: Default::default(),
             heartbeat: Default::default(),
-            routes: Default::default(),
             metrics: Default::default(),
             audit: Default::default(),
             logging: Default::default(),
-            quic: Default::default(),
+            transport: Default::default(),
         }
     }
 
@@ -436,5 +566,118 @@ mod tests {
         let mut cfg = base_hub_config();
         cfg.config_version = 99;
         validate_hub(&cfg).expect_err("should reject version");
+    }
+
+    #[test]
+    fn heartbeat_zero_interval_rejected_when_enabled() {
+        let mut cfg = base_hub_config();
+        cfg.heartbeat.interval_secs = 0;
+        let err = validate_hub(&cfg).expect_err("0 interval + enabled must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("[heartbeat]")))
+        );
+        // ...but disabled heartbeats legitimately skip the cadence rule.
+        cfg.heartbeat.enabled = false;
+        validate_hub(&cfg).expect("disabled heartbeat with 0 interval passes");
+    }
+
+    #[test]
+    fn poll_grace_below_backoff_cap_rejected() {
+        let mut cfg = base_hub_config();
+        cfg.security.poll_grace_secs = 10;
+        let err = validate_hub(&cfg).expect_err("grace below BACKOFF_CAP must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("poll_grace_secs")))
+        );
+        // Exactly at the cap passes (>= is the invariant).
+        cfg.security.poll_grace_secs = interflow_core::config::params::BACKOFF_CAP.as_secs();
+        validate_hub(&cfg).expect("grace == backoff cap passes");
+    }
+
+    #[test]
+    fn quic_keepalive_must_preempt_idle_timeout() {
+        let mut cfg = base_hub_config();
+        cfg.transport.quic.enabled = true;
+        cfg.transport.quic.keepalive_interval_ms = 40_000;
+        let err = validate_hub(&cfg).expect_err("keepalive >= idle must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("[transport.quic]")))
+        );
+        cfg.transport.quic.keepalive_interval_ms = 10_000;
+        validate_hub(&cfg).expect("sane quic timing passes");
+    }
+
+    #[test]
+    fn h2_keepalive_timeout_must_outlast_interval() {
+        let mut cfg = base_hub_config();
+        cfg.transport.h2.keepalive_interval_secs = 5;
+        cfg.transport.h2.keepalive_timeout_secs = 5;
+        let err = validate_hub(&cfg).expect_err("timeout == interval must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("[transport.h2]")))
+        );
+        cfg.transport.h2.keepalive_timeout_secs = 10;
+        validate_hub(&cfg).expect("sane h2 timing passes");
+    }
+
+    fn base_agent_config() -> AgentConfig {
+        AgentConfig {
+            control: ControlConfig {
+                enabled: false,
+                ..ControlConfig::default()
+            },
+            ..AgentConfig::for_identity("test-agent", "https://hub.example.com:6666")
+        }
+    }
+
+    #[test]
+    fn agent_zero_timeouts_rejected() {
+        let mut cfg = base_agent_config();
+        cfg.egress_backend_write_timeout_secs = 0;
+        let err = validate_agent(&cfg).expect_err("zero egress timeout must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("egress_backend")))
+        );
+
+        let mut cfg = base_agent_config();
+        cfg.agent.connect_timeout_secs = 0;
+        assert!(validate_agent(&cfg).is_err());
+
+        let mut cfg = base_agent_config();
+        cfg.agent.request_establish_timeout_secs = Some(0);
+        let err = validate_agent(&cfg).expect_err("Some(0) establish must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("request_establish")))
+        );
+
+        // The documented disable escape hatches stay valid.
+        let mut cfg = base_agent_config();
+        cfg.agent.poll_idle_timeout_secs = Some(0);
+        cfg.agent.task_stall_timeout_secs = Some(0);
+        validate_agent(&cfg).expect("documented Some(0) disables stay valid");
+    }
+
+    #[test]
+    fn agent_burst_must_cover_stream_table() {
+        let mut cfg = base_agent_config();
+        cfg.max_incoming_streams = 512;
+        cfg.stream_open_burst = 256;
+        let err = validate_agent(&cfg).expect_err("burst < streams must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("stream_open_burst")))
+        );
+        cfg.stream_open_burst = 512;
+        validate_agent(&cfg).expect("burst == streams passes");
+        // Unlimited stream cap (0) has no table bound to cover.
+        cfg.max_incoming_streams = 0;
+        cfg.stream_open_burst = 1;
+        validate_agent(&cfg).expect("unlimited streams exempt the burst rule");
     }
 }

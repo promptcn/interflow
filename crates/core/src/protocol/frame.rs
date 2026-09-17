@@ -8,26 +8,29 @@
 //!  payload_len(u32) | payload]
 //! ```
 //!
-//! Unknown-type policy: skip when [`FLAG_MUST_UNDERSTAND`] is not set;
+//! Unknown-type policy: skip when `FLAG_MUST_UNDERSTAND` is not set;
 //! protocol error when it is.
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-/// Binary frame magic (`b"IN"`)
-pub const FRAME_MAGIC: [u8; 2] = *b"IN";
+/// Wire constants below are crate-internal: they document the frame format and
+/// drive encode/decode validation, but no consumer outside this module needs
+/// them by name. [`FLAG_UDP`] is the exception — hubs branch on it when
+/// dispatching Open frames.
+const FRAME_MAGIC: [u8; 2] = *b"IN";
 /// The current protocol version.
-pub const FRAME_VERSION: u8 = 2;
+const FRAME_VERSION: u8 = 2;
 /// Upper bound for a single frame payload (4 MiB), guarding against giant allocations triggered by abnormal lengths.
-pub const MAX_FRAME_PAYLOAD: usize = 4 * 1024 * 1024;
+const MAX_FRAME_PAYLOAD: usize = 4 * 1024 * 1024;
 /// Upper bound for a single ID field.
-pub const MAX_ID_LEN: usize = 256;
+const MAX_ID_LEN: usize = 256;
 
 /// flags bit: the caller must understand this frame or tear down the connection.
-pub const FLAG_MUST_UNDERSTAND: u8 = 0x01;
+const FLAG_MUST_UNDERSTAND: u8 = 0x01;
 /// flags bit: payload compression (reserved, not enabled this cycle).
-pub const FLAG_COMPRESSED: u8 = 0x02;
+const FLAG_COMPRESSED: u8 = 0x02;
 /// flags bit: HMAC signature (reserved).
-pub const FLAG_SIGNED: u8 = 0x04;
+const FLAG_SIGNED: u8 = 0x04;
 /// flags bit: **set on Open frames only** — the stream carries UDP datagram semantics.
 ///
 /// Each Data frame's payload on the stream is exactly one complete UDP
@@ -37,7 +40,7 @@ pub const FLAG_SIGNED: u8 = 0x04;
 /// stream (Close after dial failure, fail fast).
 pub const FLAG_UDP: u8 = 0x08;
 /// flags mask: the bits currently defined.
-pub const FLAGS_KNOWN_MASK: u8 = FLAG_MUST_UNDERSTAND | FLAG_COMPRESSED | FLAG_SIGNED | FLAG_UDP;
+const FLAGS_KNOWN_MASK: u8 = FLAG_MUST_UNDERSTAND | FLAG_COMPRESSED | FLAG_SIGNED | FLAG_UDP;
 
 /// The carrying protocol of a tunnel stream (declared by the ingress rule, conveyed to egress via the Open frame).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]

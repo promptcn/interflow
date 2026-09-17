@@ -28,11 +28,9 @@
 //!   5. Heartbeat death detection: losing contact after having answered a
 //!      Pong → eviction + leftover streams end cleanly via generation
 //!      self-checks;
-//!   6. Legacy compatibility: agents that never answered a Pong do not
-//!      participate in heartbeat death detection;
-//!   7. Heartbeat contract: the hub's Ping is indeed delivered via the poll
+//!   6. Heartbeat contract: the hub's Ping is indeed delivered via the poll
 //!      channel; answering Pong as agreed keeps the agent alive long-term;
-//!   8. Real AgentClient integration: with heartbeats enabled the agent stays
+//!   7. Real AgentClient integration: with heartbeats enabled the agent stays
 //!      stably Connected (the tunnel layer answers automatically).
 
 #![allow(
@@ -167,15 +165,12 @@ async fn poll(snd: &mut SendRequest<H2RequestBody>, id: &str) -> Response<hyper:
     snd.send_request(req).await.expect("poll")
 }
 
-async fn post_pong(snd: &mut SendRequest<H2RequestBody>, id: &str) -> StatusCode {
-    snd.ready().await.expect("ready");
-    let req = Request::builder()
-        .method("POST")
-        .uri("/pong")
-        .header("x-agent-id", id)
-        .body(empty_body())
-        .unwrap();
-    snd.send_request(req).await.expect("pong").status()
+/// Sends one data-plane Pong frame over the upload stream (the heartbeat
+/// reply contract — same as the real AgentTunnel).
+async fn send_uplink_pong(up_tx: &mpsc::Sender<Bytes>, id: &str) {
+    let mut buf = BytesMut::new();
+    encode_frame(FrameType::Pong, 0, "", id, &[], &mut buf);
+    up_tx.send(buf.freeze()).await.expect("send pong");
 }
 
 async fn list_agents(snd: &mut SendRequest<H2RequestBody>) -> Vec<String> {
@@ -589,9 +584,8 @@ async fn heartbeat_evicts_pong_aware_wedge_and_ends_poll() {
     assert_eq!(resp.status(), 200);
     let mut body = resp.into_body();
 
-    // Answer one Pong: confirms heartbeat capability, joining death detection
-    // from then on
-    assert_eq!(post_pong(&mut tgt, "wedge").await, 204);
+    // Death detection participates from registration (last_pong initialized
+    // there): silence alone ages the session out.
 
     // Wait for the loss-of-contact verdict (deadline = 1*(1+1) = 2s; generous
     // headroom)
@@ -632,12 +626,13 @@ async fn pong_replying_agent_survives_heartbeat() {
 
     let mut tgt = connect(port).await;
     assert_eq!(register(&mut tgt, "good").await, 200);
+    let (up_tx, _up_resp) = open_upload(&mut tgt, "good").await;
     let resp = poll(&mut tgt, "good").await;
     assert_eq!(resp.status(), 200);
     let mut body = resp.into_body();
 
-    // Read poll frames: answer Pong on every Ping (the same contract as the
-    // real AgentTunnel), for 5s straight
+    // Read poll frames: answer Pong on every Ping over the upload stream
+    // (the same contract as the real AgentTunnel), for 5s straight
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut buf = BytesMut::new();
     let mut pings = 0usize;
@@ -657,7 +652,7 @@ async fn pong_replying_agent_survives_heartbeat() {
                 while let DecodeOutcome::Ok(f) = decode_frame(&mut buf) {
                     if matches!(f.frame_type, FrameType::Ping) {
                         pings += 1;
-                        assert_eq!(post_pong(&mut tgt, "good").await, 204);
+                        send_uplink_pong(&up_tx, "good").await;
                     }
                 }
             }

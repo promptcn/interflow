@@ -23,13 +23,6 @@ pub fn save_profile(profile: Profile) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn profile_path() -> Result<String, String> {
-    profile::profile_path()
-        .map(|p| p.display().to_string())
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub fn generate_agent_id() -> String {
     interflow_expose::client::default_agent_id()
 }
@@ -47,6 +40,20 @@ pub struct TunnelConfig {
     pub transport: Option<TransportKind>,
     /// Hub QUIC address; absent = derived from the hub URL's host:port.
     pub hub_quic_addr: Option<String>,
+}
+
+impl From<TunnelConfig> for ExposeArgs {
+    fn from(config: TunnelConfig) -> Self {
+        Self {
+            local_ports: config.local_ports,
+            hub_url: config.hub_url,
+            auth_token: config.auth_token,
+            agent_id: config.agent_id,
+            ca_path: config.ca_path.filter(|s| !s.is_empty()),
+            transport: config.transport.unwrap_or_default(),
+            hub_quic_addr: config.hub_quic_addr.filter(|s| !s.is_empty()),
+        }
+    }
 }
 
 #[tauri::command]
@@ -76,15 +83,7 @@ pub async fn start_tunnel(
         return Err(format!("CA file does not exist: {ca}"));
     }
 
-    let args = ExposeArgs {
-        local_ports: config.local_ports,
-        hub_url: config.hub_url,
-        auth_token: config.auth_token,
-        agent_id: config.agent_id,
-        ca_path: config.ca_path.filter(|s| !s.is_empty()),
-        transport: config.transport.unwrap_or_default(),
-        hub_quic_addr: config.hub_quic_addr.filter(|s| !s.is_empty()),
-    };
+    let args = ExposeArgs::from(config);
 
     let manager = {
         let guard = state.lock().map_err(|_| lock_error())?;

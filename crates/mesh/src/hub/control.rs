@@ -273,23 +273,11 @@ mod tests {
     use tokio::sync::RwLock;
 
     async fn registered_agent(agents: &SharedAgents, id: &str) {
-        let (tx, rx) = mpsc::channel(256);
-        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-        let _ = rx; // Simulating "not yet taken by poll" is fine: control sends do not depend on data channel consumption
+        // A fresh session keeps its rx "not yet taken by poll"; control
+        // sends do not depend on data-channel consumption.
         agents.write().await.insert(
             id.to_string(),
-            Arc::new(RwLock::new(AgentSession {
-                tx,
-                ctrl_tx,
-                ctrl_backlog: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                rx: Some(rx),
-                ctrl_rx: Some(ctrl_rx),
-                generation: 0,
-                last_pong: Instant::now(),
-                poll_waker: Arc::new(std::sync::Mutex::new(None)),
-                up_lease: None,
-                quic: None,
-            })),
+            Arc::new(RwLock::new(AgentSession::new(None))),
         );
     }
 

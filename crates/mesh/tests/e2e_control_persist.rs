@@ -92,7 +92,7 @@ async fn start_file_agent(
 ) -> interflow_mesh::agent::AgentHandle {
     let toml = format!(
         "# e2e fixture top comment
-config_version = 2
+config_version = 3
 
 [agent]
 id = \"persist-agent\"

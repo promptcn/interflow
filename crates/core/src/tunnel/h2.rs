@@ -29,6 +29,7 @@
 use crate::error::{InterflowError, Result};
 use crate::protocol::{FrameType, StreamProto, frame as wire};
 use crate::tunnel::agent::H2Liveness;
+use crate::tunnel::session_tasks::{Beat, SessionTasks, beat_interval};
 use crate::tunnel::transport::{RESPONSE_SOURCE, TunnelData, TunnelDispatch, TunnelTransport};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -46,8 +47,8 @@ use tracing::{debug, error, info, warn};
 /// The h2 request body type.
 ///
 /// The request body of the streaming uplink POST shares this type parameter
-/// (`SendRequest<H2RequestBody>`) with empty-body requests such as `/poll`,
-/// `/pong`, and `/register`.
+/// (`SendRequest<H2RequestBody>`) with empty-body requests such as `/poll`
+/// and `/register`.
 pub type H2RequestBody = BoxBody<Bytes, InterflowError>;
 
 /// Capacity (in frames) of the uplink frame channel. Mirrors the `/poll`
@@ -55,7 +56,7 @@ pub type H2RequestBody = BoxBody<Bytes, InterflowError>;
 /// to the pump and ultimately to the TCP/UDP source.
 const UPLOAD_CHANNEL_CAP: usize = 256;
 
-/// Builds an empty request body (shared by bodyless requests such as `/poll` and `/pong`).
+/// Builds an empty request body (shared by bodyless requests such as `/poll` and `/register`).
 pub fn empty_request_body() -> H2RequestBody {
     http_body_util::Empty::<Bytes>::new()
         .map_err(|never| match never {})
@@ -87,18 +88,19 @@ impl H2Tunnel {
     /// with the new instance for hub-side resources).
     ///
     /// `liveness` (see [`H2Liveness`]) decides the data-plane heartbeat
-    /// shape: the poll receive-side watchdog and the Pong return path.
-    /// `shutdown` is a **same-node clone** of the session token — when the
-    /// watchdog fires, the poll loop can simply `cancel()` it to terminate
-    /// the whole session (the supervisor reconnects).
+    /// shape: the poll receive-side watchdog, the Pong return path, and the
+    /// critical-task stall timeout. `tasks` owns the session token (the
+    /// cascade target of the death contract) and the task tracker.
     pub fn new(
         agent_id: String,
         hub_url: &str,
         sender: SendRequest<H2RequestBody>,
         auth_token: Option<String>,
-        shutdown: CancellationToken,
+        tasks: &SessionTasks,
         liveness: H2Liveness,
     ) -> Self {
+        let tasks = tasks.clone();
+        let shutdown = tasks.token().clone();
         let sender = Arc::new(Mutex::new(sender));
         let dispatch = Arc::new(TunnelDispatch::new());
         // Pre-build the first-round frame channel: sends that happen before the
@@ -108,44 +110,68 @@ impl H2Tunnel {
         let (first_up_tx, first_up_rx) = mpsc::channel(UPLOAD_CHANNEL_CAP);
         let up_tx = Arc::new(Mutex::new(first_up_tx));
 
-        tokio::spawn(Self::run_upload_loop(
-            sender.clone(),
-            agent_id.clone(),
-            hub_url.to_string(),
-            up_tx.clone(),
-            auth_token.clone(),
-            shutdown.clone(),
-            Some(first_up_rx),
-            liveness.establish_timeout,
-        ));
+        // Critical under the death contract: the task exiting for ANY reason
+        // (return, panic, abort) ends the session for rebuild. Before the
+        // 2026-09-16 hardening these were fire-and-forget spawns — an upload
+        // or poll task death went entirely unobserved.
+        let upload_sender = sender.clone();
+        let upload_agent_id = agent_id.clone();
+        let upload_hub_url = hub_url.to_string();
+        let upload_up_tx = up_tx.clone();
+        let upload_auth = auth_token.clone();
+        let upload_shutdown = shutdown.clone();
+        tasks.spawn_critical(
+            "h2-upload",
+            Some(liveness.task_stall_timeout),
+            move |beat| {
+                Self::run_upload_loop(
+                    upload_sender,
+                    upload_agent_id,
+                    upload_hub_url,
+                    upload_up_tx,
+                    upload_auth,
+                    upload_shutdown,
+                    Some(first_up_rx),
+                    liveness.establish_timeout,
+                    liveness.task_stall_timeout,
+                    beat,
+                )
+            },
+        );
 
         let dispatch_for_poll = dispatch.clone();
         let agent_id_for_poll = agent_id.clone();
         let hub_url_for_poll = hub_url.to_string();
         let up_tx_for_poll = up_tx.clone();
         let token_for_poll = shutdown.clone();
+        let poll_tasks = tasks.clone();
 
-        tokio::spawn(async move {
-            Self::run_poll_loop(
-                sender,
-                agent_id_for_poll,
-                hub_url_for_poll,
-                &dispatch_for_poll,
-                auth_token,
-                token_for_poll,
-                up_tx_for_poll,
-                liveness,
-            )
-            .await;
-            // Internal-cause cleanup (the second half of the termination
-            // contract): poll exiting = this tunnel will receive no more
-            // inbound frames = every consumer in the dispatch tables is
-            // already dead-waiting — clear the tables in place to release
-            // them (forwarders/pumps get None from recv() and exit, backend
-            // fds released), without depending on the consumer remembering to
-            // call shutdown(). Coexists idempotently with explicit shutdown().
-            Self::release_all_streams(&dispatch_for_poll).await;
-            debug!("data receive task finished");
+        tasks.spawn_critical("h2-poll", Some(liveness.task_stall_timeout), move |beat| {
+            async move {
+                Self::run_poll_loop(
+                    sender,
+                    agent_id_for_poll,
+                    hub_url_for_poll,
+                    &dispatch_for_poll,
+                    auth_token,
+                    token_for_poll,
+                    up_tx_for_poll,
+                    liveness,
+                    poll_tasks,
+                    liveness.task_stall_timeout,
+                    beat,
+                )
+                .await;
+                // Internal-cause cleanup (the second half of the termination
+                // contract): poll exiting = this tunnel will receive no more
+                // inbound frames = every consumer in the dispatch tables is
+                // already dead-waiting — clear the tables in place to release
+                // them (forwarders/pumps get None from recv() and exit, backend
+                // fds released), without depending on the consumer remembering to
+                // call shutdown(). Coexists idempotently with explicit shutdown().
+                Self::release_all_streams(&dispatch_for_poll).await;
+                debug!("data receive task finished");
+            }
         });
 
         Self {
@@ -242,6 +268,14 @@ impl H2Tunnel {
     /// signal. When the response body ends (hub removal / preemption /
     /// disconnect), rebuild immediately — the hub-side `/stream/up` implicit
     /// re-registration covers the removal case, fully symmetric with `/poll`.
+    ///
+    /// Runs under the session death contract: exiting for any reason (this
+    /// loop's own `break`s were already session-ending events) ends the
+    /// session. `beat` + `stall_timeout` implement the stall heartbeat —
+    /// every long wait below beats through [`Beat::during`], so a wedged
+    /// (never-progressing) loop is caught even though its channel stays
+    /// open and sends keep buffering as fake successes.
+    #[allow(clippy::too_many_arguments)]
     async fn run_upload_loop(
         sender: Arc<Mutex<SendRequest<H2RequestBody>>>,
         agent_id: String,
@@ -251,12 +285,16 @@ impl H2Tunnel {
         shutdown: CancellationToken,
         mut first_rx: Option<mpsc::Receiver<Bytes>>,
         establish_timeout: Duration,
+        stall_timeout: Duration,
+        beat: Beat,
     ) {
         const BASE_INTERVAL: Duration = Duration::from_millis(100);
         const MAX_INTERVAL: Duration = Duration::from_secs(5);
+        let beat_every = beat_interval(stall_timeout);
         let mut consecutive_failures = 0u32;
 
         loop {
+            beat.beat();
             // The first round reuses the channel pre-built at construction
             // (its tx is already in the slot; sends earlier than the 200
             // buffer there); every later round creates a new channel and
@@ -309,7 +347,7 @@ impl H2Tunnel {
             // session token and let the supervisor rebuild.
             let resp = tokio::select! {
                 () = shutdown.cancelled() => break,
-                r = tokio::time::timeout(establish_timeout, resp_result) => {
+                r = beat.during(beat_every, tokio::time::timeout(establish_timeout, resp_result)) => {
                     let Ok(resp) = r else {
                         metrics::counter!("interflow_agent_tunnel_establish_timeout_total", "stream" => "upload").increment(1);
                         warn!(
@@ -332,6 +370,8 @@ impl H2Tunnel {
                         BASE_INTERVAL,
                         MAX_INTERVAL,
                         consecutive_failures,
+                        &beat,
+                        beat_every,
                     )
                     .await;
                     continue;
@@ -344,6 +384,8 @@ impl H2Tunnel {
                         BASE_INTERVAL,
                         MAX_INTERVAL,
                         consecutive_failures,
+                        &beat,
+                        beat_every,
                     )
                     .await;
                     continue;
@@ -359,6 +401,15 @@ impl H2Tunnel {
             }
             consecutive_failures = 0;
 
+            // Fault injection: panic right after a round establishes (the
+            // upload-task death scenario) or wedge in place (the stall
+            // scenario — the channel was just swapped in, so uplink sends
+            // buffer as fake successes; only a stall heartbeat catches it).
+            crate::fault::trigger(crate::fault::FaultPoint::H2UploadLoopAfterEstablish);
+            if crate::fault::stall(crate::fault::FaultPoint::H2UploadLoopStall) {
+                std::future::pending::<()>().await;
+            }
+
             // Response body ending = upload death signal (under normal
             // conditions this body never yields data frames; it only carries
             // the "alive" semantics; the hub ending it declares this upload
@@ -367,7 +418,7 @@ impl H2Tunnel {
             loop {
                 let frame_res = tokio::select! {
                     () = shutdown.cancelled() => break,
-                    f = body.frame() => f,
+                    f = beat.during(beat_every, body.frame()) => f,
                 };
                 match frame_res {
                     None | Some(Err(_)) => break,
@@ -391,18 +442,21 @@ impl H2Tunnel {
     }
 
     /// Uplink retry backoff (failure count is incremented by the caller; mirrors the poll loop's backoff discipline).
+    /// Beats throughout — a backoff sleep is progress, not a stall.
     async fn upload_backoff(
         shutdown: &CancellationToken,
         base: Duration,
         max: Duration,
         consecutive_failures: u32,
+        beat: &Beat,
+        beat_every: Duration,
     ) {
         let backoff_ms = compute_backoff_ms(base, consecutive_failures);
         let interval = max.min(Duration::from_millis(backoff_ms));
         warn!("retrying upload stream in {interval:?}...");
         tokio::select! {
             () = shutdown.cancelled() => {},
-            () = tokio::time::sleep(interval) => {}
+            () = beat.during(beat_every, tokio::time::sleep(interval)) => {}
         }
     }
 
@@ -417,13 +471,18 @@ impl H2Tunnel {
         shutdown: CancellationToken,
         up_tx: Arc<Mutex<mpsc::Sender<Bytes>>>,
         liveness: H2Liveness,
+        tasks: SessionTasks,
+        stall_timeout: Duration,
+        beat: Beat,
     ) {
         const BASE_INTERVAL: Duration = Duration::from_millis(100);
         const MAX_INTERVAL: Duration = Duration::from_secs(5);
+        let beat_every = beat_interval(stall_timeout);
         let mut consecutive_failures = 0;
         let mut buffer = BytesMut::with_capacity(8192);
 
         loop {
+            beat.beat();
             // Build the request + send future within the same scope; the sender lock is released as soon as the send future is extracted.
             let resp_result = {
                 let mut sender_locked = sender.lock().await;
@@ -454,7 +513,7 @@ impl H2Tunnel {
                     // fail-fast).
                     let resp = tokio::select! {
                         () = shutdown.cancelled() => break,
-                        r = tokio::time::timeout(liveness.establish_timeout, fut) => {
+                        r = beat.during(beat_every, tokio::time::timeout(liveness.establish_timeout, fut)) => {
                             let Ok(resp) = r else {
                                 metrics::counter!("interflow_agent_tunnel_establish_timeout_total", "stream" => "poll").increment(1);
                                 warn!(
@@ -473,12 +532,12 @@ impl H2Tunnel {
                         &agent_id,
                         &mut buffer,
                         dispatch,
-                        &sender,
-                        &hub_url,
-                        auth_token.as_deref(),
                         &up_tx,
                         liveness,
                         &shutdown,
+                        &tasks,
+                        &beat,
+                        beat_every,
                     )
                     .await
                 }
@@ -499,7 +558,7 @@ impl H2Tunnel {
             }
             tokio::select! {
                 () = shutdown.cancelled() => break,
-                () = tokio::time::sleep(current_interval) => {}
+                () = beat.during(beat_every, tokio::time::sleep(current_interval)) => {}
             }
         }
     }
@@ -531,7 +590,7 @@ impl H2Tunnel {
     /// automatically gains heartbeat-answering capability.
     ///
     /// Data-plane liveness (root-cured on 2026-09-13):
-    /// - **Pong rides the uplink stream** (when negotiated): the answer itself
+    /// - **Pong rides the uplink stream**: the answer itself
     ///   proves the agent→hub data path;
     /// - **Poll receive-side watchdog**: a successful write on the hub side ≠
     ///   receipt by the peer (kernel/proxy buffers absorb writes); a stall in
@@ -544,12 +603,12 @@ impl H2Tunnel {
         agent_id: &str,
         buffer: &mut BytesMut,
         dispatch: &TunnelDispatch,
-        sender: &Arc<Mutex<SendRequest<H2RequestBody>>>,
-        hub_url: &str,
-        auth_token: Option<&str>,
         up_tx: &Arc<Mutex<mpsc::Sender<Bytes>>>,
         liveness: H2Liveness,
         shutdown: &CancellationToken,
+        tasks: &SessionTasks,
+        beat: &Beat,
+        beat_every: Duration,
     ) -> bool {
         let resp = match resp_result {
             Ok(r) => r,
@@ -563,6 +622,10 @@ impl H2Tunnel {
             return false;
         }
         info!("connected to hub streaming endpoint");
+        // Fault injection: panic right after the poll stream connects (the
+        // poll-task death scenario — with it dies the in-task receive
+        // watchdog).
+        crate::fault::trigger(crate::fault::FaultPoint::H2PollLoopAfterConnect);
         let mut body = resp.into_body();
         loop {
             // The watchdog resets only on "any frame": heartbeat Pings
@@ -571,12 +634,12 @@ impl H2Tunnel {
             let frame_res = if liveness.poll_watchdog.is_zero() {
                 tokio::select! {
                     () = shutdown.cancelled() => return false,
-                    f = body.frame() => f,
+                    f = beat.during(beat_every, body.frame()) => f,
                 }
             } else {
                 tokio::select! {
                     () = shutdown.cancelled() => return false,
-                    r = tokio::time::timeout(liveness.poll_watchdog, body.frame()) => {
+                    r = beat.during(beat_every, tokio::time::timeout(liveness.poll_watchdog, body.frame())) => {
                         let Ok(f) = r else {
                             warn!(
                                 "poll stream {:?} received no frames (including heartbeat Ping), \
@@ -602,14 +665,7 @@ impl H2Tunnel {
                     buffer.extend_from_slice(&data);
                     while let Some(tunnel_data) = TunnelDispatch::decode_tunnel_data(buffer) {
                         if tunnel_data.stream_type == FrameType::Ping {
-                            Self::spawn_pong(
-                                agent_id,
-                                sender,
-                                hub_url,
-                                auth_token,
-                                up_tx,
-                                liveness.pong_via_upload,
-                            );
+                            Self::spawn_pong(tasks, agent_id, up_tx);
                             continue;
                         }
                         dispatch.dispatch(tunnel_data).await;
@@ -626,86 +682,27 @@ impl H2Tunnel {
         true
     }
 
-    /// Answers a hub heartbeat Ping.
-    ///
-    /// Prefers returning the Pong frame over the uplink data stream (proving
-    /// the agent→hub data path); on failure (upload rebuild gap / encoding
-    /// error / not negotiated) it falls back to the `POST /pong` endpoint.
-    /// Runs as a separate task: a blocking `send` on a full uplink channel
-    /// must not stall the poll read loop — a full channel is itself an uplink
-    /// outage, and the hub will age the session out via last_pong, which is
-    /// semantically correct.
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_pong(
-        agent_id: &str,
-        sender: &Arc<Mutex<SendRequest<H2RequestBody>>>,
-        hub_url: &str,
-        auth_token: Option<&str>,
-        up_tx: &Arc<Mutex<mpsc::Sender<Bytes>>>,
-        pong_via_upload: bool,
-    ) {
-        let sender = sender.clone();
-        let hub_url = hub_url.to_string();
+    /// Answers a hub heartbeat Ping with a Pong frame over the uplink data
+    /// stream (proving the agent→hub data path). Runs as a separate task: a
+    /// blocking `send` on a full uplink channel must not stall the poll read
+    /// loop — a full channel is itself an uplink outage, and the hub will
+    /// age the session out via `last_pong`, which is semantically correct.
+    fn spawn_pong(tasks: &SessionTasks, agent_id: &str, up_tx: &Arc<Mutex<mpsc::Sender<Bytes>>>) {
         let agent_id = agent_id.to_string();
-        let token = auth_token.map(str::to_string);
         let up_tx = up_tx.clone();
-        tokio::spawn(async move {
-            if pong_via_upload {
-                let mut buf = BytesMut::with_capacity(64 + agent_id.len());
-                if wire::encode_frame(FrameType::Pong, 0, "", &agent_id, &[], &mut buf).is_some() {
-                    let sent = {
-                        let tx = up_tx.lock().await;
-                        tx.send(buf.freeze()).await.is_ok()
-                    };
-                    if sent {
-                        return;
-                    }
-                    debug!(
-                        "upstream Pong send failed (upload rebuilding), falling back to /pong endpoint"
-                    );
-                }
+        tasks.spawn_auxiliary(async move {
+            let mut buf = BytesMut::with_capacity(64 + agent_id.len());
+            if wire::encode_frame(FrameType::Pong, 0, "", &agent_id, &[], &mut buf).is_none() {
+                return;
             }
-            if let Err(e) = Self::send_pong(&sender, &hub_url, &agent_id, token.as_deref()).await {
-                debug!("heartbeat Pong send failed: {}", e);
+            let sent = {
+                let tx = up_tx.lock().await;
+                tx.send(buf.freeze()).await.is_ok()
+            };
+            if !sent {
+                debug!("upstream Pong send failed (upload rebuilding)");
             }
         });
-    }
-
-    /// Answers a hub heartbeat: `POST /pong`. Sent over the main HTTP/2 connection (same connection as
-    /// registration; identity binding was established by /register).
-    async fn send_pong(
-        sender: &Arc<Mutex<SendRequest<H2RequestBody>>>,
-        hub_url: &str,
-        agent_id: &str,
-        auth_token: Option<&str>,
-    ) -> Result<()> {
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri(format!("{hub_url}/pong"))
-            .header("x-agent-id", agent_id);
-        if let Some(token) = auth_token {
-            builder = builder.header("Authorization", format!("Bearer {token}"));
-        }
-        let req = builder.body(empty_request_body()).map_err(|e| {
-            InterflowError::connection(format!("failed to build Pong request: {e}"))
-        })?;
-
-        let resp = {
-            let mut sender_locked = sender.lock().await;
-            sender_locked.send_request(req)
-        };
-
-        let resp = resp
-            .await
-            .map_err(|e| InterflowError::connection(format!("failed to send Pong: {e}")))?;
-
-        if !resp.status().is_success() {
-            return Err(InterflowError::stream(format!(
-                "failed to send Pong: {}",
-                resp.status()
-            )));
-        }
-        Ok(())
     }
 }
 

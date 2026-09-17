@@ -243,7 +243,7 @@ impl RuleStore {
 
     /// Look up an ingress rule by name (for listener compensation after a
     /// Remove whose persistence failed).
-    pub async fn get_ingress(&self, name: &str) -> Option<IngressRule> {
+    pub async fn find_ingress(&self, name: &str) -> Option<IngressRule> {
         self.inner
             .read()
             .await
@@ -478,7 +478,7 @@ target_addr = "127.0.0.1:{port}""#
         let after = store.ingress_snapshot().await;
         assert_eq!(after.len(), before.len());
         assert_eq!(after[0].name, before[0].name);
-        assert_eq!(store.get_ingress("seed").await.unwrap().name, "seed");
+        assert_eq!(store.find_ingress("seed").await.unwrap().name, "seed");
     }
 
     #[tokio::test]

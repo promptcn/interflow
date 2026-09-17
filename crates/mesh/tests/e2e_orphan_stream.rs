@@ -41,12 +41,11 @@ use interflow_core::protocol::{FrameType, StreamProto};
 use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
-    agent_config, hub_config, pick_ephemeral_port, spawn_agent_registered, spawn_hub,
+    agent_config, hub_config, metrics_harness::counter_value, metrics_harness::metrics_handle,
+    pick_ephemeral_port, spawn_agent_registered, spawn_hub,
 };
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,32 +56,10 @@ use tokio::net::TcpListener;
 const RELEASE_DEADLINE: Duration = Duration::from_secs(12);
 
 // ---------------------------------------------------------------------------
-// metrics: in-process recorder read directly (same shape as the other e2e
-// suites)
+// metrics: in-process recorder read directly; `eventually` is a local
+// variant of testkit's — its timeout panic embeds the metrics snapshot,
+// which the generic helper cannot offer.
 // ---------------------------------------------------------------------------
-
-static METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
-
-fn metrics_handle() -> &'static PrometheusHandle {
-    METRICS.get_or_init(|| {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _ = metrics::set_global_recorder(recorder);
-        handle
-    })
-}
-
-/// Counter snapshot: sum the exposition lines matching the key prefix (labels
-/// allowed).
-fn counter_value(key_prefix: &str) -> u64 {
-    metrics_handle()
-        .render()
-        .lines()
-        .filter_map(|line| line.split_once(' '))
-        .filter(|(k, _)| k.starts_with(key_prefix))
-        .filter_map(|(_, v)| v.trim().parse::<u64>().ok())
-        .sum()
-}
 
 async fn eventually<F: Fn() -> bool>(cond: F, timeout: Duration, what: &str) {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -113,8 +90,10 @@ async fn connect_tunnel(hub_port: u16, agent_id: &str) -> AgentTunnel {
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         None,
-        tokio_util::sync::CancellationToken::new(),
-        interflow_core::tunnel::H2Liveness::LEGACY,
+        &interflow_core::tunnel::session_tasks::SessionTasks::new(
+            tokio_util::sync::CancellationToken::new(),
+        ),
+        interflow_core::tunnel::H2Liveness::HEARTBEAT_DISABLED,
     )
     .expect("tunnel")
 }

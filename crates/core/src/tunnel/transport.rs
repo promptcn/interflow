@@ -182,8 +182,7 @@ pub trait TunnelTransport: Send + Sync + 'static {
     /// Close frame payload as a short machine token (e.g. `connect_failed`;
     /// empty = ordinary close) so the far end can distinguish backend
     /// failures from normal teardown (2026-09-16 reason-propagation
-    /// hardening). A pre-2026-09-16 peer ignores the payload — backward
-    /// compatible on the wire.
+    /// hardening).
     async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()>;
 
     /// Registers the dedicated inbound channel for a response-direction stream (ingress return path / expose edge). Re-registering overwrites the old channel.
@@ -230,14 +229,14 @@ pub trait TunnelTransport: Send + Sync + 'static {
 /// as the fallback — no unbounded backlog.
 const STREAM_CHANNEL_CAP: usize = 256;
 
-/// Capacity of the new-stream event channel (control plane). The egress main
-/// loop only parses + spawns per event, so it drains instantly at steady
-/// state; this capacity exists to absorb stream-creation bursts, and its value
-/// aligns with the agent's local concurrent stream limit
-/// (mesh `max_incoming_streams`, default 256): a legitimate whole-table
-/// stream-creation burst should not get stuck at the channel layer. Backlog
-/// beyond capacity is bounded by [`INCOMING_SEND_TIMEOUT`] as the fallback.
-const INCOMING_CHANNEL_CAP: usize = 256;
+// Capacity of the new-stream event channel (control plane) is DERIVED from
+// the agent's local concurrent stream limit (`max_incoming_streams`), not
+// independently picked: the egress main loop drains instantly at steady
+// state, the capacity exists to absorb stream-creation bursts, and a
+// legitimate whole-table burst must not get stuck at the channel layer
+// (previously the two 256s were unrelated literals that merely happened to
+// match). See `config::params::transport::incoming_channel_cap`. Backlog
+// beyond capacity is bounded by [`INCOMING_SEND_TIMEOUT`] as the fallback.
 
 /// Bounded wait for dispatch delivering a single frame to a stream channel. On timeout the stream is poisoned (table entry removed, channel closed).
 ///
@@ -275,10 +274,10 @@ const ATTACH_GRACE: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const ATTACH_GRACE: Duration = Duration::from_millis(200);
 
-/// Concurrency budget for parking waits (aligned with [`INCOMING_CHANNEL_CAP`]): an Open flood before
-/// takeover must not breed parking tasks without bound; over-budget Opens
-/// yield immediately (same family as the event-channel backlog fallback).
-const PENDING_ATTACH_CAP: usize = INCOMING_CHANNEL_CAP;
+// The parking-wait concurrency budget mirrors the event-channel capacity
+// (same anti-flood family; see `incoming_channel_cap`): an Open flood before
+// takeover must not breed parking tasks without bound; over-budget Opens
+// yield immediately.
 
 /// Egress takeover latch: set when `take_incoming_streams` runs, waking parked Open hand-offs.
 #[derive(Default)]
@@ -319,11 +318,23 @@ pub(crate) struct TunnelDispatch {
     attach_gate: Arc<AttachGate>,
     /// Count of Opens parked in the wait (anti-flood budget).
     pending_attach: Arc<AtomicUsize>,
+    /// Parking-wait concurrency budget (mirrors the event-channel capacity).
+    pending_attach_cap: usize,
 }
 
 impl TunnelDispatch {
+    /// Builds with the default event-channel budget (the shared floor) —
+    /// for tests and callers without a stream limit.
     pub(crate) fn new() -> Self {
-        let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_CHANNEL_CAP);
+        Self::with_stream_limit(0)
+    }
+
+    /// Builds with the event-channel budget derived from the agent's local
+    /// concurrent-stream limit: `max_incoming_streams` legitimate Opens must
+    /// pass in one go; 0 (unlimited) falls back to the floor.
+    pub(crate) fn with_stream_limit(max_incoming_streams: usize) -> Self {
+        let cap = crate::config::params::transport::incoming_channel_cap(max_incoming_streams);
+        let (incoming_tx, incoming_rx) = mpsc::channel(cap);
         Self {
             resp_streams: Arc::new(RwLock::new(HashMap::new())),
             req_streams: Arc::new(RwLock::new(HashMap::new())),
@@ -331,6 +342,7 @@ impl TunnelDispatch {
             incoming_rx: std::sync::Mutex::new(Some(incoming_rx)),
             attach_gate: Arc::new(AttachGate::default()),
             pending_attach: Arc::new(AtomicUsize::new(0)),
+            pending_attach_cap: cap,
         }
     }
 
@@ -522,11 +534,14 @@ impl TunnelDispatch {
         // for takeover instead of blocking the dispatch loop. If the budget is
         // full, yield immediately (anti-flood semantics, same family as the
         // backlog fallback).
-        if self.pending_attach.fetch_add(1, Ordering::Relaxed) >= PENDING_ATTACH_CAP {
+        if self.pending_attach.fetch_add(1, Ordering::Relaxed) >= self.pending_attach_cap {
             self.pending_attach.fetch_sub(1, Ordering::Relaxed);
             metrics::counter!("interflow_agent_open_dropped_total", "reason" => "attach_backlog")
                 .increment(1);
-            warn!("pending-attach budget full ({PENDING_ATTACH_CAP}), dropping Open: {stream_id}");
+            warn!(
+                "pending-attach budget full ({}), dropping Open: {stream_id}",
+                self.pending_attach_cap
+            );
             Self::remove_req_stream(&self.req_streams, &stream_id, &tx).await;
             return;
         }
@@ -719,10 +734,13 @@ mod tests {
         let dispatch = TunnelDispatch::new();
         // Egress has taken over (receiver taken) but leaves the backlog unconsumed: fill the event channel
         let _rx = dispatch.take_incoming_streams().unwrap();
-        for i in 0..INCOMING_CHANNEL_CAP {
+        for i in 0..crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR {
             dispatch.dispatch(open_td(&format!("fill-{i}"))).await;
         }
-        assert_eq!(req_stream_count(&dispatch).await, INCOMING_CHANNEL_CAP);
+        assert_eq!(
+            req_stream_count(&dispatch).await,
+            crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR
+        );
 
         // Over-budget Open: with a paused clock, deterministically reach the timeout branch
         let started = tokio::time::Instant::now();
@@ -846,15 +864,18 @@ mod tests {
     async fn attach_pending_overflow_drops_immediately() {
         let _ = metrics_handle();
         let dispatch = TunnelDispatch::new();
-        for i in 0..PENDING_ATTACH_CAP {
+        for i in 0..crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR {
             dispatch.dispatch(open_td(&format!("park-{i}"))).await;
         }
-        assert_eq!(req_stream_count(&dispatch).await, PENDING_ATTACH_CAP);
+        assert_eq!(
+            req_stream_count(&dispatch).await,
+            crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR
+        );
 
         dispatch.dispatch(open_td("overflow")).await;
         assert_eq!(
             req_stream_count(&dispatch).await,
-            PENDING_ATTACH_CAP,
+            crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR,
             "the over-budget Open must not park (entry count unchanged)"
         );
         let dropped = metrics_handle()
@@ -871,7 +892,7 @@ mod tests {
         let mut rx = dispatch.take_incoming_streams().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = 0usize;
-        while got < PENDING_ATTACH_CAP {
+        while got < crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR {
             assert!(
                 Instant::now() < deadline,
                 "not all parked events were handed off ({got})"
@@ -1010,7 +1031,7 @@ mod tests {
     async fn timeout_rollback_keeps_newer_duplicate_entry() {
         let dispatch = Arc::new(TunnelDispatch::new());
         let _rx = dispatch.take_incoming_streams().unwrap();
-        for i in 0..INCOMING_CHANNEL_CAP {
+        for i in 0..crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR {
             dispatch.dispatch(open_td(&format!("fill-{i}"))).await;
         }
         // The first Open blocks on the timeout; while it is pending, Open the

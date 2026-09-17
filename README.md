@@ -140,7 +140,7 @@ Relative paths inside a config file (e.g. `certs/hub.crt`) resolve against the c
 - **Ingress / egress agents are symmetric**: same binary, the config decides the role; one agent can carry both directions at once
 - **Any TCP / UDP traffic**: TCP byte streams and UDP datagrams (DNS / game-style traffic) all traverse
 
-### UDP forwarding (v2)
+### UDP forwarding
 
 Declare `listen_protocol = "udp"` on an ingress rule to forward UDP; each client source address gets one tunnel stream, and datagram boundaries are preserved by the frame protocol (one frame per packet — no merging, no fragmentation):
 
@@ -169,7 +169,7 @@ Safe defaults (a differentiator neither frp nor rathole ships): a 65507-byte rea
 
 ### QUIC transport (optional, coexists with h2 as a dual stack)
 
-With `[quic]` enabled on the hub and `transport = "quic"` selected on the agent, tunnel streams run directly on QUIC native streams (custom frames written raw — eliminating single-TCP-connection head-of-line blocking and the "one HTTP exchange per frame on the upstream"); UDP sessions additionally take the QUIC DATAGRAM (RFC 9221) fast path — small packets travel unreliably and unordered straight to the peer, so packet loss no longer HOLs the whole connection (neither frp nor rathole does this). ACL / stream limits / heartbeat eviction / mTLS / cert-pin keep identical semantics across both transports, and cross-transport interop is supported (h2 agent ↔ quic agent).
+With `[transport.quic]` enabled on the hub and `transport = "quic"` selected on the agent, tunnel streams run directly on QUIC native streams (custom frames written raw — eliminating single-TCP-connection head-of-line blocking and the "one HTTP exchange per frame on the upstream"); UDP sessions additionally take the QUIC DATAGRAM (RFC 9221) fast path — small packets travel unreliably and unordered straight to the peer, so packet loss no longer HOLs the whole connection (neither frp nor rathole does this). ACL / stream limits / heartbeat eviction / mTLS / cert-pin keep identical semantics across both transports, and cross-transport interop is supported (h2 agent ↔ quic agent).
 
 Positioning of the pair: **h2 is the default and fallback-safe transport** — it connects wherever TCP egress is allowed; **QUIC is an opt-in upgrade** — pick it when the agent's network allows UDP egress (many corporate egress policies block UDP). The choice is static per-agent config with no automatic fallback between the two, which is exactly why h2 stays the default.
 
@@ -177,7 +177,7 @@ Both scenarios support it. In the mesh scenario:
 
 ```toml
 # hub
-[quic]
+[transport.quic]
 enabled = true            # requires certificates from [tls] (QUIC mandates TLS)
 listen_addr = "0.0.0.0:6667"
 datagram_enabled = true   # DATAGRAM fast path for UDP sessions (on by default)
@@ -186,7 +186,19 @@ datagram_enabled = true   # DATAGRAM fast path for UDP sessions (on by default)
 [agent]
 transport = "quic"        # default "h2"
 hub_quic_addr = "hub.example.com:6667"
+
+# Optional transport tuning (same schema on BOTH ends — see below)
+[transport.h2]
+keepalive_interval_secs = 5
+keepalive_timeout_secs = 10
 ```
+
+`[transport]` is endpoint-symmetric by design: the hub and the agent expose
+the same `[transport.h2]` / `[transport.quic]` knobs with the same defaults,
+because QUIC negotiates the idle timeout as the endpoints' *minimum* —
+raising only one side silently does nothing. Tuning one link means changing
+both sides together. Full field reference (incl. defaults and the SIGHUP
+reload contract): `docs/config-reference.md`.
 
 In the expose scenario there is no toml — the same plane is wired through CLI flags:
 
@@ -226,7 +238,7 @@ One-line positioning: **frp is the most feature-complete bundle with the largest
 | Topology | expose family (stcp / xtcp visitor) | expose only | expose (L4 passthrough + Host routing) + **symmetric site-to-site mesh** |
 | TCP data plane | reliable stream | reliable stream | **structured and lossless**: per-stream channels, no frame-loss path in the data plane; end-to-end stall bounds (dispatch 5s / backend write 10s / hub dispatch 30s), failures visible in metrics by reason |
 | Resource defense | server-side limits (maxPoolCount / maxPorts, …) | none | hub concurrency limits + ACL + audit; **independent agent-side defenses** (local stream caps / stream-open rate limiting / dial double timeouts, independent of hub configuration) |
-| Hot reload | frpc admin API (re-reads the file) | file watch (notify) | hub / edge SIGHUP; agent control API **writes back to disk** (every command acknowledged, origin-tagged, reconnect resync converges drift) |
+| Hot reload | frpc admin API (re-reads the file) | file watch (notify) | hub / edge SIGHUP with an **explicit reload contract** (immediate / new-connections-only / restart-required — the third tier is warned per field, never silently ignored); agent control API **writes back to disk** (every command acknowledged, origin-tagged, reconnect resync converges drift) |
 | Binary size | ~10 MiB | minimal build 574 KiB (feature trimming + upx) | several MiB (minimization is not a goal — see the product decisions below) |
 | Feature surface | plugin family / P2P hole punching / load balancing / health checks / dashboard | minimal | no plugins, no P2P (explicit trade-offs) |
 | Ecosystem | the largest community and distribution ecosystem | OpenWrt / embedded niche | new project |
@@ -252,9 +264,11 @@ One-line positioning: **frp is the most feature-complete bundle with the largest
 # Build the whole workspace
 cargo build --workspace
 
-# Tests (core 60 + mesh 144 + expose 43 = 247 cases: unit + e2e,
+# Tests (core 92 + mesh 180 + expose 59 = 331 cases: unit + e2e,
 # including adversarial and resilience scenarios such as silent-link
-# recovery / slow backends / Open floods / disconnect self-healing)
+# recovery / slow backends / Open floods / disconnect self-healing,
+# plus config-invariant locks: liveness-chain derivations, negotiation
+# compatibility matrix, schema validation rules)
 cargo test --workspace
 
 # Cross-platform release builds (zig for cross-compilation; artifacts land in artifacts/)
@@ -288,7 +302,7 @@ just init          # run the expose init wizard
 - **Rust 2024** + Tokio
 - **Dual transport stack**: long-lived HTTP/2 streams (hyper 1.x: `/stream/up` upstream + `/poll` downstream mirrored streaming) and QUIC (quinn 0.11: one QUIC stream per tunnel stream + RFC 9221 DATAGRAM), both sharing the same custom frame protocol
 - **rustls** (no openssl; mTLS / cert pinning / SHA256 fingerprint verification)
-- **TOML** configuration (schema v2, `deny_unknown_fields` guards against typos)
+- **TOML** configuration (schema v3, `deny_unknown_fields` guards against typos; defaults single-sourced in code — see `docs/config-reference.md`, field list CI-guarded)
 - **Tracing** + Prometheus metrics
 - **Strict lints**: `deny(unsafe_code)`, `deny(panic)`, `warn(pedantic + nursery)`
 

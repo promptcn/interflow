@@ -17,8 +17,10 @@
 //! (equivalent to h2 flow-control semantics); close = Close frame command +
 //! FIN.
 //!
-//! Parameters (backlog §6.4, starting from frp defaults): KeepAlive 10s /
-//! MaxIdleTimeout 30s. ALPN fixed to `"interflow"`.
+//! Endpoint transport parameters (idle/keepalive) come from the caller —
+//! the endpoint TOML `[transport.quic]`, defaulting to the shared transport
+//! profile (frp lineage: KeepAlive 10s / MaxIdleTimeout 30s). ALPN is fixed
+//! to `"interflow"`.
 
 // QUIC async tasks hold a 64KiB read buffer, so future size naturally
 // exceeds the pedantic threshold; the Pending/UnknownType branches of the
@@ -32,6 +34,7 @@
 use crate::error::{InterflowError, Result};
 use crate::protocol::frame as wire;
 use crate::protocol::{FrameType, StreamProto};
+use crate::tunnel::negotiation::RegisterResponse;
 use crate::tunnel::transport::FrameSource;
 use crate::tunnel::transport::{TunnelData, TunnelDispatch, TunnelTransport};
 use async_trait::async_trait;
@@ -42,21 +45,83 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::tunnel::session_tasks::{Beat, SessionTasks, beat_interval};
 use tracing::{debug, warn};
 
 /// The QUIC ALPN protocol identifier (cf. frp's `"frp"`).
 pub const QUIC_ALPN: &str = "interflow";
 
-/// KeepAlive interval (frp default).
-const KEEPALIVE: Duration = Duration::from_secs(10);
+/// QUIC session construction parameters: everything the tunnel needs beyond
+/// identity/TLS, single-sourced from the agent config + negotiation outcome.
+///
+/// Carries the stall supervision choice, establishment bound, transport
+/// tuning, and the dispatch budget.
+#[derive(Debug, Clone, Copy)]
+pub struct QuicSessionParams {
+    /// Critical-task stall timeout: `None` derives from the negotiated hub
+    /// cadence; `Some(ZERO)` disables the stall monitor; `Some(n)` pins.
+    pub stall_override: Option<Duration>,
+    /// Bound for the registration exchange (Hello → HelloAck).
+    pub establish_timeout: Duration,
+    /// Endpoint transport parameters (idle/keepalive).
+    pub transport: QuicEndpointParams,
+    /// Local concurrent-stream limit the dispatch event channel is sized
+    /// from (agent `max_incoming_streams`; 0 = the shared floor).
+    pub incoming_streams_budget: usize,
+}
+
+impl QuicSessionParams {
+    /// The shared-profile defaults (derive stall from negotiation; the
+    /// shared establish bound; default transport; floor-sized channel).
+    pub const DEFAULT: Self = Self {
+        stall_override: None,
+        establish_timeout: crate::tunnel::agent::DEFAULT_REQUEST_ESTABLISH_TIMEOUT,
+        transport: QuicEndpointParams::DEFAULT,
+        incoming_streams_budget: 0,
+    };
+}
+
+impl Default for QuicSessionParams {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// QUIC endpoint transport parameters (idle timeout + keepalive), sourced
+/// from the shared transport profile / the endpoint TOML `[transport.quic]`.
+///
+/// QUIC negotiates the idle timeout as the *minimum* of the two endpoints'
+/// values — which is exactly why these must be configured symmetrically
+/// (same schema, same defaults on hub and agent) instead of per side: a
+/// value raised on one endpoint alone silently does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuicEndpointParams {
+    /// Connection idle timeout (milliseconds).
+    pub max_idle_timeout_ms: u32,
+    /// KeepAlive interval.
+    pub keepalive_interval: Duration,
+}
+
+impl QuicEndpointParams {
+    /// The shared-profile defaults (frp lineage: 30s idle / 10s keepalive).
+    pub const DEFAULT: Self = Self {
+        max_idle_timeout_ms: crate::config::params::transport::DEFAULT_QUIC_IDLE_TIMEOUT_MS,
+        keepalive_interval: crate::config::params::transport::DEFAULT_QUIC_KEEPALIVE_INTERVAL,
+    };
+}
+
+impl Default for QuicEndpointParams {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// Transport-stats sampling interval (cheap snapshot; always on). The CC
 /// forensics anchor for the 2026-09-16 quic egress-stall case file: cwnd
 /// collapse / loss bursts / black holes show up in these logs with no
 /// extra tooling. Counters are cumulative — diff adjacent samples.
 const STATS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
-/// Idle timeout (frp default).
-const IDLE_TIMEOUT_MS: u32 = 30_000;
 /// Per-stream write-command channel capacity (backpressure threshold).
 const WRITE_CHANNEL_CAP: usize = 64;
 
@@ -71,23 +136,58 @@ pub const CAP_DATAGRAM: u8 = 0x01;
 /// out-of-order arrival).
 pub const DATAGRAM_FRAME_BUDGET: usize = 1023;
 
-/// Hello/HelloAck payload encoding: `[caps u8][token]`.
-fn encode_hello_payload(caps: u8, token: &str) -> Bytes {
+/// Hello payload encoding: `[caps u8][token]` (both endpoints).
+pub fn encode_hello_payload(caps: u8, token: &str) -> Bytes {
     let mut buf = BytesMut::with_capacity(1 + token.len());
     buf.extend_from_slice(&[caps]);
     buf.extend_from_slice(token.as_bytes());
     buf.freeze()
 }
 
-/// Hello/HelloAck payload decoding: returns (caps, token).
-fn decode_hello_payload(payload: &[u8]) -> (u8, String) {
+/// Hello payload decoding: returns (caps, token).
+pub fn decode_hello_payload(payload: &[u8]) -> (u8, String) {
     match payload.split_first() {
         Some((caps, token)) => (*caps, String::from_utf8_lossy(token).to_string()),
         None => (0, String::new()),
     }
 }
-/// Wait timeout for HelloAck.
-const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// HelloAck payload encoding: `[caps u8][capability JSON]`.
+///
+/// The leading caps byte declares transport-level capabilities (e.g.
+/// DATAGRAM support); the JSON suffix is the hub's capability declaration —
+/// the same [`RegisterResponse`] schema the h2 register response body
+/// carries, so both transports advertise identical capabilities. The hub
+/// always emits the suffix (heartbeat-disabled hubs advertise `{}`).
+pub fn encode_helloack_payload(caps: u8, capability: &RegisterResponse) -> Result<Bytes> {
+    let json = serde_json::to_vec(capability).map_err(|e| {
+        InterflowError::protocol("failed to encode capability declaration").with_source(e)
+    })?;
+    let mut buf = BytesMut::with_capacity(1 + json.len());
+    buf.extend_from_slice(&[caps]);
+    buf.extend_from_slice(&json);
+    Ok(buf.freeze())
+}
+
+/// HelloAck payload decoding: returns `(caps, declaration)`.
+///
+/// Hub and agent deploy as a versioned pair, so a payload without the JSON
+/// suffix (or an unparseable one) is a protocol violation, not a fallback
+/// trigger.
+pub fn decode_helloack_capability(payload: &[u8]) -> Result<(u8, RegisterResponse)> {
+    let Some((caps, suffix)) = payload.split_first() else {
+        return Err(InterflowError::protocol(
+            "hub HelloAck payload is empty (no caps byte)",
+        ));
+    };
+    if suffix.is_empty() {
+        return Err(InterflowError::protocol(
+            "hub HelloAck carries no capability declaration",
+        ));
+    }
+    let declaration = RegisterResponse::parse(suffix)?;
+    Ok((*caps, declaration))
+}
 
 /// Write command: an ordinary frame, or a Close frame (FIN closes out after the write).
 enum WriteCmd {
@@ -117,6 +217,10 @@ pub struct QuicTunnel {
     datagram_ok: bool,
     /// Streams whose OpenAck has been received (small Data packets on these streams take the DATAGRAM fast path).
     datagram_streams: Arc<StdMutex<std::collections::HashSet<String>>>,
+    /// The effective critical-task stall timeout (negotiated or pinned at
+    /// connect) — session-level consumers (e.g. the agent's closed watcher)
+    /// read it so every critical task in the session shares one budget.
+    stall_timeout: Duration,
 }
 
 /// Encodes a frame as `Bytes`.
@@ -174,11 +278,17 @@ async fn stream_write_loop(mut send: quinn::SendStream, mut rx: mpsc::Receiver<W
 }
 
 /// Control-stream read loop: on receiving a Ping, answer with a Pong on the control stream (hub heartbeat reply).
-async fn control_read_loop(mut rx: quinn::RecvStream, tx: mpsc::Sender<WriteCmd>) {
+async fn control_read_loop(
+    mut rx: quinn::RecvStream,
+    tx: mpsc::Sender<WriteCmd>,
+    beat: Beat,
+    beat_every: Duration,
+) {
     let mut buf = BytesMut::with_capacity(256);
     let mut chunk = [0u8; 1024];
     loop {
-        let n = match rx.read(&mut chunk).await {
+        beat.beat();
+        let n = match beat.during(beat_every, rx.read(&mut chunk)).await {
             Ok(Some(n)) => n,
             Ok(None) | Err(_) => break,
         };
@@ -208,11 +318,17 @@ async fn accept_loop(
     streams: Arc<StdMutex<HashMap<String, StreamHandle>>>,
     datagram_streams: Arc<StdMutex<std::collections::HashSet<String>>>,
     shutdown: CancellationToken,
+    beat: Beat,
+    beat_every: Duration,
 ) {
+    // Fault injection: panic at accept-loop start (inbound-stream intake
+    // death while the connection stays healthy).
+    crate::fault::trigger(crate::fault::FaultPoint::QuicAcceptLoop);
     loop {
+        beat.beat();
         let (tx, rx) = tokio::select! {
             () = shutdown.cancelled() => break,
-            r = conn.accept_bi() => match r {
+            r = beat.during(beat_every, conn.accept_bi()) => match r {
                 Ok(pair) => pair,
                 Err(_) => break, // connection closed
             },
@@ -314,9 +430,15 @@ async fn stream_read_loop(
 }
 
 /// DATAGRAM receive loop: hub-relayed datagram frames → dispatch (same rules as stream frames).
-async fn datagram_read_loop(conn: quinn::Connection, dispatch: Arc<TunnelDispatch>) {
+async fn datagram_read_loop(
+    conn: quinn::Connection,
+    dispatch: Arc<TunnelDispatch>,
+    beat: Beat,
+    beat_every: Duration,
+) {
     loop {
-        let datagram = match conn.read_datagram().await {
+        beat.beat();
+        let datagram = match beat.during(beat_every, conn.read_datagram()).await {
             Ok(d) => d,
             Err(_) => break, // connection closed
         };
@@ -336,18 +458,35 @@ impl QuicTunnel {
     /// `tls` is built by the caller (CA / mTLS client certificate / cert pin
     /// are all isomorphic with the h2 path); `server_name` is used for SNI.
     /// The overall timeout is applied by the caller (`AgentClient`).
+    ///
+    /// `stall_override` selects the critical-task stall timeout: `None`
+    /// derives it from the hub-advertised heartbeat cadence (the HelloAck
+    /// capability suffix; heartbeat-disabled hubs fall back to the fixed
+    /// fallback — see [`RegisterResponse::task_stall_timeout`]);
+    /// `Some(ZERO)` disables the stall monitor; `Some(n)` pins a value.
+    ///
+    /// `establish_timeout` bounds the registration exchange (Hello →
+    /// HelloAck) — the same send→response-establishment semantics as the h2
+    /// path's request-establish timeout. Pre-establishment there are no
+    /// critical session tasks: this bound IS the establishment watchdog.
+    ///
+    /// `params` carries the session construction parameters (stall
+    /// supervision, establishment bound, endpoint transport tuning, dispatch
+    /// budget) — see [`QuicSessionParams`].
     pub async fn connect(
         agent_id: String,
         server_addr: SocketAddr,
         server_name: &str,
         tls: rustls::ClientConfig,
         auth_token: Option<&str>,
-        shutdown: CancellationToken,
+        tasks: SessionTasks,
+        params: QuicSessionParams,
     ) -> Result<Self> {
+        let shutdown = tasks.token().clone();
         let mut transport = quinn::TransportConfig::default();
-        transport.keep_alive_interval(Some(KEEPALIVE));
+        transport.keep_alive_interval(Some(params.transport.keepalive_interval));
         transport.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
-            IDLE_TIMEOUT_MS,
+            params.transport.max_idle_timeout_ms,
         ))));
 
         let quic_tls =
@@ -373,8 +512,13 @@ impl QuicTunnel {
             .await
             .map_err(|e| InterflowError::connection(format!("QUIC handshake failed: {e}")))?;
 
-        // Control stream: open_bi → Hello (source_agent = agent_id, payload = token) → await HelloAck
-        let (control_tx, mut control_rx) = conn.open_bi().await.map_err(|e| {
+        // Control stream: open_bi → write Hello directly → await HelloAck.
+        //
+        // Nothing is spawned before establishment completes on purpose: a
+        // wedged write or a silent hub is caught by `establish_timeout`
+        // (plus the caller's overall connect timeout) — the establishment
+        // phase needs no stall heartbeat of its own.
+        let (mut control_tx, mut control_rx) = conn.open_bi().await.map_err(|e| {
             InterflowError::connection(format!("QUIC control stream open failed: {e}"))
         })?;
 
@@ -385,19 +529,14 @@ impl QuicTunnel {
             &agent_id,
             &encode_hello_payload(CAP_DATAGRAM, auth_token.unwrap_or("")),
         )?;
-        let (wtx, wrx) = mpsc::channel(WRITE_CHANNEL_CAP);
-        // The control stream's write volume is small (Hello + occasional
-        // Pong); one forwarding task owns the SendStream exclusively
-        tokio::spawn(control_write_forward(control_tx, wrx));
-        wtx.send(WriteCmd::Frame(hello)).await.map_err(|_| {
-            InterflowError::connection("QUIC control stream write channel closed".to_string())
-        })?;
-        // pong_tx is held long-term: the control-stream channel never
-        // closes; the forwarding task lives as long as the connection
-        let pong_tx = wtx;
+        control_tx
+            .write_all(&hello)
+            .await
+            .map_err(|e| InterflowError::connection(format!("QUIC Hello write failed: {e}")))?;
 
-        // Await HelloAck (the hub sends an Error frame and closes the connection on validation failure)
-        let ack_frame = tokio::time::timeout(HELLO_ACK_TIMEOUT, async {
+        // Await HelloAck (the hub sends an Error frame and closes the
+        // connection on validation failure)
+        let ack_frame = tokio::time::timeout(params.establish_timeout, async {
             let mut buf = BytesMut::with_capacity(256);
             let mut chunk = vec![0u8; 1024];
             loop {
@@ -425,14 +564,15 @@ impl QuicTunnel {
         })
         .await
         .map_err(|_| {
-            InterflowError::connection("QUIC registration timed out (>10s)".to_string())
+            InterflowError::connection(format!(
+                "QUIC registration timed out (>{:?})",
+                params.establish_timeout
+            ))
         })??;
 
-        let datagram_ok = match ack_frame.frame_type {
-            FrameType::HelloAck => {
-                let (hub_caps, _) = decode_hello_payload(&ack_frame.payload);
-                hub_caps & CAP_DATAGRAM != 0
-            }
+        // Capability negotiation: `[caps][JSON]`.
+        let (hub_caps, declaration) = match ack_frame.frame_type {
+            FrameType::HelloAck => decode_helloack_capability(&ack_frame.payload)?,
             FrameType::Error => {
                 return Err(InterflowError::connection(format!(
                     "hub rejected registration: {}",
@@ -445,32 +585,81 @@ impl QuicTunnel {
                 )));
             }
         };
+        let datagram_ok = hub_caps & CAP_DATAGRAM != 0;
 
-        let dispatch = Arc::new(TunnelDispatch::new());
+        // Effective critical-task stall: explicit pin/disable wins;
+        // otherwise the advertised cadence's aging window (dead line), with
+        // the fixed fallback for disabled heartbeat — the same derivation
+        // family the h2 path uses, so a wedged task is never tolerated
+        // longer than the hub's own eviction window on either transport.
+        let task_stall_timeout = params
+            .stall_override
+            .unwrap_or_else(|| declaration.task_stall_timeout());
+        let beat_every = beat_interval(task_stall_timeout);
+
+        // Pong write path: the control-stream forwarding task takes over
+        // AFTER establishment. Critical under the death contract: its death
+        // takes the Pong path (and every outbound control frame) with it.
+        let (wtx, wrx) = mpsc::channel(WRITE_CHANNEL_CAP);
+        tasks.spawn_critical(
+            "quic-control-write",
+            Some(task_stall_timeout),
+            move |beat| control_write_forward(control_tx, wrx, beat, beat_every),
+        );
+        // pong_tx is held long-term: the control-stream channel never
+        // closes; the forwarding task lives as long as the connection
+        let pong_tx = wtx;
+
+        let dispatch = Arc::new(TunnelDispatch::with_stream_limit(
+            params.incoming_streams_budget,
+        ));
         let streams: Arc<StdMutex<HashMap<String, StreamHandle>>> =
             Arc::new(StdMutex::new(HashMap::new()));
         let datagram_streams: Arc<StdMutex<std::collections::HashSet<String>>> =
             Arc::new(StdMutex::new(std::collections::HashSet::new()));
 
-        // Control-stream read loop: Ping → Pong (the Pong goes through the wtx forwarding write task)
+        // Control-stream read loop: Ping → Pong (the Pong goes through the
+        // wtx forwarding write task). Critical under the death contract:
+        // its death silences heartbeat answering while the connection stays
+        // healthy.
         {
             let shutdown_control = shutdown.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    () = shutdown_control.cancelled() => {}
-                    () = control_read_loop(control_rx, pong_tx) => {}
-                }
-            });
+            tasks.spawn_critical(
+                "quic-control-read",
+                Some(task_stall_timeout),
+                move |beat| async move {
+                    // Fault injection: panic at read-loop start (the heartbeat
+                    // answering task's death scenario).
+                    crate::fault::trigger(crate::fault::FaultPoint::QuicControlReadLoop);
+                    tokio::select! {
+                        () = shutdown_control.cancelled() => {}
+                        () = control_read_loop(control_rx, pong_tx, beat, beat_every) => {}
+                    }
+                },
+            );
         }
 
-        // Accept loop: hub-initiated traffic streams (egress role)
-        tokio::spawn(accept_loop(
-            conn.clone(),
-            dispatch.clone(),
-            streams.clone(),
-            datagram_streams.clone(),
-            shutdown.clone(),
-        ));
+        // Accept loop: hub-initiated traffic streams (egress role).
+        // Critical under the death contract: its death stops all inbound
+        // stream intake while the connection stays healthy.
+        {
+            let accept_conn = conn.clone();
+            let accept_dispatch = dispatch.clone();
+            let accept_streams = streams.clone();
+            let accept_datagrams = datagram_streams.clone();
+            let accept_shutdown = shutdown.clone();
+            tasks.spawn_critical("quic-accept", Some(task_stall_timeout), move |beat| {
+                accept_loop(
+                    accept_conn,
+                    accept_dispatch,
+                    accept_streams,
+                    accept_datagrams,
+                    accept_shutdown,
+                    beat,
+                    beat_every,
+                )
+            });
+        }
 
         // DATAGRAM receive loop (enabled only on successful negotiation; the
         // hub's relayed datagrams arrive here)
@@ -478,19 +667,24 @@ impl QuicTunnel {
             let conn2 = conn.clone();
             let dispatch2 = dispatch.clone();
             let shutdown2 = shutdown.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    () = shutdown2.cancelled() => {}
-                    () = datagram_read_loop(conn2, dispatch2) => {}
-                }
-            });
+            tasks.spawn_critical(
+                "quic-datagram",
+                Some(task_stall_timeout),
+                move |beat| async move {
+                    tokio::select! {
+                        () = shutdown2.cancelled() => {}
+                        () = datagram_read_loop(conn2, dispatch2, beat, beat_every) => {}
+                    }
+                },
+            );
         }
 
-        // Transport-stats sampler (see STATS_SAMPLE_INTERVAL)
+        // Transport-stats sampler (see STATS_SAMPLE_INTERVAL) — auxiliary:
+        // forensics only, its death degrades nothing.
         {
             let conn_stats = conn.clone();
             let shutdown_stats = shutdown.clone();
-            tokio::spawn(async move {
+            tasks.spawn_auxiliary(async move {
                 let mut tick = tokio::time::interval(STATS_SAMPLE_INTERVAL);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -522,7 +716,15 @@ impl QuicTunnel {
             streams,
             datagram_ok,
             datagram_streams,
+            stall_timeout: task_stall_timeout,
         })
+    }
+
+    /// The session's effective critical-task stall timeout (negotiated from
+    /// the hub cadence, or pinned via agent config at connect).
+    #[must_use]
+    pub const fn stall_timeout(&self) -> Duration {
+        self.stall_timeout
     }
 
     fn lookup_handle(&self, stream_id: &str) -> Option<StreamHandle> {
@@ -567,14 +769,33 @@ impl QuicTunnel {
 /// Reuses the command semantics of [`stream_write_loop`] but without FIN —
 /// the control stream's lifetime is bound to the connection; it exits only
 /// on write failure.
-async fn control_write_forward(mut tx: quinn::SendStream, mut rx: mpsc::Receiver<WriteCmd>) {
-    while let Some(cmd) = rx.recv().await {
+async fn control_write_forward(
+    mut tx: quinn::SendStream,
+    mut rx: mpsc::Receiver<WriteCmd>,
+    beat: Beat,
+    beat_every: Duration,
+) {
+    let mut hello_written = false;
+    loop {
+        beat.beat();
+        let Some(cmd) = beat.during(beat_every, rx.recv()).await else {
+            return;
+        };
         let buf = match cmd {
             WriteCmd::Frame(b) | WriteCmd::CloseFrame(b) => b,
         };
         if let Err(e) = tx.write_all(&buf).await {
             debug!("QUIC control stream write failed: {e}");
             return;
+        }
+        // Fault injection: wedge after the first forwarded frame (the first
+        // Pong) — the Pong path dies post-registration while the connection
+        // stays healthy; only a stall heartbeat catches it.
+        if !hello_written {
+            hello_written = true;
+            if crate::fault::stall(crate::fault::FaultPoint::QuicControlWriteStall) {
+                std::future::pending::<()>().await;
+            }
         }
     }
 }
@@ -768,5 +989,53 @@ impl QuicTunnel {
         // The write task FINs automatically after receiving the CloseFrame
         let _ = handle.tx.send(WriteCmd::CloseFrame(buf)).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::tunnel::negotiation::HeartbeatAd;
+
+    /// The HelloAck payload round-trip: caps byte preserved verbatim at
+    /// byte 0, the JSON suffix parses, and the stall derivation rides the
+    /// advertised cadence (75s dead line, not the 30s fallback).
+    #[test]
+    fn helloack_capability_payload_round_trip() {
+        let capability = RegisterResponse {
+            heartbeat: Some(HeartbeatAd {
+                interval_secs: 15,
+                max_missed: 4,
+            }),
+        };
+
+        let payload = encode_helloack_payload(CAP_DATAGRAM, &capability).unwrap();
+        assert_eq!(payload[0], CAP_DATAGRAM, "caps byte must stay byte 0");
+        let (caps, declaration) = decode_helloack_capability(&payload).unwrap();
+        assert_eq!(caps, CAP_DATAGRAM);
+        assert_eq!(declaration.heartbeat, capability.heartbeat);
+        assert_eq!(declaration.task_stall_timeout(), Duration::from_secs(75));
+    }
+
+    /// Paired deployment: a payload without a parseable declaration is a
+    /// protocol violation (bare caps byte / empty / garbage suffix).
+    #[test]
+    fn helloack_without_declaration_is_a_protocol_error() {
+        assert!(decode_helloack_capability(&[CAP_DATAGRAM]).is_err());
+        assert!(decode_helloack_capability(&[]).is_err());
+        assert!(decode_helloack_capability(&[0x01, b'{', b'!']).is_err());
+    }
+
+    /// A heartbeat-disabled hub advertises `{}` — the suffix is always
+    /// present, the derivations fall back.
+    #[test]
+    fn helloack_heartbeat_disabled_advertises_empty_object() {
+        let capability = RegisterResponse::default();
+        let payload = encode_helloack_payload(0, &capability).unwrap();
+        let (caps, declaration) = decode_helloack_capability(&payload).unwrap();
+        assert_eq!(caps, 0);
+        assert_eq!(declaration.heartbeat, None);
+        assert_eq!(declaration.task_stall_timeout(), Duration::from_secs(30));
     }
 }

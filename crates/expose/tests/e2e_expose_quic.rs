@@ -156,14 +156,8 @@ remote_addr = "{echo_addr}"
             key_path: certs.server_key_path().display().to_string(),
         }),
         quic_listen: Some(quic_listen),
-        audit_path: None,
-        new_conn_rate_per_ip_per_minute: 0,
-        stream_idle_timeout_secs: 300,
-        route_breaker_enabled: true,
-        route_breaker_failure_threshold: 10,
-        route_breaker_window_secs: 60,
-        route_breaker_cooldown_secs: 30,
         agent_recovery_timeout_secs: 120,
+        ..Default::default()
     };
     let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_args));
 
@@ -242,16 +236,9 @@ async fn edge_quic_without_tls_fails_fast() {
         hub_listen_addr: format!("127.0.0.1:{}", pick_port()).parse().unwrap(),
         routes_path: "nonexistent-routes.toml".into(),
         agent_token: "test-token".into(),
-        hub_tls: None,
         quic_listen: Some(format!("127.0.0.0:{}", pick_port()).parse().unwrap()),
-        audit_path: None,
-        new_conn_rate_per_ip_per_minute: 0,
-        stream_idle_timeout_secs: 300,
-        route_breaker_enabled: true,
-        route_breaker_failure_threshold: 10,
-        route_breaker_window_secs: 60,
-        route_breaker_cooldown_secs: 30,
         agent_recovery_timeout_secs: 120,
+        ..Default::default()
     };
     let err = interflow_expose::edge::run(edge_args)
         .await

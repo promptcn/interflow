@@ -46,7 +46,18 @@ pub async fn echo_round_trip(addr: SocketAddr, payload: &[u8]) -> std::io::Resul
 
 /// Start a UDP echo server (every received datagram is echoed back verbatim to its source).
 pub async fn spawn_udp_echo() -> (SocketAddr, JoinHandle<()>) {
-    spawn_udp_echo_with_delay(Duration::ZERO).await
+    let sock = bind_udp("127.0.0.1:0".parse().expect("addr")).expect("bind udp echo");
+    let addr = sock.local_addr().expect("udp echo addr");
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                return;
+            };
+            let _ = sock.send_to(&buf[..n], peer).await;
+        }
+    });
+    (addr, handle)
 }
 
 /// Start a UDP echo where only the first datagram's reply is delayed.
@@ -66,25 +77,6 @@ pub async fn spawn_udp_echo_first_delayed(delay: Duration) -> (SocketAddr, JoinH
             };
             if first {
                 first = false;
-                tokio::time::sleep(delay).await;
-            }
-            let _ = sock.send_to(&buf[..n], peer).await;
-        }
-    });
-    (addr, handle)
-}
-
-/// Start a delayed-reply UDP echo (the late-reply scenario where replies outlive the session's idle reclamation).
-pub async fn spawn_udp_echo_with_delay(delay: Duration) -> (SocketAddr, JoinHandle<()>) {
-    let sock = bind_udp("127.0.0.1:0".parse().expect("addr")).expect("bind udp echo");
-    let addr = sock.local_addr().expect("udp echo addr");
-    let handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        loop {
-            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
-                return;
-            };
-            if delay > Duration::ZERO {
                 tokio::time::sleep(delay).await;
             }
             let _ = sock.send_to(&buf[..n], peer).await;

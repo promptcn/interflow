@@ -134,7 +134,10 @@ async fn serve(socket: UdpSocket, rule: IngressRule, tunnel: AgentTunnel) {
         };
         // Inbound traffic refreshes the idle timer (the return path is
         // refreshed by the pump; bidirectional activity prevents expiry)
-        *session.last_active.lock().unwrap_or_else(poisoned) = Instant::now();
+        *session
+            .last_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
 
         metrics::counter!("interflow_udp_datagrams_rx").increment(1);
         metrics::counter!("interflow_udp_bytes_rx").increment(n as u64);
@@ -169,7 +172,11 @@ async fn session_stream_id(
     client: SocketAddr,
     socket: Arc<UdpSocket>,
 ) -> Option<UdpSession> {
-    if let Some(session) = sessions.lock().unwrap_or_else(poisoned).get(&client) {
+    if let Some(session) = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&client)
+    {
         return Some(UdpSession {
             stream_id: session.stream_id.clone(),
             last_active: session.last_active.clone(),
@@ -201,13 +208,16 @@ async fn session_stream_id(
         stream_id: stream_id.clone(),
         last_active: last_active.clone(),
     };
-    sessions.lock().unwrap_or_else(poisoned).insert(
-        client,
-        UdpSession {
-            stream_id: stream_id.clone(),
-            last_active: last_active.clone(),
-        },
-    );
+    sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            client,
+            UdpSession {
+                stream_id: stream_id.clone(),
+                last_active: last_active.clone(),
+            },
+        );
 
     tokio::spawn(pump_response(
         tunnel.clone(),
@@ -257,7 +267,10 @@ async fn pump_response(
     let mut closed_by_peer = false;
     loop {
         let deadline = tokio::time::Instant::from_std(
-            *last_active.lock().unwrap_or_else(poisoned) + idle_timeout,
+            *last_active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                + idle_timeout,
         );
         tokio::select! {
             msg = data_rx.recv() => {
@@ -283,7 +296,7 @@ async fn pump_response(
                         }
                         metrics::counter!("interflow_udp_datagrams_tx").increment(1);
                         metrics::counter!("interflow_udp_bytes_tx").increment(m.data.len() as u64);
-                        *last_active.lock().unwrap_or_else(poisoned) = Instant::now();
+                        *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                     }
                     None => break,
                 }
@@ -307,12 +320,10 @@ async fn pump_response(
 /// Remove the session-table entry (only when it still points at this
 /// stream_id, to avoid deleting a fresh session created by a rebuild).
 fn remove_session(sessions: &SharedSessions, client: SocketAddr, stream_id: &str) {
-    let mut map = sessions.lock().unwrap_or_else(poisoned);
+    let mut map = sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if map.get(&client).is_some_and(|s| s.stream_id == stream_id) {
         map.remove(&client);
     }
-}
-
-fn poisoned<T>(e: std::sync::PoisonError<T>) -> T {
-    e.into_inner()
 }

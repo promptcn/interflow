@@ -147,9 +147,9 @@ impl Service<Request<Incoming>> for FakeHubSvc {
             let resp = match (req.method().as_str(), req.uri().path()) {
                 ("POST", "/register") => {
                     counts.registers.fetch_add(1, Ordering::SeqCst);
-                    // Modern caps: pong via upload + 1s heartbeat cadence (the
-                    // watchdog override in the test config neutralizes this)
-                    let caps = r#"{"pong_via_upload":true,"heartbeat":{"interval_secs":1,"max_missed":2}}"#;
+                    // Caps: 1s heartbeat cadence (the watchdog override in
+                    // the test config neutralizes this)
+                    let caps = r#"{"heartbeat":{"interval_secs":1,"max_missed":2}}"#;
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(CONTENT_TYPE, "application/json")
@@ -219,10 +219,6 @@ impl Service<Request<Incoming>> for FakeHubSvc {
                         .body(hanging_body())
                         .unwrap()
                 }
-                ("POST", "/pong") => Response::builder()
-                    .status(StatusCode::NO_CONTENT)
-                    .body(full_body(Bytes::new()))
-                    .unwrap(),
                 _ => Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(full_body("not found"))

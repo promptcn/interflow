@@ -10,7 +10,8 @@ use std::sync::Arc;
 
 /// Debounce window: consecutive SIGHUPs within this window trigger only one reload.
 #[cfg(unix)]
-const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
+// Single-sourced with the hub config-reload loop (core params::ops).
+const DEBOUNCE: std::time::Duration = interflow_core::config::params::SIGHUP_RELOAD_DEBOUNCE;
 
 /// Spawns a background task listening for SIGHUP. Effective on Unix platforms only.
 pub fn spawn_reload_task(routes_path: String, router: Arc<HostRouter>) {
