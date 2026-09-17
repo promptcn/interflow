@@ -28,7 +28,7 @@ impl HubService {
         if let Err(resp) =
             bind_connection_identity(&self.connection_identity, agent_id, "poll").await
         {
-            return Ok(resp);
+            return Ok(*resp);
         }
 
         // Take the AgentSession Arc (outer read lock is very short-lived)

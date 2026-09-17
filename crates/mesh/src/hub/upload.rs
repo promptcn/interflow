@@ -61,7 +61,7 @@ impl HubService {
         if let Err(resp) =
             bind_connection_identity(&self.connection_identity, agent_id, "upload").await
         {
-            return Ok(resp);
+            return Ok(*resp);
         }
 
         // Take the AgentSession (outer read lock is very short-lived);

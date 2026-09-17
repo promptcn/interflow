@@ -234,19 +234,24 @@ pub(crate) fn agent_id_of(req: &Request<Incoming>) -> interflow_core::error::Res
 
 /// Verifies (or, on first use, establishes) the connection↔agent identity
 /// binding shared by the per-connection handlers (`/poll`, `/stream/up`).
-/// `Ok` = bound or matching; `Err(response)` = the rejection to reply with.
+/// `Ok` = bound or matching; `Err(response)` = the rejection to reply with
+/// (boxed: `Response<HubResponseBody>` is large enough to trip
+/// `clippy::result_large_err` in the `Result` return position).
 pub(crate) async fn bind_connection_identity(
     identity: &RwLock<Option<String>>,
     agent_id: &str,
     op: &str,
-) -> std::result::Result<(), Response<HubResponseBody>> {
+) -> std::result::Result<(), Box<Response<HubResponseBody>>> {
     let mut identity = identity.write().await;
     if let Some(existing_id) = &*identity {
         if existing_id != agent_id {
             warn!(
                 "identity mismatch: connection is bound to {existing_id}, but {op} attempt is for {agent_id}"
             );
-            return Err(text_response(StatusCode::FORBIDDEN, "Identity mismatch"));
+            return Err(Box::new(text_response(
+                StatusCode::FORBIDDEN,
+                "Identity mismatch",
+            )));
         }
     } else {
         *identity = Some(agent_id.to_string());

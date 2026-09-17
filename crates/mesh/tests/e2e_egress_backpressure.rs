@@ -50,8 +50,8 @@ use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_mesh::config::{EgressRule, IngressRule};
 use interflow_testkit::{
-    agent_config, echo_server, hub_config,
-    metrics_harness::eventually, metrics_harness::init_tracing, metrics_harness::metrics_handle,
+    agent_config, echo_server, hub_config, metrics_harness::eventually,
+    metrics_harness::init_tracing, metrics_harness::metrics_handle,
     metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_agent, spawn_hub,
     wait_for_tcp,
 };
