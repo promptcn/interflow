@@ -25,6 +25,10 @@ ignore = [
     "RUSTSEC-2024-0418",
     "RUSTSEC-2024-0419",
     "RUSTSEC-2024-0420",
+    # paste: unmaintained upstream with no safe replacement; it is a transitive
+    # macro dependency of the Tauri/Specta GUI build and is not present in the
+    # mesh/expose runtime graph. Re-evaluate when specta/tauri migrate off it.
+    "RUSTSEC-2024-0436",
     # unic-* family: pulled in via tauri → urlpattern → unic-ucd-ident; the
     # open-source replacements (icu_properties / unicode-ident) are still being
     # migrated to.
