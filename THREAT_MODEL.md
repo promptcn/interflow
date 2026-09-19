@@ -38,16 +38,18 @@ Assets the model protects:
   tunnel exists to grant, and what an attacker wants to reach or flood.
 - **Confidentiality and integrity of tunneled bytes** — per hop; see
   [§6](#6-attacker-position-the-relay-host-hub-or-edge-operator).
-- **Key material and configuration** on every host: the CA private key, hub
-  auth tokens, agent certificates, the control API token, rule files on disk.
+- **Key material and configuration** on every host: the tenant CA private
+  keys, agent certificates, the control API token, rule files on disk.
 
 ## 2. Trust boundaries
 
 1. **Credentials are the trust boundary.** An agent is whatever holds a
-   valid credential: the hub static token (`Authorization: Bearer` on h2,
-   token in the registration Hello on QUIC) or an mTLS client certificate
-   whose CN *is* the agent identity. Possession of an agent credential is
-   not treated as a vulnerability (see
+   valid mTLS client certificate — on both the h2 and QUIC planes the leaf
+   certificate's CN *is* the agent identity and the anchoring tenant CA
+   *is* the tenant (since the v4 mTLS-only rework there is no other
+   credential; see
+   [§6.5](#65-tenant-isolation-multi-tenant-hubs-since-v4)). Possession of
+   an agent credential is not treated as a vulnerability (see
    [SECURITY.md](SECURITY.md#out-of-scope) — rotate it); what this model
    does is bound what the position can do ([§5](#5-attacker-position-holder-of-agent-credentials)).
 2. **The relay host is inside the trust boundary.** Agent↔hub sessions are
@@ -69,6 +71,7 @@ The model enumerates four positions, ordered by how much they hold:
 | 2 | Holder of agent credentials (compromised credential) | [§5](#5-attacker-position-holder-of-agent-credentials) |
 | 3 | The relay host operator (hub or edge) | [§6](#6-attacker-position-the-relay-host-hub-or-edge-operator) |
 | 4 | Local actor on an agent host (control API) | [§7](#7-attacker-position-local-actor-on-an-agent-host--the-control-api-surface) |
+| 5 | A malicious or compromised **tenant** (multi-tenant hub) | [§6.5](#65-tenant-isolation-multi-tenant-hubs-since-v4) |
 
 ## 4. Attacker position: public unauthenticated client
 
@@ -76,15 +79,14 @@ The model enumerates four positions, ordered by how much they hold:
 
 Registration requires a credential before any tunnel capability exists:
 
-- Default auth mode is `static-token`; `allow_anonymous` defaults to `false`
-  and config validation requires at least one credential when it is off
-  (`crates/mesh/src/config/hub.rs`).
-- Token comparison is constant-time at all three auth sites: h2 Bearer
-  (`crates/mesh/src/hub/service.rs`), QUIC registration Hello
-  (`crates/mesh/src/hub/quic.rs`), and the agent control API
-  (`crates/mesh/src/agent/control.rs`) — all via `subtle::ConstantTimeEq`.
-- In mTLS mode the client certificate's CN is extracted and bound as the
-  agent identity (`crates/core/src/tls/server.rs`; QUIC side reads quinn's
+- mTLS is the only authentication mode: the client certificate must chain
+  to a tenant CA in the trust table (`[[auth.tenants]]`), and config
+  validation rejects an empty trust table or a missing/disabled `[tls]`
+  (`crates/mesh/src/config/hub.rs`, `crates/mesh/src/config/validate.rs`).
+- The client certificate's leaf CN is extracted and bound as the agent
+  identity, and the tenant is derived from which tenant CA anchors the
+  chain — a cryptographic fact, never claimable
+  (`crates/core/src/tls/server.rs`; the QUIC side reads quinn's
   `peer_identity()`).
 - **Hub identity verification on the agent side**: agents authenticate the
   hub via the configured CA, or pin its leaf certificate by SHA-256
@@ -93,8 +95,8 @@ Registration requires a credential before any tunnel capability exists:
   endpoints are the same process, so the trust model needs no CA chain
   (`crates/expose/src/edge/mod.rs`).
 - **Pre-auth per-IP rate limiting** (default 30 auth attempts per minute,
-  `AuthRateLimiter`) rejects brute-force enumeration with 429 before token
-  validation; failures are counted and audited
+  `AuthRateLimiter`) rejects brute-force enumeration with 429 before
+  registration is processed; failures are counted and audited
   (`interflow_hub_auth_failures` metric with reason).
 
 ### 4.2 Reaching the expose edge
@@ -123,9 +125,10 @@ defenses are resource-shape defenses:
 - **QUIC plane (opt-in)**: with `--quic-listen` the embedded hub opens a
   public QUIC listener for expose clients. It is the same hardening as the
   mesh hub's QUIC face — TLS is mandatory (the listener refuses to start
-  without `--hub-cert`/`--hub-key`), agent registration authenticates the
-  static token with a constant-time compare at the Hello frame, and
-  handshake failures / idle connections are counted and evicted — so the
+  without `--hub-cert`/`--hub-key`), clients authenticate with mTLS client
+  certificates at the handshake (the registration Hello frame carries
+  capability bits, not a credential), and handshake failures / idle
+  connections are counted and evicted — so the
   added public surface inherits §4.1 rather than introducing a new trust
   path. The nginx-fronted HTTP/1 surface above is unaffected either way.
 
@@ -209,17 +212,90 @@ thresholds hurting legitimate traffic" apart from "under flood".
 ## 6. Attacker position: the relay host (hub or edge operator)
 
 The hub never terminates public TLS and never parses HTTP — but it does
-terminate the agent↔hub TLS and handle the frame stream, so **tunneled
-payloads are readable and modifiable by whoever controls the relay host**.
-Confidentiality and integrity are **per hop** (agent ↔ relay, relay ↔ agent);
-there is no end-to-end protection between the two agents today. Operating a
-site-to-site mesh through a public relay means trusting that relay with
-plaintext — pick the hub host accordingly, or run the hub on infrastructure
-you control.
+terminate the agent↔hub TLS and handle the frame stream. What the relay
+host can do to tunnel payloads therefore depends on the tenant's e2e
+(`[e2e]`) configuration (docs/design/agent-e2e-encryption.md):
 
-The same holds for scenario A's edge: the public TLS termination belongs to
-the fronting proxy; the proxy→edge hop is plaintext HTTP/1 by design and
-must stay on the same host or a trusted network segment.
+- **`[e2e] mode = "off"` (default): per-hop TLS only.** Tunneled payloads
+  are readable and modifiable by whoever controls the relay host —
+  confidentiality and integrity are per hop (agent ↔ relay, relay ↔
+  agent). Operating a site-to-site mesh through a public relay in this
+  mode means trusting that relay with plaintext; pick the hub host
+  accordingly, or run the hub on infrastructure you control.
+- **`[e2e] mode = "required"` (per tenant): per-hop TLS + an inner
+  agent↔agent TLS 1.3 layer.** After the Open frame, the two agents run an
+  mTLS handshake *inside* the tunnel stream (handshake bytes ride ordinary
+  Data frames) and all payload bytes are ciphertext to the relay: it can
+  neither read, modify, inject, nor impersonate (leaf CN must equal the
+  stream's declared peer, chain must anchor to the tenant's configured
+  anchors), and the egress dials the LAN backend only after that handshake
+  verifies — a malicious relay's content-level capabilities degrade to
+  availability attacks (drop/delay/reorder streams), which are outside
+  this layer's promise. Stream metadata (source/target agents, target
+  address, size/timing) remains visible to the relay by routing necessity.
+  `opportunistic` mode exists only as a migration window and provides no
+  security claim (an active downgrade is indistinguishable from an old
+  peer).
+
+UDP streams remain on per-hop TLS in every mode (phase-1 boundary of the
+RFC above): a tenant with UDP rules keeps its plaintext-to-relay exposure
+for those streams and shows up as an audit item.
+
+The same model applies to scenario A's edge: the public TLS termination
+belongs to the fronting proxy, the proxy→edge hop is plaintext HTTP/1 by
+design and must stay on the same host or a trusted network segment, and
+gateway flows carry the inner layer only when the edge runs with the
+stable gateway identity (`--gateway-cert/--gateway-key`; without it the
+per-restart minted principal cannot be anchored anywhere, and
+`required`-mode egresses reject gateway streams by design).
+
+### 6.5 Tenant isolation (multi-tenant hubs, since v4)
+
+Since the v4 mTLS-only rework (docs/design/multi-tenant-mtls-only.md), a hub
+may carry multiple tenants, each with its own client CA:
+
+- **Identity** is `(tenant, agent_id)` — the tenant is derived from which
+  tenant root anchors the certificate chain (a cryptographic fact, never
+  claimable), the agent id from the leaf CN. A tenant CA's private key
+  leaking mints identities for **that tenant only**; rotation unit = tenant.
+- **Cross-tenant streams are denied by default**; same-tenant streams are
+  allowed by default; `[[acl.rules]]` grant explicit cross-tenant
+  exceptions. The expose edge's in-process `_edge` gateway principal is the
+  only always-cross-tenant opener (it is the route origin for every public
+  connection and rotates its ephemeral CA each restart).
+- **Token authentication no longer exists** (agent or admin): client
+  certificates are the only credential, on both the h2 and QUIC planes. A
+  SIGHUP reload rebuilds the mTLS acceptor from the tenant table — a reload
+  can no longer silently drop client-certificate enforcement.
+- `GET /agents` is tenant-scoped observability: an identity sees its own
+  tenant's list only (a cross-tenant list is reconnaissance material).
+- **Real client IPs** are restored per topology and key rate limits,
+  connection caps, audit and metrics **only** — never identity or ACL
+  decisions (identity is exclusively mTLS). The mechanisms are mutually
+  exclusive and share one `--trusted-proxy` set: **PROXY protocol v2**
+  (`ppp` crate, v1 rejected; LB / nginx-stream fronts, preamble read
+  pre-peek; an untrusted source sending a PROXY signature is hard-rejected)
+  and **X-Forwarded-For** on the edge's standard nginx HTTP `proxy_pass`
+  leg (stock nginx cannot emit PROXY there): only the right-most chain
+  entry appended by a trusted proxy is used, left-side (client-forged)
+  entries are ignored, and `required` rejects a trusted proxy that sends no
+  parseable header. With XFF active, per-IP gating for a trusted proxy is
+  deferred until the request head is buffered; the fronting nginx's own
+  `limit_req`/`limit_conn` cover that leg in the meantime.
+- Residual: the §6 relay-host plaintext exposure is now conditional —
+  closed for TCP streams of `required` tenants by the agent↔agent inner
+  TLS layer (docs/design/agent-e2e-encryption.md, implemented), still open
+  for `off` tenants, `opportunistic` windows, and UDP streams (phase 2).
+
+### Supply-chain note (the `ppp` dependency)
+
+`ppp` 2.3.0 is the first parser-class third-party dependency on a
+pre-authentication path (PROXY preamble). Rationale and the audit surface:
+single transitive dependency (`thiserror`), ecosystem de-facto standard
+since 2019; parsed input restricted to v2 (nginx always emits v2); the
+integration boundary carries property tests plus a fuzz-style
+arbitrary-bytes battery (no panic, no IP from untrusted sources), aligned
+with the §8.2 fuzzing roadmap.
 
 ## 7. Attacker position: local actor on an agent host — the control API surface
 
@@ -289,8 +365,8 @@ Mirrors [SECURITY.md](SECURITY.md#out-of-scope), with the model's rationale:
 
 - **Volumetric DDoS** that saturates the host's network before interflow
   sees a packet — no application can defend below its own NIC queue.
-- **Compromised trusted credentials** (leaked hub token, stolen agent
-  certificate or CA key). Key material is the trust boundary ([§2](#2-trust-boundaries));
+- **Compromised trusted credentials** (a stolen agent certificate or tenant
+  CA key). Key material is the trust boundary ([§2](#2-trust-boundaries));
   the response is rotation, and the model's job is bounding the position
   ([§5](#5-attacker-position-holder-of-agent-credentials)).
 - **Dependency vulnerabilities** — report upstream; exploitable-through-

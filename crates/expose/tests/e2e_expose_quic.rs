@@ -117,7 +117,7 @@ async fn run_quic_round_trip(derived_addr: bool) {
 
     // 1. echo backend + certs (SAN covers localhost + 127.0.0.1 → QUIC SNI ok)
     let echo_addr = spawn_echo().await;
-    let certs = TestCerts::generate("expose-quic-e2e", "unused-client-cn");
+    let _certs = TestCerts::generate("expose-quic-e2e", "unused-client-cn");
 
     // 2. Ports: with a derived address, QUIC shares the hub TCP port number
     let edge_port = pick_port();
@@ -138,6 +138,7 @@ async fn run_quic_round_trip(derived_addr: bool) {
             r#"
 [[routes]]
 host = "test.local"
+tenant = "test"
 agent_id = "expose-quic-test"
 remote_addr = "{echo_addr}"
 "#
@@ -146,11 +147,13 @@ remote_addr = "{echo_addr}"
     .expect("write routes.toml");
 
     // 4. Spawn edge: hub TLS on (QUIC mandates it) + QUIC listener on
+    let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let edge_args = EdgeArgs {
         listen_addr: edge_listen,
         hub_listen_addr: hub_listen,
         routes_path: routes_path.to_string_lossy().into_owned(),
-        agent_token: "test-token".into(),
+        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
+        proxy_protocol: Default::default(),
         hub_tls: Some(EdgeHubTls {
             cert_path: certs.server_cert_path().display().to_string(),
             key_path: certs.server_key_path().display().to_string(),
@@ -170,10 +173,12 @@ remote_addr = "{echo_addr}"
 
     // 5. Spawn the expose client over QUIC (CA = the test CA; hub URL only
     //    matters for derivation in the derived variant)
+    let (client_cert, client_key) = certs.named_client_cert("expose-quic-test");
     let client_args = ExposeArgs {
         local_ports: vec![echo_addr.port()],
-        hub_url: format!("http://127.0.0.1:{hub_port}"),
-        auth_token: "test-token".into(),
+        hub_url: format!("https://127.0.0.1:{hub_port}"),
+        client_cert: Some(client_cert.display().to_string()),
+        client_key: Some(client_key.display().to_string()),
         agent_id: "expose-quic-test".into(),
         ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::Quic,
@@ -230,21 +235,26 @@ async fn full_edge_expose_quic_derived_addr() {
 /// `--quic-listen` without hub TLS must fail fast with a pointed config
 /// error, before any listener binds.
 #[tokio::test]
-async fn edge_quic_without_tls_fails_fast() {
+async fn edge_without_tls_fails_fast() {
+    // Since the mTLS-only rework the edge hub requires --hub-cert/--hub-key
+    // unconditionally (client certificates are verified at the TLS
+    // handshake) — the old QUIC-only prerequisite is subsumed by it.
     let edge_args = EdgeArgs {
         listen_addr: format!("127.0.0.1:{}", pick_port()).parse().unwrap(),
         hub_listen_addr: format!("127.0.0.1:{}", pick_port()).parse().unwrap(),
         routes_path: "nonexistent-routes.toml".into(),
-        agent_token: "test-token".into(),
-        quic_listen: Some(format!("127.0.0.0:{}", pick_port()).parse().unwrap()),
+        tenant_cas: Vec::new(),
+        proxy_protocol: Default::default(),
+        hub_tls: None,
+        quic_listen: None,
         agent_recovery_timeout_secs: 120,
         ..Default::default()
     };
     let err = interflow_expose::edge::run(edge_args)
         .await
-        .expect_err("quic without tls must fail");
+        .expect_err("edge without hub TLS must fail");
     assert!(
-        err.to_string().contains("QUIC"),
-        "error should name the QUIC/TLS requirement: {err}"
+        err.to_string().contains("mTLS requires"),
+        "error should name the TLS requirement: {err}"
     );
 }

@@ -26,6 +26,11 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::net::SocketAddr;
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 fn bench_udp_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -137,11 +142,12 @@ criterion_group!(benches, bench_udp_throughput);
 criterion_main!(benches);
 
 mod setup {
+    use super::certs;
     // Thin glue: stack assembly lives in interflow-testkit (certs, hub/agent
     // configs, UDP echo, probes).
     use interflow_mesh::agent::AgentHandle;
     use interflow_testkit::config::{
-        acl, agent_config, agent_quic_config, hub_config, hub_quic_config, udp_egress_rule,
+        agent_config, agent_quic_config, hub_config, hub_quic_config, udp_egress_rule,
         udp_ingress_rule, unlock_stream_limits,
     };
     use interflow_testkit::stack::{HubHandle, pick_ephemeral_port, spawn_agent, spawn_hub};
@@ -171,16 +177,16 @@ mod setup {
         let ingress_port = pick_ephemeral_port();
         let (echo_addr, echo) = interflow_testkit::spawn_udp_echo().await;
 
-        let mut hub_cfg = hub_config(hub_port, vec![acl("ingress", "egress")]);
+        let mut hub_cfg = hub_config(hub_port, certs(), Vec::new());
         unlock_stream_limits(&mut hub_cfg);
         let hub = spawn_hub(hub_cfg).await;
 
-        let mut egress_cfg = agent_config("egress", hub_port);
+        let mut egress_cfg = agent_config("egress", hub_port, certs());
         egress_cfg.egress = vec![udp_idle(udp_egress_rule("echo", echo_addr))];
         let egress = spawn_agent(egress_cfg);
 
         let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().expect("addr");
-        let mut ingress_cfg = agent_config("ingress", hub_port);
+        let mut ingress_cfg = agent_config("ingress", hub_port, certs());
         ingress_cfg.ingress = vec![udp_ingress_idle(udp_ingress_rule(
             "to-egress",
             ingress_addr,
@@ -196,21 +202,20 @@ mod setup {
     /// QUIC stack (with the DATAGRAM fast path: small packets ride RFC 9221,
     /// loss does not HOL).
     pub async fn spawn_quic_stack() -> std::result::Result<(SocketAddr, StackKeep), String> {
-        let certs = interflow_testkit::certs::TestCerts::generate("udp-bench-quic", "quic-egress");
         let hub_port = pick_ephemeral_port();
         let ingress_port = pick_ephemeral_port();
         let (echo_addr, echo) = interflow_testkit::spawn_udp_echo().await;
 
-        let mut hub_cfg = hub_quic_config(hub_port, &certs, vec![acl("ingress", "egress")]);
+        let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
         unlock_stream_limits(&mut hub_cfg);
         let hub = spawn_hub(hub_cfg).await;
 
-        let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+        let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
         egress_cfg.egress = vec![udp_idle(udp_egress_rule("echo", echo_addr))];
         let egress = spawn_agent(egress_cfg);
 
         let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().expect("addr");
-        let mut ingress_cfg = agent_quic_config("ingress", hub_port, &certs);
+        let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
         ingress_cfg.ingress = vec![udp_ingress_idle(udp_ingress_rule(
             "to-egress",
             ingress_addr,

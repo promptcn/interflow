@@ -53,10 +53,13 @@ enum Commands {
         /// Hub URL (overrides profile).
         #[arg(long)]
         hub: Option<String>,
-        /// Agent token (overrides profile).
+        /// Client certificate PEM path, signed by a tenant CA (overrides profile).
         #[arg(long)]
-        token: Option<String>,
-        /// Agent ID (overrides profile; defaults to expose-<host>-<rand>).
+        client_cert: Option<String>,
+        /// Client key PEM path (overrides profile; must be 0600).
+        #[arg(long)]
+        client_key: Option<String>,
+        /// Agent ID (overrides profile; defaults to expose-<host>-<rand>; must equal the client certificate CN).
         #[arg(long)]
         agent_id: Option<String>,
         /// Trusted hub CA path (only effective for https; overrides profile).
@@ -81,21 +84,52 @@ enum Commands {
         /// Public listen address (nginx forwards traffic here).
         #[arg(long, default_value = "0.0.0.0:8443")]
         listen: SocketAddr,
-        /// Internal hub listen address (127.0.0.1 only).
+        /// Internal hub listen address. Default 127.0.0.1 (edge and hub in
+        /// one process); use 0.0.0.0 when LAN expose agents dial in over
+        /// the internet (the hub plane is mTLS + TLS).
         #[arg(long, default_value = "127.0.0.1:16666")]
         hub_listen: SocketAddr,
         /// Routing table toml path.
         #[arg(long)]
         routes: String,
-        /// Agent token (both edge itself and remote expose clients use it to register with the hub).
-        #[arg(long)]
-        token: String,
+        /// Tenant client-CA entry `<name>=<path>` (repeatable): expose clients
+        /// of tenant <name> authenticate with certificates issued by that CA.
+        /// The edge's own gateway principal is minted in memory at startup.
+        #[arg(long = "client-ca", value_name = "NAME=PATH", value_parser = parse_client_ca)]
+        client_ca: Vec<(String, String)>,
+        /// PROXY protocol on the public listener: `off` (default), `on`
+        /// (accept from trusted proxies), `required` (trusted proxies must
+        /// send it). For a PROXY-capable front (LB / nginx stream) — the
+        /// standard nginx HTTP proxy_pass leg cannot emit it and should use
+        /// --x-forwarded-for instead.
+        #[arg(long, default_value = "off")]
+        proxy_protocol: String,
+        /// X-Forwarded-For real-IP restoration on the public listener:
+        /// `off` (default), `on` (trusted proxies; absent header falls back
+        /// to the TCP peer), `required` (trusted proxies must send it). This
+        /// is the standard nginx HTTP proxy_pass topology — stock nginx
+        /// cannot emit the PROXY protocol on that leg.
+        #[arg(long = "x-forwarded-for", value_name = "MODE", default_value = "off")]
+        x_forwarded_for: interflow_core::security::XffMode,
+        /// Trusted proxy CIDR shared by PROXY protocol and X-Forwarded-For
+        /// (repeatable; default 127.0.0.1 + ::1).
+        #[arg(long = "trusted-proxy", value_name = "CIDR")]
+        trusted_proxy: Vec<String>,
         /// Hub TLS certificate (if nginx already terminates TLS, edge needs no internal TLS).
         #[arg(long)]
         hub_cert: Option<String>,
         /// Hub TLS private key.
         #[arg(long)]
         hub_key: Option<String>,
+        /// Stable gateway identity certificate — the leaf+CA chain bundle
+        /// from `interflow-mesh certs gateway issue` (see --gateway-key).
+        /// Providing it replaces the per-restart minted identity AND opts
+        /// gateway flows into the inner TLS (e2e) layer.
+        #[arg(long = "gateway-cert", requires = "gateway_key")]
+        gateway_cert: Option<String>,
+        /// Stable gateway identity private key (see --gateway-cert).
+        #[arg(long = "gateway-key", requires = "gateway_cert")]
+        gateway_key: Option<String>,
         /// QUIC listen address for the embedded hub (e.g. `0.0.0.0:16666`):
         /// enables the QUIC transport for expose clients. The UDP port is
         /// exposed directly (nginx does not carry it) and requires
@@ -188,7 +222,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Expose {
             ports,
             hub,
-            token,
+            client_cert,
+            client_key,
             agent_id,
             ca_path,
             transport,
@@ -199,8 +234,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let hub_url = pick("hub", hub, p.hub_url.as_deref())
                 .ok_or_else(|| "missing --hub or profile.hub_url".to_string())?;
-            let auth_token = pick("token", token, p.auth_token.as_deref())
-                .ok_or_else(|| "missing --token or profile.auth_token".to_string())?;
+            let client_cert = absolutized(
+                &pick("client_cert", client_cert, p.client_cert.as_deref())
+                    .ok_or_else(|| "missing --client-cert or profile.client_cert".to_string())?,
+            )?;
+            let client_key = absolutized(
+                &pick("client_key", client_key, p.client_key.as_deref())
+                    .ok_or_else(|| "missing --client-key or profile.client_key".to_string())?,
+            )?;
             let agent_id = pick("agent_id", agent_id, p.agent_id.as_deref())
                 .unwrap_or_else(client::default_agent_id);
             // CLI flag > profile > h2 default
@@ -214,10 +255,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // A relative --ca-path means "relative to the current directory"
             // for this run; absolutize it once so --save persists a value
             // that keeps working from any directory.
-            let ca_path = match pick("ca_path", ca_path, p.ca_path.as_deref()) {
-                Some(ca) => Some(absolutize(Path::new(&ca))?.display().to_string()),
-                None => None,
-            };
+            let ca_path = pick("ca_path", ca_path, p.ca_path.as_deref())
+                .map(|ca| absolutized(&ca))
+                .transpose()?;
             // Fail fast on a TLS-requiring transport with a missing CA
             // instead of dying mid-connect (profile-internal relative paths
             // anchor to the profile directory, CLI flags to the CWD). QUIC
@@ -235,7 +275,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // quic profile); hub_quic_addr persists only explicit values.
                 let new_profile = profile::Profile {
                     hub_url: Some(hub_url.clone()),
-                    auth_token: Some(auth_token.clone()),
+                    client_cert: Some(client_cert.clone()),
+                    client_key: Some(client_key.clone()),
                     agent_id: Some(agent_id.clone()),
                     ca_path: ca_path.clone(),
                     local_ports: if ports.is_empty() {
@@ -254,8 +295,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let args = ExposeArgs {
                 local_ports: ports,
                 hub_url,
-                auth_token,
                 agent_id,
+                client_cert: Some(client_cert),
+                client_key: Some(client_key),
                 ca_path,
                 transport,
                 hub_quic_addr,
@@ -317,9 +359,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             listen,
             hub_listen,
             routes,
-            token,
+            client_ca,
+            proxy_protocol,
+            x_forwarded_for,
+            trusted_proxy,
             hub_cert,
             hub_key,
+            gateway_cert,
+            gateway_key,
             quic_listen,
             audit_path,
             new_conn_rate_per_ip_per_minute,
@@ -332,8 +379,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let hub_tls = match (hub_cert, hub_key) {
                 (Some(cert_path), Some(key_path)) => Some(EdgeHubTls {
-                    cert_path,
-                    key_path,
+                    cert_path: absolutized(&cert_path)?,
+                    key_path: absolutized(&key_path)?,
                 }),
                 (None, None) => None,
                 _ => {
@@ -343,12 +390,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             };
+            let gateway_identity = match (gateway_cert, gateway_key) {
+                (Some(cert_path), Some(key_path)) => {
+                    Some((absolutized(&cert_path)?, absolutized(&key_path)?))
+                }
+                (None, None) => None,
+                // clap `requires` already forces pairing; unreachable arm.
+                _ => {
+                    return Err(
+                        "the stable gateway identity requires both --gateway-cert and --gateway-key"
+                            .into(),
+                    );
+                }
+            };
+            let proxy_mode = proxy_protocol
+                .parse::<interflow_core::security::ProxyProtocolMode>()
+                .map_err(|e| format!("invalid --proxy-protocol value: {e}"))?;
             let args = EdgeArgs {
                 listen_addr: listen,
                 hub_listen_addr: hub_listen,
                 routes_path: routes,
-                agent_token: token,
+                tenant_cas: client_ca,
+                proxy_protocol: interflow_core::security::ProxyProtocolConfig {
+                    mode: proxy_mode,
+                    trusted_proxies: if trusted_proxy.is_empty() {
+                        vec!["127.0.0.1".to_string(), "::1".to_string()]
+                    } else {
+                        trusted_proxy
+                    },
+                },
+                x_forwarded_for,
                 hub_tls,
+                gateway_identity,
                 quic_listen,
                 audit_path,
                 new_conn_rate_per_ip_per_minute,
@@ -384,6 +457,42 @@ fn pick(name: &str, cli: Option<String>, from_profile: Option<&str>) -> Option<S
         tracing::debug!("argument {name} not provided (not set on CLI or in profile)");
         None
     }
+}
+
+/// Absolutizes a path argument once (relative → CWD, leading `~` → home) so
+/// `--save` persists values that keep working from any directory. The same
+/// treatment for every filesystem-path argument; profile-internal relative
+/// values already anchored to the profile directory at load.
+fn absolutized(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(absolutize(Path::new(value))?.display().to_string())
+}
+
+/// clap value parser for `--client-ca NAME=PATH`.
+fn parse_client_ca(s: &str) -> Result<(String, String), String> {
+    let (name, path) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected NAME=PATH, got {s:?}"))?;
+    let valid = !name.starts_with('_')
+        && !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !valid {
+        return Err(format!(
+            "invalid tenant name {name:?} ([A-Za-z0-9_-], no leading '_')"
+        ));
+    }
+    if path.is_empty() {
+        return Err("empty CA path".to_string());
+    }
+    // Same normalization as every other path flag (relative → CWD, `~` →
+    // home); the value never passes through a shell when quoted.
+    let path = absolutize(Path::new(path))
+        .map_err(|e| e.to_string())?
+        .display()
+        .to_string();
+    Ok((name.to_string(), path))
 }
 
 /// clap value parser for `--log-level`: reject a mistyped filter at parse

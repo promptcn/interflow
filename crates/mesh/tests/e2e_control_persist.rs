@@ -28,6 +28,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 const TOKEN: &str = "e2e-secret-token";
 
 /// Temp dir (cleaned up on Drop).
@@ -90,19 +95,29 @@ async fn start_file_agent(
     ctrl_port: u16,
     path: &std::path::Path,
 ) -> interflow_mesh::agent::AgentHandle {
+    let (cert, key) = certs().named_client_cert("persist-agent");
     let toml = format!(
         "# e2e fixture top comment
 config_version = 3
 
 [agent]
 id = \"persist-agent\"
-hub_url = \"http://127.0.0.1:{hub_port}\"
+hub_url = \"https://127.0.0.1:{hub_port}\"
+
+[tls]
+enabled = true
+ca_path = \"{ca}\"
+client_cert_path = \"{cert}\"
+client_key_path = \"{key}\"
 
 [control]
 enabled = true
 listen_addr = \"127.0.0.1:{ctrl_port}\"
 auth_token = \"{TOKEN}\"
-"
+",
+        ca = certs().ca_path().display(),
+        cert = cert.display(),
+        key = key.display(),
     );
     std::fs::write(path, toml).expect("write config");
     let cfg = load_agent_config(path).expect("parse config");
@@ -121,7 +136,7 @@ auth_token = \"{TOKEN}\"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_api_persists_rules_across_restart() {
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let tmp = TempDir::new("restart");
@@ -246,7 +261,7 @@ async fn control_api_persists_rules_across_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_api_same_name_replaces() {
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let tmp = TempDir::new("replace");

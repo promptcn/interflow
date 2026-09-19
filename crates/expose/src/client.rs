@@ -20,10 +20,13 @@ pub struct ExposeArgs {
     pub local_ports: Vec<u16>,
     /// Hub URL.
     pub hub_url: String,
-    /// Agent token for the hub.
-    pub auth_token: String,
-    /// Local agent_id (must match the one referenced in edge's routes.toml).
+    /// Local agent_id — must equal the client certificate's CN (the hub binds
+    /// identity at registration).
     pub agent_id: String,
+    /// Client certificate PEM path (mTLS: the hub accepts nothing else).
+    pub client_cert: Option<String>,
+    /// Client key PEM path (0600).
+    pub client_key: Option<String>,
     /// Trusted CA path (required when the hub uses a self-signed cert; None uses the system CA).
     pub ca_path: Option<String>,
     /// Transport toward the hub (h2 default; quic eliminates TCP head-of-line
@@ -136,8 +139,8 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
         Some(TlsConfig {
             enabled: true,
             ca_path: args.ca_path.clone(),
-            client_cert_path: None,
-            client_key_path: None,
+            client_cert_path: args.client_cert.clone(),
+            client_key_path: args.client_key.clone(),
             hub_cert_fingerprint: None,
         })
     } else {
@@ -164,7 +167,6 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
             hub_url: args.hub_url.clone(),
             transport: args.transport,
             hub_quic_addr,
-            auth_token: Some(args.auth_token.clone()),
             ..AgentInfo::default()
         },
         egress,
@@ -210,8 +212,9 @@ mod tests {
         ExposeArgs {
             local_ports: vec![3000],
             hub_url: hub_url.to_string(),
-            auth_token: "t".into(),
             agent_id: "a".into(),
+            client_cert: None,
+            client_key: None,
             ca_path: None,
             transport,
             hub_quic_addr: hub_quic_addr.map(str::to_string),

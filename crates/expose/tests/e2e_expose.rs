@@ -22,7 +22,7 @@
     unused_mut
 )]
 use interflow_expose::client::ExposeArgs;
-use interflow_expose::edge::{EdgeArgs, HostRouter, Route, RoutesConfig};
+use interflow_expose::edge::{EdgeArgs, EdgeHubTls, HostRouter, Route, RoutesConfig};
 use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -85,14 +85,18 @@ async fn wait_for_tcp(addr: SocketAddr, timeout: Duration) -> std::io::Result<()
 async fn host_router_routes_by_host() {
     let echo_addr = spawn_echo().await;
 
-    let router = Arc::new(HostRouter::from_config(&RoutesConfig {
-        routes: vec![Route {
-            host: "test.local".into(),
-            agent_id: "expose-test".into(),
-            remote_addr: echo_addr,
-        }],
-        logging: None,
-    }));
+    let router = Arc::new(
+        HostRouter::from_config(&RoutesConfig {
+            routes: vec![Route {
+                host: "test.local".into(),
+                tenant: "test".into(),
+                agent_id: "expose-test".into(),
+                remote_addr: echo_addr,
+            }],
+            logging: None,
+        })
+        .unwrap(),
+    );
 
     assert_eq!(router.len(), 1);
     let r = router.lookup("test.local").expect("route found");
@@ -134,6 +138,7 @@ async fn full_edge_expose_round_trip() {
         r#"
 [[routes]]
 host = "test.local"
+tenant = "test"
 agent_id = "expose-test"
 remote_addr = "{echo_addr}"
 "#
@@ -145,11 +150,17 @@ remote_addr = "{echo_addr}"
     std::fs::write(&routes_path, &routes_content).expect("write routes.toml");
 
     // 4. Spawn edge (hub server + edge agent + listener)
+    let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let edge_args = EdgeArgs {
         listen_addr: edge_listen,
         hub_listen_addr: hub_listen,
         routes_path: routes_path.to_string_lossy().into_owned(),
-        agent_token: "test-token".into(),
+        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
+        proxy_protocol: Default::default(),
+        hub_tls: Some(EdgeHubTls {
+            cert_path: certs.server_cert_path().display().to_string(),
+            key_path: certs.server_key_path().display().to_string(),
+        }),
         agent_recovery_timeout_secs: 120,
         ..Default::default()
     };
@@ -165,12 +176,14 @@ remote_addr = "{echo_addr}"
         .expect("edge listener should start within 5s");
 
     // 6. Spawn the expose client (connects to the edge's hub, agent_id=expose-test, egress to echo)
+    let (client_cert, client_key) = certs.client_paths();
     let client_args = ExposeArgs {
         local_ports: vec![echo_addr.port()],
-        hub_url: format!("http://127.0.0.1:{hub_port}"),
-        auth_token: "test-token".into(),
+        hub_url: format!("https://127.0.0.1:{hub_port}"),
+        client_cert: Some(client_cert.display().to_string()),
+        client_key: Some(client_key.display().to_string()),
         agent_id: "expose-test".into(),
-        ca_path: None,
+        ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
     };
@@ -180,7 +193,7 @@ remote_addr = "{echo_addr}"
         );
 
     // 7. Wait for the agent to register with the hub (no health-check channel; a simple sleep)
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // 8. Send an HTTP/1.1 request to the edge listener
     let mut sock = TcpStream::connect(edge_listen)

@@ -6,6 +6,11 @@
 //! systemd, Docker, or GUI launches. CLI-flag paths keep the standard Unix
 //! CWD semantics and are out of scope.
 //!
+//! A leading `~` (bare or `~/…`) expands to the user's home directory at
+//! every entry point. Hand-typed paths (config files, profiles, GUI forms)
+//! never pass through a shell, so the program itself carries this one shell
+//! convention instead of each entry failing on the literal.
+//!
 //! Anchoring happens at load time, immediately after secret expansion and
 //! before validation, so every downstream consumer (validation, TLS
 //! acceptors, audit writers, hot-reload) sees absolute paths and needs no
@@ -14,11 +19,41 @@
 use crate::error::{InterflowError, Result};
 use std::path::{Path, PathBuf};
 
+/// Expands a leading `~` to the user's home directory.
+///
+/// Covers the two forms a user can type: `~` alone and `~/rest`. `~user/…`
+/// would require the user database (getpwent) and is deliberately left as a
+/// literal — existence validation then reports it instead of silently
+/// rewriting it into the wrong home. Unexpandable inputs (no home dir, other
+/// prefixes) pass through unchanged.
+pub fn expand_tilde(path: &str) -> String {
+    expand_tilde_opt(path).unwrap_or_else(|| path.to_string())
+}
+
+/// `Some` only when `path` is `~` or `~/…` and the home directory resolves.
+fn expand_tilde_opt(path: &str) -> Option<String> {
+    let rest = match path {
+        "~" => "",
+        p if p.starts_with("~/") => &p[2..],
+        _ => return None,
+    };
+    let home = dirs::home_dir()?;
+    // join("") would append a trailing separator to the bare `~` form.
+    Some(if rest.is_empty() {
+        home.display().to_string()
+    } else {
+        home.join(rest).display().to_string()
+    })
+}
+
 /// Absolutizes `path` against the process working directory when relative.
 ///
 /// `fs::canonicalize` is deliberately avoided: it requires the file to
 /// already exist and prefixes `\\?\` on Windows.
 pub fn absolutize(path: &Path) -> Result<PathBuf> {
+    if let Some(expanded) = path.to_str().and_then(expand_tilde_opt) {
+        return Ok(PathBuf::from(expanded));
+    }
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
@@ -38,6 +73,11 @@ pub fn absolutize(path: &Path) -> Result<PathBuf> {
 /// components are lexically dropped; `..` is preserved (no symlink-aware
 /// canonicalization — the target may not exist yet).
 pub fn anchor(base_dir: &Path, value: &str) -> String {
+    // Tilde expansion wins over anchoring: `~/x` is lexically relative but
+    // semantically absolute, so it must never join the config directory.
+    if let Some(expanded) = expand_tilde_opt(value) {
+        return expanded;
+    }
     if value.is_empty() || Path::new(value).is_absolute() {
         value.to_string()
     } else {
@@ -95,5 +135,48 @@ mod tests {
         let joined = absolutize(Path::new("hub.toml")).unwrap();
         assert!(joined.is_absolute());
         assert!(joined.ends_with("hub.toml"));
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~"), home.display().to_string());
+        assert_eq!(
+            expand_tilde("~/interflow-certs/agents/edge-lan-agent.crt"),
+            home.join("interflow-certs/agents/edge-lan-agent.crt")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn tilde_user_and_other_prefixes_stay_literal() {
+        // `~user` needs getpwent; leaving it literal lets existence
+        // validation report it instead of rewriting into the wrong home.
+        assert_eq!(expand_tilde("~leo/certs/hub.crt"), "~leo/certs/hub.crt");
+        assert_eq!(expand_tilde("certs/hub.crt"), "certs/hub.crt");
+        assert_eq!(
+            expand_tilde("/etc/interflow/hub.crt"),
+            "/etc/interflow/hub.crt"
+        );
+        assert_eq!(expand_tilde(""), "");
+    }
+
+    #[test]
+    fn anchor_expands_tilde_instead_of_joining_base() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            anchor(Path::new("/etc/interflow"), "~/certs/agent.crt"),
+            home.join("certs/agent.crt").display().to_string()
+        );
+    }
+
+    #[test]
+    fn absolutize_expands_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(
+            absolutize(Path::new("~/hub.toml")).unwrap(),
+            home.join("hub.toml")
+        );
     }
 }

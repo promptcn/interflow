@@ -14,7 +14,7 @@ pub use interflow_core::tunnel::TunnelData;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
@@ -23,7 +23,7 @@ use crate::config::HubConfig;
 use http_body_util::combinators::BoxBody;
 use hyper::body::Frame;
 use interflow_core::protocol::frame as wire;
-use tokio_rustls::TlsAcceptor;
+use interflow_core::tls::TlsPlane;
 
 /// Hub HTTP response body type alias.
 pub type HubResponseBody = BoxBody<Bytes, InterflowError>;
@@ -31,12 +31,56 @@ pub type HubResponseBody = BoxBody<Bytes, InterflowError>;
 /// Alias for `Arc<RwLock<HubConfig>>`, supporting hot reload.
 pub type SharedHubConfig = Arc<RwLock<HubConfig>>;
 
-/// Alias for `Arc<RwLock<Option<TlsAcceptor>>>`, supporting TLS
-/// configuration hot reload.
-pub type SharedTlsAcceptor = Arc<RwLock<Option<TlsAcceptor>>>;
+/// The TLS plane (mTLS acceptor + tenant derivation set), swapped atomically
+/// on reload so a connection's handshake and its tenant derivation always
+/// come from the same configuration generation.
+///
+/// `std::sync::RwLock`: the read side only clones an `Arc` (never awaits);
+/// the write side is the SIGHUP reload task.
+pub type SharedTlsPlane = Arc<std::sync::RwLock<Arc<TlsPlane>>>;
 
-/// Registry type: `agent_id -> Arc<RwLock<AgentSession>>`.
+/// Registry type: qualified agent key `"{tenant}/{agent_id}"` ->
+/// `Arc<RwLock<AgentSession>>`. The qualified key is unambiguous because
+/// neither tenant names nor agent ids may contain `/`.
 pub type SharedAgents = Arc<RwLock<HashMap<String, Arc<RwLock<AgentSession>>>>>;
+
+/// The registry key form `"{tenant}/{agent}"`.
+///
+/// The single source of the qualified-id format: everything that builds or
+/// asserts a registry key goes through this fn (never by hand), so a format
+/// change surfaces as a compile-time event at one definition site, not as
+/// scattered red tests.
+pub fn qualified_agent_id(tenant: &str, agent: &str) -> String {
+    format!("{tenant}/{agent}")
+}
+
+/// The mTLS-derived identity of one connection: tenant ownership comes from
+/// the certificate chain's anchoring root (never claimable), the agent id is
+/// the leaf CN.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIdentity {
+    /// Owning tenant name.
+    pub tenant: Arc<str>,
+    /// Agent id (the client certificate CN).
+    pub agent: String,
+    /// Whether the owning tenant is a trusted gateway (may open streams
+    /// across tenant boundaries).
+    pub trusted_gateway: bool,
+}
+
+impl PeerIdentity {
+    /// The registry key form `"{tenant}/{agent}"`.
+    pub fn qualified(&self) -> String {
+        qualified_agent_id(&self.tenant, &self.agent)
+    }
+
+    /// Splits a qualified key `"{tenant}/{agent}"` back into its parts.
+    /// `None` for malformed keys.
+    pub fn split_qualified(key: &str) -> Option<(&str, &str)> {
+        let (tenant, agent) = key.split_once('/')?;
+        (!tenant.is_empty() && !agent.is_empty()).then_some((tenant, agent))
+    }
+}
 
 /// Shared table of `agent_id -> active stream count`.
 ///
@@ -58,8 +102,6 @@ pub type SharedActiveStreams = Arc<RwLock<HashMap<String, ActiveStream>>>;
 /// server/service/accept/reload".
 #[derive(Clone)]
 pub struct HubLimits {
-    /// Whether the ACL is enabled (checks are skipped when there are no rules).
-    pub acl_enabled: Arc<AtomicBool>,
     /// Maximum concurrent active streams per agent.
     pub max_streams_per_agent: Arc<AtomicUsize>,
     /// Maximum concurrent active streams globally.
@@ -75,7 +117,6 @@ impl HubLimits {
     /// configuration.
     pub fn from_config(cfg: &HubConfig) -> Self {
         Self {
-            acl_enabled: Arc::new(AtomicBool::new(!cfg.acl.is_empty())),
             max_streams_per_agent: Arc::new(AtomicUsize::new(cfg.security.max_streams_per_agent)),
             max_streams_total: Arc::new(AtomicUsize::new(cfg.security.max_streams_total)),
             channel_send_timeout_secs: Arc::new(AtomicU64::new(
@@ -391,6 +432,10 @@ pub struct QuicAgentConn {
     /// Whether this agent negotiated DATAGRAM capability (Hello/HelloAck
     /// caps).
     pub datagram_cap: std::sync::atomic::AtomicBool,
+    /// Whether this agent declared the e2e (inner TLS) capability in its
+    /// Hello caps — observation only (fleet visibility), never a routing
+    /// or downgrade input (RFC agent-e2e-encryption §3.6).
+    pub e2e_cap: std::sync::atomic::AtomicBool,
 }
 
 /// Adapts an `mpsc::Receiver<TunnelData>` into a `futures::Stream` for a

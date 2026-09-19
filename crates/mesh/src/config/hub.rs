@@ -1,8 +1,9 @@
 //! Hub configuration schema.
 //!
 //! All structs use `deny_unknown_fields` to guard against typos. The `[auth]`
-//! section is required — either provide credentials or set an explicit
-//! `allow_anonymous = true` (see [`validate`] for details).
+//! section is required and must carry a non-empty tenant trust table —
+//! authentication is mTLS-only, there are no credential toggles (see
+//! [`validate`] for details).
 
 use interflow_core::config::params::liveness::HeartbeatCadence;
 use interflow_core::config::params::transport::{
@@ -21,7 +22,15 @@ use std::net::SocketAddr;
 /// registration); moved `[quic]` into `[transport.quic]` and added
 /// `[transport.h2]` (endpoint-symmetric keepalive, previously hard-coded);
 /// `tls.min_version` now actually enforced (previously silently ignored).
-pub const HUB_CONFIG_VERSION: u32 = 3;
+///
+/// v4 (2026-09-18, multi-tenant mTLS-only): `[auth]` reduced to
+/// `rate_limit_per_minute` + the `[[auth.tenants]]` trust table (mTLS client
+/// certificates are the only authentication; `mode`, `allow_anonymous`,
+/// `[auth.static_token]` and `[auth.mtls]` are gone — see
+/// docs/design/multi-tenant-mtls-only.md). `[[acl.rules]]` entries gained
+/// tenant fields and rules now only grant cross-tenant exceptions (same
+/// tenant is allowed by default). `[server]` gained `proxy_protocol`.
+pub const HUB_CONFIG_VERSION: u32 = 4;
 
 /// Hub configuration root structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,77 +251,59 @@ impl From<&HeartbeatConfig> for HeartbeatAd {
 pub struct ServerConfig {
     /// Listen address.
     pub listen_addr: SocketAddr,
+    /// PROXY protocol negotiation (restores the real client IP behind an
+    /// nginx `stream`/`proxy_pass` front). See
+    /// `interflow_core::security::proxy_protocol` for the trust matrix.
+    #[serde(default)]
+    pub proxy_protocol: interflow_core::security::ProxyProtocolConfig,
 }
 
-/// Authentication configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Authentication configuration: mTLS-only, one trust entry per tenant.
+///
+/// There is exactly one authentication mode (client certificates) and no
+/// credential toggles: the `[auth]` section carries the tenant trust table
+/// and the registration rate limit, nothing else (RFC
+/// docs/design/multi-tenant-mtls-only.md §3.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// Authentication mode. Defaults to `static-token`.
-    #[serde(default = "default_auth_mode")]
-    pub mode: AuthMode,
-    /// Whether anonymous access is allowed. Defaults to `false`.
-    ///
-    /// **Must never be set to `true` in production.** For local development
-    /// only. [`validate`] requires at least one credential when this is
-    /// `false`.
-    #[serde(default)]
-    pub allow_anonymous: bool,
     /// Maximum authentication attempts per IP per minute. 0 means unlimited.
-    /// Defaults to 30.
+    /// Defaults to 30. mTLS has no brute-forceable secret; the limiter's
+    /// remaining job is churn/DoS suppression on the registration endpoints.
     #[serde(default = "default_rate_limit_per_minute")]
     pub rate_limit_per_minute: u32,
-    /// Static token credentials (required when `mode = "static-token"`).
+    /// Tenant trust table (`[[auth.tenants]]`): one named client CA per
+    /// tenant. Validation requires it non-empty (an empty trust table can
+    /// authenticate nobody) and `[tls]` present (mTLS implies TLS).
     #[serde(default)]
-    pub static_token: Option<StaticTokenConfig>,
-    /// mTLS credentials (required when `mode = "mtls"`).
-    #[serde(default)]
-    pub mtls: Option<MtlsConfig>,
+    pub tenants: Vec<TenantConfig>,
 }
 
-impl AuthConfig {
-    /// Whether at least one credential is configured.
-    pub fn has_any_credential(&self) -> bool {
-        self.allow_anonymous
-            || self
-                .static_token
-                .as_ref()
-                .is_some_and(|s| s.agent.is_some())
-            || self.mtls.is_some()
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit_per_minute: default_rate_limit_per_minute(),
+            tenants: Vec::new(),
+        }
     }
 }
 
-/// Authentication mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AuthMode {
-    /// Static Bearer token comparison ([`StaticTokenConfig`]).
-    #[default]
-    StaticToken,
-    /// TLS client certificate verification ([`MtlsConfig`]).
-    Mtls,
-    /// Anonymous (requires `allow_anonymous = true`).
-    Anonymous,
-}
-
-/// Static token credentials.
+/// One tenant's client-CA trust entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct StaticTokenConfig {
-    /// Agent token (required for `/register`, `/poll` and `/stream`).
-    pub agent: Option<String>,
-    /// Admin token (required only for `/agents`; falls back to `agent` when
-    /// unset).
-    #[serde(default)]
-    pub admin: Option<String>,
-}
-
-/// mTLS credentials.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MtlsConfig {
-    /// Path to the trusted client CA certificate PEM.
+pub struct TenantConfig {
+    /// Tenant name: `[A-Za-z0-9_-]`, 1–64 chars, no leading `_` (the `_`
+    /// prefix is reserved for internal principals such as the expose edge
+    /// gateway).
+    pub name: String,
+    /// Path to the tenant's client CA certificate PEM (public certificates
+    /// only — the CA private key must never live on the hub host).
     pub ca_path: String,
+    /// Gateway tenants may open streams across tenant boundaries. Legitimately
+    /// used only by the expose edge's in-process principal; operator
+    /// configuration should never set this.
+    #[serde(default)]
+    pub trusted_gateway: bool,
 }
 
 /// TLS server configuration.
@@ -337,7 +328,8 @@ const fn default_tls_min_version() -> interflow_core::tls::TlsMinVersion {
     interflow_core::tls::TlsMinVersion::V1_2
 }
 
-/// ACL configuration wrapper. The `[[acl.rules]]` list.
+/// ACL configuration wrapper. The `[[acl.rules]]` list — cross-tenant
+/// exceptions only (same-tenant streams are allowed by default).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AclConfig {
@@ -358,14 +350,22 @@ impl AclConfig {
     }
 }
 
-/// One ACL rule: whether the `source` agent is allowed to open streams to the
-/// `target` agent.
+/// One ACL rule: a **cross-tenant exception** letting `source` open streams
+/// to `target`.
+///
+/// Same-tenant streams are allowed by default and need no rule; an empty
+/// rule set therefore means full inter-tenant isolation (the inverse of the
+/// pre-v4 "empty = allow-all" semantics).
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AclRule {
-    /// Initiating agent id.
+    /// Initiating tenant.
+    pub source_tenant: String,
+    /// Initiating agent id (within `source_tenant`).
     pub source: String,
-    /// Target agent id.
+    /// Target tenant.
+    pub target_tenant: String,
+    /// Target agent id (within `target_tenant`).
     pub target: String,
 }
 
@@ -392,10 +392,6 @@ impl Default for MetricsConfig {
             path: default_metrics_path(),
         }
     }
-}
-
-const fn default_auth_mode() -> AuthMode {
-    AuthMode::StaticToken
 }
 
 const fn default_rate_limit_per_minute() -> u32 {
@@ -425,30 +421,41 @@ mod tests {
     #[test]
     fn acl_rules_round_trip() {
         let toml_str = r#"
-config_version = 3
+config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
 
 [auth]
-mode = "static-token"
+rate_limit_per_minute = 30
 
-[auth.static_token]
-agent = "agent-token"
+[[auth.tenants]]
+name = "acme"
+ca_path = "certs/acme-ca.crt"
+
+[[auth.tenants]]
+name = "globex"
+ca_path = "certs/globex-ca.crt"
 
 [[acl.rules]]
+source_tenant = "acme"
 source = "ingress-01"
+target_tenant = "globex"
 target = "egress-01"
 
 [[acl.rules]]
+source_tenant = "acme"
 source = "ingress-02"
+target_tenant = "globex"
 target = "egress-02"
 "#;
         let config: HubConfig = toml::from_str(toml_str).expect("parse");
-        assert_eq!(config.config_version, 3);
+        assert_eq!(config.config_version, HUB_CONFIG_VERSION);
         assert_eq!(config.acl.rules.len(), 2);
         assert!(config.acl.rules.contains(&AclRule {
+            source_tenant: "acme".to_string(),
             source: "ingress-01".to_string(),
+            target_tenant: "globex".to_string(),
             target: "egress-01".to_string(),
         }));
     }
@@ -456,24 +463,26 @@ target = "egress-02"
     #[test]
     fn empty_acl_when_no_rules() {
         let toml_str = r#"
-config_version = 3
+config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
 
 [auth]
-mode = "anonymous"
-allow_anonymous = true
+[[auth.tenants]]
+name = "acme"
+ca_path = "certs/acme-ca.crt"
 "#;
         let config: HubConfig = toml::from_str(toml_str).expect("parse");
         assert!(config.acl.is_empty());
-        assert!(config.auth.allow_anonymous);
+        assert_eq!(config.auth.tenants.len(), 1);
+        assert_eq!(config.auth.tenants[0].name, "acme");
     }
 
     #[test]
     fn deny_unknown_fields_rejects_typo() {
         let toml_str = r#"
-config_version = 3
+config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -500,14 +509,15 @@ litsten_addr = "oops"
         assert_eq!(d.max_missed, 4);
 
         let toml_str = r#"
-config_version = 3
+config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
 
 [auth]
-mode = "anonymous"
-allow_anonymous = true
+[[auth.tenants]]
+name = "acme"
+ca_path = "certs/acme-ca.crt"
 
 [security]
 channel_send_timeout_secs = 5
@@ -529,14 +539,15 @@ max_missed = 1
     #[test]
     fn heartbeat_section_absent_uses_defaults() {
         let toml_str = r#"
-config_version = 3
+config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
 
 [auth]
-mode = "anonymous"
-allow_anonymous = true
+[[auth.tenants]]
+name = "acme"
+ca_path = "certs/acme-ca.crt"
 "#;
         let config: HubConfig = toml::from_str(toml_str).expect("parse");
         assert!(config.heartbeat.enabled);
@@ -547,14 +558,15 @@ allow_anonymous = true
     #[test]
     fn security_stream_caps_parse_from_toml() {
         let toml_str = r#"
-config_version = 3
+config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
 
 [auth]
-mode = "anonymous"
-allow_anonymous = true
+[[auth.tenants]]
+name = "acme"
+ca_path = "certs/acme-ca.crt"
 
 [security]
 max_streams_per_agent = 8
@@ -568,14 +580,15 @@ max_streams_total = 128
     #[test]
     fn security_stream_caps_default_when_absent() {
         let toml_str = r#"
-config_version = 3
+config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
 
 [auth]
-mode = "anonymous"
-allow_anonymous = true
+[[auth.tenants]]
+name = "acme"
+ca_path = "certs/acme-ca.crt"
 "#;
         let config: HubConfig = toml::from_str(toml_str).expect("parse");
         assert_eq!(config.security.max_streams_per_agent, 256);

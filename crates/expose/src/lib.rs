@@ -5,7 +5,6 @@
 
 #![deny(unsafe_code)]
 
-pub mod cert_gen;
 pub mod client;
 pub mod edge;
 pub mod init;

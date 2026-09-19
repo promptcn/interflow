@@ -1,0 +1,34 @@
+# LAN A agent: accepts local connections and opens tunnel streams to LAN B.
+
+config_version = 3
+
+[agent]
+id = "lan-a"
+hub_url = "https://127.0.0.1:6666"
+
+[tls]
+enabled = true
+ca_path = "certs/tenants/demo-ca.crt"
+client_cert_path = "certs/agents/lan-a.crt"
+client_key_path = "certs/agents/lan-a.key"
+
+[e2e]
+mode = "required"
+
+[control]
+enabled = false
+
+[logging]
+level = "info,interflow=debug"
+format = "plain"
+
+[[ingress]]
+name = "to-lan-b"
+listen_addr = "127.0.0.1:3001"
+target_agent = "lan-b"
+remote_addr = "127.0.0.1:3000"
+
+# Optional QUIC transport (must also be enabled on the hub):
+# [agent]
+# transport = "quic"
+# hub_quic_addr = "127.0.0.1:6666"

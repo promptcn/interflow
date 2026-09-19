@@ -1,61 +1,44 @@
-// Tauri API wrapper: types aligned with the Rust-side serde definitions.
+// Tauri API wrapper over the generated IPC contract.
+//
+// `./bindings` is generated from src-tauri/src/contract.rs via tauri-specta
+// (`npm run gen:bindings`) — the single source of truth. Never hand-write a
+// type in this file that mirrors a Rust struct; extend the Rust contract and
+// regenerate instead (the 2026-09-18 auth_token drift is why this exists).
 
-/// Transport toward the hub (serialized form of the Rust `TransportKind`).
-export type Transport = "h2" | "quic";
+import { commands, events } from "./bindings";
+import type { Event } from "@tauri-apps/api/event";
+import type { LogLine, Profile, TunnelConfig, TunnelState } from "./bindings";
 
-export interface Profile {
-  hub_url: string | null;
-  auth_token: string | null;
-  agent_id: string | null;
-  ca_path: string | null;
-  local_ports?: number[] | null;
-  transport?: Transport | null;
-  hub_quic_addr?: string | null;
+export type { LogLine, Profile, Transport, TunnelConfig, TunnelState } from "./bindings";
+
+/// Result commands return a typed `{status: ok|error}` envelope instead of
+/// throwing; unwrap back to exceptions so callers keep try/catch semantics.
+async function unwrap<T>(
+  result: Promise<{ status: "ok"; data: T } | { status: "error"; error: string }>
+): Promise<T> {
+  const res = await result;
+  if (res.status === "error") throw new Error(res.error);
+  return res.data;
 }
-
-export interface TunnelConfig {
-  local_ports: number[];
-  hub_url: string;
-  auth_token: string;
-  agent_id: string;
-  ca_path: string | null;
-  transport?: Transport | null;
-  hub_quic_addr?: string | null;
-}
-
-export type TunnelState =
-  | "Connecting"
-  | { Connected: { agent_id: string } }
-  | { Reconnecting: { reason: string; backoff_secs: number } }
-  | "Stopped"
-  | { Failed: { error: string } };
-
-export interface LogLine {
-  ts: string;
-  level: string;
-  target: string;
-  message: string;
-}
-
-const invoker = async <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<T>(cmd, args);
-};
 
 export const api = {
-  loadProfile: () => invoker<Profile>("load_profile"),
-  saveProfile: (profile: Profile) => invoker<void>("save_profile", { profile }),
-  generateAgentId: () => invoker<string>("generate_agent_id"),
-  startTunnel: (config: TunnelConfig) => invoker<void>("start_tunnel", { config }),
-  stopTunnel: () => invoker<void>("stop_tunnel"),
-  getState: () => invoker<TunnelState>("get_state"),
-  getRecentLogs: () => invoker<LogLine[]>("get_recent_logs"),
+  loadProfile: () => unwrap(commands.loadProfile()),
+  saveProfile: (profile: Profile) => unwrap(commands.saveProfile(profile)),
+  generateAgentId: () => commands.generateAgentId(),
+  startTunnel: (config: TunnelConfig) => unwrap(commands.startTunnel(config)),
+  stopTunnel: () => unwrap(commands.stopTunnel()),
+  getState: () => unwrap(commands.getState()),
+  getRecentLogs: () => unwrap(commands.getRecentLogs()),
+  clearLogs: () => unwrap(commands.clearLogs()),
 };
 
-export async function listenEvent<T>(event: string, handler: (payload: T) => void): Promise<() => void> {
-  const { listen } = await import("@tauri-apps/api/event");
-  const unlisten = await listen<T>(event, (e) => handler(e.payload));
-  return unlisten;
+/// Both listeners resolve to an unlisten fn (App keeps them for cleanup).
+export function onTunnelState(handler: (state: TunnelState) => void): Promise<() => void> {
+  return events.tunnelState.listen((e: Event<TunnelState>) => handler(e.payload));
+}
+
+export function onLogLine(handler: (line: LogLine) => void): Promise<() => void> {
+  return events.log.listen((e: Event<LogLine>) => handler(e.payload));
 }
 
 export function stateText(state: TunnelState | null): string {
@@ -63,9 +46,9 @@ export function stateText(state: TunnelState | null): string {
   if (state === "Connecting") return "Connecting…";
   if (state === "Stopped") return "Stopped";
   if (typeof state === "object") {
-    if ("Connected" in state) return `Connected (${state.Connected.agent_id})`;
-    if ("Reconnecting" in state) return `Reconnecting (${state.Reconnecting.reason}, retrying in ${state.Reconnecting.backoff_secs}s)`;
-    if ("Failed" in state) return `Failed: ${state.Failed.error}`;
+    if (state.Connected) return `Connected (${state.Connected.agent_id})`;
+    if (state.Reconnecting) return `Reconnecting (${state.Reconnecting.reason}, retrying in ${state.Reconnecting.backoff_secs}s)`;
+    if (state.Failed) return `Failed: ${state.Failed.error}`;
   }
   return "Unknown";
 }
@@ -74,13 +57,13 @@ export function stateColor(state: TunnelState | null): string {
   if (!state || state === "Stopped") return "#787878";
   if (state === "Connecting") return "#ffcc00";
   if (typeof state === "object") {
-    if ("Connected" in state) return "#34c759";
-    if ("Reconnecting" in state) return "#ffcc00";
-    if ("Failed" in state) return "#ff453a";
+    if (state.Connected) return "#34c759";
+    if (state.Reconnecting) return "#ffcc00";
+    if (state.Failed) return "#ff453a";
   }
   return "#787878";
 }
 
 export function isRunning(state: TunnelState | null): boolean {
-  return state === "Connecting" || (typeof state === "object" && state !== null && ("Connected" in state || "Reconnecting" in state));
+  return state === "Connecting" || (typeof state === "object" && state !== null && (!!state.Connected || !!state.Reconnecting));
 }

@@ -46,7 +46,9 @@ pub fn spawn_reload_task(routes_path: String, router: Arc<HostRouter>) {
                 info!("received SIGHUP, reloading routes.toml...");
                 match RoutesConfig::load(&routes_path) {
                     Ok(cfg) => {
-                        router.apply(&cfg);
+                        if let Err(e) = router.apply(&cfg) {
+                            error!("routes reload rejected (keeping the old table): {e}");
+                        }
                         if let Some(logging) = &cfg.logging {
                             // Warn while the previous filter is still active,
                             // then switch: the new level governs everything after.

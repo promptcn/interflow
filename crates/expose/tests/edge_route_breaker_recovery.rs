@@ -36,7 +36,7 @@
     unused_mut
 )]
 use interflow_expose::client::ExposeArgs;
-use interflow_expose::edge::{EdgeArgs, run};
+use interflow_expose::edge::{EdgeArgs, EdgeHubTls, run};
 use interflow_mesh::config::TransportKind;
 use interflow_testkit::metrics_harness::{metrics_handle, wait_counter_at_least};
 use std::net::SocketAddr;
@@ -157,6 +157,7 @@ async fn route_breaker_recovers_after_backend_returns() {
             r#"
 [[routes]]
 host = "rev.local"
+tenant = "test"
 agent_id = "expose-breaker-recovery"
 remote_addr = "127.0.0.1:{backend_port}"
 "#
@@ -166,11 +167,17 @@ remote_addr = "127.0.0.1:{backend_port}"
 
     // Route breaker: trip after 3 failing closes, cooldown 2s so the
     // recovery phase is fast.
+    let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let edge_args = EdgeArgs {
         listen_addr: edge_listen,
         hub_listen_addr: hub_listen,
         routes_path: routes_path.to_string_lossy().into_owned(),
-        agent_token: "test-token".into(),
+        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
+        proxy_protocol: Default::default(),
+        hub_tls: Some(EdgeHubTls {
+            cert_path: certs.server_cert_path().display().to_string(),
+            key_path: certs.server_key_path().display().to_string(),
+        }),
         route_breaker_failure_threshold: 3,
         route_breaker_cooldown_secs: 2,
         agent_recovery_timeout_secs: 120,
@@ -184,12 +191,14 @@ remote_addr = "127.0.0.1:{backend_port}"
         .await
         .expect("edge listener should start within 5s");
 
+    let (client_cert, client_key) = certs.named_client_cert("expose-breaker-recovery");
     let client_args = ExposeArgs {
         local_ports: vec![backend_port],
-        hub_url: format!("http://127.0.0.1:{hub_port}"),
-        auth_token: "test-token".into(),
+        hub_url: format!("https://127.0.0.1:{hub_port}"),
+        client_cert: Some(client_cert.display().to_string()),
+        client_key: Some(client_key.display().to_string()),
         agent_id: "expose-breaker-recovery".into(),
-        ca_path: None,
+        ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
     };

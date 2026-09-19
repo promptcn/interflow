@@ -347,11 +347,173 @@ where
 /// The hub emits `CLOSE:{sid}:{reason}` (empty reason = ordinary close);
 /// anything that does not carry this prefix (a late/foreign frame) is
 /// treated as a reason-less close.
-fn parse_close_reason(stream_id: &str, data: &[u8]) -> CloseReason {
+pub(crate) fn parse_close_reason(stream_id: &str, data: &[u8]) -> CloseReason {
     let prefix = format!("CLOSE:{stream_id}:");
     String::from_utf8_lossy(data)
         .strip_prefix(&prefix)
         .map_or(CloseReason::CloseFrame, CloseReason::from_token)
+}
+
+/// Pumps one e2e (inner TLS) stream between two full duplex endpoints.
+///
+/// `local`: the local data endpoint (client socket on the ingress / backend
+/// TCP on the egress). `tunnel`: the inner TLS stream over the tunnel side
+/// (the handshake already succeeded). The same shared-progress idle clock
+/// and write-stall budget discipline as [`pump_tcp_stream`] apply; the
+/// write-stall budget guards writes toward `local` (the only sink that can
+/// stall — the tunnel side is a channel send with backpressure).
+///
+/// `cut_delivery` is invoked exactly once before the pump returns (both
+/// end paths): it must stop dispatch from delivering new frames for the
+/// stream — the ingress unregisters its response channel, the egress its
+/// incoming-stream channel (the same contract
+/// [`StreamPumpTarget::unregister_stream`] documents for the plain pump).
+/// On the local-EOF path it is what converges the drain half: the channel
+/// closure surfaces as the tunnel side's EOF.
+///
+/// End-of-stream choreography (mirroring [`pump_tcp_stream`]'s close-out
+/// semantics):
+/// - `local` EOF first → `tunnel.shutdown()` (TLS close_notify rides Data
+///   frames, then the adapter's Close) and the tunnel→local half drains
+///   what is already in flight;
+/// - tunnel EOF first (peer Close / channel closure surfaced as EOF by the
+///   TLS layer) → `local` is shut down and the pump returns.
+///
+/// Cancellation safety: same as [`pump_tcp_stream`] — droppable at any
+/// time by an outer select, losing at most one in-flight chunk.
+pub async fn pump_duplex<L, T, F>(
+    local: L,
+    tunnel: T,
+    cfg: &PumpConfig,
+    stream_id: &str,
+    cut_delivery: F,
+) -> StreamOutcome
+where
+    L: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
+    F: std::future::Future<Output = ()>,
+{
+    let label = cfg.log_label;
+    let progress = SharedProgress::new();
+    // Each half owns the crossed halves of the two endpoints (the same
+    // single-reader/single-writer split the plain pump gets for free from
+    // `TcpStream::into_split`).
+    let (mut local_rd, mut local_wr) = tokio::io::split(local);
+    let (mut tunnel_rd, mut tunnel_wr) = tokio::io::split(tunnel);
+
+    // local → tunnel: reads the local endpoint, writes into the inner TLS
+    // stream (channel-backed; bounded by the shared idle budget).
+    let local_half = async {
+        let mut buf = BytesMut::with_capacity(16 * 1024);
+        loop {
+            if buf.capacity() < 4096 {
+                buf.reserve(16 * 1024);
+            }
+            let Some(remaining) = progress.remaining(cfg.idle_timeout) else {
+                metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                debug!("{label} e2e stream idle timeout (local side): {stream_id}");
+                break;
+            };
+            match tokio::time::timeout(remaining, local_rd.read_buf(&mut buf)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(_)) => {
+                    progress.touch();
+                    let chunk = buf.split().freeze();
+                    if let Err(e) = tunnel_wr.write_all(&chunk).await {
+                        debug!("{label} e2e tunnel write failed: {e}");
+                        break;
+                    }
+                    if let Err(e) = tunnel_wr.flush().await {
+                        debug!("{label} e2e tunnel flush failed: {e}");
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    debug!("{label} failed to read local endpoint: {e}");
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        // Local direction ended: send the TLS close_notify through the
+        // tunnel (Data frames), then the adapter's stream close.
+        let _ = tunnel_wr.shutdown().await;
+    };
+
+    // tunnel → local: sole observer of the outcome facts.
+    let tunnel_half = async {
+        let mut outcome = StreamOutcome {
+            close_reason: None,
+            response_relayed: false,
+        };
+        let mut buf = BytesMut::with_capacity(16 * 1024);
+        loop {
+            if buf.capacity() < 4096 {
+                buf.reserve(16 * 1024);
+            }
+            let Some(remaining) = progress.remaining(cfg.idle_timeout) else {
+                metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                debug!("{label} e2e stream idle timeout (tunnel side): {stream_id}");
+                break;
+            };
+            match tokio::time::timeout(remaining, tunnel_rd.read_buf(&mut buf)).await {
+                Ok(Ok(0)) => break, // peer Close / channel EOF via the TLS layer
+                Ok(Ok(_)) => {
+                    progress.touch();
+                    let chunk = buf.split().freeze();
+                    match tokio::time::timeout(cfg.write_stall_timeout, local_wr.write_all(&chunk))
+                        .await
+                    {
+                        Ok(Ok(())) => outcome.response_relayed = true,
+                        Ok(Err(e)) => {
+                            debug!("{label} failed to write local endpoint: {e}");
+                            break;
+                        }
+                        Err(_) => {
+                            metrics::counter!(cfg.write_stall_counter).increment(1);
+                            debug!("{label} local write stalled, closing: {stream_id}");
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    // Missing close_notify and similar TLS-layer reports of
+                    // the peer's departure end the stream the same way.
+                    debug!("{label} e2e tunnel read ended: {e}");
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        // Tunnel side done: half-close the local endpoint so its reader
+        // sees the end (best effort — a dead socket still ends the pump).
+        let _ = local_wr.shutdown().await;
+        outcome
+    };
+
+    tokio::pin!(local_half, tunnel_half, cut_delivery);
+
+    enum HalfDone {
+        Local,
+        Tunnel(StreamOutcome),
+    }
+    let done = tokio::select! {
+        out = &mut tunnel_half => HalfDone::Tunnel(out),
+        () = &mut local_half => HalfDone::Local,
+    };
+    // Dispatch stops delivering for this stream before the pump returns —
+    // on the local-EOF path that closure is what converges the drain half.
+    (&mut cut_delivery).await;
+
+    match done {
+        // Tunnel side ended (peer Close / EOF): the local endpoint is
+        // dropped with this function — nothing more to relay.
+        HalfDone::Tunnel(outcome) => outcome,
+        // Local endpoint EOF: drain the tunnel→local direction until the
+        // peer's Close arrives (our close_notify went out in the local
+        // half's epilogue; the cut channel closure ends the drain).
+        HalfDone::Local => (&mut tunnel_half).await,
+    }
 }
 
 #[cfg(test)]
@@ -689,5 +851,64 @@ mod tests {
             "idle teardown fired at {elapsed:?}, expected ~120ms"
         );
         assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+    }
+
+    // ---- pump_duplex (e2e streams) ----
+
+    /// Tunnel side EOF: buffered tunnel data is relayed to the local
+    /// endpoint first, then the pump returns and shuts the local side.
+    #[tokio::test]
+    async fn duplex_tunnel_eof_relays_data_then_closes_local() {
+        let (local, mut local_peer) = duplex(64 * 1024);
+        let (tunnel, mut tunnel_peer) = duplex(64 * 1024);
+
+        tunnel_peer.write_all(b"resp-data").await.unwrap();
+        drop(tunnel_peer); // peer Close → tunnel EOF
+
+        let outcome = pump_duplex(local, tunnel, &test_cfg(), "s1", async {}).await;
+        assert!(
+            outcome.response_relayed,
+            "tunnel bytes must reach the local end"
+        );
+
+        let mut got = Vec::new();
+        local_peer.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"resp-data");
+    }
+
+    /// Local endpoint EOF: its bytes flow to the tunnel side, the shutdown
+    /// propagates, and the pump returns after draining the reverse
+    /// direction (no unregister — that stays with the caller).
+    #[tokio::test]
+    async fn duplex_local_eof_forwards_and_returns() {
+        let (local, mut local_peer) = duplex(64 * 1024);
+        let (tunnel, mut tunnel_peer) = duplex(64 * 1024);
+
+        local_peer.write_all(b"req-data").await.unwrap();
+        local_peer.shutdown().await.unwrap();
+
+        // Tunnel peer: collects the request, then departs so the drain ends.
+        let tunnel_side = tokio::spawn(async move {
+            let mut got = Vec::new();
+            tunnel_peer.read_to_end(&mut got).await.unwrap();
+            got
+        });
+
+        let outcome = pump_duplex(local, tunnel, &test_cfg(), "s1", async {}).await;
+        assert!(!outcome.response_relayed);
+        assert_eq!(tunnel_side.await.unwrap(), b"req-data");
+    }
+
+    /// A non-reading local endpoint hits the write-stall budget and ends
+    /// the pump (the only stallable sink is the local endpoint).
+    #[tokio::test(start_paused = true)]
+    async fn duplex_write_stall_terminates_pump() {
+        let (local, _non_reading_peer) = duplex(8);
+        let (tunnel, mut tunnel_peer) = duplex(64 * 1024);
+        tunnel_peer.write_all(&[7u8; 64]).await.unwrap();
+
+        pump_duplex(local, tunnel, &test_cfg(), "s1", async {}).await;
+        // Reaching here at all is the assertion: the stall budget fired
+        // instead of hanging forever on write_all.
     }
 }

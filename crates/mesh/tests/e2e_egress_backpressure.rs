@@ -52,8 +52,7 @@ use interflow_mesh::config::{EgressRule, IngressRule};
 use interflow_testkit::{
     agent_config, echo_server, hub_config, metrics_harness::eventually,
     metrics_harness::init_tracing, metrics_harness::metrics_handle,
-    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_agent, spawn_hub,
-    wait_for_tcp,
+    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_hub, wait_for_tcp,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -61,6 +60,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 /// Adaptive total budget per test (poisoning 5s + backend write timeout 10s +
 /// scheduling headroom).
@@ -153,7 +157,7 @@ async fn connect_tunnel(
     hub_port: u16,
     agent_id: &str,
 ) -> (AgentTunnel, tokio::task::JoinHandle<()>) {
-    let client = AgentClient::new(agent_config(agent_id, hub_port)).expect("agent build");
+    let client = AgentClient::new(agent_config(agent_id, hub_port, certs())).expect("agent build");
     let conn = client
         .connect_and_register()
         .await
@@ -162,7 +166,6 @@ async fn connect_tunnel(
         agent_id.to_string(),
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
-        None,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
             tokio_util::sync::CancellationToken::new(),
         ),
@@ -215,8 +218,19 @@ async fn wait_egress_ready(inj: &AgentTunnel, echo_addr: SocketAddr) {
     loop {
         attempt += 1;
         let sid = format!("probe-{attempt}");
-        match tunnel_round_trip(inj, &sid, echo_addr, b"ping", Duration::from_secs(2)).await {
-            resp if resp == b"ping" => return,
+        let mut rx = inj.register_stream(sid.clone()).await;
+        inj.send_open(&sid, "eg", Some(&echo_addr.to_string()), StreamProto::Tcp)
+            .await
+            .expect("probe open");
+        let _ = inj.send_data(&sid, Bytes::copy_from_slice(b"ping")).await;
+        // Data = ready; Close (typically "Target agent not registered" while
+        // the egress is still connecting) or timeout = retry. The mTLS
+        // handshake makes the registration race observable, so the retry
+        // must actually happen here rather than panicking inside
+        // `tunnel_round_trip`.
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(frame)) if frame.stream_type == FrameType::Data => return,
+            Ok(Some(frame)) if frame.stream_type == FrameType::Close => {}
             _ => {}
         }
         if tokio::time::Instant::now() >= deadline {
@@ -230,12 +244,12 @@ async fn wait_egress_ready(inj: &AgentTunnel, echo_addr: SocketAddr) {
 /// (hub_port, echo_addr, injector).
 async fn start_stack(write_timeout: u64) -> (u16, SocketAddr, AgentTunnel) {
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.egress_backend_write_timeout_secs = write_timeout;
-    spawn_agent(eg);
+    let _eg_handle = interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;
@@ -338,14 +352,14 @@ async fn t1_slow_backend_does_not_corrupt_unrelated_streams() {
 async fn t2_poison_is_visible_and_agent_survives() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
     let (slow_addr, _slow_active) = slow_backend().await;
 
     // Default write timeout 10s: let dispatch poisoning (5s) trigger before the
     // forwarder write timeout.
     let handle: AgentHandle = {
-        let mut eg = agent_config("eg", hub_port);
+        let mut eg = agent_config("eg", hub_port, certs());
         eg.egress_backend_write_timeout_secs = 10;
         AgentClient::new(eg).expect("agent build").start()
     };
@@ -437,19 +451,19 @@ async fn t2_poison_is_visible_and_agent_survives() {
 async fn t3_targetless_udp_stream_rejected_not_misrouted() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (tcp_addr, tcp_conns, tcp_bytes) = counting_backend().await;
 
     // The egress has only one TCP rule: the old code would misroute targetless
     // UDP Data here.
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.egress = vec![EgressRule {
         name: "only-tcp".into(),
         target_addr: tcp_addr,
         target_protocol: StreamProto::Tcp,
         udp_idle_timeout_secs: None,
     }];
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -504,17 +518,17 @@ async fn t3_targetless_udp_stream_rejected_not_misrouted() {
 async fn t4_udp_session_recycles_and_new_session_works() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (udp_addr, _udp) = interflow_testkit::spawn_udp_echo().await;
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.egress = vec![EgressRule {
         name: "udp-out".into(),
         target_addr: udp_addr,
         target_protocol: StreamProto::Udp,
         udp_idle_timeout_secs: Some(1),
     }];
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -569,12 +583,12 @@ async fn t4_udp_session_recycles_and_new_session_works() {
 async fn t5_no_connection_leak_after_kill_and_shutdown() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
     let (slow_addr, slow_active) = slow_backend().await;
 
     let handle: AgentHandle = {
-        let mut eg = agent_config("eg", hub_port);
+        let mut eg = agent_config("eg", hub_port, certs());
         eg.egress_backend_write_timeout_secs = 3;
         AgentClient::new(eg).expect("agent build").start()
     };
@@ -632,14 +646,14 @@ async fn t5_no_connection_leak_after_kill_and_shutdown() {
 async fn t6_loopback_agent_is_both_ingress_and_egress() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
 
     // Same agent: the ingress rule's target points at itself (hub loopback
     // routing), no egress rules (the dynamic target is carried by the Open
     // frame to this agent's forwarder).
     let listen_port = pick_ephemeral_port();
-    let mut both = agent_config("both", hub_port);
+    let mut both = agent_config("both", hub_port, certs());
     both.ingress = vec![IngressRule {
         name: "loop".into(),
         listen_addr: format!("127.0.0.1:{listen_port}").parse().unwrap(),
@@ -651,7 +665,7 @@ async fn t6_loopback_agent_is_both_ingress_and_egress() {
         udp_per_ip_bytes_per_sec: 0,
         udp_egress_bytes_per_sec: 0,
     }];
-    spawn_agent(both);
+    interflow_testkit::spawn_agent_registered(both).await;
 
     let listen_addr: SocketAddr = format!("127.0.0.1:{listen_port}").parse().unwrap();
     wait_for_tcp(listen_addr, Duration::from_secs(10))
@@ -680,13 +694,13 @@ async fn t7_response_poison_closes_stalled_client_only() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
 
-    spawn_agent(agent_config("eg", hub_port));
+    interflow_testkit::spawn_agent_registered(agent_config("eg", hub_port, certs())).await;
 
     let listen_port = pick_ephemeral_port();
-    let mut ing = agent_config("ing", hub_port);
+    let mut ing = agent_config("ing", hub_port, certs());
     ing.ingress = vec![IngressRule {
         name: "to-eg".into(),
         listen_addr: format!("127.0.0.1:{listen_port}").parse().unwrap(),
@@ -698,7 +712,7 @@ async fn t7_response_poison_closes_stalled_client_only() {
         udp_per_ip_bytes_per_sec: 0,
         udp_egress_bytes_per_sec: 0,
     }];
-    spawn_agent(ing);
+    interflow_testkit::spawn_agent_registered(ing).await;
 
     let listen_addr: SocketAddr = format!("127.0.0.1:{listen_port}").parse().unwrap();
     wait_for_tcp(listen_addr, Duration::from_secs(10))

@@ -24,18 +24,23 @@ use interflow_mesh::agent::{AgentClient, AgentState};
 use interflow_mesh::config::{EgressRule, TransportKind};
 use interflow_mesh::hub::HubServer;
 use interflow_testkit::{
-    acl, agent_config, agent_quic_config, echo_server, hub_config, hub_quic_config,
-    pick_ephemeral_port, wait_agent_connected,
+    agent_config, agent_quic_config, echo_server, hub_config, hub_quic_config, pick_ephemeral_port,
+    wait_agent_connected,
 };
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 /// `run_until`: an idle hub returns Ok within the time limit after shutdown
 /// and releases its port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hub_run_until_returns_and_releases_port() {
     let hub_port = pick_ephemeral_port();
-    let cfg = hub_config(hub_port, vec![]);
+    let cfg = hub_config(hub_port, certs(), vec![]);
     let server = HubServer::new(cfg, "<test>".to_string()).expect("hub build");
 
     let token = CancellationToken::new();
@@ -74,7 +79,7 @@ async fn hub_shutdown_drains_registered_agent() {
     let hub_port = pick_ephemeral_port();
     let (echo_addr, _echo) = echo_server().await;
 
-    let cfg = hub_config(hub_port, vec![acl("ingress", "egress")]);
+    let cfg = hub_config(hub_port, certs(), Vec::new());
     let server = HubServer::new(cfg, "<test>".to_string()).expect("hub build");
     let token = CancellationToken::new();
     let hub_task = {
@@ -83,7 +88,7 @@ async fn hub_shutdown_drains_registered_agent() {
     };
 
     // egress agent connects directly to the hub
-    let mut agent_cfg = agent_config("egress", hub_port);
+    let mut agent_cfg = agent_config("egress", hub_port, certs());
     agent_cfg.agent.transport = TransportKind::H2;
     agent_cfg.egress = vec![EgressRule {
         name: "echo".into(),
@@ -142,11 +147,10 @@ async fn hub_shutdown_drains_registered_agent() {
 /// port is released.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hub_shutdown_closes_quic_endpoint() {
-    let certs = interflow_testkit::certs::TestCerts::generate("hub-shutdown", "shutdown-egress");
     let (echo_addr, _echo) = echo_server().await;
     let hub_port = pick_ephemeral_port();
 
-    let cfg = hub_quic_config(hub_port, &certs, vec![acl("ingress", "egress")]);
+    let cfg = hub_quic_config(hub_port, certs(), Vec::new());
     let server = HubServer::new(cfg, "<test>".to_string()).expect("hub build");
     let token = CancellationToken::new();
     let hub_task = {
@@ -155,7 +159,7 @@ async fn hub_shutdown_closes_quic_endpoint() {
     };
 
     // QUIC egress agent
-    let mut agent_cfg = agent_quic_config("shutdown-egress", hub_port, &certs);
+    let mut agent_cfg = agent_quic_config("shutdown-egress", hub_port, certs());
     agent_cfg.egress = vec![EgressRule {
         name: "echo".into(),
         target_addr: echo_addr,

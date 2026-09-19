@@ -13,7 +13,8 @@
 //!
 //! Connection lifecycle:
 //! - Control stream (first bidirectional stream): Hello (`source_agent` =
-//!   agent_id, payload = token) → HelloAck; Ping/Pong heartbeat runs on the
+//!   agent_id, payload = capability bits; identity is the mTLS client
+//!   certificate, CN must equal agent_id) → HelloAck; Ping/Pong heartbeat runs on the
 //!   control stream (reusing `AgentSession::last_pong` and the eviction
 //!   primitive);
 //! - Connection-lost watcher: deregister + sweep orphan streams.
@@ -48,8 +49,8 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::config::AuthMode;
 use interflow_core::tunnel::negotiation::{HeartbeatAd, RegisterResponse};
+use tokio_rustls::rustls::pki_types::CertificateDer;
 
 /// Relay channel capacity (same as the poll channel).
 const RELAY_CHANNEL_CAP: usize = 256;
@@ -77,46 +78,41 @@ const READ_CHUNK: usize = 64 * 1024;
 /// Starts the QUIC listener. Returns an error when enabled but TLS
 /// certificates are missing (QUIC mandates TLS).
 pub(crate) async fn spawn_quic_listener(ctx: AcceptContext) -> Result<()> {
-    let (quic_cfg, tls_cfg, auth_mode, tcp_listen) = {
+    let (quic_cfg, tcp_listen) = {
         let cfg = ctx.config.read().await;
-        (
-            cfg.transport.quic.clone(),
-            cfg.tls.clone(),
-            cfg.auth.mode,
-            cfg.server.listen_addr,
-        )
+        (cfg.transport.quic.clone(), cfg.server.listen_addr)
     };
     if !quic_cfg.enabled {
         return Ok(());
     }
 
-    let Some(tls) = tls_cfg else {
+    let Some(tls) = ctx.config.read().await.tls.clone() else {
         return Err(InterflowError::config(
             "[transport.quic] enabled = true requires certificates from [tls] (QUIC mandates TLS)"
                 .to_string(),
         ));
     };
 
-    let client_ca = match auth_mode {
-        AuthMode::Mtls => {
-            let cfg = ctx.config.read().await;
-            cfg.auth.mtls.as_ref().map(|m| m.ca_path.clone())
-        }
-        _ => None,
-    };
-    let min_version = {
-        let cfg = ctx.config.read().await;
-        cfg.tls
-            .as_ref()
-            .map_or_else(interflow_core::tls::TlsMinVersion::default, |t| {
-                t.min_version
-            })
-    };
-    let mut server_tls = interflow_core::tls::build_rustls_server_config(
+    // mTLS on the QUIC plane: the merged tenant roots enforce client
+    // certificates at the handshake; tenant derivation runs post-handshake
+    // against the shared TLS plane (hot-reloadable, same generation as the
+    // h2 acceptor). The QUIC listener itself is bound once at startup
+    // (reload of the rustls config remains restart-required, per the
+    // reload contract).
+    //
+    // QUIC mandates TLS 1.3: a [tls] min_version of 1.2 is honored on the h2
+    // plane only — here it is clamped to 1.3 (quinn/rustls reject 1.2-only
+    // version lists for QUIC).
+    let plane = ctx
+        .tls_plane
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let mut server_tls = interflow_core::tls::build_rustls_server_config_with_roots(
         &tls.cert_path,
         &tls.key_path,
-        client_ca.as_deref(),
-        min_version,
+        Some(&plane.verifier.merged_roots()),
+        interflow_core::tls::TlsMinVersion::V1_3,
     )?;
     server_tls.alpn_protocols = vec![interflow_core::tunnel::quic::QUIC_ALPN.as_bytes().to_vec()];
 
@@ -198,6 +194,7 @@ async fn handle_connection(ctx: AcceptContext, conn: quinn::Connection) {
         conn: conn.clone(),
         control: tokio::sync::Mutex::new(control_tx),
         datagram_cap: std::sync::atomic::AtomicBool::new(false),
+        e2e_cap: std::sync::atomic::AtomicBool::new(false),
     });
 
     let Some((agent_id, state_arc)) =
@@ -367,56 +364,68 @@ async fn register_quic_agent(
         return None;
     }
 
-    // Authentication: static-token (constant-time comparison) / mTLS (CN binding)
-    let (auth_mode, allow_anonymous, static_token) = {
-        let cfg = ctx.config.read().await;
-        (
-            cfg.auth.mode,
-            cfg.auth.allow_anonymous,
-            cfg.auth.static_token.as_ref().and_then(|s| s.agent.clone()),
-        )
-    };
-    let (hello_caps, token) = interflow_core::tunnel::quic::decode_hello_payload(&hello.payload);
+    // Authentication: the QUIC handshake's client certificate. Identity =
+    // (tenant from the chain's anchoring root, agent from the leaf CN); the
+    // Hello's source_agent must equal the CN. The tenant is derived against
+    // the shared TLS plane (hot-reloadable generation).
+    let hello_caps = interflow_core::tunnel::quic::decode_hello_payload(&hello.payload);
     let agent_datagram_cap = quinn_caps_enabled(ctx).await
         && (hello_caps & interflow_core::tunnel::quic::CAP_DATAGRAM != 0);
-    match auth_mode {
-        AuthMode::StaticToken => {
-            if !allow_anonymous {
-                let expected = static_token.unwrap_or_default();
-                let ok = !token.is_empty()
-                    && subtle::ConstantTimeEq::ct_eq(token.as_bytes(), expected.as_bytes()).into();
-                if !ok {
-                    warn!("QUIC registration rejected: invalid token agent={agent_id} ({peer})");
-                    metrics::counter!("interflow_hub_auth_failures", "reason" => "quic_token")
-                        .increment(1);
-                    send_error_and_close(conn, "invalid token").await;
-                    return None;
-                }
-            }
-        }
-        AuthMode::Mtls => {
-            let cn = interflow_core::tls::extract_cn_from_quinn_identity(conn.peer_identity());
-            match cn {
-                Some(cn) if cn == agent_id => {}
-                _ => {
-                    warn!(
-                        "QUIC registration rejected: mTLS CN does not match agent_id agent={agent_id} ({peer})"
-                    );
-                    metrics::counter!("interflow_hub_auth_failures", "reason" => "quic_mtls_cn")
-                        .increment(1);
-                    send_error_and_close(conn, "cn mismatch").await;
-                    return None;
-                }
-            }
-        }
-        AuthMode::Anonymous => {}
-    }
+    // Observation-only e2e capability (fleet visibility for the migration
+    // windows; never a routing/fallback input — RFC §3.6). Stored on the
+    // session so the gauge below reflects the live fleet, not registrations.
+    let agent_e2e_cap = hello_caps & interflow_core::tunnel::quic::CAP_E2E != 0;
+    let identity: Option<crate::hub::state::PeerIdentity> = 'auth: {
+        let plane = ctx
+            .tls_plane
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let chain = conn
+            .peer_identity()
+            .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
+            .map(|boxed| *boxed);
+        let Some(chain) = chain else {
+            warn!("QUIC registration rejected: no client certificate ({peer})");
+            metrics::counter!("interflow_hub_auth_failures", "reason" => "quic_no_cert")
+                .increment(1);
+            send_error_and_close(conn, "client certificate required").await;
+            break 'auth None;
+        };
+        let Some(tenant) = plane.verifier.derive(&chain) else {
+            warn!("QUIC registration rejected: chain claimed by no tenant ({peer})");
+            metrics::counter!("interflow_hub_auth_failures", "reason" => "tenant_unclaimed")
+                .increment(1);
+            send_error_and_close(conn, "tenant unclaimed").await;
+            break 'auth None;
+        };
+        let cn = interflow_core::tls::extract_cn_from_chain(&chain);
+        let Some(cn) = cn.filter(|cn| cn == &agent_id) else {
+            warn!(
+                "QUIC registration rejected: mTLS CN does not match agent_id agent={agent_id} ({peer})"
+            );
+            metrics::counter!("interflow_hub_auth_failures", "reason" => "quic_mtls_cn")
+                .increment(1);
+            send_error_and_close(conn, "cn mismatch").await;
+            break 'auth None;
+        };
+        let _ = cn;
+        break 'auth Some(crate::hub::state::PeerIdentity {
+            tenant: tenant.tenant,
+            agent: agent_id.clone(),
+            trusted_gateway: tenant.trusted_gateway,
+        });
+    };
+    let identity = identity?;
+    let agent_key = identity.qualified();
 
     // Register (reuses registration semantics: replace in place + sweep
-    // orphan streams + absolute-value gauge)
+    // orphan streams + absolute-value gauge). The registry key is
+    // tenant-qualified — same-tenant reconnect preemption works, cross-tenant
+    // same-name ids never collide.
     let state_arc = {
         let mut agents = ctx.agents.write().await;
-        if let Some(existing) = agents.get(&agent_id) {
+        if let Some(existing) = agents.get(&agent_key) {
             // QUIC registration overwrites an h2 session (same preemption
             // semantics, mirrored)
             existing
@@ -426,7 +435,7 @@ async fn register_quic_agent(
             existing.clone()
         } else {
             let arc = Arc::new(RwLock::new(AgentSession::new(Some(quic_conn.clone()))));
-            agents.insert(agent_id.clone(), arc.clone());
+            agents.insert(agent_key.clone(), arc.clone());
             arc
         }
     };
@@ -436,13 +445,23 @@ async fn register_quic_agent(
     quic_conn
         .datagram_cap
         .store(agent_datagram_cap, std::sync::atomic::Ordering::Relaxed);
+    quic_conn
+        .e2e_cap
+        .store(agent_e2e_cap, std::sync::atomic::Ordering::Relaxed);
     metrics::counter!("interflow_quic_agents_registered").increment(1);
+    if agent_e2e_cap {
+        // Observation-only mixed-fleet discovery (RFC §3.6): cumulative
+        // registrations of e2e-capable agents. A live gauge would need
+        // replacement-aware accounting on re-registration; a counter cannot
+        // drift.
+        metrics::counter!("interflow_quic_agents_e2e_capable_registered").increment(1);
+    }
 
     crate::hub::service::HubService::sweep_agent_streams(
         &ctx.agents,
         &ctx.active_streams,
         &ctx.stream_counts,
-        &agent_id,
+        &agent_key,
     )
     .await;
 
@@ -468,7 +487,7 @@ async fn register_quic_agent(
     {
         Ok(payload) => payload,
         Err(e) => {
-            warn!("QUIC capability declaration encode failed agent={agent_id}: {e}");
+            warn!("QUIC capability declaration encode failed agent={agent_key}: {e}");
             return None;
         }
     };
@@ -477,7 +496,7 @@ async fn register_quic_agent(
     {
         let mut control = quic_conn.control.lock().await;
         if control.write_all(&ack).await.is_err() {
-            warn!("QUIC HelloAck send failed agent={agent_id}");
+            warn!("QUIC HelloAck send failed agent={agent_key}");
             return None;
         }
     }
@@ -486,7 +505,7 @@ async fn register_quic_agent(
     // heartbeat configuration and the eviction primitive)
     spawn_quic_heartbeat(
         ctx.clone(),
-        agent_id.clone(),
+        agent_key.clone(),
         state_arc.clone(),
         quic_conn.clone(),
     );
@@ -514,13 +533,13 @@ async fn register_quic_agent(
 
     ctx.audit.record(
         AuditKind::AgentRegistered {
-            agent_id: agent_id.clone(),
+            agent_id: agent_key.clone(),
         },
-        Some(agent_id.clone()),
+        Some(agent_key.clone()),
         Some(peer.to_string()),
     );
-    info!("QUIC agent registered: {agent_id} ({peer})");
-    Some((agent_id, state_arc))
+    info!("QUIC agent registered: {agent_key} ({peer})");
+    Some((agent_key, state_arc))
 }
 
 /// Authentication failure: best-effort send of an Error frame, then close
@@ -683,6 +702,7 @@ pub(crate) async fn open_relay_stream(
     source_agent: &str,
     target_addr: Option<&str>,
     proto: StreamProto,
+    e2e: bool,
 ) -> Option<mpsc::Sender<TunnelData>> {
     let (tx, rx) = mpsc::channel::<TunnelData>(RELAY_CHANNEL_CAP);
     let (mut send, recv) = target_conn.conn.open_bi().await.ok()?;
@@ -691,12 +711,13 @@ pub(crate) async fn open_relay_stream(
         .load(std::sync::atomic::Ordering::Relaxed);
 
     // Open frame: payload = "{source}:{addr}" (egress parsing format
-    // identical to the h2 path)
+    // identical to the h2 path). The e2e declaration rides the flags so
+    // the target knows the stream wants the inner TLS layer.
     let open_payload = format!("{source_agent}:{}", target_addr.unwrap_or(""));
     let mut open = BytesMut::with_capacity(64 + open_payload.len());
     wire::encode_frame(
         FrameType::Open,
-        proto.as_flag(),
+        proto.as_flag() | (u8::from(e2e) * interflow_core::protocol::FLAG_E2E),
         stream_id,
         source_agent,
         open_payload.as_bytes(),
@@ -969,9 +990,11 @@ async fn handle_quic_stream(
             "QUIC stream first frame must be Open".to_string(),
         ));
     }
-    // Anti-forgery: the frame's declared source must match the connection
-    // identity
-    if opened.source_agent != source_agent {
+    // Anti-forgery: the frame's declared source (wire form: bare agent id)
+    // must match the connection identity (tenant-qualified key).
+    let identity_matches = crate::hub::state::PeerIdentity::split_qualified(&source_agent)
+        .is_some_and(|(_, bare)| bare == opened.source_agent);
+    if !identity_matches {
         warn!(
             "QUIC forgery check: connection identity {source_agent}, frame claims {}",
             opened.source_agent
@@ -981,41 +1004,50 @@ async fn handle_quic_stream(
 
     let stream_id = opened.stream_id;
     // payload = "{target_agent}:{target_addr}"
+    //
+    // No target form validation here — a known asymmetry with the h2 plane,
+    // whose upload payload gate rejects malformed targets with "invalid open
+    // payload" before routing. On this plane malformed or empty targets
+    // qualify into a `"{tenant}/..."` key that fails closed at the
+    // tenant-policy gate below (`split_qualified` → `None` → deny). Both
+    // gates are pinned as an explicit contract by
+    // `tests/e2e_open_target_contract.rs`; aligning them belongs to the
+    // future shared stream-admission seam.
     let payload_str = String::from_utf8_lossy(&opened.payload).to_string();
     let (target_agent, target_addr) = match payload_str.split_once(':') {
         Some((t, a)) => (t.to_string(), (!a.is_empty()).then(|| a.to_string())),
         None => (payload_str, None),
     };
     let proto = StreamProto::from_frame_flags(opened.flags);
+    let e2e = opened.flags & interflow_core::protocol::FLAG_E2E != 0;
 
-    // ACL (same judgment as handle_open)
-    if ctx
-        .limits
-        .acl_enabled
-        .load(std::sync::atomic::Ordering::Relaxed)
+    // Tenant isolation policy (same judgment as the h2 `frame_open`): a bare
+    // target resolves into the source's own tenant, a `tenant/agent` form is
+    // cross-tenant and needs gateway status or an explicit ACL exception.
+    let source_tenant =
+        crate::hub::state::PeerIdentity::split_qualified(&source_agent).map_or("", |(t, _)| t);
+    let target_agent = crate::hub::routing::qualify_target(&target_agent, source_tenant);
+    if !crate::hub::routing::tenant_policy_allows(
+        &ctx.tls_plane,
+        &ctx.config,
+        &source_agent,
+        &target_agent,
+    )
+    .await
     {
-        let config = ctx.config.read().await;
-        if !config.acl.is_empty() {
-            let rule = crate::config::AclRule {
+        warn!("tenant policy denied (QUIC): {source_agent} -> {target_agent}");
+        metrics::counter!("interflow_hub_acl_denied").increment(1);
+        ctx.audit.record(
+            AuditKind::StreamDenied {
+                stream_id: stream_id.clone(),
                 source: source_agent.clone(),
-                target: target_agent.clone(),
-            };
-            if !config.acl.contains(&rule) {
-                warn!("ACL denied (QUIC): {source_agent} -> {target_agent}");
-                metrics::counter!("interflow_hub_acl_denied").increment(1);
-                ctx.audit.record(
-                    AuditKind::StreamDenied {
-                        stream_id: stream_id.clone(),
-                        source: source_agent.clone(),
-                        reason: format!("acl_denied: target={target_agent}"),
-                    },
-                    Some(source_agent.clone()),
-                    None,
-                );
-                write_close_frame(tx, &stream_id).await;
-                return Ok(());
-            }
-        }
+                reason: format!("tenant_denied: target={target_agent}"),
+            },
+            Some(source_agent.clone()),
+            None,
+        );
+        write_close_frame(tx, &stream_id).await;
+        return Ok(());
     }
 
     // Stream limits (same table as handle_open)
@@ -1067,6 +1099,7 @@ async fn handle_quic_stream(
                 &source_agent,
                 target_addr.as_deref(),
                 proto,
+                e2e,
             )
             .await
         } else {
@@ -1076,7 +1109,7 @@ async fn handle_quic_stream(
                 stream_id: stream_id.clone(),
                 source: FrameSource::Open,
                 stream_type: FrameType::Open,
-                flags: proto.as_flag(),
+                flags: proto.as_flag() | (u8::from(e2e) * interflow_core::protocol::FLAG_E2E),
                 data: Bytes::from(format!(
                     "{source_agent}:{}",
                     target_addr.clone().unwrap_or_default()

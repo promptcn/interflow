@@ -30,14 +30,21 @@
 
 use crate::edge::host_router::HostRouter;
 use interflow_core::protocol::{CloseReason, StreamProto};
-use interflow_core::security::{AuditKind, AuditSink, AuthRateLimiter, ConnTracker};
+use interflow_core::security::ProxyProtocolPolicy;
+use interflow_core::security::XffPolicy;
+use interflow_core::security::forwarded_for::XffResolution;
+use interflow_core::security::proxy_protocol::{ProxyError, ProxyOutcome};
+use interflow_core::security::{
+    AuditKind, AuditSink, AuthRateLimiter, ConnGuard, ConnTracker, XffError,
+};
 use interflow_core::tunnel::AgentTunnel;
 use interflow_core::tunnel::pump::{PumpConfig, StreamOutcome, pump_tcp_stream};
 use interflow_mesh::agent::target_breaker::{BreakerDecision, TargetBreakers};
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
@@ -129,6 +136,22 @@ pub struct EdgeListener {
     /// agent close reasons, stops dead-route retry loops at the internet
     /// edge (no Open through the tunnel while tripped).
     pub route_breaker: Option<Arc<TargetBreakers>>,
+    /// Compiled PROXY-protocol policy: restores real client IPs behind a
+    /// PROXY-v2-capable front (rate limit / caps / audit key on the
+    /// effective IP — never identity).
+    pub proxy_policy: Arc<ProxyProtocolPolicy>,
+    /// Compiled X-Forwarded-For policy: restores real client IPs on the
+    /// standard nginx HTTP `proxy_pass` leg (stock nginx cannot emit the
+    /// PROXY protocol there). Shares the proxy policy's trusted set; the
+    /// derived IP keys governance/audit only — never identity.
+    pub xff_policy: Arc<XffPolicy>,
+    /// Gateway inner-TLS material (present iff the stable identity was
+    /// loaded): gateway flows then declare `FLAG_E2E` and run the inner
+    /// handshake against the route tenant's anchor, falling back to
+    /// plaintext on failure — the edge host is the product's plaintext
+    /// terminus, so fallback costs availability, not confidentiality; the
+    /// security enforcement lives at the egress side (`required` mode).
+    pub e2e: Option<Arc<crate::edge::gateway::EdgeE2e>>,
 }
 
 impl EdgeListener {
@@ -150,53 +173,28 @@ impl EdgeListener {
         let audit = self.audit;
         let route_breaker = self.route_breaker;
 
+        let proxy_policy = self.proxy_policy;
+        let xff_policy = self.xff_policy;
+        let e2e = self.e2e;
+
         loop {
             let (stream, addr) = listener.accept().await?;
 
-            // Per-IP new-connection rate limit (before conn_tracker: prevents
-            // attackers from exhausting the ConnTracker map via rapid
-            // acquire/release)
-            if let Some(limiter) = &rate_limiter
-                && !limiter.check(addr.ip())
-            {
-                metrics::counter!("interflow_edge_conn_rate_limited").increment(1);
-                audit.record(
-                    AuditKind::StreamDenied {
-                        stream_id: String::new(),
-                        source: addr.ip().to_string(),
-                        reason: "rate_limited".into(),
-                    },
-                    None,
-                    Some(addr.to_string()),
-                );
-                debug!("edge connection denied (rate limited): {addr}");
-                drop(stream);
-                continue;
-            }
-
-            // Per-IP + global connection cap check
-            let Some(guard) = conn_tracker.try_acquire(addr.ip()) else {
-                metrics::counter!("interflow_edge_conn_rejected").increment(1);
-                audit.record(
-                    AuditKind::StreamDenied {
-                        stream_id: String::new(),
-                        source: addr.ip().to_string(),
-                        reason: "conn_limit_exceeded".into(),
-                    },
-                    None,
-                    Some(addr.to_string()),
-                );
-                debug!("edge connection denied (connection limit): {addr}");
-                continue;
-            };
-
+            // Per-IP resource gating runs inside the connection task, after
+            // the PROXY negotiation keys it on the real client IP (behind
+            // nginx every TCP peer is 127.0.0.1 — gating there would throttle
+            // the proxy itself).
             let router = router.clone();
             let tunnel = tunnel.clone();
             let audit = audit.clone();
             let route_breaker = route_breaker.clone();
+            let conn_tracker = conn_tracker.clone();
+            let rate_limiter = rate_limiter.clone();
+            let proxy_policy = proxy_policy.clone();
+            let xff_policy = xff_policy.clone();
+            let e2e = e2e.clone();
 
             tokio::spawn(async move {
-                let _guard = guard;
                 if let Err(e) = handle_connection(
                     stream,
                     addr,
@@ -206,6 +204,11 @@ impl EdgeListener {
                     stream_idle_timeout,
                     &audit,
                     route_breaker.as_ref(),
+                    &conn_tracker,
+                    rate_limiter.as_ref(),
+                    &proxy_policy,
+                    &xff_policy,
+                    e2e.as_ref(),
                 )
                 .await
                 {
@@ -229,15 +232,82 @@ async fn handle_connection(
     stream_idle_timeout: Duration,
     audit: &AuditSink,
     route_breaker: Option<&Arc<TargetBreakers>>,
+    conn_tracker: &Arc<ConnTracker>,
+    rate_limiter: Option<&Arc<AuthRateLimiter>>,
+    proxy_policy: &Arc<ProxyProtocolPolicy>,
+    xff_policy: &Arc<XffPolicy>,
+    e2e: Option<&Arc<crate::edge::gateway::EdgeE2e>>,
 ) -> interflow_core::error::Result<()> {
     use interflow_core::error::InterflowError;
     // TCP_NODELAY: disable Nagle to reduce small-packet latency (notable for echo / ping-pong workloads)
     let _ = socket.set_nodelay(true);
 
+    // 1. PROXY protocol negotiation (same budget as the Host peek): derives
+    //    the effective client IP; over-read bytes of a direct connection are
+    //    replayed as the start of the HTTP buffer.
+    let mut initial = bytes::BytesMut::with_capacity(HOST_PEEK_BYTES);
+    let mut effective_ip =
+        match tokio::time::timeout(host_peek_timeout, proxy_policy.read(&mut socket, peer.ip()))
+            .await
+        {
+            Ok(Ok(ProxyOutcome::Proxied { effective })) => effective,
+            Ok(Ok(ProxyOutcome::Direct { read_back })) => {
+                if !read_back.is_empty() {
+                    initial.extend_from_slice(&read_back);
+                }
+                peer.ip()
+            }
+            Ok(Err(e)) => {
+                metrics::counter!("interflow_edge_proxy_rejected").increment(1);
+                let reason = match &e {
+                    ProxyError::UntrustedSignature => "untrusted_proxy_signature",
+                    ProxyError::RequiredMissing => "proxy_header_required",
+                    ProxyError::Malformed(_) => "malformed_proxy_header",
+                    ProxyError::Io(_) => "proxy_read_error",
+                };
+                warn!("PROXY negotiation rejected ({reason}): peer={peer}");
+                audit.record(
+                    AuditKind::StreamDenied {
+                        stream_id: String::new(),
+                        source: peer.ip().to_string(),
+                        reason: reason.to_string(),
+                    },
+                    None,
+                    Some(peer.to_string()),
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                metrics::counter!("interflow_edge_proxy_timeout").increment(1);
+                return Ok(());
+            }
+        };
+
+    // 2. Real-IP source selection. X-Forwarded-For restoration applies only
+    //    when the mechanism is enabled AND the TCP peer is a trusted proxy
+    //    (the header from anyone else is attacker-controlled). For everyone
+    //    else the peer IP is authoritative and the per-IP gate runs before
+    //    the peek, preserving the connect→peek→disconnect flood defense.
+    //    For a trusted proxy the gate is deferred until the request head is
+    //    buffered: the effective IP lives in the XFF header, and nginx's own
+    //    limit_req/limit_conn cap that fronting leg meanwhile.
+    let xff_deferred = xff_policy.mode.enabled() && xff_policy.is_trusted(peer.ip());
+    let mut guard = if xff_deferred {
+        None
+    } else {
+        match gate_connection(effective_ip, peer, audit, rate_limiter, conn_tracker) {
+            Some(g) => Some(g),
+            None => return Ok(()),
+        }
+    };
+
     // Read the first bytes into a buffer, accumulating until the Host header
     // is found or the cap is reached. The whole peek phase is bounded by a
-    // timeout to defend against slow-loris.
-    let mut initial = bytes::BytesMut::with_capacity(HOST_PEEK_BYTES);
+    // timeout to defend against slow-loris. When XFF is deferred the loop
+    // continues past the Host until the full request head arrives (blank
+    // line) — the XFF header may follow Host in the buffer, and stopping at
+    // Host would silently drop it.
+
     let host = tokio::time::timeout(host_peek_timeout, async {
         let mut tmp = vec![0u8; 4096];
         loop {
@@ -251,6 +321,24 @@ async fn handle_connection(
                 return Err(InterflowError::protocol("connection closed early"));
             }
             initial.extend_from_slice(&tmp[..n]);
+            if xff_deferred {
+                if find_headers_end(&initial).is_none() {
+                    continue;
+                }
+                match extract_host(&initial) {
+                    HostParseResult::Found(h) => return Ok(h),
+                    HostParseResult::Invalid(reason) => {
+                        metrics::counter!("interflow_edge_host_invalid").increment(1);
+                        return Err(InterflowError::protocol(reason));
+                    }
+                    // The head is complete: no Host will appear by reading
+                    // more header bytes — only body could follow.
+                    HostParseResult::NotFound => {
+                        metrics::counter!("interflow_edge_host_invalid").increment(1);
+                        return Err(InterflowError::protocol("missing_host"));
+                    }
+                }
+            }
             match extract_host(&initial) {
                 HostParseResult::Found(h) => return Ok(h),
                 HostParseResult::Invalid(reason) => {
@@ -270,14 +358,50 @@ async fn handle_connection(
         metrics::counter!("interflow_edge_host_peek_failed").increment(1);
     })?;
 
+    // 3. Deferred XFF resolution + gate: the head is buffered, the
+    //    right-most chain entry is the IP our trusted proxy observed.
+    if xff_deferred {
+        effective_ip = match xff_policy.resolve(&initial) {
+            XffResolution::Effective(ip) => ip,
+            XffResolution::Peer => peer.ip(),
+            XffResolution::Denied(err) => {
+                let reason = match err {
+                    XffError::Missing => {
+                        metrics::counter!("interflow_edge_xff_missing").increment(1);
+                        "x_forwarded_for_required"
+                    }
+                    XffError::Invalid => {
+                        metrics::counter!("interflow_edge_xff_invalid").increment(1);
+                        "x_forwarded_for_invalid"
+                    }
+                };
+                warn!("X-Forwarded-For rejected ({reason}): peer={peer}");
+                audit.record(
+                    AuditKind::StreamDenied {
+                        stream_id: String::new(),
+                        source: peer.ip().to_string(),
+                        reason: reason.to_string(),
+                    },
+                    None,
+                    Some(peer.to_string()),
+                );
+                return Ok(());
+            }
+        };
+        match gate_connection(effective_ip, peer, audit, rate_limiter, conn_tracker) {
+            Some(g) => guard = Some(g),
+            None => return Ok(()),
+        }
+    }
+
     let Some(route) = router.lookup(&host) else {
         // No route matched: close silently, send no 404, do not leak that the edge is alive
-        warn!("no route matched host={host} (peer={peer})");
+        warn!("no route matched host={host} (peer={peer}, effective={effective_ip})");
         metrics::counter!("interflow_edge_no_route").increment(1);
         audit.record(
             AuditKind::StreamDenied {
                 stream_id: String::new(),
-                source: peer.ip().to_string(),
+                source: effective_ip.to_string(),
                 reason: format!("no_route: {host}"),
             },
             None,
@@ -287,8 +411,8 @@ async fn handle_connection(
     };
 
     debug!(
-        "edge route hit: {host} → agent={} remote={}",
-        route.agent_id, route.remote_addr
+        "edge route hit: {host} → {}/{} remote={}",
+        route.tenant, route.agent_id, route.remote_addr
     );
 
     // Route-level breaker gate: a tripped route is closed right here — no
@@ -304,7 +428,7 @@ async fn handle_connection(
         audit.record(
             AuditKind::StreamDenied {
                 stream_id: String::new(),
-                source: peer.ip().to_string(),
+                source: effective_ip.to_string(),
                 reason: format!("route_circuit_open: {host}"),
             },
             None,
@@ -318,18 +442,160 @@ async fn handle_connection(
     let stream_id = uuid::Uuid::new_v4().to_string();
     let data_rx = tunnel.register_stream(stream_id.clone()).await;
 
+    // Tenant-qualified target: the hub resolves (tenant, agent_id); a route
+    // whose agent is registered under another tenant finds no target and the
+    // Open fails closed.
+    let qualified_target = format!("{}/{}", route.tenant, route.agent_id);
     let remote_addr_str = route.remote_addr.to_string();
-    if let Err(e) = tunnel
-        .send_open(
-            &stream_id,
-            &route.agent_id,
-            Some(&remote_addr_str),
-            StreamProto::Tcp,
-        )
-        .await
-    {
+
+    // Inner TLS (e2e) participation: only with the stable gateway identity
+    // AND a per-tenant anchor for this route (a tenant without --client-ca
+    // cannot be inner-verified; those streams proceed plain, logged once
+    // per route lookup at debug).
+    let e2e_material = e2e.and_then(|e| e.material_for(&route.tenant));
+    let open_result = if e2e_material.is_some() {
+        tunnel
+            .send_open_with(
+                &stream_id,
+                &qualified_target,
+                Some(&remote_addr_str),
+                StreamProto::Tcp,
+                true,
+            )
+            .await
+    } else {
+        tunnel
+            .send_open(
+                &stream_id,
+                &qualified_target,
+                Some(&remote_addr_str),
+                StreamProto::Tcp,
+            )
+            .await
+    };
+    let _ = guard;
+    if let Err(e) = open_result {
         tunnel.unregister_stream(&stream_id).await;
         return Err(e);
+    }
+
+    // E2e path: the inner handshake rides Data frames through the hub; the
+    // already-read first bytes become TLS application data after the
+    // handshake. Fallback to plaintext mirrors the mesh ingress's
+    // `opportunistic` semantics (the edge host is the product's plaintext
+    // terminus; enforcement lives at the egress).
+    if let Some(material) = e2e_material {
+        let connector = match interflow_core::tls::inner_client_config(&material, &route.agent_id) {
+            Ok(config) => Some(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+                config,
+            ))),
+            Err(e) => {
+                // Stale material (files changed underneath): proceed plain
+                // rather than failing the visitor.
+                debug!(
+                    "edge e2e connector build failed for {}: {e}",
+                    route.agent_id
+                );
+                metrics::counter!("interflow_edge_e2e_handshake_failures_total",
+                    "reason" => "protocol")
+                .increment(1);
+                None
+            }
+        };
+        if let Some(connector) = connector {
+            let adapter = interflow_core::tunnel::e2e::E2eTunnelIo::ingress(
+                data_rx,
+                tunnel.clone(),
+                stream_id.clone(),
+            );
+            match interflow_core::tunnel::e2e::inner_tls_connect(
+                adapter,
+                connector,
+                EDGE_E2E_HANDSHAKE_TIMEOUT,
+            )
+            .await
+            {
+                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Established(mut tls, reason) => {
+                    metrics::counter!("interflow_edge_e2e_handshakes_total").increment(1);
+                    if !initial.is_empty() && tls.write_all(&initial).await.is_err() {
+                        tunnel.unregister_stream(&stream_id).await;
+                        return Ok(());
+                    }
+                    let sid = stream_id.clone();
+                    let t2 = tunnel.clone();
+                    let outcome = interflow_core::tunnel::pump::pump_duplex(
+                        socket,
+                        tls,
+                        &pump_cfg(stream_idle_timeout),
+                        &stream_id,
+                        async move {
+                            let _ = t2.send_close(&sid).await;
+                            t2.unregister_stream(&sid).await;
+                        },
+                    )
+                    .await;
+                    let outcome = interflow_core::tunnel::pump::StreamOutcome {
+                        close_reason: outcome.close_reason.or_else(|| reason.get()),
+                        response_relayed: outcome.response_relayed,
+                    };
+                    if let Some(breaker) = route_breaker {
+                        match route_evidence(&outcome, route_probe) {
+                            RouteEvidence::Failure => breaker.note_failure(&host),
+                            RouteEvidence::DerivativeFailure => breaker.note_soft_failure(&host),
+                            RouteEvidence::Recovery => breaker.note_success(&host),
+                            RouteEvidence::Neutral => {}
+                        }
+                    }
+                    return Ok(());
+                }
+                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { parts, error } => {
+                    let reason_label = interflow_core::tls::classify_handshake_error(&error);
+                    metrics::counter!("interflow_edge_e2e_handshake_failures_total",
+                        "reason" => reason_label)
+                    .increment(1);
+                    debug!(
+                        "edge e2e handshake failed ({reason_label}: {error}), falling back to                          plaintext: host={host}"
+                    );
+                    // Fallback: our initial bytes go out as plain Data;
+                    // the peer bytes buffered during the attempt replay to
+                    // the visitor socket; then the plain pump takes over.
+                    if !initial.is_empty() {
+                        let initial_bytes = initial.split().freeze();
+                        if tunnel.send_data(&stream_id, initial_bytes).await.is_err() {
+                            tunnel.unregister_stream(&stream_id).await;
+                            return Ok(());
+                        }
+                    }
+                    let (rd, mut wr) = socket.into_split();
+                    if !parts.buffered.is_empty() && wr.write_all(&parts.buffered).await.is_err() {
+                        tunnel.unregister_stream(&stream_id).await;
+                        return Ok(());
+                    }
+                    let outcome = pump_tcp_stream(
+                        rd,
+                        wr,
+                        parts.rx,
+                        tunnel,
+                        &stream_id,
+                        &pump_cfg(stream_idle_timeout),
+                    )
+                    .await;
+                    if let Some(breaker) = route_breaker {
+                        match route_evidence(&outcome, route_probe) {
+                            RouteEvidence::Failure => breaker.note_failure(&host),
+                            RouteEvidence::DerivativeFailure => breaker.note_soft_failure(&host),
+                            RouteEvidence::Recovery => breaker.note_success(&host),
+                            RouteEvidence::Neutral => {}
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        // Connector build failed (stale material): fall through to the plain
+        // path below with the plain channel — but the adapter consumed
+        // data_rx above only in the handshake branch; here nothing was
+        // consumed, so the plain path's expectations still hold.
     }
 
     // Send the already-read first bytes into the tunnel first (the egress
@@ -387,6 +653,50 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Applies the per-IP new-connection rate limit and concurrency caps to one
+/// connection, keyed on the effective client IP (TCP peer, PROXY-asserted,
+/// or XFF-restored). A denial records metrics + audit and yields `None` —
+/// the caller drops the connection without a response.
+fn gate_connection(
+    effective_ip: IpAddr,
+    peer: SocketAddr,
+    audit: &AuditSink,
+    rate_limiter: Option<&Arc<AuthRateLimiter>>,
+    conn_tracker: &Arc<ConnTracker>,
+) -> Option<ConnGuard> {
+    if let Some(limiter) = rate_limiter
+        && !limiter.check(effective_ip)
+    {
+        metrics::counter!("interflow_edge_conn_rate_limited").increment(1);
+        audit.record(
+            AuditKind::StreamDenied {
+                stream_id: String::new(),
+                source: effective_ip.to_string(),
+                reason: "rate_limited".into(),
+            },
+            None,
+            Some(peer.to_string()),
+        );
+        debug!("edge connection denied (rate limited): effective={effective_ip} peer={peer}");
+        return None;
+    }
+    if let Some(guard) = conn_tracker.try_acquire(effective_ip) {
+        return Some(guard);
+    }
+    metrics::counter!("interflow_edge_conn_rejected").increment(1);
+    audit.record(
+        AuditKind::StreamDenied {
+            stream_id: String::new(),
+            source: effective_ip.to_string(),
+            reason: "conn_limit_exceeded".into(),
+        },
+        None,
+        Some(peer.to_string()),
+    );
+    debug!("edge connection denied (connection limit): effective={effective_ip} peer={peer}");
+    None
+}
+
 /// Host parse result: three states, distinguishing "not found yet" from
 /// "definitely invalid".
 enum HostParseResult {
@@ -412,6 +722,21 @@ enum HostParseResult {
 /// 5-byte sliding-window match like `\nHost: ...\n`, which would be
 /// misjudged as duplicate_host and reject a legitimate request.
 ///
+/// Inner-TLS handshake deadline for gateway flows (mirrors the mesh
+/// agent-side `[e2e] handshake_timeout_secs` default).
+const EDGE_E2E_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The listener's pump configuration (shared by the plain and e2e paths).
+const fn pump_cfg(stream_idle_timeout: std::time::Duration) -> PumpConfig {
+    PumpConfig {
+        idle_timeout: stream_idle_timeout,
+        write_stall_timeout: CLIENT_WRITE_STALL_TIMEOUT,
+        idle_timeout_counter: "interflow_edge_stream_idle_timeout",
+        write_stall_counter: "interflow_edge_client_write_stall",
+        log_label: "edge",
+    }
+}
+
 /// Hardening (kept from the original implementation):
 /// - Return `Invalid` immediately upon detecting a second Host header (reject the whole connection; prevents header injection/smuggling)
 /// - Validate host characters: only `[A-Za-z0-9.\-:()\[\]]` allowed; values with control characters/spaces are rejected

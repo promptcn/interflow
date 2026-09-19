@@ -19,7 +19,7 @@ artifacts/
 *.token.*
 
 # Certificates and keys never enter git (policy: 2026-09-15; history purged the
-# same day — any cert material is generated on demand via scripts/gen_certs.sh
+# same day — any cert material is generated on demand via `interflow-mesh certs`
 # and lives only on the machine that runs it)
 *.key
 *.key~
@@ -28,7 +28,11 @@ artifacts/
 *.csr
 *.srl
 *.pem
+# On-demand certificate OUTPUT directories (the suffix rules above already
+# cover the material; this catches stray files). crates/certs/ is the
+# interflow-certs SOURCE crate, not a generated directory.
 certs/
+!crates/certs/
 
 # editor
 .idea/

@@ -1,6 +1,6 @@
 [package]
 name = "interflow-mesh"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Site-to-site TCP tunnel: any TCP traffic between two private networks via a public hub"
@@ -21,7 +21,10 @@ path = "src/main.rs"
 fault-injection = ["interflow-core/fault-injection"]
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.2" }
+interflow-core = { path = "../core", version = "0.3" }
+# Certificate issuance behind the `certs` subcommand (single rcgen
+# implementation shared with the expose wizard and the test kit)
+interflow-certs = { path = "../certs", version = "0.3" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -84,7 +87,7 @@ chrono = "0.4"
 # Shared test/bench harness (dev-dependency cycle: testkit depends on mesh,
 # supported by cargo, same pattern as tokio/tokio-test; testkit stays out of the
 # production dependency graph)
-interflow-testkit = { path = "../testkit", version = "0.2", features = ["fault-injection"] }
+interflow-testkit = { path = "../testkit", version = "0.3", features = ["fault-injection"] }
 # paused-clock unit tests (egress send-path health)
 tokio = { workspace = true, features = ["test-util"] }
 # bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion
@@ -92,6 +95,8 @@ tokio = { workspace = true, features = ["test-util"] }
 libc = "0.2"
 # e2e test logging (output goes to the test writer when RUST_LOG=interflow=debug)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# certs_cli: fresh per-test certificate directories
+tempfile = "3"
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
 # e2e assertions on metrics counters (in-process recorder installed for direct snapshot reads)
 metrics = "0.24.6"

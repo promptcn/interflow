@@ -50,6 +50,11 @@ pub enum CloseReason {
     /// Session end (token cancelled): no Close echo (the tunnel is dead);
     /// local release only.
     SessionClosed,
+    /// The inner agent↔agent TLS handshake (e2e encryption) failed, timed
+    /// out, or never happened on a stream that required it — the stream is
+    /// closed instead of degrading to plaintext (fail-closed; RFC
+    /// docs/design/agent-e2e-encryption.md §3.5/§4).
+    E2eHandshakeFailed,
     /// A token this build does not know (newer peer); preserved verbatim so
     /// relays and logs never lie about what the peer said.
     Other(String),
@@ -71,6 +76,7 @@ impl CloseReason {
             Self::LocalLimit => "local_limit",
             Self::UdpIdle => "udp_idle",
             Self::SessionClosed => "session_closed",
+            Self::E2eHandshakeFailed => "e2e_handshake_failed",
             Self::Other(token) => token,
         }
     }
@@ -95,6 +101,7 @@ impl CloseReason {
             "local_limit" => Self::LocalLimit,
             "udp_idle" => Self::UdpIdle,
             "session_closed" => Self::SessionClosed,
+            "e2e_handshake_failed" => Self::E2eHandshakeFailed,
             other => Self::Other(other.to_string()),
         }
     }
@@ -128,6 +135,7 @@ mod tests {
             CloseReason::LocalLimit,
             CloseReason::UdpIdle,
             CloseReason::SessionClosed,
+            CloseReason::E2eHandshakeFailed,
         ];
         for reason in &known {
             assert_eq!(
@@ -181,6 +189,7 @@ mod tests {
             CloseReason::LocalLimit,
             CloseReason::UdpIdle,
             CloseReason::SessionClosed,
+            CloseReason::E2eHandshakeFailed,
         ] {
             let token = reason.as_str();
             assert!(

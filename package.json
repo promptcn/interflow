@@ -1,13 +1,14 @@
 {
   "name": "interflow",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Interflow GUI (Tauri 2 + React): frontend and tooling for the expose desktop app.",
   "private": true,
   "scripts": {
     "tauri": "tauri",
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "gen:bindings": "cargo run --manifest-path src-tauri/Cargo.toml --bin export-bindings -- src/bindings.ts"
   },
   "author": "PromptcnAI",
   "license": "Apache-2.0",

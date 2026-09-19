@@ -9,8 +9,8 @@
 # /etc/interflow/certs — no WORKDIR gymnastics needed):
 #   docker run -d \
 #     -p 6666:6666 \
-#     -v $PWD/crates/mesh/examples/hub.toml:/etc/interflow/hub.toml:ro \
-#     -v $PWD/crates/mesh/examples/certs:/etc/interflow/certs:ro \
+#     -v $PWD/examples/site-to-site/hub.toml:/etc/interflow/hub.toml:ro \
+#     -v $PWD/examples/site-to-site/certs:/etc/interflow/certs:ro \
 #     interflow:latest
 #
 # Run the mesh agent:

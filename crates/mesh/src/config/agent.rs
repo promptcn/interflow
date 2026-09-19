@@ -114,6 +114,10 @@ pub struct AgentConfig {
     /// TLS client configuration (optional).
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// E2e encryption (agent↔agent inner TLS); default off = behavior
+    /// unchanged.
+    #[serde(default)]
+    pub e2e: E2eConfig,
     /// Transport-layer tuning, endpoint-symmetric with the hub's
     /// `[transport]` (see [`crate::config::transport`]).
     #[serde(default)]
@@ -166,6 +170,7 @@ impl Default for AgentConfig {
             control: ControlConfig::default(),
             security: SecurityConfig::default(),
             tls: None,
+            e2e: E2eConfig::default(),
             transport: AgentTransportConfig::default(),
             logging: LoggingConfig::default(),
         }
@@ -218,9 +223,6 @@ pub struct AgentInfo {
     /// `transport = "quic"`.
     #[serde(default)]
     pub hub_quic_addr: Option<String>,
-    /// Bearer token; required when the hub has authentication enabled.
-    #[serde(default)]
-    pub auth_token: Option<String>,
     /// Overall timeout (seconds) for connecting to the hub (DNS + TCP + TLS
     /// handshake + registration).
     ///
@@ -284,7 +286,6 @@ impl Default for AgentInfo {
             hub_url: String::new(),
             transport: TransportKind::default(),
             hub_quic_addr: None,
-            auth_token: None,
             connect_timeout_secs: default_connect_timeout_secs(),
             poll_idle_timeout_secs: None,
             request_establish_timeout_secs: None,
@@ -459,6 +460,82 @@ pub struct TlsConfig {
     pub hub_cert_fingerprint: Option<String>,
 }
 
+/// The per-tenant e2e encryption (agent↔agent inner TLS) mode.
+///
+/// Security semantics exist only for [`E2eMode::Required`] (encrypted) and
+/// [`E2eMode::Off`] (current per-hop behavior); `opportunistic` is a
+/// migration-window observation mode whose plaintext fallback cannot
+/// distinguish an old peer from an active downgrade — never a security
+/// claim (RFC docs/design/agent-e2e-encryption.md §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum E2eMode {
+    /// Streams carry the inner TLS layer; a failed/absent handshake closes
+    /// the stream — never a plaintext fallback (fail-closed).
+    Required,
+    /// Attempt the inner TLS handshake; on failure fall back to plaintext
+    /// (migration window only).
+    Opportunistic,
+    /// Current behavior: per-hop TLS only, the hub terminates TLS and sees
+    /// tunnel payloads.
+    #[default]
+    Off,
+}
+
+/// E2e encryption (agent↔agent inner TLS) configuration
+/// (RFC docs/design/agent-e2e-encryption.md §5.1).
+///
+/// The inner layer reuses the `[tls]` client certificate pair verbatim —
+/// no new key material. The tenant anchor for verifying peers is the same
+/// file the agent already holds as `[tls] ca_path` (single-CA model);
+/// `gateway_ca_path` / `extra_trusted_cas` add the gateway anchor and
+/// cross-tenant exception anchors. Startup-only: the e2e runtime is
+/// assembled once and does not participate in rule reload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct E2eConfig {
+    /// Mode (default `off`).
+    pub mode: E2eMode,
+    /// Handshake deadline in seconds for both sides (default 10; 0 is
+    /// rejected — guards the stream table against handshake dribble).
+    #[serde(default = "default_e2e_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
+    /// Egress side: the stable gateway anchor CA PEM
+    /// (`certs gateway issue` output). In `required` mode, gateway streams
+    /// must complete the inner handshake against this anchor — without it
+    /// there is no cryptographically verifiable gateway exemption, only a
+    /// hub assertion (spoofable), so such streams are rejected.
+    #[serde(default)]
+    pub gateway_ca_path: Option<String>,
+    /// Cross-tenant exception anchors: the peer tenants' CA PEMs for ACL
+    /// exception flows. Keep the set minimal — it is an audit item (RFC
+    /// §8.2 #4).
+    #[serde(default)]
+    pub extra_trusted_cas: Vec<String>,
+}
+
+impl E2eConfig {
+    /// Whether the inner TLS layer participates at all.
+    pub fn enabled(&self) -> bool {
+        self.mode != E2eMode::Off
+    }
+}
+
+impl Default for E2eConfig {
+    fn default() -> Self {
+        Self {
+            mode: E2eMode::default(),
+            handshake_timeout_secs: default_e2e_handshake_timeout_secs(),
+            gateway_ca_path: None,
+            extra_trusted_cas: Vec::new(),
+        }
+    }
+}
+
+const fn default_e2e_handshake_timeout_secs() -> u64 {
+    10
+}
+
 const fn default_udp_per_ip_pps() -> u32 {
     50
 }
@@ -545,7 +622,6 @@ config_version = 3
 [agent]
 id = "test-agent"
 hub_url = "https://hub.example.com:6666"
-auth_token = "secret"
 
 [tls]
 enabled = true
@@ -775,5 +851,58 @@ hub_url = "https://hub.example.com:6666"
         assert_eq!(d.egress_target_breaker_failure_threshold, 5);
         assert_eq!(d.egress_target_breaker_window_secs, 10);
         assert_eq!(d.egress_target_breaker_cooldown_secs, 30);
+        // e2e defaults to fully off (old configs parse with zero behavior
+        // change).
+        assert_eq!(d.e2e.mode, E2eMode::Off);
+        assert_eq!(d.e2e.handshake_timeout_secs, 10);
+    }
+
+    /// The `[e2e]` section parses with its documented shape; a partial
+    /// section keeps the defaults for the omitted fields.
+    #[test]
+    fn e2e_section_parses() {
+        let toml_str = r#"
+config_version = 3
+
+[agent]
+id = "a1"
+hub_url = "https://hub.example.com:6666"
+
+[e2e]
+mode = "required"
+gateway_ca_path = "certs/gateway-ca.crt"
+extra_trusted_cas = ["certs/globex-ca.crt", "certs/initech-ca.crt"]
+"#;
+        let parsed: AgentConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(parsed.e2e.mode, E2eMode::Required);
+        assert_eq!(parsed.e2e.handshake_timeout_secs, 10); // default kept
+        assert_eq!(
+            parsed.e2e.gateway_ca_path.as_deref(),
+            Some("certs/gateway-ca.crt")
+        );
+        assert_eq!(parsed.e2e.extra_trusted_cas.len(), 2);
+        assert!(parsed.e2e.enabled());
+
+        // opportunistic parses; the unknown-mode typo must not.
+        let opportunistic: AgentConfig = toml::from_str(
+            "config_version = 3\n[agent]\nid = \"a\"\nhub_url = \"https://h\"\n\n[e2e]\nmode = \"opportunistic\"\n",
+        )
+        .expect("parse opportunistic");
+        assert_eq!(opportunistic.e2e.mode, E2eMode::Opportunistic);
+        assert!(
+            toml::from_str::<AgentConfig>(
+                "config_version = 3\n[agent]\nid = \"a\"\nhub_url = \"https://h\"\n\n[e2e]\nmode = \"preferred\"\n"
+            )
+            .is_err(),
+            "the rejected alias must stay rejected (naming is a security-semantics decision, RFC §4)"
+        );
+    }
+
+    /// `deny_unknown_fields` on the e2e section makes old binaries reject
+    /// the new fields = forced paired upgrade, fail-fast (RFC §6).
+    #[test]
+    fn e2e_section_rejects_unknown_fields() {
+        let toml_str = "config_version = 3\n[agent]\nid = \"a\"\nhub_url = \"https://h\"\n\n[e2e]\nmode = \"off\"\nmin_version = \"1.3\"\n";
+        assert!(toml::from_str::<AgentConfig>(toml_str).is_err());
     }
 }

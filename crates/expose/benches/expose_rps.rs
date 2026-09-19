@@ -72,7 +72,7 @@ fn bench_expose_rps(c: &mut Criterion) {
 mod setup {
     use super::*;
     use interflow_expose::client::ExposeArgs;
-    use interflow_expose::edge::{EdgeArgs, Route, RoutesConfig};
+    use interflow_expose::edge::{EdgeArgs, EdgeHubTls, Route, RoutesConfig};
     use interflow_mesh::config::TransportKind;
 
     pub async fn spawn_stack() -> (
@@ -114,6 +114,7 @@ mod setup {
         let routes = RoutesConfig {
             routes: vec![Route {
                 host: "test.local".into(),
+                tenant: "test".into(),
                 agent_id: "expose-test".into(),
                 remote_addr: echo_addr,
             }],
@@ -126,12 +127,19 @@ mod setup {
         let routes_str = toml::to_string(&routes).expect("serialize routes");
         std::fs::write(&routes_path, &routes_str).expect("write routes.toml");
 
+        let certs = interflow_testkit::certs::TestCerts::generate("bench", "expose-test");
         let edge_args = EdgeArgs {
             listen_addr: edge_listen,
             hub_listen_addr: hub_listen,
             routes_path: routes_path.to_string_lossy().into_owned(),
-            agent_token: "test-token".into(),
-            hub_tls: None,
+            tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
+            proxy_protocol: Default::default(),
+            x_forwarded_for: Default::default(),
+            hub_tls: Some(EdgeHubTls {
+                cert_path: certs.server_cert_path().display().to_string(),
+                key_path: certs.server_key_path().display().to_string(),
+            }),
+            gateway_identity: None,
             quic_listen: None,
             audit_path: None,
             new_conn_rate_per_ip_per_minute: 0,
@@ -152,12 +160,14 @@ mod setup {
             .await
             .expect("hub should start within 5s");
 
+        let (client_cert, client_key) = certs.client_paths();
         let client_args = ExposeArgs {
             local_ports: vec![echo_addr.port()],
-            hub_url: format!("http://127.0.0.1:{hub_port}"),
-            auth_token: "test-token".into(),
+            hub_url: format!("https://127.0.0.1:{hub_port}"),
             agent_id: "expose-test".into(),
-            ca_path: None,
+            client_cert: Some(client_cert.display().to_string()),
+            client_key: Some(client_key.display().to_string()),
+            ca_path: Some(certs.ca_path().display().to_string()),
             transport: TransportKind::H2,
             hub_quic_addr: None,
         };

@@ -29,7 +29,7 @@
     unused_mut
 )]
 use interflow_expose::client::ExposeArgs;
-use interflow_expose::edge::{EdgeArgs, run};
+use interflow_expose::edge::{EdgeArgs, EdgeHubTls, run};
 use interflow_mesh::config::TransportKind;
 use interflow_testkit::metrics_harness::{counter_value, metrics_handle, wait_counter_at_least};
 use std::net::SocketAddr;
@@ -96,6 +96,7 @@ async fn dead_route_storm_stops_at_the_edge() {
             r#"
 [[routes]]
 host = "dead.local"
+tenant = "test"
 agent_id = "expose-breaker"
 remote_addr = "127.0.0.1:{dead}"
 "#
@@ -107,11 +108,17 @@ remote_addr = "127.0.0.1:{dead}"
     // agent-side breaker keeps its default threshold of 5, which the edge
     // trip (3) undercuts — the route never lets the agent reach its own
     // threshold, which is exactly the point of stopping at the source.
+    let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let edge_args = EdgeArgs {
         listen_addr: edge_listen,
         hub_listen_addr: hub_listen,
         routes_path: routes_path.to_string_lossy().into_owned(),
-        agent_token: "test-token".into(),
+        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
+        proxy_protocol: Default::default(),
+        hub_tls: Some(EdgeHubTls {
+            cert_path: certs.server_cert_path().display().to_string(),
+            key_path: certs.server_key_path().display().to_string(),
+        }),
         route_breaker_failure_threshold: 3,
         agent_recovery_timeout_secs: 120,
         ..Default::default()
@@ -124,12 +131,14 @@ remote_addr = "127.0.0.1:{dead}"
         .await
         .expect("edge listener should start within 5s");
 
+    let (client_cert, client_key) = certs.named_client_cert("expose-breaker");
     let client_args = ExposeArgs {
         local_ports: vec![dead],
-        hub_url: format!("http://127.0.0.1:{hub_port}"),
-        auth_token: "test-token".into(),
+        hub_url: format!("https://127.0.0.1:{hub_port}"),
+        client_cert: Some(client_cert.display().to_string()),
+        client_key: Some(client_key.display().to_string()),
         agent_id: "expose-breaker".into(),
-        ca_path: None,
+        ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
     };

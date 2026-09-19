@@ -7,7 +7,7 @@
 //! tokio/tokio-test), so the production dependency graph is unaffected.
 //!
 //! Modules:
-//! - [`certs`]: rcgen self-signed CA / server / client certificates
+//! - [`certs`]: self-signed CA / server / client certificates (via interflow-certs)
 //! - [`config`]: `HubConfig` / `AgentConfig` builders (test and bench presets)
 //! - [`stack`]: in-process hub / agent assembly + graceful shutdown + readiness probes
 //! - [`backend`]: echo / UDP echo / SSE timestamped-chunk backends (phased, with silence/burst support)
@@ -29,6 +29,7 @@
 
 pub mod backend;
 pub mod certs;
+pub use certs::{tls_client_connect, tls_client_connect_with};
 pub mod config;
 #[cfg(feature = "fault-injection")]
 pub mod fault;

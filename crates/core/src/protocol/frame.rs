@@ -21,7 +21,7 @@ const FRAME_MAGIC: [u8; 2] = *b"IN";
 /// The current protocol version.
 const FRAME_VERSION: u8 = 2;
 /// Upper bound for a single frame payload (4 MiB), guarding against giant allocations triggered by abnormal lengths.
-const MAX_FRAME_PAYLOAD: usize = 4 * 1024 * 1024;
+pub const MAX_FRAME_PAYLOAD: usize = 4 * 1024 * 1024;
 /// Upper bound for a single ID field.
 const MAX_ID_LEN: usize = 256;
 
@@ -39,8 +39,16 @@ const FLAG_SIGNED: u8 = 0x04;
 /// peers ignore unknown flags bits and degrade to treating it as a TCP
 /// stream (Close after dial failure, fail fast).
 pub const FLAG_UDP: u8 = 0x08;
+/// flags bit: **set on Open frames only** — the stream asks for the
+/// agent↔agent inner TLS layer.
+///
+/// Old peers ignore unknown flags bits and keep the plain streaming
+/// behavior; a `required`-mode new peer treats their flagless streams as a
+/// downgrade and closes them (fail-closed, never plaintext).
+pub const FLAG_E2E: u8 = 0x10;
 /// flags mask: the bits currently defined.
-const FLAGS_KNOWN_MASK: u8 = FLAG_MUST_UNDERSTAND | FLAG_COMPRESSED | FLAG_SIGNED | FLAG_UDP;
+const FLAGS_KNOWN_MASK: u8 =
+    FLAG_MUST_UNDERSTAND | FLAG_COMPRESSED | FLAG_SIGNED | FLAG_UDP | FLAG_E2E;
 
 /// The carrying protocol of a tunnel stream (declared by the ingress rule, conveyed to egress via the Open frame).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -559,5 +567,31 @@ mod tests {
             StreamProto::from_frame_flags(FLAG_MUST_UNDERSTAND),
             StreamProto::Tcp
         );
+    }
+
+    /// FLAG_E2E is an Open-frame declaration orthogonal to StreamProto: it
+    /// survives encode/decode (must be inside FLAGS_KNOWN_MASK) and does not
+    /// perturb proto recovery — a TCP e2e stream is still Tcp.
+    #[test]
+    fn e2e_flag_round_trip_on_open() {
+        let mut buf = BytesMut::new();
+        assert!(
+            encode_frame(
+                FrameType::Open,
+                FLAG_E2E | FLAG_UDP,
+                "sid",
+                "agent",
+                b"1.2.3.4:53",
+                &mut buf
+            )
+            .is_some()
+        );
+        let mut rx = buf;
+        let DecodeOutcome::Ok(f) = decode_frame(&mut rx) else {
+            panic!("expected Ok");
+        };
+        assert_eq!(f.flags, FLAG_E2E | FLAG_UDP);
+        assert_eq!(StreamProto::from_frame_flags(f.flags), StreamProto::Udp);
+        assert_eq!(StreamProto::from_frame_flags(FLAG_E2E), StreamProto::Tcp);
     }
 }

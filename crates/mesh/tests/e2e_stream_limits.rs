@@ -24,48 +24,33 @@
 use interflow_core::protocol::{FrameType, StreamProto};
 use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::agent::AgentClient;
-use interflow_mesh::config::{AgentConfig, AgentInfo, HubSecurityConfig};
-use interflow_testkit::{hub_config, pick_ephemeral_port, spawn_hub};
+use interflow_mesh::config::HubSecurityConfig;
+use interflow_testkit::{agent_config, hub_config, pick_ephemeral_port, spawn_hub};
 use tokio::sync::mpsc;
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 /// Build and start a hub with the given security config; returns hub_port.
 async fn start_hub(security: HubSecurityConfig) -> u16 {
     let hub_port = pick_ephemeral_port();
-    let mut cfg = hub_config(hub_port, vec![]);
+    let mut cfg = hub_config(hub_port, certs(), vec![]);
     cfg.security = security;
     spawn_hub(cfg).await;
     hub_port
 }
 
-/// Build a minimal agent config (no ingress/egress; used only for
-/// registration + sending send_open).
-fn minimal_agent(hub_port: u16, id: &str) -> AgentConfig {
-    AgentConfig {
-        agent: AgentInfo {
-            id: id.to_string(),
-            hub_url: format!("http://127.0.0.1:{hub_port}"),
-            connect_timeout_secs: 5,
-            ..AgentInfo::default()
-        },
-        control: interflow_mesh::config::ControlConfig {
-            enabled: false,
-            ..interflow_mesh::config::ControlConfig::default()
-        },
-        logging: interflow_mesh::config::LoggingConfig {
-            level: "warn".to_string(),
-            format: interflow_mesh::config::LogFormat::Plain,
-        },
-        ..AgentConfig::default()
-    }
-}
-
 /// Connect to the hub + register + return an AgentTunnel (the caller holds
-/// _conn_handle to keep it alive).
+/// _conn_handle to keep it alive). The agent config is the testkit preset
+/// (mTLS client certificate CN == agent id + `https://` hub URL — the hub is
+/// mTLS-only since v4).
 async fn connect_tunnel(
     hub_port: u16,
     agent_id: &str,
 ) -> (AgentTunnel, tokio::task::JoinHandle<()>) {
-    let client = AgentClient::new(minimal_agent(hub_port, agent_id)).expect("agent build");
+    let client = AgentClient::new(agent_config(agent_id, hub_port, certs())).expect("agent build");
     let conn = client
         .connect_and_register()
         .await
@@ -74,7 +59,6 @@ async fn connect_tunnel(
         agent_id.to_string(),
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
-        None,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
             tokio_util::sync::CancellationToken::new(),
         ),

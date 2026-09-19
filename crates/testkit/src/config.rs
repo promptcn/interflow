@@ -7,25 +7,32 @@ use crate::certs::TestCerts;
 use interflow_core::protocol::StreamProto;
 use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
-    AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, AuthMode,
-    ControlConfig, EgressRule, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig, HubQuicConfig,
-    HubSecurityConfig, HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig, ServerConfig,
-    StaticTokenConfig, TransportKind,
+    AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, ControlConfig,
+    EgressRule, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig,
+    HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig, ServerConfig, TenantConfig,
+    TransportKind,
 };
 use std::net::SocketAddr;
 
-/// Convenience constructor for a test ACL rule.
-pub fn acl(source: &str, target: &str) -> AclRule {
+/// The single tenant every testkit hub trusts (the `TestCerts` CA).
+pub const TEST_TENANT: &str = "test";
+
+/// Convenience constructor for a cross-tenant ACL exception rule.
+pub fn acl(source_tenant: &str, source: &str, target_tenant: &str, target: &str) -> AclRule {
     AclRule {
+        source_tenant: source_tenant.to_string(),
         source: source.to_string(),
+        target_tenant: target_tenant.to_string(),
         target: target.to_string(),
     }
 }
 
-/// Build a minimal startable hub config: no TLS, allow_anonymous=true, optional ACL.
-pub fn hub_config(listen_port: u16, acl_rules: Vec<AclRule>) -> HubConfig {
+/// Build a minimal startable hub config: mTLS with the TestCerts CA as the
+/// single `test` tenant, TLS on, optional cross-tenant ACL exceptions.
+pub fn hub_config(listen_port: u16, certs: &TestCerts, acl_rules: Vec<AclRule>) -> HubConfig {
     hub_config_tuned(
         listen_port,
+        certs,
         acl_rules,
         HubSecurityConfig::default(),
         HeartbeatConfig::default(),
@@ -36,6 +43,7 @@ pub fn hub_config(listen_port: u16, acl_rules: Vec<AclRule>) -> HubConfig {
 /// use short timeouts).
 pub fn hub_config_tuned(
     listen_port: u16,
+    certs: &TestCerts,
     acl_rules: Vec<AclRule>,
     security: HubSecurityConfig,
     heartbeat: HeartbeatConfig,
@@ -46,15 +54,22 @@ pub fn hub_config_tuned(
             listen_addr: format!("127.0.0.1:{listen_port}")
                 .parse()
                 .expect("listen addr"),
+            proxy_protocol: Default::default(),
         },
         auth: AuthConfig {
-            mode: AuthMode::Anonymous,
-            allow_anonymous: true,
             rate_limit_per_minute: 0, // rate limiting disabled for tests
-            static_token: None,
-            mtls: None,
+            tenants: vec![TenantConfig {
+                name: TEST_TENANT.to_string(),
+                ca_path: certs.ca_path().display().to_string(),
+                trusted_gateway: false,
+            }],
         },
-        tls: None,
+        tls: Some(HubTlsConfig {
+            enabled: true,
+            cert_path: certs.server_cert_path().display().to_string(),
+            key_path: certs.server_key_path().display().to_string(),
+            min_version: TlsMinVersion::V1_2,
+        }),
         acl: AclConfig {
             rules: acl_rules.into_iter().collect(),
         },
@@ -67,50 +82,10 @@ pub fn hub_config_tuned(
     }
 }
 
-/// Build a hub config with a static token (for auth-failure tests).
-pub fn hub_config_with_token(
-    listen_port: u16,
-    agent_token: &str,
-    admin_token: Option<&str>,
-) -> HubConfig {
-    HubConfig {
-        config_version: HUB_CONFIG_VERSION,
-        server: ServerConfig {
-            listen_addr: format!("127.0.0.1:{listen_port}")
-                .parse()
-                .expect("listen addr"),
-        },
-        auth: AuthConfig {
-            mode: AuthMode::StaticToken,
-            allow_anonymous: false,
-            rate_limit_per_minute: 0,
-            static_token: Some(StaticTokenConfig {
-                agent: Some(agent_token.to_string()),
-                admin: admin_token.map(str::to_string),
-            }),
-            mtls: None,
-        },
-        tls: None,
-        acl: AclConfig::default(),
-        security: HubSecurityConfig::default(),
-        heartbeat: HeartbeatConfig::default(),
-        metrics: MetricsConfig::default(),
-        audit: Default::default(),
-        logging: LoggingConfig::default(),
-        transport: Default::default(),
-    }
-}
-
-/// Build a QUIC-enabled hub config (TLS mandatory, anonymous mode; QUIC and TCP share the
-/// same port as a dual stack).
+/// Build a QUIC-enabled hub config (QUIC and TCP share the same port as a
+/// dual stack).
 pub fn hub_quic_config(listen_port: u16, certs: &TestCerts, acl_rules: Vec<AclRule>) -> HubConfig {
-    let mut cfg = hub_config(listen_port, acl_rules);
-    cfg.tls = Some(HubTlsConfig {
-        enabled: true,
-        cert_path: certs.server_cert_path().display().to_string(),
-        key_path: certs.server_key_path().display().to_string(),
-        min_version: TlsMinVersion::V1_3,
-    });
+    let mut cfg = hub_config(listen_port, certs, acl_rules);
     cfg.transport.quic = HubQuicConfig {
         enabled: true,
         // Default: same port as TCP (TCP/UDP coexist independently)
@@ -128,17 +103,26 @@ pub fn unlock_stream_limits(cfg: &mut HubConfig) {
     cfg.security.max_streams_total = 0;
 }
 
-/// Build a minimal startable agent config (h2, anonymous, warn-level logs).
-pub fn agent_config(id: &str, hub_port: u16) -> AgentConfig {
+/// Build a minimal startable agent config (h2 + mTLS client certificate
+/// signed by the TestCerts CA — the CN must equal `id`).
+pub fn agent_config(id: &str, hub_port: u16, certs: &TestCerts) -> AgentConfig {
+    let (cert, key) = certs.named_client_cert(id);
     AgentConfig {
         agent: AgentInfo {
             id: id.to_string(),
-            hub_url: format!("http://127.0.0.1:{hub_port}"),
+            hub_url: format!("https://127.0.0.1:{hub_port}"),
             // Test-only override: a shorter connect budget keeps failure
             // cases at second scale (production default is 15s).
             connect_timeout_secs: 5,
             ..AgentInfo::default()
         },
+        tls: Some(AgentTlsConfig {
+            enabled: true,
+            ca_path: Some(certs.ca_path().display().to_string()),
+            client_cert_path: Some(cert.display().to_string()),
+            client_key_path: Some(key.display().to_string()),
+            hub_cert_fingerprint: None,
+        }),
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()
@@ -151,19 +135,11 @@ pub fn agent_config(id: &str, hub_port: u16) -> AgentConfig {
     }
 }
 
-/// Build a QUIC agent config (CA verification, no client certificate; mTLS scenarios add
-/// the cert/key separately).
+/// Build a QUIC agent config (mTLS, same certificate discipline as h2).
 pub fn agent_quic_config(id: &str, hub_port: u16, certs: &TestCerts) -> AgentConfig {
-    let mut cfg = agent_config(id, hub_port);
+    let mut cfg = agent_config(id, hub_port, certs);
     cfg.agent.transport = TransportKind::Quic;
     cfg.agent.hub_quic_addr = Some(format!("127.0.0.1:{hub_port}"));
-    cfg.tls = Some(AgentTlsConfig {
-        enabled: true,
-        ca_path: Some(certs.ca_path().display().to_string()),
-        client_cert_path: None,
-        client_key_path: None,
-        hub_cert_fingerprint: None,
-    });
     cfg
 }
 

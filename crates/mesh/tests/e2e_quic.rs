@@ -30,17 +30,19 @@
     unused_mut
 )]
 use interflow_core::protocol::StreamProto;
-use interflow_mesh::config::{
-    AgentTlsConfig, AuthConfig, AuthMode, EgressRule, IngressRule, MtlsConfig,
-};
-use interflow_testkit::certs::TestCerts;
+use interflow_mesh::config::{AgentTlsConfig, AuthConfig, EgressRule, IngressRule, TenantConfig};
 use interflow_testkit::{
-    acl, agent_config, agent_quic_config, echo_server, hub_quic_config, pick_ephemeral_port,
+    agent_config, agent_quic_config, echo_server, hub_quic_config, pick_ephemeral_port,
     spawn_agent, spawn_hub, spawn_udp_echo, tcp_egress_rule, tcp_ingress_rule, udp_echo_round_trip,
     udp_egress_rule, udp_ingress_rule, wait_for_tcp,
 };
 use std::net::SocketAddr;
 use std::time::Duration;
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 // ---------------------------------------------------------------------------
 // T4: transport matrix
@@ -49,17 +51,14 @@ use std::time::Duration;
 /// TCP echo round trip over quic x quic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_tcp_round_trip() {
-    let certs = TestCerts::generate("quic-e2e", "quic-egress");
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,interflow=debug")
+        .try_init();
     let (echo_addr, _echo) = echo_server().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_quic_config(
-        hub_port,
-        &certs,
-        vec![acl("ingress", "egress")],
-    ))
-    .await;
+    let _hub = spawn_hub(hub_quic_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![EgressRule {
         name: "echo".to_string(),
         target_addr: echo_addr,
@@ -69,7 +68,7 @@ async fn quic_tcp_round_trip() {
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_quic_config("ingress", hub_port, &certs);
+    let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         name: "to-egress".to_string(),
         listen_addr: format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -101,22 +100,16 @@ async fn quic_tcp_round_trip() {
 /// UDP echo round trip over quic x quic (UDP carried over a QUIC stream).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_udp_round_trip() {
-    let certs = TestCerts::generate("quic-e2e", "quic-egress");
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_quic_config(
-        hub_port,
-        &certs,
-        vec![acl("ingress", "egress")],
-    ))
-    .await;
+    let _hub = spawn_hub(hub_quic_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_quic_config("ingress", hub_port, &certs);
+    let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
         format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -136,18 +129,15 @@ async fn quic_udp_round_trip() {
 /// Cross-transport interop: h2 (TLS) ingress <-> quic egress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_transport_h2_ingress_quic_egress() {
-    let certs = TestCerts::generate("quic-e2e", "quic-egress");
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,interflow=debug")
+        .try_init();
     let (echo_addr, _echo) = echo_server().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_quic_config(
-        hub_port,
-        &certs,
-        vec![acl("ingress", "egress")],
-    ))
-    .await;
+    let _hub = spawn_hub(hub_quic_config(hub_port, certs(), Vec::new())).await;
 
     // quic egress
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![EgressRule {
         name: "echo".to_string(),
         target_addr: echo_addr,
@@ -157,15 +147,8 @@ async fn cross_transport_h2_ingress_quic_egress() {
     let _egress = spawn_agent(egress_cfg);
 
     // h2 ingress (TLS over TCP, certificates from the same CA)
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.agent.hub_url = format!("https://localhost:{hub_port}");
-    ingress_cfg.tls = Some(AgentTlsConfig {
-        enabled: true,
-        ca_path: Some(certs.ca_path().display().to_string()),
-        client_cert_path: None,
-        client_key_path: None,
-        hub_cert_fingerprint: None,
-    });
     let ingress_port = pick_ephemeral_port();
     ingress_cfg.ingress = vec![IngressRule {
         name: "to-egress".to_string(),
@@ -201,22 +184,16 @@ async fn cross_transport_h2_ingress_quic_egress() {
 /// still preserved by the frame payload_len, byte for byte identical.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_udp_datagram_mixed_sizes() {
-    let certs = TestCerts::generate("quic-e2e", "quic-egress");
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_quic_config(
-        hub_port,
-        &certs,
-        vec![acl("ingress", "egress")],
-    ))
-    .await;
+    let _hub = spawn_hub(hub_quic_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_quic_config("ingress", hub_port, &certs);
+    let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
         format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -250,25 +227,26 @@ async fn quic_udp_datagram_mixed_sizes() {
 /// and sends/receives normally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_mtls_valid_client_cert() {
-    let certs = TestCerts::generate("quic-e2e", "quic-egress");
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("info,interflow=debug")
+        .try_init();
     let (echo_addr, _echo) = echo_server().await;
     let hub_port = pick_ephemeral_port();
 
-    let mut hub_cfg = hub_quic_config(hub_port, &certs, vec![acl("ingress", "quic-egress")]);
+    let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
     hub_cfg.auth = AuthConfig {
-        mode: AuthMode::Mtls,
-        allow_anonymous: false,
         rate_limit_per_minute: 0,
-        static_token: None,
-        mtls: Some(MtlsConfig {
-            ca_path: certs.ca_path().display().to_string(),
-        }),
+        tenants: vec![TenantConfig {
+            name: interflow_testkit::TEST_TENANT.to_string(),
+            ca_path: certs().ca_path().display().to_string(),
+            trusted_gateway: false,
+        }],
     };
     let _hub = spawn_hub(hub_cfg).await;
 
     // quic egress (client certificate with CN = quic-egress)
-    let (client_cert, client_key) = certs.client_paths();
-    let mut egress_cfg = agent_quic_config("quic-egress", hub_port, &certs);
+    let (client_cert, client_key) = certs().named_client_cert("quic-egress");
+    let mut egress_cfg = agent_quic_config("quic-egress", hub_port, certs());
     egress_cfg.agent.id = "quic-egress".to_string();
     egress_cfg.egress = vec![EgressRule {
         name: "echo".to_string(),
@@ -278,7 +256,7 @@ async fn quic_mtls_valid_client_cert() {
     }];
     egress_cfg.tls = Some(AgentTlsConfig {
         enabled: true,
-        ca_path: Some(certs.ca_path().display().to_string()),
+        ca_path: Some(certs().ca_path().display().to_string()),
         client_cert_path: Some(client_cert.display().to_string()),
         client_key_path: Some(client_key.display().to_string()),
         hub_cert_fingerprint: None,
@@ -287,9 +265,9 @@ async fn quic_mtls_valid_client_cert() {
 
     // quic ingress (a client certificate with CN=ingress issued by the same
     // CA)
-    let (ingress_cert, ingress_key) = certs.named_client_cert("ingress");
+    let (ingress_cert, ingress_key) = certs().named_client_cert("ingress");
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_quic_config("ingress", hub_port, &certs);
+    let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         name: "to-egress".to_string(),
         listen_addr: format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -303,7 +281,7 @@ async fn quic_mtls_valid_client_cert() {
     }];
     ingress_cfg.tls = Some(AgentTlsConfig {
         enabled: true,
-        ca_path: Some(certs.ca_path().display().to_string()),
+        ca_path: Some(certs().ca_path().display().to_string()),
         client_cert_path: Some(ingress_cert.display().to_string()),
         client_key_path: Some(ingress_key.display().to_string()),
         hub_cert_fingerprint: None,
@@ -322,49 +300,47 @@ async fn quic_mtls_valid_client_cert() {
     assert_eq!(resp, payload);
 }
 
-/// Under mTLS, a client certificate with a mismatched CN is rejected: agent
-/// registration fails (connection closed).
+/// Under mTLS, a client certificate with a mismatched CN never reaches the
+/// hub. Since the 2026-09-18 identity pre-validation (design §3.2) the
+/// mismatch fails at `AgentClient` construction — a local config error
+/// instead of a rejected registration — so the wrong pair cannot even
+/// start. The hub-side CN check remains as the backstop for clients that
+/// bypass mesh's own agent stack.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_mtls_cn_mismatch_rejected() {
-    let certs = TestCerts::generate("quic-e2e", "quic-egress");
     let hub_port = pick_ephemeral_port();
 
-    let mut hub_cfg = hub_quic_config(hub_port, &certs, vec![]);
+    let mut hub_cfg = hub_quic_config(hub_port, certs(), vec![]);
     hub_cfg.auth = AuthConfig {
-        mode: AuthMode::Mtls,
-        allow_anonymous: false,
         rate_limit_per_minute: 0,
-        static_token: None,
-        mtls: Some(MtlsConfig {
-            ca_path: certs.ca_path().display().to_string(),
-        }),
+        tenants: vec![TenantConfig {
+            name: interflow_testkit::TEST_TENANT.to_string(),
+            ca_path: certs().ca_path().display().to_string(),
+            trusted_gateway: false,
+        }],
     };
     let _hub = spawn_hub(hub_cfg).await;
 
     // Certificate with CN = quic-egress, but the agent id claims ingress →
-    // must be rejected
-    let (client_cert, client_key) = certs.client_paths();
-    let mut cfg = agent_quic_config("ingress", hub_port, &certs);
+    // must be rejected at construction, hub or no hub
+    let (client_cert, client_key) = certs().named_client_cert("quic-egress");
+    let mut cfg = agent_quic_config("ingress", hub_port, certs());
     cfg.tls = Some(AgentTlsConfig {
         enabled: true,
-        ca_path: Some(certs.ca_path().display().to_string()),
+        ca_path: Some(certs().ca_path().display().to_string()),
         client_cert_path: Some(client_cert.display().to_string()),
         client_key_path: Some(client_key.display().to_string()),
         hub_cert_fingerprint: None,
     });
 
-    let client = interflow_mesh::agent::AgentClient::new(cfg).expect("agent build");
-    let handle = client.start();
-    // Registration rejected → connection closed by the hub → the session
-    // fails and loops reconnecting (failing forever)
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    use interflow_mesh::agent::AgentState;
-    let state = handle.state();
+    let err = interflow_mesh::agent::AgentClient::new(cfg)
+        .map(|_| ())
+        .expect_err("CN mismatch must fail construction, not registration");
     assert!(
-        !matches!(state, AgentState::Connected { .. }),
-        "QUIC registration with a mismatched CN must fail (actual state: {state:?})"
+        err.to_string()
+            .contains("agent ID must equal the certificate CN (quic-egress)"),
+        "wrong message: {err}"
     );
-    let _ = handle.shutdown_graceful().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -375,17 +351,11 @@ async fn quic_mtls_cn_mismatch_rejected() {
 // evicts), re-registration restores forwarding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_disconnect_evicts_and_recovers() {
-    let certs = TestCerts::generate("quic-e2e", "quic-egress");
     let (echo_addr, _echo) = echo_server().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_quic_config(
-        hub_port,
-        &certs,
-        vec![acl("ingress", "egress")],
-    ))
-    .await;
+    let _hub = spawn_hub(hub_quic_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![EgressRule {
         name: "echo".to_string(),
         target_addr: echo_addr,
@@ -402,7 +372,7 @@ async fn quic_disconnect_evicts_and_recovers() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_quic_config("ingress", hub_port, &certs);
+    let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         name: "to-egress".to_string(),
         listen_addr: format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -490,14 +460,13 @@ async fn assert_conn_torn_down(sock: &mut tokio::net::TcpStream, budget: Duratio
 /// soak guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_open_to_unregistered_target_closes_client_connection() {
-    let certs = TestCerts::generate("quic-close-sentinel", "ingress");
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_quic_config(hub_port, &certs, vec![])).await;
+    let _hub = spawn_hub(hub_quic_config(hub_port, certs(), vec![])).await;
 
     // The ingress's target points at an agent that never registers — the Open
     // must go down the hub's synchronous-rejection path
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_quic_config("ingress", hub_port, &certs);
+    let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![tcp_ingress_rule(
         "to-missing",
         format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -537,22 +506,16 @@ async fn quic_open_to_unregistered_target_closes_client_connection() {
 /// hang. This case must fail before the fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_target_agent_disconnect_tears_down_source_client_connections() {
-    let certs = TestCerts::generate("quic-close-sentinel", "egress");
     let (echo_addr, _echo) = echo_server().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_quic_config(
-        hub_port,
-        &certs,
-        vec![acl("ingress", "egress")],
-    ))
-    .await;
+    let _hub = spawn_hub(hub_quic_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_quic_config("ingress", hub_port, &certs);
+    let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![tcp_ingress_rule(
         "to-egress",
         format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -623,9 +586,8 @@ async fn quic_hub_silent_death_idle_agent_leaves_connected() {
     use interflow_testkit::impair::{ImpairConfig, UdpImpairProxy};
     use interflow_testkit::wait_agent_connected;
 
-    let certs = TestCerts::generate("quic-blackhole", "idle-agent");
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_quic_config(hub_port, &certs, vec![])).await;
+    let _hub = spawn_hub(hub_quic_config(hub_port, certs(), vec![])).await;
 
     // Pass-through impairment proxy: all of the agent's QUIC traffic reaches
     // the hub through it (zero latency, zero loss)
@@ -640,7 +602,7 @@ async fn quic_hub_silent_death_idle_agent_leaves_connected() {
     .await
     .expect("impair proxy");
 
-    let mut cfg = agent_quic_config("idle-agent", hub_port, &certs);
+    let mut cfg = agent_quic_config("idle-agent", hub_port, certs());
     cfg.agent.hub_quic_addr = Some(proxy.local_addr().to_string());
     let agent = spawn_agent(cfg);
 

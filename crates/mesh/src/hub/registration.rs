@@ -9,7 +9,7 @@ use interflow_core::tunnel::negotiation::{HeartbeatAd, RegisterResponse};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 impl HubService {
     /// Handles a `/register` request.
@@ -29,40 +29,59 @@ impl HubService {
         &self,
         agent_id: String,
     ) -> Result<Response<HubResponseBody>> {
-        info!("Agent registered: {} from {}", agent_id, self.peer_addr);
-
-        // Identity binding check
-        {
-            let mut identity = self.connection_identity.write().await;
-            if let Some(existing_id) = &*identity {
-                if existing_id != &agent_id {
+        // Identity binding: the claimed bare id must equal the mTLS-derived
+        // identity's agent (CN). The tenant is never claimable — it comes
+        // from the certificate chain's anchoring root, so cross-tenant
+        // preemption is structurally impossible.
+        let identity = {
+            let identity = self.connection_identity.read().await;
+            match &*identity {
+                Some(existing) if existing.agent == agent_id => existing.clone(),
+                Some(existing) => {
                     warn!(
-                        "identity mismatch: connection is bound to {}, but registration attempt is for {}",
-                        existing_id, agent_id
+                        "identity mismatch: connection is bound to {}/{}, but registration attempt is for {agent_id}",
+                        existing.tenant, existing.agent
                     );
                     metrics::counter!("interflow_hub_auth_failures", "reason" => "identity_mismatch").increment(1);
                     self.audit.record(
                         AuditKind::AgentRegisterDenied {
                             reason: format!(
-                                "identity_mismatch: bound={existing_id}, claimed={agent_id}"
+                                "identity_mismatch: bound={}/{}, claimed={agent_id}",
+                                existing.tenant, existing.agent
                             ),
                         },
-                        Some(existing_id.clone()),
+                        Some(existing.qualified()),
                         Some(self.peer_str()),
                     );
                     return Ok(text_response(StatusCode::FORBIDDEN, "Identity mismatch"));
                 }
-            } else {
-                *identity = Some(agent_id.clone());
-                debug!("Connection bound to identity: {}", agent_id);
+                None => {
+                    metrics::counter!("interflow_hub_auth_failures", "reason" => "no_client_cert")
+                        .increment(1);
+                    self.audit.record(
+                        AuditKind::AgentRegisterDenied {
+                            reason: "no_client_cert".into(),
+                        },
+                        None,
+                        Some(self.peer_str()),
+                    );
+                    return Ok(text_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Client certificate required",
+                    ));
+                }
             }
-        }
+        };
+        let agent_key = identity.qualified();
+        info!("Agent registered: {agent_key} from {}", self.peer_addr);
 
         // Single write lock: atomically insert or replace the channel in
         // place (see [`AgentSession::install_channels`] for why in place).
+        // The registry key is tenant-qualified: the same bare id under
+        // another tenant is a different, non-colliding entry.
         let registered_count = {
             let mut agents = self.agents.write().await;
-            match agents.get(&agent_id) {
+            match agents.get(&agent_key) {
                 Some(existing) => {
                     // h2 registration overwrites a QUIC session: the old
                     // relay connection closes itself out via its
@@ -71,7 +90,7 @@ impl HubService {
                 }
                 None => {
                     agents.insert(
-                        agent_id.clone(),
+                        agent_key.clone(),
                         Arc::new(RwLock::new(AgentSession::new(None))),
                     );
                 }
@@ -93,15 +112,15 @@ impl HubService {
             &self.agents,
             &self.active_streams,
             &self.stream_counts,
-            &agent_id,
+            &agent_key,
         )
         .await;
 
         self.audit.record(
             AuditKind::AgentRegistered {
-                agent_id: agent_id.clone(),
+                agent_id: agent_key.clone(),
             },
-            Some(agent_id),
+            Some(agent_key),
             Some(self.peer_str()),
         );
 

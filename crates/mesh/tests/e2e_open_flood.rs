@@ -46,7 +46,7 @@ use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, hub_config_tuned, metrics_harness::counter_value,
     metrics_harness::eventually, metrics_harness::init_tracing, metrics_harness::metrics_handle,
-    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_agent, spawn_hub,
+    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_hub,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -55,6 +55,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 /// Serial test lock: multiple stacks within the same binary share the global
 /// recorder; serializing avoids counter interference.
@@ -115,7 +120,7 @@ async fn connect_tunnel(
     hub_port: u16,
     agent_id: &str,
 ) -> (AgentTunnel, tokio::task::JoinHandle<()>) {
-    let client = AgentClient::new(agent_config(agent_id, hub_port)).expect("agent build");
+    let client = AgentClient::new(agent_config(agent_id, hub_port, certs())).expect("agent build");
     let conn = client
         .connect_and_register()
         .await
@@ -124,7 +129,6 @@ async fn connect_tunnel(
         agent_id.to_string(),
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
-        None,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
             tokio_util::sync::CancellationToken::new(),
         ),
@@ -245,6 +249,7 @@ async fn f1_flood_does_not_break_session() {
     };
     spawn_hub(hub_config_tuned(
         hub_port,
+        certs(),
         vec![],
         security,
         interflow_mesh::config::HeartbeatConfig::default(),
@@ -252,10 +257,10 @@ async fn f1_flood_does_not_break_session() {
     .await;
     let (echo_addr, _echo) = echo_server().await;
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.max_stream_opens_per_sec = 0;
     eg.max_incoming_streams = 0;
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;
@@ -293,14 +298,14 @@ async fn f2_local_stream_limit_rejects_and_releases() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
     let (backend, conns, _active) = counting_backend().await;
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.max_incoming_streams = 4;
     eg.max_stream_opens_per_sec = 0;
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;
@@ -354,15 +359,15 @@ async fn f3_rate_limit_bounds_churn_connections() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
     let (backend, conns, _active) = counting_backend().await;
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.max_stream_opens_per_sec = 5;
     eg.stream_open_burst = 10;
     eg.max_incoming_streams = 0;
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;
@@ -412,18 +417,18 @@ async fn f4_dial_failure_frees_slot() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
     // A closed local port: the connection is guaranteed to be refused
     // (ECONNREFUSED), deterministic across environments
     let refused_addr = format!("127.0.0.1:{}", interflow_testkit::pick_ephemeral_port());
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.egress_connect_timeout_secs = 1;
     eg.egress_resolve_timeout_secs = 1;
     eg.max_incoming_streams = 1;
     eg.max_stream_opens_per_sec = 0;
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;
@@ -455,11 +460,11 @@ async fn f5_legit_burst_not_rejected() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
 
-    let eg = agent_config("eg", hub_port); // all defaults: 100/s + burst 256 + local 256
-    spawn_agent(eg);
+    let eg = agent_config("eg", hub_port, certs()); // all defaults: 100/s + burst 256 + local 256
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;
@@ -499,12 +504,12 @@ async fn f6_no_slot_leak_after_flood() {
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.max_incoming_streams = 8;
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;

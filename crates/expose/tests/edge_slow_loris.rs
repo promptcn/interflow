@@ -23,6 +23,8 @@
 )]
 use interflow_expose::client::ExposeArgs;
 use interflow_expose::edge::EdgeArgs;
+use interflow_expose::edge::EdgeHubTls;
+use interflow_mesh::agent::AgentState;
 use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -93,6 +95,7 @@ async fn spawn_stack(
         r#"
 [[routes]]
 host = "test.local"
+tenant = "test"
 agent_id = "expose-test"
 remote_addr = "{backend_addr}"
 "#
@@ -103,11 +106,17 @@ remote_addr = "{backend_addr}"
     ));
     std::fs::write(&routes_path, &routes_content).expect("write routes.toml");
 
+    let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let edge_args = EdgeArgs {
         listen_addr: edge_listen,
         hub_listen_addr: hub_listen,
         routes_path: routes_path.to_string_lossy().into_owned(),
-        agent_token: "test-token".into(),
+        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
+        proxy_protocol: Default::default(),
+        hub_tls: Some(EdgeHubTls {
+            cert_path: certs.server_cert_path().display().to_string(),
+            key_path: certs.server_key_path().display().to_string(),
+        }),
         audit_path,
         stream_idle_timeout_secs,
         agent_recovery_timeout_secs: 120,
@@ -122,17 +131,32 @@ remote_addr = "{backend_addr}"
         .await
         .expect("edge hub should start within 5s");
 
+    let (client_cert, client_key) = certs.client_paths();
     let client_args = ExposeArgs {
         local_ports: vec![backend_addr.port()],
-        hub_url: format!("http://127.0.0.1:{hub_port}"),
-        auth_token: "test-token".into(),
+        hub_url: format!("https://127.0.0.1:{hub_port}"),
+        client_cert: Some(client_cert.display().to_string()),
+        client_key: Some(client_key.display().to_string()),
         agent_id: "expose-test".into(),
-        ca_path: None,
+        ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
     };
-    tokio::task::spawn(async move { interflow_expose::client::start(&client_args)?.join().await });
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let handle = interflow_expose::client::start(&client_args).expect("start expose client");
+    let mut state = handle.subscribe_state();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match state.borrow_and_update().clone() {
+            AgentState::Connected { agent_id } if agent_id == client_args.agent_id => break,
+            AgentState::Failed { error } => panic!("expose client failed: {error}"),
+            _ => {}
+        }
+        tokio::time::timeout_at(deadline, state.changed())
+            .await
+            .expect("expose client should register within 5s")
+            .expect("expose client state watch should stay alive");
+    }
+    tokio::task::spawn(async move { handle.join().await });
 
     edge_listen
 }

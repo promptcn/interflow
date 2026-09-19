@@ -48,8 +48,9 @@ are described in [THREAT_MODEL.md](THREAT_MODEL.md).
 
 **Out of scope**
 
-- Compromised trusted credentials (e.g. a leaked hub Bearer token or TLS
-  private key). Key material is the trust boundary it is; rotate it.
+- Compromised trusted credentials (e.g. a leaked tenant CA key, agent
+  private key, or hub TLS private key). Key material is the trust boundary
+  it is; rotate it.
 - Volumetric DDoS that saturates the host's network before interflow sees it.
   Reports of *asymmetric* resource exhaustion in interflow's own handling
   (cheap for the attacker, expensive for the process) are in scope.

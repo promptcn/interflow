@@ -4,12 +4,11 @@
 use crate::config::load_hub_config;
 // Unconditional: the spawn_reload_task signature references HubLimits on all
 // platforms (the non-Unix body is a no-op, but the type must still resolve).
+use crate::hub::SharedHubConfig;
 use crate::hub::state::HubLimits;
-use crate::hub::{SharedHubConfig, SharedTlsAcceptor};
+use crate::hub::state::SharedTlsPlane;
 #[cfg(unix)]
 use interflow_core::telemetry;
-#[cfg(unix)]
-use interflow_core::tls::build_tls_acceptor;
 #[cfg(unix)]
 use std::sync::atomic::Ordering;
 #[cfg(unix)]
@@ -26,10 +25,14 @@ const DEBOUNCE: std::time::Duration = interflow_core::config::params::SIGHUP_REL
 ///
 /// The reload contract, made explicit (see [`restart_required_changes`]):
 ///
-/// **Reloaded immediately** — logging level; limit atomics (ACL toggle /
-/// stream caps / `channel_send_timeout` / `poll_grace`, see [`HubLimits`]);
-/// the TLS acceptor; the heartbeat cadence (the loop re-reads config every
-/// tick); the whole `HubConfig` document every reader sees afterwards.
+/// **Reloaded immediately** — logging level; limit atomics (stream caps /
+/// `channel_send_timeout` / `poll_grace`, see [`HubLimits`]); the TLS plane
+/// (mTLS acceptor **with client certificates required** + the tenant
+/// derivation set, rebuilt together from the tenant trust table — the
+/// fail-open regression where a reload silently swapped in a no-client-auth
+/// acceptor is structurally excluded since 2026-09-18); the heartbeat
+/// cadence (the loop re-reads config every tick); the whole `HubConfig`
+/// document every reader sees afterwards.
 ///
 /// **Applied to NEW connections only** — `[transport.h2]` keepalive and
 /// `[transport.quic]` idle/keepalive/datagram tuning (transport configs are
@@ -47,7 +50,7 @@ const DEBOUNCE: std::time::Duration = interflow_core::config::params::SIGHUP_REL
 pub fn spawn_reload_task(
     config_path: String,
     config_lock: SharedHubConfig,
-    tls_acceptor_lock: SharedTlsAcceptor,
+    tls_plane_lock: SharedTlsPlane,
     limits: HubLimits,
     tasks: &tokio_util::task::TaskTracker,
     shutdown: tokio_util::sync::CancellationToken,
@@ -76,7 +79,7 @@ pub fn spawn_reload_task(
                 }
                 last_reload = Some(std::time::Instant::now());
                 info!("Received SIGHUP, reloading configuration...");
-                reload_once(&config_path, &config_lock, &tls_acceptor_lock, &limits).await;
+                reload_once(&config_path, &config_lock, &tls_plane_lock, &limits).await;
             }
         });
     }
@@ -85,7 +88,7 @@ pub fn spawn_reload_task(
         let _ = (
             config_path,
             config_lock,
-            tls_acceptor_lock,
+            tls_plane_lock,
             limits,
             tasks,
             shutdown,
@@ -134,7 +137,7 @@ fn restart_required_changes(
 async fn reload_once(
     config_path: &str,
     config_lock: &SharedHubConfig,
-    tls_acceptor_lock: &SharedTlsAcceptor,
+    tls_plane_lock: &SharedTlsPlane,
     limits: &HubLimits,
 ) {
     match load_hub_config(config_path) {
@@ -145,37 +148,30 @@ async fn reload_once(
 
             // 2. Update limit atomics (lock-free reads on the hot path)
             limits
-                .acl_enabled
-                .store(!new_config.acl.is_empty(), Ordering::Relaxed);
-
-            // 3. Update TLS configuration (normalized at the loading layer: Some means enabled)
-            let new_tls_acceptor = new_config
-                .tls
-                .as_ref()
-                .and_then(|tls_config| {
-                    match build_tls_acceptor(
-                        &tls_config.cert_path,
-                        &tls_config.key_path,
-                        tls_config.min_version,
-                    ) {
-                        Ok(acceptor) => Some(acceptor),
-                        Err(e) => {
-                            error!("TLS reload failed: {e}");
-                            None
-                        }
-                    }
-                })
-                .flatten();
-
-            {
-                let mut tls_w = tls_acceptor_lock.write().await;
-                *tls_w = new_tls_acceptor;
-            }
-
-            // 4. Update stream count caps and channel timeouts
-            limits
                 .max_streams_per_agent
                 .store(new_config.security.max_streams_per_agent, Ordering::Relaxed);
+
+            // 3. Rebuild the TLS plane from the tenant trust table: the mTLS
+            // acceptor (client certificates required) and the tenant
+            // derivation set swap together, as one generation. A build
+            // failure keeps the old plane serving — reload is fail-closed,
+            // never fail-open (the pre-2026-09-18 reload built a
+            // no-client-auth acceptor here, silently disabling client-certificate
+            // enforcement for every connection accepted afterwards).
+            match crate::hub::server::build_runtime_tls_plane(&new_config) {
+                Ok(new_plane) => {
+                    let mut plane_w = tls_plane_lock
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *plane_w = std::sync::Arc::new(new_plane);
+                    info!("TLS plane reloaded (mTLS acceptor + tenant table)");
+                }
+                Err(e) => {
+                    error!("TLS plane reload failed (keeping the old plane): {e}");
+                }
+            }
+
+            // 4. Update stream caps and channel timeouts
             limits
                 .max_streams_total
                 .store(new_config.security.max_streams_total, Ordering::Relaxed);
@@ -215,8 +211,7 @@ async fn reload_once(
 mod tests {
     use super::*;
     use crate::config::{
-        AclConfig, AuthConfig, AuthMode, HubConfig, HubSecurityConfig, MetricsConfig, ServerConfig,
-        StaticTokenConfig,
+        AclConfig, AuthConfig, HubConfig, HubSecurityConfig, MetricsConfig, ServerConfig,
     };
     use interflow_core::config::{AuditConfig, LoggingConfig};
 
@@ -225,16 +220,11 @@ mod tests {
             config_version: crate::config::HUB_CONFIG_VERSION,
             server: ServerConfig {
                 listen_addr: "127.0.0.1:6666".parse().unwrap(),
+                proxy_protocol: Default::default(),
             },
             auth: AuthConfig {
-                mode: AuthMode::StaticToken,
-                allow_anonymous: false,
                 rate_limit_per_minute: 30,
-                static_token: Some(StaticTokenConfig {
-                    agent: Some("t".to_string()),
-                    admin: None,
-                }),
-                mtls: None,
+                tenants: Vec::new(),
             },
             tls: None,
             acl: AclConfig::default(),

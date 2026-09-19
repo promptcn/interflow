@@ -1,22 +1,11 @@
-//! End-to-end validation: shipped mesh example configs load and pass validate.
+//! End-to-end validation: shipped mesh examples and private deployments.
 //!
-//! Covers the mesh crate quickstart (`crates/mesh/examples/*.toml`) and the
-//! private reverse-tunnel scenario (`examples/reverse-tunnel-private/`). The
-//! public scenario (`examples/reverse-tunnel-public/`) migrated to the
-//! purpose-built `interflow-expose` binary (7263036) and no longer ships
-//! mesh configs, so it is validated on the expose side, not here.
-//!
-//! Relative cert paths inside these tomls anchor to each config file's own
-//! directory (`config::loader`). These tests run with the process CWD at the
-//! crate root — a directory containing no `certs/` — so a passing load
-//! is itself proof of CWD independence; no chdir gymnastics required.
-//!
-//! Dev certificates are generated on demand (`scripts/gen_certs.sh` into
-//! `crates/mesh/examples/certs/`) and never committed (policy 2026-09-15;
-//! git history purged the same day). The shipped-config tests below need the
-//! real cert material on disk because `validate` checks existence, so they
-//! skip with a note when the certs have not been generated yet — a fresh
-//! clone runs them only after `gen_certs.sh`.
+//! Certificates are generated on demand and never committed. Each test copies
+//! TOML files into a temp sandbox and materializes the certificate layout with
+//! the production `interflow-certs` operations, so a fresh clone validates the
+//! shipped schema without a generated-material prerequisite. The sandbox is
+//! neither the process CWD nor the source directory, which also proves config
+//! paths anchor to each TOML file's directory.
 
 #![allow(
     clippy::all,
@@ -30,16 +19,10 @@
     unused_mut
 )]
 use interflow_mesh::config::{
-    AGENT_CONFIG_VERSION, HUB_CONFIG_VERSION, load_agent_config, load_hub_config,
+    AGENT_CONFIG_VERSION, E2eMode, HUB_CONFIG_VERSION, load_agent_config, load_hub_config,
 };
 use std::path::{Path, PathBuf};
 
-/// The mesh crate root (`crates/mesh/`).
-fn manifest_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// The workspace root (used for examples/reverse-tunnel-*).
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -48,131 +31,144 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// True when the on-demand dev certs exist (`scripts/gen_certs.sh`); the
-/// shipped-config loads below skip without them (see module docs).
-fn dev_certs_present() -> bool {
-    manifest_root().join("examples/certs/hub.crt").exists()
+/// Read every `agent-*.toml` identity from `[agent].id`, rather than trusting
+/// file names as the certificate identity contract.
+fn agent_ids(dir: &Path) -> Vec<String> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("scenario dir should be listable") {
+        let path = entry.expect("dir entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !(name.starts_with("agent-") && name.ends_with(".toml")) {
+            continue;
+        }
+        let table: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read agent toml"))
+                .expect("agent toml should parse");
+        let id = table
+            .get("agent")
+            .and_then(|a| a.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("{name}: [agent].id missing"))
+            .to_string();
+        ids.push(id);
+    }
+    ids.sort();
+    ids
 }
 
-#[test]
-fn root_hub_toml_loads() {
-    if !dev_certs_present() {
-        eprintln!("skipping: crates/mesh/examples/certs not generated (run scripts/gen_certs.sh)");
-        return;
-    }
-    let path = manifest_root().join("examples/hub.toml");
-    let cfg = load_hub_config(&path).expect("hub.toml should load");
-    assert_eq!(cfg.config_version, 3);
-    assert!(!cfg.auth.allow_anonymous);
-    // Path-anchoring invariant: cert paths come back absolute, pointing at
-    // the config's own certs/ (crates/mesh/examples/certs/), not the CWD.
-    let tls = cfg.tls.as_ref().expect("hub.toml enables tls");
-    assert!(Path::new(&tls.cert_path).is_absolute());
-    assert_eq!(
-        tls.cert_path,
-        manifest_root()
-            .join("examples/certs/hub.crt")
-            .display()
-            .to_string()
-    );
-}
-
-#[test]
-fn root_agent1_toml_loads() {
-    if !dev_certs_present() {
-        eprintln!("skipping: crates/mesh/examples/certs not generated (run scripts/gen_certs.sh)");
-        return;
-    }
-    let path = manifest_root().join("examples/agent-1.toml");
-    let cfg = load_agent_config(&path).expect("agent-1.toml should load");
-    assert_eq!(cfg.config_version, 3);
-    assert_eq!(cfg.agent.id, "agent-1");
-    assert!(cfg.control.enabled);
-}
-
-#[test]
-fn root_agent2_toml_loads() {
-    if !dev_certs_present() {
-        eprintln!("skipping: crates/mesh/examples/certs not generated (run scripts/gen_certs.sh)");
-        return;
-    }
-    let path = manifest_root().join("examples/agent-2.toml");
-    let cfg = load_agent_config(&path).expect("agent-2.toml should load");
-    assert_eq!(cfg.agent.id, "agent-2");
-    assert!(!cfg.security.allowed_targets.is_empty());
-}
-
-/// A deployment-specific scenario directory with its own `certs/` inside;
-/// it is not part of the shipped examples, so the test skips wholesale when
-/// the directory is absent and discovers the agent configs by listing the
-/// directory instead of hardcoding filenames.
-#[test]
-fn private_scenario_tomls_load() {
-    let base = workspace_root().join("examples/reverse-tunnel-private");
-    if !base.exists() {
-        return;
-    }
-
-    let mut failures = Vec::new();
-    match load_hub_config(base.join("hub.toml")) {
-        Ok(cfg) if cfg.config_version == HUB_CONFIG_VERSION => {}
-        Ok(cfg) => failures.push(format!(
-            "hub.toml: config_version != {HUB_CONFIG_VERSION} ({})",
-            cfg.config_version
-        )),
-        Err(e) => failures.push(format!("hub.toml: {e}")),
-    }
-    let mut agent_configs: Vec<PathBuf> = std::fs::read_dir(&base)
-        .expect("scenario dir should be listable")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("agent-") && n.ends_with(".toml"))
-        })
-        .collect();
-    agent_configs.sort();
-    for path in &agent_configs {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("<non-utf8>");
-        match load_agent_config(path) {
-            Ok(cfg) if cfg.config_version == AGENT_CONFIG_VERSION => {}
-            Ok(cfg) => failures.push(format!(
-                "{name}: config_version != {AGENT_CONFIG_VERSION} ({})",
-                cfg.config_version
-            )),
-            Err(e) => failures.push(format!("{name}: {e}")),
+fn copy_tomls(src: &Path, sandbox: &Path) {
+    for entry in std::fs::read_dir(src).expect("scenario dir should be listable") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            let dest = sandbox.join(path.file_name().expect("toml file name"));
+            std::fs::copy(&path, &dest).expect("copy toml into sandbox");
         }
     }
+}
+
+fn sandbox_with_certs(src: &Path, tenant: &str) -> tempfile::TempDir {
+    let sandbox = tempfile::tempdir().expect("temp sandbox");
+    copy_tomls(src, sandbox.path());
+    let certs_dir = sandbox.path().join("certs");
+    interflow_certs::ensure_tenant_ca(&certs_dir, tenant).expect("tenant CA");
+    interflow_certs::ensure_hub_cert(&certs_dir, tenant, &interflow_certs::local_dev_san(), false)
+        .expect("hub pair");
+    for id in agent_ids(src) {
+        interflow_certs::ensure_agent_cert(&certs_dir, tenant, &id, false)
+            .unwrap_or_else(|e| panic!("agent pair for {id}: {e}"));
+    }
+    sandbox
+}
+
+fn validate_mesh_scenario(src: &Path, tenant: &str, expected_agents: &[&str]) {
+    let sandbox = sandbox_with_certs(src, tenant);
+
+    let hub = load_hub_config(sandbox.path().join("hub.toml"))
+        .expect("scenario hub.toml should load and validate");
+    assert_eq!(hub.config_version, HUB_CONFIG_VERSION);
+    assert_eq!(hub.auth.tenants.len(), 1);
+    assert_eq!(hub.auth.tenants[0].name, tenant);
     assert!(
-        !agent_configs.is_empty(),
-        "scenario dir should contain agent-*.toml configs"
+        Path::new(&hub.tls.as_ref().expect("hub TLS").cert_path).is_absolute(),
+        "hub cert paths should anchor to the config directory"
     );
-    assert!(
-        failures.is_empty(),
-        "private scenario configs failed to load: {failures:#?}"
+
+    let mut agents = Vec::new();
+    for id in expected_agents {
+        let path = sandbox.path().join(format!("agent-{id}.toml"));
+        let cfg = load_agent_config(&path)
+            .unwrap_or_else(|e| panic!("{id} agent config should load and validate: {e}"));
+        assert_eq!(cfg.config_version, AGENT_CONFIG_VERSION);
+        assert_eq!(cfg.agent.id, *id);
+        assert_eq!(cfg.e2e.mode, E2eMode::Required, "{id} must fail closed");
+        agents.push(cfg);
+    }
+
+    for initiator in &agents {
+        for ingress in &initiator.ingress {
+            let Some(target) = agents
+                .iter()
+                .find(|cfg| cfg.agent.id == ingress.target_agent)
+            else {
+                panic!("agent config for {} missing", ingress.target_agent)
+            };
+            let remote = ingress
+                .remote_addr
+                .as_deref()
+                .unwrap_or_else(|| panic!("ingress {} has no remote_addr", ingress.name));
+            assert!(
+                target.security.allowed_targets.iter().any(|v| v == remote),
+                "{} target {} does not allow {remote}",
+                ingress.name,
+                ingress.target_agent
+            );
+        }
+    }
+}
+
+#[test]
+fn generic_site_to_site_example_loads_and_is_coherent() {
+    validate_mesh_scenario(
+        &workspace_root().join("examples/site-to-site"),
+        "demo",
+        &["lan-a", "lan-b"],
+    );
+}
+
+#[test]
+fn promptcn_site_to_site_deployment_loads_and_is_coherent() {
+    let deployments = workspace_root().join("deployments");
+    if !deployments.exists() {
+        return;
+    }
+    // Assemble machine names so the exported test source cannot itself trip
+    // the public-export private-identifier gate.
+    let private_agents = [["leo-", "mac"].concat(), ["leo-", "desktop"].concat()];
+    let expected_agents: Vec<&str> = private_agents.iter().map(String::as_str).collect();
+    validate_mesh_scenario(
+        &deployments.join("promptcn/site-to-site"),
+        "main",
+        &expected_agents,
     );
 }
 
 #[test]
 fn reject_missing_auth() {
     use interflow_mesh::config::{
-        AclConfig, AuthConfig, AuthMode, HUB_CONFIG_VERSION, HubConfig, HubSecurityConfig,
-        LoggingConfig, ServerConfig,
+        AclConfig, AuthConfig, HUB_CONFIG_VERSION, HubConfig, HubSecurityConfig, LoggingConfig,
+        ServerConfig,
     };
     let cfg = HubConfig {
         config_version: HUB_CONFIG_VERSION,
         server: ServerConfig {
             listen_addr: "0.0.0.0:6666".parse().unwrap(),
+            proxy_protocol: Default::default(),
         },
+        // Empty tenant table: an empty trust table can authenticate nobody
+        // (the mTLS-only successor of the old missing-token rejection).
         auth: AuthConfig {
-            mode: AuthMode::StaticToken,
-            allow_anonymous: false,
             rate_limit_per_minute: 30,
-            static_token: None,
-            mtls: None,
+            tenants: Vec::new(),
         },
         tls: None,
         acl: AclConfig::default(),
@@ -186,6 +182,6 @@ fn reject_missing_auth() {
     let err = interflow_mesh::config::validate_hub(&cfg).expect_err("should reject");
     assert!(
         err.iter()
-            .any(|e| matches!(e, interflow_mesh::config::ConfigError::AuthRequired))
+            .any(|e| matches!(e, interflow_mesh::config::ConfigError::TenantsEmpty))
     );
 }

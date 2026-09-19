@@ -1,18 +1,24 @@
-//! `HubService` — hyper `Service` implementation: rate limiting, unified
-//! authentication, request routing.
+//! `HubService` — hyper `Service` implementation: rate limiting, mTLS
+//! identity gating, request routing.
 //!
 //! Every HTTP/2 request first goes through [`Service::call`]:
-//! 1. per-IP token-bucket rate limiting ([`AuthRateLimiter`]); over the limit returns 429
-//! 2. fetch `auth_token` / `admin_token` and decide the required token level by path
-//! 3. validate the `Authorization: Bearer <token>` header with constant-time comparison
-//! 4. dispatch to the concrete handler (registration / routing / poll / handlers)
+//! 1. per-IP token-bucket rate limiting ([`AuthRateLimiter`], keyed on the
+//!    PROXY-protocol effective IP); over the limit returns 429
+//! 2. mTLS identity gate: the connection must carry a derived
+//!    [`PeerIdentity`] (tenant from the chain's anchoring root, agent from
+//!    the leaf CN) — the per-handler `x-agent-id` binding then pins every
+//!    request to that identity
+//! 3. dispatch to the concrete handler (registration / routing / poll / handlers)
+//!
+//! There is no bearer-token authentication: client certificates are the only
+//! credential (RFC docs/design/multi-tenant-mtls-only.md).
 
 use crate::hub::ActiveStream;
 use crate::hub::state::{
-    HubHandles, HubResponseBody, SharedAgents, SharedHubConfig, SharedStreamCounts,
+    HubHandles, HubResponseBody, PeerIdentity, SharedAgents, SharedHubConfig, SharedStreamCounts,
+    SharedTlsPlane,
 };
 use bytes::Bytes;
-use http::HeaderValue;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::Service;
@@ -21,10 +27,10 @@ use interflow_core::error::InterflowError;
 use interflow_core::security::{AuditKind, AuditSink, AuthRateLimiter};
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use tokio::sync::RwLock;
 
@@ -41,10 +47,19 @@ pub struct HubService {
     pub(crate) config: SharedHubConfig,
     /// Peer TCP address.
     pub(crate) peer_addr: SocketAddr,
+    /// Effective client IP (the PROXY-protocol address when fronted by a
+    /// trusted proxy, else the TCP peer). Rate limiting, connection caps and
+    /// audit key on this — never identity or ACL decisions.
+    pub(crate) effective_ip: IpAddr,
     /// Table of active streams.
     pub(crate) active_streams: Arc<RwLock<HashMap<String, ActiveStream>>>,
-    /// Agent identity bound to this connection. `None` means not yet registered.
-    pub(crate) connection_identity: Arc<RwLock<Option<String>>>,
+    /// mTLS identity bound to this connection: preset at handshake (tenant
+    /// from the chain's anchoring CA, agent from the leaf CN). `None` only
+    /// if the acceptor was misassembled — every request then fails closed.
+    pub(crate) connection_identity: Arc<RwLock<Option<PeerIdentity>>>,
+    /// TLS plane (mTLS acceptor + tenant derivation) — the routing layer
+    /// consults it for trusted-gateway status.
+    pub(crate) tls_plane: SharedTlsPlane,
     /// Hot-reloadable runtime limits (ACL toggle / stream count caps /
     /// dispatch timeout / poll grace).
     pub(crate) limits: crate::hub::state::HubLimits,
@@ -62,19 +77,32 @@ impl HubService {
     pub(crate) fn new(
         ctx: crate::hub::accept::AcceptContext,
         peer_addr: SocketAddr,
-        connection_identity: Arc<RwLock<Option<String>>>,
+        effective_ip: IpAddr,
+        connection_identity: Arc<RwLock<Option<PeerIdentity>>>,
     ) -> Self {
         Self {
             agents: ctx.agents,
             config: ctx.config,
             peer_addr,
+            effective_ip,
             active_streams: ctx.active_streams,
             connection_identity,
+            tls_plane: ctx.tls_plane,
             limits: ctx.limits,
             rate_limiter: ctx.rate_limiter,
             stream_counts: ctx.stream_counts,
             audit: ctx.audit,
         }
+    }
+
+    /// The registry key of this connection's identity (`"{tenant}/{agent}"`).
+    /// Callers must have passed the identity gate in [`Service::call`] first.
+    pub(crate) async fn qualified_id(&self) -> String {
+        self.connection_identity
+            .read()
+            .await
+            .as_ref()
+            .map_or_else(String::new, PeerIdentity::qualified)
     }
 
     /// Takes the shared handle set (used by agent eviction / heartbeat /
@@ -104,6 +132,11 @@ impl HubService {
     /// Takes the peer address as a string (for auditing).
     pub(crate) fn peer_str(&self) -> String {
         self.peer_addr.to_string()
+    }
+
+    /// The connection's derived identity, if any (fail-closed gate).
+    pub(crate) async fn identity(&self) -> Option<PeerIdentity> {
+        self.connection_identity.read().await.clone()
     }
 }
 
@@ -158,10 +191,10 @@ impl Service<Request<Incoming>> for HubService {
         Box::pin(async move {
             let path = req.uri().path().to_string();
 
-            // Rate limiting (before authentication; defends against brute-force
-            // token enumeration)
+            // Rate limiting (registration-endpoint churn / DoS suppression;
+            // mTLS has no brute-forceable credential)
             if let Some(limiter) = &svc.rate_limiter
-                && !limiter.check(svc.peer_addr.ip())
+                && !limiter.check(svc.effective_ip)
             {
                 metrics::counter!("interflow_hub_auth_failures", "reason" => "rate_limited")
                     .increment(1);
@@ -175,37 +208,23 @@ impl Service<Request<Incoming>> for HubService {
                 return Ok(too_many_requests());
             }
 
-            // Unified authentication: fetch token levels + validate Bearer
-            let (auth_token, admin_token) = {
-                let cfg = svc.config.read().await;
-
-                cfg.auth
-                    .static_token
-                    .as_ref()
-                    .map_or((None, None), |s| (s.agent.clone(), s.admin.clone()))
-            };
-
-            // `/agents` requires the admin token (if configured); everything
-            // else uses the auth token.
-            let required_token = if path == "/agents" {
-                admin_token.as_ref().or(auth_token.as_ref())
-            } else {
-                auth_token.as_ref()
-            };
-
-            if let Some(token) = required_token
-                && !bearer_token_valid(req.headers().get("Authorization"), token)
-            {
-                metrics::counter!("interflow_hub_auth_failures", "reason" => "bad_token")
+            // mTLS identity gate: a connection without a derived identity is
+            // a fail-closed reject (only reachable if the acceptor was
+            // misassembled — the handshake normally requires client certs).
+            if svc.identity().await.is_none() {
+                metrics::counter!("interflow_hub_auth_failures", "reason" => "no_client_cert")
                     .increment(1);
                 svc.audit.record(
                     AuditKind::AgentRegisterDenied {
-                        reason: "bad_token".into(),
+                        reason: "no_client_cert".into(),
                     },
                     None,
                     Some(peer_str.clone()),
                 );
-                return Ok(text_response(StatusCode::UNAUTHORIZED, "Unauthorized"));
+                return Ok(text_response(
+                    StatusCode::UNAUTHORIZED,
+                    "Client certificate required",
+                ));
             }
 
             match (req.method(), path.as_str()) {
@@ -232,54 +251,39 @@ pub(crate) fn agent_id_of(req: &Request<Incoming>) -> interflow_core::error::Res
         .ok_or_else(|| InterflowError::protocol("missing agent-id".to_string()))
 }
 
-/// Verifies (or, on first use, establishes) the connection↔agent identity
-/// binding shared by the per-connection handlers (`/poll`, `/stream/up`).
-/// `Ok` = bound or matching; `Err(response)` = the rejection to reply with
-/// (boxed: `Response<HubResponseBody>` is large enough to trip
+/// Verifies the connection↔agent identity binding shared by the
+/// per-connection handlers (`/poll`, `/stream/up`): the claimed bare
+/// `x-agent-id` must equal the mTLS-derived identity's agent (CN). The
+/// identity itself is preset at handshake and is never claimable.
+/// `Ok` = matching; `Err(response)` = the rejection to reply with (boxed:
+/// `Response<HubResponseBody>` is large enough to trip
 /// `clippy::result_large_err` in the `Result` return position).
 pub(crate) async fn bind_connection_identity(
-    identity: &RwLock<Option<String>>,
+    identity: &RwLock<Option<PeerIdentity>>,
     agent_id: &str,
     op: &str,
 ) -> std::result::Result<(), Box<Response<HubResponseBody>>> {
-    let mut identity = identity.write().await;
-    if let Some(existing_id) = &*identity {
-        if existing_id != agent_id {
+    let identity = identity.read().await;
+    if let Some(existing) = &*identity {
+        if existing.agent != agent_id {
             warn!(
-                "identity mismatch: connection is bound to {existing_id}, but {op} attempt is for {agent_id}"
+                "identity mismatch: connection is bound to {}/{} (tenant/agent), but {op} attempt is for {agent_id}",
+                existing.tenant, existing.agent
             );
             return Err(Box::new(text_response(
                 StatusCode::FORBIDDEN,
                 "Identity mismatch",
             )));
         }
+        Ok(())
     } else {
-        *identity = Some(agent_id.to_string());
-        debug!("Connection bound to identity ({op}): {agent_id}");
+        // Fail-closed: no derived identity (handshake anomaly).
+        warn!("{op} on a connection without a derived identity");
+        Err(Box::new(text_response(
+            StatusCode::UNAUTHORIZED,
+            "Client certificate required",
+        )))
     }
-    Ok(())
-}
-
-/// Validates the `Authorization: Bearer <token>` header with constant-time
-/// comparison to prevent timing attacks.
-fn bearer_token_valid(header: Option<&HeaderValue>, expected: &str) -> bool {
-    let Some(header_val) = header.and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
-    let Some(bearer_token) = header_val.strip_prefix("Bearer ") else {
-        return false;
-    };
-    constant_time_eq(bearer_token.as_bytes(), expected.as_bytes())
-}
-
-/// Constant-time byte comparison. Returns false immediately when lengths
-/// differ; for equal lengths uses `subtle::ConstantTimeEq`.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).unwrap_u8() == 1
 }
 
 #[cfg(test)]
@@ -289,24 +293,4 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     clippy::expect_used,
     clippy::missing_docs_in_private_items
 )]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn constant_time_eq_handles_differing_lengths() {
-        assert!(!constant_time_eq(b"a", b"ab"));
-        assert!(!constant_time_eq(b"ab", b"a"));
-        assert!(constant_time_eq(b"abc", b"abc"));
-    }
-
-    #[test]
-    fn bearer_validation_rejects_missing_and_malformed() {
-        assert!(!bearer_token_valid(None, "secret"));
-        let bad = HeaderValue::from_static("Basic xyz");
-        assert!(!bearer_token_valid(Some(&bad), "secret"));
-        let ok = HeaderValue::from_static("Bearer secret");
-        assert!(bearer_token_valid(Some(&ok), "secret"));
-        let wrong = HeaderValue::from_static("Bearer hunter2");
-        assert!(!bearer_token_valid(Some(&wrong), "secret"));
-    }
-}
+mod tests {}

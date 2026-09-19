@@ -102,14 +102,11 @@ impl AgentTunnel {
         agent_id: String,
         hub_url: &str,
         sender: SendRequest<H2RequestBody>,
-        auth_token: Option<String>,
         tasks: &SessionTasks,
         liveness: H2Liveness,
     ) -> Result<Self> {
         Ok(Self {
-            inner: std::sync::Arc::new(H2Tunnel::new(
-                agent_id, hub_url, sender, auth_token, tasks, liveness,
-            )),
+            inner: std::sync::Arc::new(H2Tunnel::new(agent_id, hub_url, sender, tasks, liveness)),
         })
     }
 
@@ -173,6 +170,21 @@ impl AgentTunnel {
     ) -> Result<()> {
         self.inner
             .send_open(stream_id, target_agent, target_addr, proto)
+            .await
+    }
+
+    /// [`AgentTunnel::send_open`] with the per-stream e2e (inner TLS)
+    /// declaration (`FLAG_E2E` on the Open frame).
+    pub async fn send_open_with(
+        &self,
+        stream_id: &str,
+        target_agent: &str,
+        target_addr: Option<&str>,
+        proto: StreamProto,
+        e2e: bool,
+    ) -> Result<()> {
+        self.inner
+            .send_open_with(stream_id, target_agent, target_addr, proto, e2e)
             .await
     }
 
@@ -279,16 +291,17 @@ fn slot_empty_error() -> InterflowError {
 
 #[async_trait::async_trait]
 impl TunnelTransport for SlotBackend {
-    async fn send_open(
+    async fn send_open_with(
         &self,
         stream_id: &str,
         target_agent: &str,
         target_addr: Option<&str>,
         proto: StreamProto,
+        e2e: bool,
     ) -> Result<()> {
         self.backend()
             .ok_or_else(slot_empty_error)?
-            .send_open(stream_id, target_agent, target_addr, proto)
+            .send_open_with(stream_id, target_agent, target_addr, proto, e2e)
             .await
     }
 

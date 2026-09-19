@@ -56,6 +56,11 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 /// Which request the fake hub strangles: it accepts the request but never
 /// sends response headers (the service future never resolves — hyper holds
 /// the stream open, everything else on the connection stays healthy).
@@ -276,8 +281,11 @@ async fn upload_request_never_answering_rebuilds_session() {
     })
     .await;
 
-    let mut cfg = agent_config("hang-upload", fake.addr.port());
+    let mut cfg = agent_config("hang-upload", fake.addr.port(), certs());
     cfg.agent.hub_url = format!("http://{}", fake.addr);
+    // The fake hub speaks plain h2 (no TLS terminator); the mTLS fixture
+    // must be stripped for these protocol-level cases.
+    cfg.tls = None;
     cfg.agent.request_establish_timeout_secs = Some(1);
     // Keep the watchdog far away so the ONLY thing that can fire here is the
     // establish bound.
@@ -297,8 +305,11 @@ async fn poll_request_never_answering_rebuilds_session() {
     })
     .await;
 
-    let mut cfg = agent_config("hang-poll", fake.addr.port());
+    let mut cfg = agent_config("hang-poll", fake.addr.port(), certs());
     cfg.agent.hub_url = format!("http://{}", fake.addr);
+    // The fake hub speaks plain h2 (no TLS terminator); the mTLS fixture
+    // must be stripped for these protocol-level cases.
+    cfg.tls = None;
     cfg.agent.request_establish_timeout_secs = Some(1);
     cfg.agent.poll_idle_timeout_secs = Some(30);
     let agent = spawn_agent_registered(cfg).await;

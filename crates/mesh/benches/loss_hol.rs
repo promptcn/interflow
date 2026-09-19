@@ -43,7 +43,7 @@ use clap::Parser;
 use interflow_mesh::config::{AgentTlsConfig, TransportKind};
 use interflow_testkit::backend::{CHUNK_HEADER, chunk_instant, decode_chunk, sse_backend};
 use interflow_testkit::config::{
-    acl, agent_config, agent_quic_config, hub_quic_config, tcp_egress_rule, tcp_ingress_rule,
+    agent_config, agent_quic_config, hub_quic_config, tcp_egress_rule, tcp_ingress_rule,
     unlock_stream_limits,
 };
 use interflow_testkit::impair::{DropPattern, ImpairConfig, TcpImpairProxy, UdpImpairProxy};
@@ -53,6 +53,11 @@ use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 /// CLI arguments (defaults match the backlog 1.5 baseline).
 #[derive(Parser, Debug, Clone)]
@@ -363,8 +368,7 @@ async fn run_scenario(
 
     // Hub: TLS + QUIC dual stack (the same hub shape for both transports,
     // ensuring comparability)
-    let certs = interflow_testkit::certs::TestCerts::generate("loss-hol", "loss-egress");
-    let mut hub_cfg = hub_quic_config(hub_port, &certs, vec![acl("ingress", "egress")]);
+    let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
     unlock_stream_limits(&mut hub_cfg);
     let hub = spawn_hub(hub_cfg).await;
 
@@ -398,7 +402,7 @@ async fn run_scenario(
 
     let tls = AgentTlsConfig {
         enabled: true,
-        ca_path: Some(certs.ca_path().display().to_string()),
+        ca_path: Some(certs().ca_path().display().to_string()),
         client_cert_path: None,
         client_key_path: None,
         hub_cert_fingerprint: None,
@@ -407,12 +411,12 @@ async fn run_scenario(
     // Egress agent: connect target = the proxy (impairment lives on this link)
     let mut egress_cfg = match transport {
         TransportKind::H2 => {
-            let mut cfg = agent_config("egress", hub_port);
+            let mut cfg = agent_config("egress", hub_port, certs());
             cfg.agent.hub_url = format!("http://{}", tcp_proxy.as_ref().unwrap().local_addr());
             cfg
         }
         TransportKind::Quic => {
-            let mut cfg = agent_quic_config("egress", hub_port, &certs);
+            let mut cfg = agent_quic_config("egress", hub_port, certs());
             cfg.agent.hub_quic_addr = Some(udp_proxy.as_ref().unwrap().local_addr().to_string());
             cfg
         }
@@ -424,8 +428,8 @@ async fn run_scenario(
 
     // Ingress agent: connects directly to the hub (no impairment)
     let mut ingress_cfg = match transport {
-        TransportKind::H2 => agent_config("ingress", hub_port),
-        TransportKind::Quic => agent_quic_config("ingress", hub_port, &certs),
+        TransportKind::H2 => agent_config("ingress", hub_port, certs()),
+        TransportKind::Quic => agent_quic_config("ingress", hub_port, certs()),
     };
     ingress_cfg.agent.connect_timeout_secs = 10;
     ingress_cfg.tls = Some(tls);

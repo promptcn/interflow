@@ -1,17 +1,24 @@
-//! rcgen self-signed certificates: CA + SAN(127.0.0.1/localhost) server + client on
+//! Self-signed certificates: CA + SAN(localhost/127.0.0.1) server + client on
 //! demand (CN = agent id).
 //!
-//! Directory isolation: each generation uses its own temp directory (an in-process
-//! atomic sequence number + a caller-provided tag), so parallel tests/scenarios never
-//! mix up certificates. Private key files are set to 0600 as the hub's validation
-//! requires.
+//! Issuance goes through `interflow-certs` — the same implementation behind
+//! `interflow-mesh certs` and the expose init wizard — so test certificates
+//! have production shape (ServerAuth/ClientAuth EKU, explicit validity).
+//!
+//! Directory isolation: each generation uses its own temp directory (an
+//! in-process atomic sequence number + a caller-provided tag), so parallel
+//! tests/scenarios never mix up certificates. Private key files are set to
+//! 0600 as the hub's validation requires.
 
 use std::path::{Path, PathBuf};
 
 /// One generated certificate set (material held as PEM strings; files written on demand).
 pub struct TestCerts {
     dir: PathBuf,
-    ca_cn: String,
+    /// Per-CN issued-cert cache: parallel tests share one `TestCerts` (via a
+    /// `OnceLock`); re-issuing would rewrite the same files concurrently and
+    /// hand a reader a half-written PEM.
+    issued: std::sync::Mutex<std::collections::HashMap<String, (PathBuf, PathBuf)>>,
     ca_pem: String,
     ca_key: String,
     server_cert: String,
@@ -35,54 +42,37 @@ impl TestCerts {
     /// Generate CA + server certificate + a default client certificate (`client_cn` is
     /// usually the agent id; mTLS CN-binding tests depend on it).
     pub fn generate(tag: &str, client_cn: &str) -> TestCerts {
-        use rcgen::{CertificateParams, DnType, DnValue, Issuer, KeyPair};
-
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("interflow-{tag}-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cert dir: {e}"));
 
-        // CA
-        let ca_cn = format!("Interflow {tag} CA");
-        let mut ca_params = CertificateParams::default();
-        ca_params
-            .distinguished_name
-            .push(DnType::CommonName, DnValue::Utf8String(ca_cn.clone()));
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().expect("ca key");
-        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
-
-        // server: SAN covers localhost + 127.0.0.1 (SNI works with either IP or hostname;
-        // CertificateParams::new parses strings as IP/DNS automatically)
-        let server_params =
-            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
-                .expect("server params");
-        let server_key = KeyPair::generate().expect("server key");
-        let issuer = Issuer::from_params(&ca_params, &ca_key);
-        let server_cert = server_params
-            .signed_by(&server_key, &issuer)
-            .expect("server cert");
-
-        // client (CN = caller-specified, usually the agent id)
-        let mut client_params = CertificateParams::default();
-        client_params.distinguished_name.push(
-            DnType::CommonName,
-            DnValue::Utf8String(client_cn.to_string()),
-        );
-        let client_key = KeyPair::generate().expect("client key");
-        let client_cert = client_params
-            .signed_by(&client_key, &issuer)
-            .expect("client cert");
+        let ca = interflow_certs::build_ca(tag, interflow_certs::Validity::ca_default())
+            .unwrap_or_else(|e| panic!("test CA: {e}"));
+        let loaded = interflow_certs::LoadedCa::from_material(&ca)
+            .unwrap_or_else(|e| panic!("test CA load: {e}"));
+        // Server: SAN covers localhost + 127.0.0.1 (SNI works with either IP
+        // or hostname — the local-development dial forms).
+        let server = loaded
+            .build_server_cert(
+                &interflow_certs::local_dev_san(),
+                interflow_certs::Validity::leaf_default(),
+            )
+            .unwrap_or_else(|e| panic!("test server cert: {e}"));
+        // Client (CN = caller-specified, usually the agent id)
+        let client = loaded
+            .build_client_cert(client_cn, interflow_certs::Validity::leaf_default())
+            .unwrap_or_else(|e| panic!("test client cert: {e}"));
 
         let certs = TestCerts {
-            ca_cn,
-            ca_pem: ca_cert.pem(),
-            ca_key: ca_key.serialize_pem(),
-            server_cert: server_cert.pem(),
-            server_key: server_key.serialize_pem(),
-            client_cert: client_cert.pem(),
-            client_key: client_key.serialize_pem(),
+            issued: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ca_pem: ca.cert_pem,
+            ca_key: ca.key_pem,
+            server_cert: server.cert_pem,
+            server_key: server.key_pem,
+            client_cert: client.cert_pem,
+            client_key: client.key_pem,
             dir,
         };
 
@@ -117,34 +107,85 @@ impl TestCerts {
     /// Sign another client certificate with the CA under a given CN (each identity for
     /// multi-agent mTLS).
     pub fn named_client_cert(&self, cn: &str) -> (PathBuf, PathBuf) {
-        use rcgen::{CertificateParams, DnType, DnValue, Issuer, KeyPair};
+        // Hold the lock across issue + cache: parallel tests calling this for
+        // the same CN must never both issue (two different keys racing onto
+        // the same paths = cert/key mismatch on disk).
+        let mut cache = self.issued.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pair) = cache.get(cn) {
+            return pair.clone();
+        }
+        let pair = self.issue_client_cert(cn);
+        cache.insert(cn.to_string(), pair.clone());
+        pair
+    }
 
-        // Rebuild the same CA parameters as generate (same DN + same key → same issuer subject)
-        let mut ca_params = CertificateParams::default();
-        ca_params
-            .distinguished_name
-            .push(DnType::CommonName, DnValue::Utf8String(self.ca_cn.clone()));
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::from_pem(&self.ca_key).expect("ca key parse");
-        let issuer = Issuer::from_params(&ca_params, ca_key);
-
-        let mut params = CertificateParams::default();
-        params
-            .distinguished_name
-            .push(DnType::CommonName, DnValue::Utf8String(cn.to_string()));
-        let key = KeyPair::generate().expect("client key");
-        let cert = params.signed_by(&key, &issuer).expect("client cert");
+    /// Issues (uncached) a client certificate under `cn`.
+    fn issue_client_cert(&self, cn: &str) -> (PathBuf, PathBuf) {
+        let loaded = interflow_certs::LoadedCa::from_pem_pair(&self.ca_pem, &self.ca_key)
+            .unwrap_or_else(|e| panic!("test CA reload: {e}"));
+        let pair = loaded
+            .build_client_cert(cn, interflow_certs::Validity::leaf_default())
+            .unwrap_or_else(|e| panic!("test client cert: {e}"));
 
         let cert_path = write_file(
             &self.dir.join(format!("client-{cn}.pem")),
-            &cert.pem(),
+            &pair.cert_pem,
             false,
         );
         let key_path = write_file(
             &self.dir.join(format!("client-{cn}.key")),
-            &key.serialize_pem(),
+            &pair.key_pem,
             true,
         );
         (cert_path, key_path)
     }
+}
+
+/// Protocol-level test helper: connects a TLS client stream to `addr`,
+/// presenting the client certificate issued for `cn` (the hub is mTLS-only;
+/// plain h2 handshakes are rejected at the TLS layer). Verifies the server
+/// against the CA under the name `localhost`.
+pub async fn tls_client_connect(
+    certs: &TestCerts,
+    cn: &str,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let (cert_path, key_path) = certs.named_client_cert(cn);
+    tls_client_connect_with(&certs.ca_path(), &cert_path, &key_path, "localhost", addr).await
+}
+
+/// Path-parameterized variant of [`tls_client_connect`]: connects with an
+/// arbitrary certificate triple and server name (used to handshake-test
+/// material issued by `interflow-mesh certs`).
+pub async fn tls_client_connect_with(
+    ca_path: &Path,
+    client_cert_path: &Path,
+    client_key_path: &Path,
+    server_name: &str,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let cert_pem = std::fs::read(client_cert_path)?;
+    let key_pem = std::fs::read(client_key_path)?;
+    let ca_pem = std::fs::read(ca_path)?;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_pemfile::certs(&mut &ca_pem[..]) {
+        let _ = roots.add(c.expect("ca cert"));
+    }
+    let client_cert: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
+        .collect::<Result<_, _>>()
+        .expect("client cert");
+    let key = rustls_pemfile::private_key(&mut &key_pem[..])
+        .expect("client key")
+        .expect("client key present");
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(client_cert, key)
+        .expect("client auth");
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let server_name =
+        rustls::pki_types::ServerName::try_from(server_name.to_string()).expect("server name");
+    connector.connect(server_name, tcp).await
 }

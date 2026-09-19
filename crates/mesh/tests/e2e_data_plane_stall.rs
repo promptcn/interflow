@@ -60,6 +60,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 // ---------------------------------------------------------------------------
 // T1: real hub (heartbeats disabled → a legitimately silent poll stream) +
 // forced 2s watchdog → session rebuild
@@ -72,6 +77,7 @@ async fn forced_watchdog_rebuilds_session_on_real_hub() {
     // Ping); at that point only the watchdog can distinguish stall from idle
     let hub_cfg = hub_config_tuned(
         hub_port,
+        certs(),
         vec![],
         HubSecurityConfig::default(),
         HeartbeatConfig {
@@ -81,7 +87,7 @@ async fn forced_watchdog_rebuilds_session_on_real_hub() {
     );
     let _hub = spawn_hub(hub_cfg).await;
 
-    let mut cfg = agent_config("stall-real", hub_port);
+    let mut cfg = agent_config("stall-real", hub_port, certs());
     cfg.agent.poll_idle_timeout_secs = Some(2);
     let agent = spawn_agent_registered(cfg).await;
 
@@ -316,8 +322,11 @@ async fn pinged_then_stalled_poll_stream_triggers_session_rebuild() {
     let fake = spawn_fake_hub(FakeMode::Modern).await;
     let port = fake.addr.port();
 
-    let mut cfg = agent_config("stall-wedge", port);
+    let mut cfg = agent_config("stall-wedge", port, certs());
     cfg.agent.hub_url = format!("http://{}", fake.addr);
+    // The fake hub speaks plain h2 (no TLS terminator); the mTLS fixture
+    // must be stripped for these protocol-level cases.
+    cfg.tls = None;
     cfg.agent.poll_idle_timeout_secs = Some(1);
     let agent = spawn_agent_registered(cfg).await;
 
@@ -387,8 +396,11 @@ async fn pinged_then_stalled_poll_stream_triggers_session_rebuild() {
 async fn unparseable_register_body_fails_registration() {
     let fake = spawn_fake_hub(FakeMode::PlainText).await;
 
-    let mut cfg = agent_config("stall-plaintext", fake.addr.port());
+    let mut cfg = agent_config("stall-plaintext", fake.addr.port(), certs());
     cfg.agent.hub_url = format!("http://{}", fake.addr);
+    // The fake hub speaks plain h2 (no TLS terminator); the mTLS fixture
+    // must be stripped for these protocol-level cases.
+    cfg.tls = None;
     let agent = AgentClient::new(cfg).expect("client build").start();
 
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -471,6 +483,7 @@ async fn data_plane_heartbeat_metrics_flow() {
     let hub_port = pick_ephemeral_port();
     let hub_cfg = hub_config_tuned(
         hub_port,
+        certs(),
         vec![],
         HubSecurityConfig::default(),
         HeartbeatConfig {
@@ -481,7 +494,7 @@ async fn data_plane_heartbeat_metrics_flow() {
     );
     let _hub = spawn_hub(hub_cfg).await;
 
-    let agent = spawn_agent_registered(agent_config("metrics-agent", hub_port)).await;
+    let agent = spawn_agent_registered(agent_config("metrics-agent", hub_port, certs())).await;
 
     let before = scrape_metrics(metrics_addr).await;
     tokio::time::sleep(Duration::from_secs(4)).await;

@@ -12,6 +12,11 @@ use interflow_testkit::{agent_config, hub_config, pick_ephemeral_port, spawn_hub
 use std::time::Duration;
 use tokio::sync::watch;
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 /// Wait until the watch state satisfies `predicate`; panic on timeout.
 async fn wait_state(
     mut rx: watch::Receiver<AgentState>,
@@ -40,10 +45,10 @@ async fn wait_state(
 #[tokio::test]
 async fn start_connect_and_graceful_shutdown() {
     let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut handle = AgentClient::new(agent_config("handle-test", hub_port))
+    let mut handle = AgentClient::new(agent_config("handle-test", hub_port, certs()))
         .expect("agent build")
         .start();
     let mut events = handle.take_events();
@@ -87,7 +92,7 @@ async fn no_hub_then_reconnect() {
     // Do not start the hub yet: connection refused → the supervisor should
     // enter Reconnecting (with backoff) rather than exit
     let hub_port = pick_ephemeral_port();
-    let handle = AgentClient::new(agent_config("reconnect-test", hub_port))
+    let handle = AgentClient::new(agent_config("reconnect-test", hub_port, certs()))
         .expect("agent build")
         .start();
     let mut state_rx = handle.subscribe_state();
@@ -108,7 +113,7 @@ async fn no_hub_then_reconnect() {
 
     // Once the hub comes up, the agent should reconnect automatically within
     // the backoff window
-    let hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     wait_state(
         handle.subscribe_state(),
         Duration::from_secs(35),
@@ -122,7 +127,7 @@ async fn no_hub_then_reconnect() {
 
 #[tokio::test]
 async fn config_error_fails_fast() {
-    let mut cfg = agent_config("bad-cfg", pick_ephemeral_port());
+    let mut cfg = agent_config("bad-cfg", pick_ephemeral_port(), certs());
     // Invalid URL: a config-class error; the supervisor should become Failed
     // instead of retrying forever
     cfg.agent.hub_url = "not a url".to_string();

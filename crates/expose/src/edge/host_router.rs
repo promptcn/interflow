@@ -4,6 +4,7 @@
 //! ```toml
 //! [[routes]]
 //! host = "myapp.example.com"
+//! tenant = "acme"
 //! agent_id = "expose-myapp"
 //! remote_addr = "127.0.0.1:3000"
 //!
@@ -29,7 +30,12 @@ use std::sync::Arc;
 pub struct Route {
     /// Host header of public requests (lowercase, no port).
     pub host: String,
-    /// The corresponding local expose agent_id.
+    /// Owning tenant: the Open target resolves to `(tenant, agent_id)` — a
+    /// route pointing at an agent registered under another tenant simply
+    /// finds no target and is rejected (tenant mismatch fails closed).
+    pub tenant: String,
+    /// The corresponding local expose agent_id (must be registered under
+    /// `tenant`; its certificate CN must equal it).
     pub agent_id: String,
     /// Target address the egress agent dials (where the local service
     /// actually listens).
@@ -74,16 +80,18 @@ impl RoutesConfig {
 }
 
 impl HostRouter {
-    /// Constructs from a `RoutesConfig`.
-    pub fn from_config(cfg: &RoutesConfig) -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::from_pointee(cfg_to_map(cfg))),
-        }
+    /// Constructs from a `RoutesConfig`. A duplicate (normalized) host is a
+    /// configuration error — the pre-v4 silent last-wins hid route hijacks
+    /// and typos; now the load fails loudly instead.
+    pub fn from_config(cfg: &RoutesConfig) -> Result<Self> {
+        Ok(Self {
+            inner: Arc::new(ArcSwap::from_pointee(cfg_to_map(cfg)?)),
+        })
     }
 
     /// Loads from a TOML file and constructs.
     pub fn load(path: &str) -> Result<Self> {
-        Ok(Self::from_config(&RoutesConfig::load(path)?))
+        Self::from_config(&RoutesConfig::load(path)?)
     }
 
     /// Looks up a host. The `host` argument is normalized (lowercased, port
@@ -95,15 +103,15 @@ impl HostRouter {
     /// Swaps in the routing table from an already-parsed config. Public so
     /// the SIGHUP reload task can apply routes and logging from a single
     /// parse (one file read can never update routes but not logging).
-    pub fn apply(&self, cfg: &RoutesConfig) {
-        self.inner.store(Arc::new(cfg_to_map(cfg)));
+    pub fn apply(&self, cfg: &RoutesConfig) -> Result<()> {
+        self.inner.store(Arc::new(cfg_to_map(cfg)?));
+        Ok(())
     }
 
     /// Re-reads `routes.toml` and swaps the routing table wholesale. On parse
-    /// failure the old table is kept.
+    /// failure **or a duplicate-host rejection** the old table is kept.
     pub fn reload(&self, path: &str) -> Result<()> {
-        self.apply(&RoutesConfig::load(path)?);
-        Ok(())
+        self.apply(&RoutesConfig::load(path)?)
     }
 
     /// Number of registered hosts.
@@ -127,12 +135,21 @@ fn normalize_host(s: &str) -> String {
     }
 }
 
-/// Normalizes a `RoutesConfig` into a host→Route map (hosts already normalized).
-fn cfg_to_map(cfg: &RoutesConfig) -> HashMap<String, Route> {
-    cfg.routes
-        .iter()
-        .map(|r| (normalize_host(&r.host), r.clone()))
-        .collect()
+/// Normalizes a `RoutesConfig` into a host→Route map (hosts already
+/// normalized). Duplicate hosts (after normalization) are rejected — silent
+/// last-wins would let a typo or a tampered file hijack a route.
+fn cfg_to_map(cfg: &RoutesConfig) -> Result<HashMap<String, Route>> {
+    let mut map = HashMap::with_capacity(cfg.routes.len());
+    for r in &cfg.routes {
+        let key = normalize_host(&r.host);
+        if map.contains_key(&key) {
+            return Err(InterflowError::config(format!(
+                "duplicate host in routing table: {key} (routes.toml must map each host exactly once)"
+            )));
+        }
+        map.insert(key, r.clone());
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
@@ -157,12 +174,13 @@ mod tests {
         let cfg = RoutesConfig {
             routes: vec![Route {
                 host: "MyApp.Example.com".into(),
+                tenant: "acme".into(),
                 agent_id: "expose-myapp".into(),
                 remote_addr: "127.0.0.1:3000".parse().unwrap(),
             }],
             logging: None,
         };
-        let router = HostRouter::from_config(&cfg);
+        let router = HostRouter::from_config(&cfg).unwrap();
         assert!(router.lookup("myapp.example.com").is_some());
         assert!(router.lookup("myapp.example.com:8443").is_some());
         assert!(router.lookup("MYAPP.EXAMPLE.COM").is_some());
@@ -176,6 +194,7 @@ mod tests {
             r#"
 [[routes]]
 host = "a.example.com"
+tenant = "acme"
 agent_id = "agent-a"
 remote_addr = "127.0.0.1:3000"
 "#,
@@ -188,6 +207,7 @@ remote_addr = "127.0.0.1:3000"
             r#"
 [[routes]]
 host = "a.example.com"
+tenant = "acme"
 agent_id = "agent-a"
 remote_addr = "127.0.0.1:3000"
 
@@ -240,6 +260,7 @@ unknown_key = 1
             r#"
 [[routes]]
 host = "a.example.com"
+tenant = "acme"
 agent_id = "agent-a"
 remote_addr = "127.0.0.1:3000"
 "#,
@@ -257,6 +278,7 @@ remote_addr = "127.0.0.1:3000"
             r#"
 [[routes]]
 host = "b.example.com"
+tenant = "acme"
 agent_id = "agent-b"
 remote_addr = "127.0.0.1:4000"
 
@@ -266,7 +288,7 @@ level = "debug"
         )
         .unwrap();
         let cfg = RoutesConfig::load(path.to_str().unwrap()).unwrap();
-        router.apply(&cfg);
+        router.apply(&cfg).unwrap();
         assert!(
             router.lookup("a.example.com").is_none(),
             "old route should be gone"

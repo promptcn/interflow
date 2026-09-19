@@ -3,10 +3,10 @@
 //! The GUI process never calls `interflow_core::telemetry::init_logging` (the global subscriber);
 //! instead, it assembles its own Registry + EnvFilter + GuiLogLayer.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tracing::field::Visit;
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::Context;
@@ -14,7 +14,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer};
 
 /// A single log line pushed to the frontend.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, specta::Type)]
 pub struct LogLine {
     pub ts: String,
     pub level: String,
@@ -41,6 +41,12 @@ impl LogBuffer {
             .lock()
             .map(|buf| buf.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut buf) = self.inner.lock() {
+            buf.clear();
+        }
     }
 
     fn push(&self, line: LogLine) {
@@ -144,7 +150,7 @@ pub async fn pump(app: AppHandle, mut rx: tokio::sync::mpsc::Receiver<LogLine>) 
             };
             guard.logs.push(line.clone());
         }
-        let _ = app.emit("log", &line);
+        let _ = tauri_specta::Event::emit(&crate::contract::LogEvent(line), &app);
     }
 }
 

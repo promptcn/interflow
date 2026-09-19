@@ -7,8 +7,10 @@ interface Props {
   setPorts: (ports: number[]) => void;
   hubUrl: string;
   setHubUrl: (v: string) => void;
-  token: string;
-  setToken: (v: string) => void;
+  clientCert: string;
+  setClientCert: (v: string) => void;
+  clientKey: string;
+  setClientKey: (v: string) => void;
   agentId: string;
   setAgentId: (v: string) => void;
   caPath: string;
@@ -33,14 +35,25 @@ export default function ConfigForm(p: Props) {
     setNewPort("");
   };
 
-  const pickCa = async () => {
+  const pickFile = async (
+    title: string,
+    extensions: string[],
+    onPicked: (path: string) => void
+  ) => {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const file = await open({
-      title: "Choose a CA certificate (PEM)",
-      filters: [{ name: "PEM certificate", extensions: ["pem", "crt", "cer"] }],
+      title,
+      filters: [{ name: "PEM file", extensions }],
     });
-    if (typeof file === "string") p.setCaPath(file);
+    if (typeof file === "string") onPicked(file);
   };
+
+  const pickCa = () =>
+    pickFile("Choose a CA certificate (PEM)", ["pem", "crt", "cer"], p.setCaPath);
+  const pickClientCert = () =>
+    pickFile("Choose a client certificate (PEM)", ["pem", "crt", "cer"], p.setClientCert);
+  const pickClientKey = () =>
+    pickFile("Choose a client key (PEM)", ["pem", "key"], p.setClientKey);
 
   return (
     <div className="form">
@@ -90,14 +103,29 @@ export default function ConfigForm(p: Props) {
       </div>
 
       <div className="row">
-        <label>Token</label>
+        <label>Client cert</label>
         <input
-          type="password"
           disabled={p.disabled}
-          value={p.token}
-          onChange={(e) => p.setToken(e.target.value)}
-          placeholder="Agent token for the hub"
+          value={p.clientCert}
+          onChange={(e) => p.setClientCert(e.target.value)}
+          placeholder="mTLS identity, e.g. agents/<agent-id>.crt — CN must equal the Agent ID"
         />
+        <button disabled={p.disabled} onClick={pickClientCert}>
+          Browse
+        </button>
+      </div>
+
+      <div className="row">
+        <label>Client key</label>
+        <input
+          disabled={p.disabled}
+          value={p.clientKey}
+          onChange={(e) => p.setClientKey(e.target.value)}
+          placeholder="e.g. agents/<agent-id>.key (must be 0600)"
+        />
+        <button disabled={p.disabled} onClick={pickClientKey}>
+          Browse
+        </button>
       </div>
 
       <div className="row">
@@ -107,6 +135,10 @@ export default function ConfigForm(p: Props) {
           value={p.agentId}
           onChange={(e) => p.setAgentId(e.target.value)}
           placeholder="Must match edge routes.toml"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          autoComplete="off"
         />
         <button disabled={p.disabled} onClick={p.onGenerateAgentId}>
           Random

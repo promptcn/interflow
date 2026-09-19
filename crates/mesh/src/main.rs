@@ -3,11 +3,13 @@
 //! Subcommands:
 //! - `interflow-mesh hub --config hub.toml` — start the public relay
 //! - `interflow-mesh agent --config agent.toml` — start the LAN agent (can carry both ingress + egress)
+//! - `interflow-mesh certs ...` — issue/validate mTLS certificates (operator machine)
 //! - `interflow-mesh version` — version information
 
 use clap::{Parser, Subcommand};
 use interflow_core::config::paths::absolutize;
 use interflow_core::telemetry;
+use interflow_mesh::certs::CertsCommand;
 use interflow_mesh::config::{load_agent_config, load_hub_config};
 use std::path::Path;
 
@@ -34,6 +36,13 @@ enum Commands {
         /// Config file path
         #[arg(short, long)]
         config: String,
+    },
+    /// Issue and validate mTLS certificates: tenant CAs, the hub server
+    /// pair, agent client pairs (run on an operator machine, never on the
+    /// hub host)
+    Certs {
+        #[command(subcommand)]
+        command: CertsCommand,
     },
     /// Show version information
     Version,
@@ -165,6 +174,12 @@ async fn main() -> interflow_core::error::Result<()> {
                 tracing::error!("Graceful shutdown failed: {e}");
             }
             std::process::exit(exit_code);
+        }
+        Commands::Certs { command } => {
+            // The certs tool is plain synchronous IO; errors carry the
+            // concrete mismatch/remediation text from interflow-certs.
+            interflow_mesh::certs::run(command)
+                .map_err(|e| interflow_core::error::InterflowError::config(e.to_string()))?;
         }
         Commands::Version => {
             let build_date = env!("INTERFLOW_BUILD_DATE");

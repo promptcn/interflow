@@ -12,6 +12,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use interflow_core::error::{InterflowError, Result};
 use interflow_core::fault::FaultPoint;
 use interflow_core::tls::client::build_client_config;
+use interflow_core::tls::extract_cn_from_pem_file;
 use interflow_core::tunnel::negotiation::RegisterResponse;
 use interflow_core::tunnel::session_tasks::{
     SessionExitGuard, SessionTasks, TaskExit, TaskExitReason,
@@ -70,6 +71,9 @@ pub struct AgentClient {
     /// rebuild — residual flows from the previous session keep consuming
     /// quota, so the limit never goes blind.
     egress_runtime: Arc<crate::agent::egress::EgressRuntime>,
+    /// E2e (inner TLS) runtime (agent-scoped, startup-only assembly);
+    /// `None` when the mode is off.
+    e2e_runtime: Option<Arc<crate::agent::e2e::E2eRuntime>>,
 }
 
 /// How one session ended (the supervisor decides reconnect or exit from this).
@@ -122,13 +126,7 @@ impl AgentClient {
     /// Suited to embedded agents (expose edge) and tests — there is no
     /// config file to write back to.
     pub fn new(config: AgentConfig) -> Result<Self> {
-        let rule_store = RuleStore::from_config(&config, None);
-        let egress_runtime = Arc::new(crate::agent::egress::EgressRuntime::from_config(&config));
-        Ok(Self {
-            config,
-            rule_store,
-            egress_runtime,
-        })
+        Self::build(config, None)
     }
 
     /// File-backed construction: control-API rule adds/removes are atomically
@@ -137,13 +135,58 @@ impl AgentClient {
         config: AgentConfig,
         path: impl Into<std::path::PathBuf>,
     ) -> Result<Self> {
-        let rule_store = RuleStore::from_config(&config, Some(path.into()));
+        Self::build(config, Some(path.into()))
+    }
+
+    /// The single construction funnel: every production entry (mesh CLI,
+    /// expose CLI, GUI, expose edge) passes through here, so the identity
+    /// pre-validation below cannot be bypassed by picking a different
+    /// constructor.
+    fn build(config: AgentConfig, rule_path: Option<std::path::PathBuf>) -> Result<Self> {
+        Self::validate_identity_binding(&config)?;
+        let rule_store = RuleStore::from_config(&config, rule_path);
         let egress_runtime = Arc::new(crate::agent::egress::EgressRuntime::from_config(&config));
+        // E2e (inner TLS) material: startup-only assembly — a bad anchor
+        // set fails the agent here instead of per-stream at runtime.
+        let e2e_runtime = crate::agent::e2e::E2eRuntime::from_config(&config)?;
         Ok(Self {
             config,
             rule_store,
             egress_runtime,
+            e2e_runtime,
         })
+    }
+
+    /// Startup pre-validation of the identity binding (design
+    /// `multi-tenant-mtls-only` §3.2): `agent.id` must equal the client
+    /// certificate's CN — exactly what the hub enforces at registration
+    /// (403 Identity mismatch), on every stream bind, and in the QUIC
+    /// hello. Failing it here turns "everything looks right but the hub
+    /// rejects me" into an immediate local error, before any supervisor
+    /// task or TLS handshake exists.
+    ///
+    /// Only runs when a client certificate is configured: certificate-less
+    /// constructions (plain-http dev/test setups) keep their meaning —
+    /// *requiring* the certificate is the config loader's policy, not the
+    /// client's.
+    fn validate_identity_binding(config: &AgentConfig) -> Result<()> {
+        let Some(cert_path) = config
+            .tls
+            .as_ref()
+            .filter(|tls| tls.enabled)
+            .and_then(|tls| tls.client_cert_path.as_deref())
+        else {
+            return Ok(());
+        };
+        let cn = extract_cn_from_pem_file(cert_path)?.ok_or_else(|| {
+            InterflowError::config(format!("client certificate has no CN: {cert_path}"))
+        })?;
+        if cn != config.agent.id {
+            return Err(InterflowError::config(format!(
+                "agent ID must equal the certificate CN ({cn})"
+            )));
+        }
+        Ok(())
     }
 
     /// Start the agent supervisor, returning the handle immediately.
@@ -389,6 +432,7 @@ impl AgentClient {
         let security_config = self.config.security.clone();
         let egress_policy = crate::agent::egress::EgressPolicy::from(&self.config);
         let egress_runtime = Arc::clone(&self.egress_runtime);
+        let e2e_runtime = self.e2e_runtime.clone();
         let handler_token = session_token.clone();
         let handler_tracker = session_tracker.clone();
         let teardown_tunnel = tunnel.clone();
@@ -411,6 +455,7 @@ impl AgentClient {
                 handler_token.clone(),
                 handler_tracker.clone(),
                 ingress_rx,
+                e2e_runtime.clone(),
             );
 
             // Create Egress Handler (sends response-direction frames via the
@@ -426,6 +471,7 @@ impl AgentClient {
                 handler_tracker,
                 egress_rx,
                 incoming,
+                e2e_runtime,
             );
 
             // Run both concurrently; session cancellation counts as a normal
@@ -603,7 +649,6 @@ impl AgentClient {
                     conn.agent_id.clone(),
                     &conn.hub_url,
                     conn.send_request.clone(),
-                    self.config.agent.auth_token.clone(),
                     tasks,
                     liveness,
                 )?;
@@ -707,6 +752,8 @@ impl AgentClient {
                 )),
             },
             incoming_streams_budget: self.config.max_incoming_streams,
+            // Observation-only capability declaration (RFC §3.6).
+            e2e_capable: self.config.e2e.enabled(),
         };
         let tunnel = std::sync::Arc::new(
             interflow_core::tunnel::quic::QuicTunnel::connect(
@@ -714,7 +761,6 @@ impl AgentClient {
                 server_addr,
                 &server_name,
                 tls_config,
-                self.config.agent.auth_token.as_deref(),
                 tasks.clone(),
                 session_params,
             )
@@ -1055,14 +1101,10 @@ impl AgentClient {
         &self,
         send_request: &mut SendRequest<H2RequestBody>,
     ) -> Result<RegisterResponse> {
-        let mut builder = Request::builder()
+        let builder = Request::builder()
             .method("POST")
             .uri("/register")
             .header("x-agent-id", &self.config.agent.id);
-
-        if let Some(token) = &self.config.agent.auth_token {
-            builder = builder.header("Authorization", format!("Bearer {token}"));
-        }
 
         let register_req = builder.body(empty_request_body()).unwrap();
 
@@ -1166,5 +1208,81 @@ mod tests {
             "fatal errors carry no fallback hint: {e}"
         );
         assert!(e.is_fatal(), "wrapping must not downgrade a config error");
+    }
+
+    /// The identity binding pre-validation (design §3.2): an agent id that
+    /// differs from the certificate CN — the macOS-autocapitalized
+    /// `Expose-lan-agent` shape from the 2026-09-18 GUI papercuts — must fail
+    /// at construction with the certificate's actual CN in the message,
+    /// not at the hub with a 403 after a full TLS handshake.
+    #[test]
+    fn construction_rejects_agent_id_that_differs_from_cert_cn() {
+        let certs = interflow_testkit::certs::TestCerts::generate("cn-bind", "expose-lan-agent");
+        let (cert, key) = certs.client_paths();
+        let config = AgentConfig {
+            agent: crate::config::AgentInfo {
+                id: "Expose-lan-agent".to_string(),
+                hub_url: "https://127.0.0.1:16666".to_string(),
+                ..crate::config::AgentInfo::default()
+            },
+            tls: Some(crate::config::AgentTlsConfig {
+                enabled: true,
+                ca_path: Some(certs.ca_path().display().to_string()),
+                client_cert_path: Some(cert.display().to_string()),
+                client_key_path: Some(key.display().to_string()),
+                hub_cert_fingerprint: None,
+            }),
+            ..AgentConfig::default()
+        };
+
+        let err = AgentClient::new(config)
+            .map(|_| ())
+            .expect_err("CN mismatch must fail construction, not registration");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent ID must equal the certificate CN (expose-lan-agent)"),
+            "wrong message: {msg}"
+        );
+        assert!(err.is_fatal(), "a wrong agent id is a config error");
+    }
+
+    /// The matching pair (id == CN) and the certificate-less constructions
+    /// (plain-http test setups) must keep constructing.
+    #[test]
+    fn construction_accepts_matching_cn_and_certificate_less_configs() {
+        let certs = interflow_testkit::certs::TestCerts::generate("cn-bind-ok", "agent-a");
+        let (cert, key) = certs.named_client_cert("agent-a");
+        let tls = |cert: std::path::PathBuf, key: std::path::PathBuf| {
+            Some(crate::config::AgentTlsConfig {
+                enabled: true,
+                ca_path: Some(certs.ca_path().display().to_string()),
+                client_cert_path: Some(cert.display().to_string()),
+                client_key_path: Some(key.display().to_string()),
+                hub_cert_fingerprint: None,
+            })
+        };
+        let config = AgentConfig {
+            agent: crate::config::AgentInfo {
+                id: "agent-a".to_string(),
+                hub_url: "https://127.0.0.1:16666".to_string(),
+                ..crate::config::AgentInfo::default()
+            },
+            tls: tls(cert, key),
+            ..AgentConfig::default()
+        };
+        assert!(AgentClient::new(config).is_ok());
+
+        let plain = AgentConfig {
+            tls: None,
+            ..AgentConfig {
+                agent: crate::config::AgentInfo {
+                    id: "agent-a".to_string(),
+                    hub_url: "https://127.0.0.1:16666".to_string(),
+                    ..crate::config::AgentInfo::default()
+                },
+                ..AgentConfig::default()
+            }
+        };
+        assert!(AgentClient::new(plain).is_ok());
     }
 }

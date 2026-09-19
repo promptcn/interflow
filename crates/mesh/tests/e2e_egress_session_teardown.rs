@@ -54,6 +54,11 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 /// Silent streams established per round (simulating HMR WebSocket + SSE
 /// long-lived connections).
 const STREAMS_PER_ROUND: usize = 5;
@@ -117,7 +122,7 @@ async fn silent_backend() -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
 /// Bare-tunnel injection endpoint: connect to the hub + register + AgentTunnel
 /// (frame-level direct send, with full control over the frame count).
 async fn connect_tunnel(hub_port: u16, agent_id: &str) -> AgentTunnel {
-    let client = AgentClient::new(agent_config(agent_id, hub_port)).expect("agent build");
+    let client = AgentClient::new(agent_config(agent_id, hub_port, certs())).expect("agent build");
     let conn = client
         .connect_and_register()
         .await
@@ -126,7 +131,6 @@ async fn connect_tunnel(hub_port: u16, agent_id: &str) -> AgentTunnel {
         agent_id.to_string(),
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
-        None,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
             tokio_util::sync::CancellationToken::new(),
         ),
@@ -145,13 +149,13 @@ async fn session_rebuild_releases_silent_streams_without_accumulation() {
     let _ = metrics_handle(); // install the recorder as early as possible: the metrics macros cache per callsite
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    let mut hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let mut hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
 
     let (silent_addr, accepted, active) = silent_backend().await;
     // Registration gate: round 0's Opens address this egress immediately;
     // an unregistered target would be torn down with `_close_` and surface
     // as a confusing `eventually` timeout instead of a registration failure.
-    let agent: AgentHandle = spawn_agent_registered(agent_config("eg", hub_port)).await;
+    let agent: AgentHandle = spawn_agent_registered(agent_config("eg", hub_port, certs())).await;
 
     let closed_before = counter_value("interflow_egress_stream_closed_total");
     let mut expected_accepted = 0usize;
@@ -203,7 +207,7 @@ async fn session_rebuild_releases_silent_streams_without_accumulation() {
 
         // Restart the hub and wait for the agent to reconnect (the next round
         // uses the new session's egress)
-        hub = spawn_hub(hub_config(hub_port, vec![])).await;
+        hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
         let deadline = tokio::time::Instant::now() + RECONNECT_DEADLINE;
         loop {
             if matches!(agent.state(), AgentState::Connected { .. }) {

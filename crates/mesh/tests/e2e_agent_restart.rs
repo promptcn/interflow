@@ -26,6 +26,11 @@ use interflow_mesh::agent::handle::{AgentHandle, AgentState};
 use interflow_testkit::{agent_config, hub_config, pick_ephemeral_port, spawn_hub};
 use std::time::Duration;
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 /// Wait until the agent state reaches Connected or the timeout elapses.
 async fn wait_state(handle: &AgentHandle, timeout: Duration) -> AgentState {
     let mut rx = handle.subscribe_state();
@@ -50,24 +55,26 @@ async fn wait_state(handle: &AgentHandle, timeout: Duration) -> AgentState {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_restart_after_graceful_shutdown_reconnects() {
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let agent_id = "restart-agent";
 
     // First start
-    let handle1 = interflow_mesh::agent::AgentClient::new(agent_config(agent_id, hub_port))
-        .expect("agent build")
-        .start();
+    let handle1 =
+        interflow_mesh::agent::AgentClient::new(agent_config(agent_id, hub_port, certs()))
+            .expect("agent build")
+            .start();
     wait_state(&handle1, Duration::from_secs(10)).await;
 
     // Graceful shutdown (the GUI stop path)
     handle1.shutdown_graceful().await.expect("shutdown");
 
     // Immediately restart (without waiting for any server-side timeout)
-    let handle2 = interflow_mesh::agent::AgentClient::new(agent_config(agent_id, hub_port))
-        .expect("agent build")
-        .start();
+    let handle2 =
+        interflow_mesh::agent::AgentClient::new(agent_config(agent_id, hub_port, certs()))
+            .expect("agent build")
+            .start();
     wait_state(&handle2, Duration::from_secs(5)).await;
 
     // Stay up another 2s to confirm it is stably Connected (before the fix,
@@ -93,14 +100,18 @@ async fn poll_drop_returns_rx_for_next_poll() {
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let (send_request, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, Empty<bytes::Bytes>>(TokioIo::new(
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{hub_port}"))
-                .await
-                .expect("tcp"),
+            interflow_testkit::tls_client_connect(
+                certs(),
+                "poll-agent",
+                format!("127.0.0.1:{hub_port}").parse().unwrap(),
+            )
+            .await
+            .expect("tls"),
         ))
         .await
         .expect("handshake");
@@ -167,7 +178,7 @@ async fn stale_rx_return_after_reregister_is_discarded() {
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     async fn connect(
@@ -175,9 +186,13 @@ async fn stale_rx_return_after_reregister_is_discarded() {
     ) -> hyper::client::conn::http2::SendRequest<Empty<bytes::Bytes>> {
         let (send_request, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
             .handshake::<_, Empty<bytes::Bytes>>(TokioIo::new(
-                tokio::net::TcpStream::connect(format!("127.0.0.1:{hub_port}"))
-                    .await
-                    .expect("tcp"),
+                interflow_testkit::tls_client_connect(
+                    certs(),
+                    "gen-agent",
+                    format!("127.0.0.1:{hub_port}").parse().unwrap(),
+                )
+                .await
+                .expect("tls"),
             ))
             .await
             .expect("handshake");
@@ -290,7 +305,7 @@ async fn spawn_black_hole() -> u16 {
 async fn connect_timeout_recovers_from_black_hole() {
     let black_port = spawn_black_hole().await;
 
-    let mut cfg = agent_config("blackhole-agent", black_port);
+    let mut cfg = agent_config("blackhole-agent", black_port, certs());
     cfg.agent.connect_timeout_secs = 2;
 
     let handle = interflow_mesh::agent::AgentClient::new(cfg)
@@ -314,11 +329,11 @@ async fn connect_timeout_recovers_from_black_hole() {
     // Restore the link: point at a real hub; the same agent should be
     // Connected normally (timeout → retry → recovery)
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let handle2 =
-        interflow_mesh::agent::AgentClient::new(agent_config("blackhole-agent", hub_port))
+        interflow_mesh::agent::AgentClient::new(agent_config("blackhole-agent", hub_port, certs()))
             .expect("agent build 2")
             .start();
     wait_state(&handle2, Duration::from_secs(10)).await;

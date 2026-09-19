@@ -33,9 +33,15 @@ use interflow_core::error::InterflowError;
 use interflow_core::protocol::frame::{DecodeOutcome, FrameType, decode_frame, encode_frame};
 use interflow_core::tunnel::H2RequestBody;
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
+use interflow_mesh::hub::qualified_agent_id;
 use interflow_testkit::{hub_config_tuned, pick_ephemeral_port, spawn_hub};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 fn security() -> HubSecurityConfig {
     HubSecurityConfig {
@@ -48,12 +54,16 @@ fn security() -> HubSecurityConfig {
     }
 }
 
-async fn connect(port: u16) -> SendRequest<H2RequestBody> {
+async fn connect(port: u16, cn: &str) -> SendRequest<H2RequestBody> {
     let (send_request, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, H2RequestBody>(TokioIo::new(
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-                .await
-                .expect("tcp"),
+            interflow_testkit::tls_client_connect(
+                certs(),
+                cn,
+                format!("127.0.0.1:{port}").parse().unwrap(),
+            )
+            .await
+            .expect("tls"),
         ))
         .await
         .expect("handshake");
@@ -175,13 +185,14 @@ async fn second_upload_same_agent_gets_409() {
     let port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config_tuned(
         port,
+        certs(),
         vec![],
         security(),
         HeartbeatConfig::default(),
     ))
     .await;
 
-    let mut a = connect(port).await;
+    let mut a = connect(port, "dup").await;
     assert_eq!(register(&mut a, "dup").await, 200);
     let (tx1, resp1) = open_upload_ok(&mut a, "dup").await;
 
@@ -214,6 +225,7 @@ async fn register_preempts_active_upload() {
     let port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config_tuned(
         port,
+        certs(),
         vec![],
         security(),
         HeartbeatConfig::default(),
@@ -221,14 +233,14 @@ async fn register_preempts_active_upload() {
     .await;
 
     // Connection A: register + active upload
-    let mut a = connect(port).await;
+    let mut a = connect(port, "agent-x").await;
     assert_eq!(register(&mut a, "agent-x").await, 200);
     let (_tx_a, resp_a) = open_upload_ok(&mut a, "agent-x").await;
     let mut body_a = resp_a.into_body();
 
     // Connection B: re-register the same identity (preemption: generation +1,
     // the old lease is cancelled)
-    let mut b = connect(port).await;
+    let mut b = connect(port, "agent-x").await;
     assert_eq!(register(&mut b, "agent-x").await, 200);
 
     // A's upload response should end (lease cancelled → reader exits →
@@ -263,15 +275,16 @@ async fn forged_source_frame_rejected_upload_survives() {
     let port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config_tuned(
         port,
+        certs(),
         vec![],
         security(),
         HeartbeatConfig::default(),
     ))
     .await;
 
-    let mut a = connect(port).await;
+    let mut a = connect(port, "real").await;
     assert_eq!(register(&mut a, "real").await, 200);
-    let mut other = connect(port).await;
+    let mut other = connect(port, "other").await;
     assert_eq!(register(&mut other, "other").await, 200);
 
     let (up_tx, _up_resp) = open_upload_ok(&mut a, "real").await;
@@ -338,12 +351,15 @@ async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
         interval_secs: 1,
         max_missed: 1,
     };
-    let _hub = spawn_hub(hub_config_tuned(port, vec![], security(), hb)).await;
+    let _hub = spawn_hub(hub_config_tuned(port, certs(), vec![], security(), hb)).await;
 
-    let mut a = connect(port).await;
+    let mut a = connect(port, "wedge").await;
     assert_eq!(register(&mut a, "wedge").await, 200);
     let (up_tx, up_resp) = open_upload_ok(&mut a, "wedge").await;
     let mut up_body = up_resp.into_body();
+    // Registry keys are tenant-qualified (`"{tenant}/{agent}"`); build the
+    // expected key through the production single source, never by hand.
+    let wedge_key = qualified_agent_id(interflow_testkit::TEST_TENANT, "wedge");
 
     // One data-plane Pong (uplink frame) proves the heartbeat reply path,
     // then go silent → eviction
@@ -354,7 +370,7 @@ async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
-        if !list_agents(&mut a).await.contains(&"wedge".to_string()) {
+        if !list_agents(&mut a).await.contains(&wedge_key) {
             break;
         }
         assert!(
@@ -389,7 +405,7 @@ async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
         "rebuilding the upload should implicitly re-register successfully"
     );
     assert!(
-        list_agents(&mut a).await.contains(&"wedge".to_string()),
+        list_agents(&mut a).await.contains(&wedge_key),
         "should be back in the registry after implicit re-registration"
     );
 }

@@ -1,6 +1,6 @@
 [package]
 name = "interflow-core"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 description = "HTTP/2 tunnel primitives shared by interflow-expose and interflow-mesh"
@@ -37,6 +37,8 @@ async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
 toml = "1"
+# Home-directory lookup for tilde expansion (config path normalization)
+dirs = { workspace = true }
 
 # Error handling
 thiserror = "2"
@@ -69,15 +71,23 @@ hex = "0.4"
 
 # Security: per-IP token-bucket rate limiting
 governor = "0.10.4"
+# Security: PROXY protocol v2 preamble parsing (edge public + hub agent planes
+# behind nginx; v1 is deliberately not accepted — nginx always sends v2)
+ppp = "2.3"
+# Security: trusted-proxy CIDR matching for the PROXY protocol trust matrix
+ipnetwork = "0.21.1"
 # TaskTracker (session task supervision) requires the rt feature
 tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
-# Self-signed certificates for the TLS min-version handshake test
-rcgen = "0.14"
+# Self-signed certificates for the TLS min-version handshake test (the single
+# rcgen implementation; core keeps issuance out of its production graph)
+interflow-certs = { path = "../certs", version = "0.3" }
 # Paused clock (start_paused) for unit tests to deterministically verify the INCOMING_SEND_TIMEOUT path
 tokio = { workspace = true, features = ["test-util"] }
+# Constructing explicit (expired) validity windows in inner-TLS verifier tests
+time = "0.3"
 
 # ============================================================================
 # Benchmarks (criterion)

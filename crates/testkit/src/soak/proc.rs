@@ -6,35 +6,37 @@
 //! shut down through the real SIGTERM → graceful drain path.
 
 use crate::certs::TestCerts;
+use crate::config::TEST_TENANT;
 use interflow_core::protocol::StreamProto;
 use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
-    AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, AuthMode,
-    ControlConfig, EgressRule, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig, HubQuicConfig,
-    HubSecurityConfig, HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig, ServerConfig,
-    TransportKind,
+    AclConfig, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, ControlConfig, EgressRule,
+    HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig, HubTlsConfig,
+    IngressRule, LoggingConfig, MetricsConfig, ServerConfig, TenantConfig, TransportKind,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
-/// Hub config (real TOML): TLS + QUIC dual stack, anonymous + ACL, default heartbeat
-/// (liveness deadline 75s), metrics endpoint enabled (canary assertions go through the
-/// production telemetry path).
+/// Hub config (real TOML): TLS + QUIC dual stack, mTLS (single test tenant),
+/// default heartbeat (liveness deadline 75s), metrics endpoint enabled (canary
+/// assertions go through the production telemetry path).
 #[allow(clippy::too_many_arguments)]
 pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) -> HubConfig {
     HubConfig {
         config_version: HUB_CONFIG_VERSION,
         server: ServerConfig {
             listen_addr: listen,
+            proxy_protocol: Default::default(),
         },
         auth: AuthConfig {
-            mode: AuthMode::Anonymous,
-            allow_anonymous: true,
             rate_limit_per_minute: 0,
-            static_token: None,
-            mtls: None,
+            tenants: vec![TenantConfig {
+                name: TEST_TENANT.to_string(),
+                ca_path: certs.ca_path().display().to_string(),
+                trusted_gateway: false,
+            }],
         },
         tls: Some(HubTlsConfig {
             enabled: true,
@@ -42,22 +44,9 @@ pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) ->
             key_path: certs.server_key_path().display().to_string(),
             min_version: TlsMinVersion::V1_3,
         }),
-        acl: AclConfig {
-            rules: vec![
-                AclRule {
-                    source: "ingress".to_string(),
-                    target: "egress".to_string(),
-                },
-                // churn agent (dedicated to the eviction scenario): the short-lived-stream
-                // source, see the "churn + re-registration eviction" scenario in the runner
-                AclRule {
-                    source: "churn".to_string(),
-                    target: "egress".to_string(),
-                },
-            ]
-            .into_iter()
-            .collect(),
-        },
+        // Same-tenant streams are allowed by default (tenant isolation
+        // policy); the soak's ingress/churn → egress pairs need no rules.
+        acl: AclConfig::default(),
         security: HubSecurityConfig::default(),
         heartbeat: HeartbeatConfig::default(),
         metrics: MetricsConfig {

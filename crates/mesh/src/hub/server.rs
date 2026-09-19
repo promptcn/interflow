@@ -13,16 +13,14 @@
 //! - accept: [`crate::hub::accept`]
 //! - Auth rate limiting: [`interflow_core::security::rate_limit`]
 
-use crate::config::AuthMode;
 use crate::config::HubConfig;
-use crate::hub::accept::{AcceptContext, handle_connection};
+use crate::hub::accept::AcceptContext;
 use crate::hub::reload::spawn_reload_task;
-use crate::hub::{
-    ActiveStream, SharedAgents, SharedHubConfig, SharedStreamCounts, SharedTlsAcceptor,
-};
-use interflow_core::error::Result;
-use interflow_core::security::{AuditKind, AuditSink, AuthRateLimiter, ConnTracker};
-use interflow_core::tls::{build_mtls_acceptor, build_tls_acceptor};
+use crate::hub::state::SharedTlsPlane;
+use crate::hub::{ActiveStream, SharedAgents, SharedHubConfig, SharedStreamCounts};
+use interflow_core::error::{InterflowError, Result};
+use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker};
+use interflow_core::tls::{TenantTrustRoot, TlsPlane, build_tls_plane};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,13 +32,39 @@ use tracing::{info, warn};
 /// close out; on timeout, return forcibly.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Builds the runtime TLS plane from the config's tenant trust table:
+/// loads each tenant CA, builds the merged-root acceptor and the
+/// per-tenant derivation set. Shared by startup and the SIGHUP reload.
+pub(crate) fn build_runtime_tls_plane(cfg: &HubConfig) -> Result<TlsPlane> {
+    let Some(tls) = &cfg.tls else {
+        return Err(InterflowError::config(
+            "mTLS requires [tls] to be configured (client certificates are verified at the TLS handshake)",
+        ));
+    };
+    let mut roots = Vec::with_capacity(cfg.auth.tenants.len());
+    for tenant in &cfg.auth.tenants {
+        let pem = std::fs::read(&tenant.ca_path).map_err(|e| {
+            InterflowError::config(format!(
+                "tenant '{}' CA read failed ({}): {e}",
+                tenant.name, tenant.ca_path
+            ))
+        })?;
+        roots.push(TenantTrustRoot::from_pem(
+            &tenant.name,
+            tenant.trusted_gateway,
+            &pem,
+        )?);
+    }
+    build_tls_plane(&tls.cert_path, &tls.key_path, &roots, tls.min_version)
+}
+
 /// Hub server orchestrator.
 pub struct HubServer {
     config: SharedHubConfig,
     config_path: String,
     agents: SharedAgents,
     active_streams: Arc<RwLock<HashMap<String, ActiveStream>>>,
-    tls_acceptor: SharedTlsAcceptor,
+    tls_plane: SharedTlsPlane,
     limits: crate::hub::state::HubLimits,
     rate_limiter: Option<Arc<AuthRateLimiter>>,
     stream_counts: SharedStreamCounts,
@@ -49,12 +73,13 @@ pub struct HubServer {
 }
 
 impl HubServer {
-    /// Assembles a hub server. TLS is initialized here (failures return an
-    /// error immediately rather than being deferred to accept).
+    /// Assembles a hub server. The mTLS TLS plane (acceptor + tenant
+    /// derivation set) is initialized here; failures return an error
+    /// immediately rather than being deferred to accept.
     pub fn new(config: HubConfig, config_path: String) -> Result<Self> {
-        let limits = crate::hub::state::HubLimits::from_config(&config);
-        let original_audit_config = config.audit.clone();
-        let conn_tracker = Arc::new(ConnTracker::new(
+        let _limits = crate::hub::state::HubLimits::from_config(&config);
+        let _original_audit_config = config.audit.clone();
+        let _conn_tracker = Arc::new(ConnTracker::new(
             config.security.max_connections_per_ip,
             config.security.max_connections_total,
         ));
@@ -67,47 +92,43 @@ impl HubServer {
             );
         }
 
-        // Normalized at the loading layer: Some(tls) means enabled.
-        let tls_acceptor = if let Some(tls_config) = &config.tls {
-            match config.auth.mode {
-                AuthMode::Mtls => {
-                    let Some(mtls_cfg) = &config.auth.mtls else {
-                        return Err(interflow_core::error::InterflowError::config(
-                            "[auth] mode = \"mtls\" is missing the [auth.mtls] section".to_string(),
-                        ));
-                    };
-                    info!("mTLS enabled (client cert required, CN bound to agent identity)");
-                    Some(build_mtls_acceptor(
-                        &tls_config.cert_path,
-                        &tls_config.key_path,
-                        &mtls_cfg.ca_path,
-                        tls_config.min_version,
-                    )?)
-                }
-                AuthMode::StaticToken | AuthMode::Anonymous => {
-                    info!("TLS enabled (no client cert verification)");
-                    build_tls_acceptor(
-                        &tls_config.cert_path,
-                        &tls_config.key_path,
-                        tls_config.min_version,
-                    )?
-                }
-            }
-        } else {
-            if matches!(config.auth.mode, AuthMode::Mtls) {
-                warn!(
-                    "[auth] mode = \"mtls\" but [tls] is not configured; starting without TLS, authentication is effectively anonymous"
-                );
-            }
-            None
-        };
+        // mTLS-only: the TLS plane is built from the tenant trust table.
+        // Validation guarantees non-empty tenants + [tls] present; the
+        // builder re-checks (the embedded edge constructs configs
+        // programmatically, bypassing the config-file validator).
+        let plane = build_runtime_tls_plane(&config)?;
+        Self::with_tls_plane(config, config_path, plane)
+    }
+
+    /// [`Self::new`] with a prebuilt TLS plane — the embedded edge's entry
+    /// point: it mixes in-memory trust roots (tenant CAs from the CLI plus
+    /// the per-restart gateway principal) that have no ca_path files.
+    pub fn with_tls_plane(config: HubConfig, config_path: String, plane: TlsPlane) -> Result<Self> {
+        let limits = crate::hub::state::HubLimits::from_config(&config);
+        let original_audit_config = config.audit.clone();
+        let conn_tracker = Arc::new(ConnTracker::new(
+            config.security.max_connections_per_ip,
+            config.security.max_connections_total,
+        ));
+        let rate_limiter = AuthRateLimiter::new(config.auth.rate_limit_per_minute).map(Arc::new);
+        if rate_limiter.is_some() {
+            info!(
+                "Auth rate limiting enabled: {} requests/min/IP",
+                config.auth.rate_limit_per_minute
+            );
+        }
+        let tls_plane: SharedTlsPlane = Arc::new(std::sync::RwLock::new(Arc::new(plane)));
+        info!(
+            "mTLS enabled: {} tenant trust root(s), client certs required, identity = (tenant, CN)",
+            config.auth.tenants.len()
+        );
 
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
             config_path,
             agents: Arc::new(RwLock::new(HashMap::new())),
             active_streams: Arc::new(RwLock::new(HashMap::new())),
-            tls_acceptor: Arc::new(RwLock::new(tls_acceptor)),
+            tls_plane,
             limits,
             rate_limiter,
             stream_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -167,7 +188,7 @@ impl HubServer {
         spawn_reload_task(
             self.config_path.clone(),
             self.config.clone(),
-            self.tls_acceptor.clone(),
+            self.tls_plane.clone(),
             self.limits.clone(),
             &tasks,
             shutdown.clone(),
@@ -192,33 +213,21 @@ impl HubServer {
 
         // QUIC dual-stack listener (when enabled; failures propagate
         // immediately — configuration errors must not silently degrade)
-        crate::hub::quic::spawn_quic_listener(AcceptContext {
-            agents: self.agents.clone(),
-            config: self.config.clone(),
-            active_streams: self.active_streams.clone(),
-            tls_acceptor: self.tls_acceptor.clone(),
-            limits: self.limits.clone(),
-            rate_limiter: self.rate_limiter.clone(),
-            stream_counts: self.stream_counts.clone(),
-            audit: self.audit.clone(),
-            tasks: tasks.clone(),
-            shutdown: shutdown.clone(),
-        })
-        .await?;
-
-        let conn_tracker = self.conn_tracker.clone();
         let ctx = AcceptContext {
             agents: self.agents.clone(),
             config: self.config.clone(),
             active_streams: self.active_streams.clone(),
-            tls_acceptor: self.tls_acceptor.clone(),
+            tls_plane: self.tls_plane.clone(),
             limits: self.limits.clone(),
             rate_limiter: self.rate_limiter.clone(),
             stream_counts: self.stream_counts.clone(),
             audit: self.audit.clone(),
+            conn_tracker: self.conn_tracker.clone(),
             tasks: tasks.clone(),
             shutdown: shutdown.clone(),
         };
+
+        crate::hub::quic::spawn_quic_listener(ctx.clone()).await?;
 
         // Both listeners are up (TCP bound above, QUIC spawned just before):
         // anyone waiting on the readiness signal may connect now. A dropped
@@ -233,31 +242,13 @@ impl HubServer {
                 res = listener.accept() => res?,
             };
             // TCP_NODELAY: disable Nagle to reduce small-packet latency
-            // (significant for HTTP/2 multiplexing)
+            // (significant for HTTP/2 multiplexing). Per-IP rate limiting
+            // and connection caps run inside the connection task, after the
+            // PROXY-protocol negotiation keys them on the real client IP.
             let _ = stream.set_nodelay(true);
-            // Connection-level rate limiting: check synchronously before
-            // spawning the task (avoids wasting resources on a handshake
-            // before rejection)
-            let Some(guard) = conn_tracker.try_acquire(addr.ip()) else {
-                metrics::counter!("interflow_hub_conn_rejected").increment(1);
-                self.audit.record(
-                    AuditKind::ConnLimitExceeded {
-                        peer_ip: addr.ip().to_string(),
-                        scope: "conn_limit".into(),
-                    },
-                    None,
-                    Some(addr.to_string()),
-                );
-                warn!("Connection rejected (per-IP or global limit exceeded): {addr}");
-                drop(stream); // explicit close
-                continue;
-            };
-
             let ctx = ctx.clone();
             tasks.spawn(async move {
-                // guard auto-releases on Drop when the task ends
-                let _guard = guard;
-                if let Err(e) = handle_connection(ctx, stream, addr).await {
+                if let Err(e) = crate::hub::accept::handle_connection(ctx, stream, addr).await {
                     tracing::error!("Connection handling failed: {}", e);
                 }
             });

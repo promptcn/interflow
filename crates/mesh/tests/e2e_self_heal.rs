@@ -37,15 +37,19 @@ use interflow_core::protocol::frame::FrameType;
 use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::agent::{AgentHandle, AgentState};
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
-use interflow_testkit::certs::TestCerts;
 use interflow_testkit::fault::{self, FaultPlan};
 use interflow_testkit::{
-    acl, agent_config, agent_quic_config, echo_server, hub_config, hub_config_tuned,
-    hub_quic_config, pick_ephemeral_port, spawn_agent, spawn_agent_registered, spawn_hub,
-    tcp_egress_rule, wait_agent_connected,
+    agent_config, agent_quic_config, echo_server, hub_config, hub_config_tuned, hub_quic_config,
+    pick_ephemeral_port, spawn_agent, spawn_agent_registered, spawn_hub, tcp_egress_rule,
+    wait_agent_connected,
 };
 use std::net::SocketAddr;
 use std::time::Duration;
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 /// Generous budget for a full session rebuild (panic → backoff → reconnect →
 /// register) under parallel-test load; the *red* signal is the budget
@@ -219,8 +223,8 @@ async fn supervisor_died(handle: &AgentHandle, within: Duration) -> bool {
 async fn h2_stack_with_egress() -> (SocketAddr, u16, AgentHandle) {
     let (echo_addr, _echo_handle) = echo_server().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![acl("front", "egress")])).await;
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent_registered(egress_cfg).await;
     (echo_addr, hub_port, egress)
@@ -231,7 +235,8 @@ async fn h2_stack_with_egress() -> (SocketAddr, u16, AgentHandle) {
 fn fast_heartbeat_h2_config(hub_port: u16) -> interflow_mesh::config::HubConfig {
     hub_config_tuned(
         hub_port,
-        vec![acl("front", "egress")],
+        certs(),
+        Vec::new(),
         HubSecurityConfig::default(),
         HeartbeatConfig {
             enabled: true,
@@ -260,7 +265,7 @@ async fn session_panic_survives_and_reconnects() {
     let (echo_addr, hub_port, egress) = h2_stack_with_egress().await;
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::AgentSessionAfterRegister));
-    let front = spawn_agent(agent_config("front", hub_port));
+    let front = spawn_agent(agent_config("front", hub_port, certs()));
 
     // Recovery: Connected again within the rebuild budget.
     assert!(
@@ -313,7 +318,7 @@ async fn upload_task_panic_rebuilds_session() {
     let (echo_addr, hub_port, egress) = h2_stack_with_egress().await;
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::H2UploadLoopAfterEstablish));
-    let front = spawn_agent(agent_config("front", hub_port));
+    let front = spawn_agent(agent_config("front", hub_port, certs()));
     // Subscribe BEFORE the fault can fire (see the helper's doc comment).
     let left_connected = watch_state_left_connected(&front, REBUILD_BUDGET);
     assert!(
@@ -367,7 +372,7 @@ async fn poll_task_panic_rebuilds_session() {
     let (echo_addr, hub_port, egress) = h2_stack_with_egress().await;
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::H2PollLoopAfterConnect));
-    let front = spawn_agent(agent_config("front", hub_port));
+    let front = spawn_agent(agent_config("front", hub_port, certs()));
     let left_connected = watch_state_left_connected(&front, REBUILD_BUDGET);
     assert!(
         wait_agent_connected(&front, Duration::from_secs(10)).await,
@@ -415,12 +420,12 @@ async fn wedged_upload_rebuilds_via_stall_watchdog() {
     let (echo_addr, _echo_handle) = echo_server().await;
     let hub_port = pick_ephemeral_port();
     let _hub = spawn_hub(fast_heartbeat_h2_config(hub_port)).await;
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent_registered(egress_cfg).await;
 
     let faults = fault::install(FaultPlan::new().stall_at(FaultPoint::H2UploadLoopStall));
-    let front = spawn_agent(agent_config("front", hub_port));
+    let front = spawn_agent(agent_config("front", hub_port, certs()));
     assert!(
         wait_agent_connected(&front, Duration::from_secs(10)).await,
         "agent should connect initially (state: {:?})",
@@ -468,7 +473,7 @@ async fn supervisor_panic_is_observable_to_embedders() {
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::AgentSuperviseLoopTick));
 
     let closed_port = pick_ephemeral_port();
-    let mut cfg = agent_config("doomed", closed_port);
+    let mut cfg = agent_config("doomed", closed_port, certs());
     cfg.agent.connect_timeout_secs = 1;
     let handle = spawn_agent(cfg);
 
@@ -522,10 +527,9 @@ async fn supervisor_panic_is_observable_to_embedders() {
 async fn quic_control_read_panic_rebuilds_session() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
-    let certs = TestCerts::generate("self-heal", "self-heal");
     let (echo_addr, _echo_handle) = echo_server().await;
     let hub_port = pick_ephemeral_port();
-    let mut hub_cfg = hub_quic_config(hub_port, &certs, vec![acl("front", "egress")]);
+    let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
     hub_cfg.heartbeat = HeartbeatConfig {
         enabled: false,
         interval_secs: 15,
@@ -533,12 +537,12 @@ async fn quic_control_read_panic_rebuilds_session() {
     };
     let _hub = spawn_hub(hub_cfg).await;
 
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent_registered(egress_cfg).await;
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::QuicControlReadLoop));
-    let front = spawn_agent(agent_quic_config("front", hub_port, &certs));
+    let front = spawn_agent(agent_quic_config("front", hub_port, certs()));
     let left_connected = watch_state_left_connected(&front, REBUILD_BUDGET);
     assert!(
         wait_agent_connected(&front, Duration::from_secs(10)).await,
@@ -575,10 +579,9 @@ async fn quic_control_read_panic_rebuilds_session() {
 async fn quic_accept_loop_panic_rebuilds_session() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
-    let certs = TestCerts::generate("self-heal", "self-heal");
     let (echo_addr, _echo_handle) = echo_server().await;
     let hub_port = pick_ephemeral_port();
-    let mut hub_cfg = hub_quic_config(hub_port, &certs, vec![acl("front", "egress")]);
+    let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
     hub_cfg.heartbeat = HeartbeatConfig {
         enabled: true,
         interval_secs: 1,
@@ -588,10 +591,10 @@ async fn quic_accept_loop_panic_rebuilds_session() {
 
     // Ordering discipline: front first (its accept-loop consult precedes the
     // plan), then arm, then the targeted egress agent.
-    let front = spawn_agent_registered(agent_quic_config("front", hub_port, &certs)).await;
+    let front = spawn_agent_registered(agent_quic_config("front", hub_port, certs())).await;
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::QuicAcceptLoop));
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent(egress_cfg);
     assert!(
@@ -624,11 +627,10 @@ async fn quic_accept_loop_panic_rebuilds_session() {
 async fn quic_closed_watcher_panic_survives_hub_restart() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
-    let certs = TestCerts::generate("self-heal", "self-heal");
     let (echo_addr, _echo_handle) = echo_server().await;
     let hub_port = pick_ephemeral_port();
     let hub_cfg = || {
-        let mut c = hub_quic_config(hub_port, &certs, vec![acl("front", "egress")]);
+        let mut c = hub_quic_config(hub_port, certs(), Vec::new());
         c.heartbeat = HeartbeatConfig {
             enabled: true,
             interval_secs: 1,
@@ -639,12 +641,12 @@ async fn quic_closed_watcher_panic_survives_hub_restart() {
 
     let _hub1 = spawn_hub(hub_cfg()).await;
 
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let _egress_keep = spawn_agent_registered(egress_cfg).await;
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::QuicClosedWatcher));
-    let front = spawn_agent(agent_quic_config("front", hub_port, &certs));
+    let front = spawn_agent(agent_quic_config("front", hub_port, certs()));
     assert!(
         wait_agent_connected(&front, Duration::from_secs(10)).await,
         "agent should connect initially (state: {:?})",
@@ -690,10 +692,9 @@ async fn quic_closed_watcher_panic_survives_hub_restart() {
 async fn quic_control_write_stall_rebuilds_session() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
-    let certs = TestCerts::generate("self-heal", "self-heal");
     let (echo_addr, _echo_handle) = echo_server().await;
     let hub_port = pick_ephemeral_port();
-    let mut hub_cfg = hub_quic_config(hub_port, &certs, vec![acl("front", "egress")]);
+    let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
     hub_cfg.heartbeat = HeartbeatConfig {
         enabled: true,
         interval_secs: 1,
@@ -701,7 +702,7 @@ async fn quic_control_write_stall_rebuilds_session() {
     };
     let _hub = spawn_hub(hub_cfg).await;
 
-    let mut egress_cfg = agent_quic_config("egress", hub_port, &certs);
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent_registered(egress_cfg).await;
 
@@ -714,7 +715,7 @@ async fn quic_control_write_stall_rebuilds_session() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let faults = fault::install(FaultPlan::new().stall_at(FaultPoint::QuicControlWriteStall));
-    let mut front_cfg = agent_quic_config("front", hub_port, &certs);
+    let mut front_cfg = agent_quic_config("front", hub_port, certs());
     // Pin the stall window tight so the test asserts the watchdog path
     // independent of the negotiated derivation (the pinned 2s happens to
     // equal this hub's advertised 1s×(1+1) dead line).

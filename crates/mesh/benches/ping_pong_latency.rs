@@ -23,6 +23,11 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 const ITERATIONS: usize = 1000;
 
 fn bench_pingpong(c: &mut Criterion) {
@@ -59,11 +64,12 @@ fn bench_pingpong(c: &mut Criterion) {
 }
 
 mod setup {
+    use super::certs;
     // Thin glue: stack assembly lives in interflow-testkit (hub/agent
     // configs, echo backend, readiness probe).
     use interflow_mesh::agent::AgentHandle;
     use interflow_testkit::config::{
-        acl, agent_config, hub_config, tcp_egress_rule, tcp_ingress_rule, unlock_stream_limits,
+        agent_config, hub_config, tcp_egress_rule, tcp_ingress_rule, unlock_stream_limits,
     };
     use interflow_testkit::stack::{
         HubHandle, pick_ephemeral_port, spawn_agent, spawn_hub, wait_for_tcp,
@@ -83,17 +89,17 @@ mod setup {
         let ingress_port = pick_ephemeral_port();
         let (echo_addr, echo) = interflow_testkit::echo_server().await;
 
-        let mut hub_cfg = hub_config(hub_port, vec![acl("ingress", "egress")]);
+        let mut hub_cfg = hub_config(hub_port, certs(), Vec::new());
         unlock_stream_limits(&mut hub_cfg);
         hub_cfg.logging.level = "warn".into();
         let hub = spawn_hub(hub_cfg).await;
 
-        let mut egress_cfg = agent_config("egress", hub_port);
+        let mut egress_cfg = agent_config("egress", hub_port, certs());
         egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
         let egress = spawn_agent(egress_cfg);
 
         let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().expect("addr");
-        let mut ingress_cfg = agent_config("ingress", hub_port);
+        let mut ingress_cfg = agent_config("ingress", hub_port, certs());
         ingress_cfg.ingress = vec![tcp_ingress_rule(
             "to-egress",
             ingress_addr,

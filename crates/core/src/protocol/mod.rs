@@ -6,4 +6,4 @@ pub mod close_reason;
 pub mod frame;
 
 pub use close_reason::CloseReason;
-pub use frame::{FLAG_UDP, FrameType, StreamProto};
+pub use frame::{FLAG_E2E, FLAG_UDP, FrameType, MAX_FRAME_PAYLOAD, StreamProto};

@@ -51,6 +51,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 /// Egress drain window (egress.rs BACKEND_EOF_DRAIN_GRACE) + assertion
 /// headroom.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(12);
@@ -80,7 +85,7 @@ async fn eventually<F: Fn() -> bool>(cond: F, timeout: Duration, what: &str) {
 /// Bare-tunnel injection endpoint: connect to the hub + register + AgentTunnel
 /// (frame-level direct send, with full control over the frame count).
 async fn connect_tunnel(hub_port: u16, agent_id: &str) -> AgentTunnel {
-    let client = AgentClient::new(agent_config(agent_id, hub_port)).expect("agent build");
+    let client = AgentClient::new(agent_config(agent_id, hub_port, certs())).expect("agent build");
     let conn = client
         .connect_and_register()
         .await
@@ -89,7 +94,6 @@ async fn connect_tunnel(hub_port: u16, agent_id: &str) -> AgentTunnel {
         agent_id.to_string(),
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
-        None,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
             tokio_util::sync::CancellationToken::new(),
         ),
@@ -256,13 +260,13 @@ async fn recv_response_data(
 async fn backend_eof_without_peer_close_releases_fd() {
     let _ = metrics_handle();
     let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
 
     let (backend_addr, active) = close_after_echo_backend(b"ping").await;
     // Registration gate: an Open routed to an unregistered target is torn
     // down by the hub with `_close_`, so the egress must be registered
     // before the injector addresses it (startup-race hardening).
-    let _agent = spawn_agent_registered(agent_config("eg", hub_port)).await;
+    let _agent = spawn_agent_registered(agent_config("eg", hub_port, certs())).await;
     let inj = connect_tunnel(hub_port, "inj-t1").await;
 
     let closed_before =
@@ -314,13 +318,13 @@ async fn backend_eof_without_peer_close_releases_fd() {
 async fn backend_eof_drain_window_delivers_late_request_tail() {
     let _ = metrics_handle();
     let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
 
     let (backend_addr, tail, active) = half_close_backend(b"ping").await;
     // Registration gate: an Open routed to an unregistered target is torn
     // down by the hub with `_close_`, so the egress must be registered
     // before the injector addresses it (startup-race hardening).
-    let _agent = spawn_agent_registered(agent_config("eg", hub_port)).await;
+    let _agent = spawn_agent_registered(agent_config("eg", hub_port, certs())).await;
     let inj = connect_tunnel(hub_port, "inj-t2").await;
 
     {
@@ -377,14 +381,14 @@ async fn backend_eof_drain_window_delivers_late_request_tail() {
 async fn source_re_register_sweep_notifies_egress_streams() {
     let _ = metrics_handle();
     let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
 
     const K: usize = 3;
     let (backend_addr, active) = silent_backend().await;
     // Registration gate: an Open routed to an unregistered target is torn
     // down by the hub with `_close_`, so the egress must be registered
     // before the injector addresses it (startup-race hardening).
-    let _agent = spawn_agent_registered(agent_config("eg", hub_port)).await;
+    let _agent = spawn_agent_registered(agent_config("eg", hub_port, certs())).await;
     let inj = connect_tunnel(hub_port, "src-t4").await;
 
     for i in 0..K {
@@ -440,13 +444,13 @@ async fn source_re_register_sweep_notifies_egress_streams() {
 async fn normal_source_close_still_releases_backend() {
     let _ = metrics_handle();
     let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, vec![])).await;
+    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
 
     let (backend_addr, active) = silent_backend().await;
     // Registration gate: an Open routed to an unregistered target is torn
     // down by the hub with `_close_`, so the egress must be registered
     // before the injector addresses it (startup-race hardening).
-    let _agent = spawn_agent_registered(agent_config("eg", hub_port)).await;
+    let _agent = spawn_agent_registered(agent_config("eg", hub_port, certs())).await;
     let inj = connect_tunnel(hub_port, "inj-reg").await;
 
     let mut resp = inj.register_stream("reg".to_string()).await;

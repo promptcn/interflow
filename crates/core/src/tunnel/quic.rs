@@ -1,7 +1,8 @@
 //! QUIC tunnel backend: one QUIC connection carries all tunnel streams (frp-isomorphic, backlog §6.2 option 2).
 //!
 //! - **Control stream** (the first bidirectional stream): Hello
-//!   (registration, payload = token) → HelloAck; hub heartbeat Pings are
+//!   (registration + capability bits; authentication is exclusively the TLS
+//!   client certificate) → HelloAck; hub heartbeat Pings are
 //!   intercepted on the control stream and answered with Pong (aligned with
 //!   the h2 backend's automatic answering at the poll layer).
 //! - **Traffic streams**: each tunnel stream = one bidirectional QUIC stream
@@ -69,6 +70,13 @@ pub struct QuicSessionParams {
     /// Local concurrent-stream limit the dispatch event channel is sized
     /// from (agent `max_incoming_streams`; 0 = the shared floor).
     pub incoming_streams_budget: usize,
+    /// Declares the e2e (inner TLS) capability in the Hello caps byte —
+    /// **observation only**: the hub uses it for fleet visibility
+    /// (`interflow_quic_agents_e2e_capable`), never as an input to any
+    /// downgrade/fallback decision (caps assertions come from the hub,
+    /// which is inside the threat model; RFC
+    /// docs/design/agent-e2e-encryption.md §3.6).
+    pub e2e_capable: bool,
 }
 
 impl QuicSessionParams {
@@ -79,6 +87,7 @@ impl QuicSessionParams {
         establish_timeout: crate::tunnel::agent::DEFAULT_REQUEST_ESTABLISH_TIMEOUT,
         transport: QuicEndpointParams::DEFAULT,
         incoming_streams_budget: 0,
+        e2e_capable: false,
     };
 }
 
@@ -127,6 +136,10 @@ const WRITE_CHANNEL_CAP: usize = 64;
 
 /// Capability bit in the first byte of the Hello/HelloAck payload: the QUIC DATAGRAM (RFC 9221) fast path.
 pub const CAP_DATAGRAM: u8 = 0x01;
+/// Capability bit in the first byte of the Hello payload: the agent runs
+/// with the e2e (inner TLS) layer configured (observation only — see
+/// [`QuicSessionParams::e2e_capable`]).
+pub const CAP_E2E: u8 = 0x02;
 
 /// Budget for a whole frame carried in a DATAGRAM.
 ///
@@ -136,20 +149,18 @@ pub const CAP_DATAGRAM: u8 = 0x01;
 /// out-of-order arrival).
 pub const DATAGRAM_FRAME_BUDGET: usize = 1023;
 
-/// Hello payload encoding: `[caps u8][token]` (both endpoints).
-pub fn encode_hello_payload(caps: u8, token: &str) -> Bytes {
-    let mut buf = BytesMut::with_capacity(1 + token.len());
+/// Hello payload encoding: `[caps u8]`. Authentication is exclusively the
+/// QUIC TLS handshake (client certificates); the frame carries no
+/// credential material.
+pub fn encode_hello_payload(caps: u8) -> Bytes {
+    let mut buf = BytesMut::with_capacity(1);
     buf.extend_from_slice(&[caps]);
-    buf.extend_from_slice(token.as_bytes());
     buf.freeze()
 }
 
-/// Hello payload decoding: returns (caps, token).
-pub fn decode_hello_payload(payload: &[u8]) -> (u8, String) {
-    match payload.split_first() {
-        Some((caps, token)) => (*caps, String::from_utf8_lossy(token).to_string()),
-        None => (0, String::new()),
-    }
+/// Hello payload decoding: returns caps.
+pub fn decode_hello_payload(payload: &[u8]) -> u8 {
+    payload.first().copied().unwrap_or(0)
 }
 
 /// HelloAck payload encoding: `[caps u8][capability JSON]`.
@@ -478,7 +489,6 @@ impl QuicTunnel {
         server_addr: SocketAddr,
         server_name: &str,
         tls: rustls::ClientConfig,
-        auth_token: Option<&str>,
         tasks: SessionTasks,
         params: QuicSessionParams,
     ) -> Result<Self> {
@@ -522,12 +532,13 @@ impl QuicTunnel {
             InterflowError::connection(format!("QUIC control stream open failed: {e}"))
         })?;
 
+        let hello_caps = CAP_DATAGRAM | (u8::from(params.e2e_capable) * CAP_E2E);
         let hello = encode_frame_bytes(
             FrameType::Hello,
             0,
             "",
             &agent_id,
-            &encode_hello_payload(CAP_DATAGRAM, auth_token.unwrap_or("")),
+            &encode_hello_payload(hello_caps),
         )?;
         control_tx
             .write_all(&hello)
@@ -802,12 +813,13 @@ async fn control_write_forward(
 
 #[async_trait]
 impl TunnelTransport for QuicTunnel {
-    async fn send_open(
+    async fn send_open_with(
         &self,
         stream_id: &str,
         target_agent: &str,
         target_addr: Option<&str>,
         proto: StreamProto,
+        e2e: bool,
     ) -> Result<()> {
         let (tx, rx) = self
             .conn
@@ -843,13 +855,9 @@ impl TunnelTransport for QuicTunnel {
         // bound by connection registration, and the in-frame source_agent is
         // only a redundant check)
         let payload = format!("{target_agent}:{}", target_addr.unwrap_or(""));
-        self.send_frame_on(
-            stream_id,
-            FrameType::Open,
-            proto.as_flag(),
-            payload.as_bytes(),
-        )
-        .await
+        let flags = proto.as_flag() | if e2e { crate::protocol::FLAG_E2E } else { 0 };
+        self.send_frame_on(stream_id, FrameType::Open, flags, payload.as_bytes())
+            .await
     }
 
     async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()> {

@@ -1,6 +1,6 @@
 [package]
 name = "interflow-expose"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Ngrok-style tunnel: public hostname → local service"
@@ -15,8 +15,11 @@ name = "interflow-expose"
 path = "src/main.rs"
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.2" }
-interflow-mesh = { path = "../mesh", version = "0.2" }
+interflow-core = { path = "../core", version = "0.3" }
+interflow-mesh = { path = "../mesh", version = "0.3" }
+# Certificate issuance (init wizard + the edge's ephemeral gateway identity) —
+# the single rcgen implementation shared with `interflow-mesh certs`
+interflow-certs = { path = "../certs", version = "0.3" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -27,11 +30,10 @@ hyper-util = { version = "0.1.20", features = ["tokio"] }
 http = "1.4"
 http-body-util = "0.1.3"
 
-# TLS / certificate generation
+# TLS (issuance itself lives in interflow-certs)
 tokio-rustls = "0.26.4"
 rustls = "0.23"
 rustls-pemfile = "2.2.0"
-rcgen = "0.14"
 sha2 = "0.11"
 
 # Config / serialization
@@ -47,8 +49,7 @@ thiserror = "2"
 # Utilities
 bytes = "1.12"
 uuid = { version = "1.23", features = ["v4"] }
-dirs = "6"
-rand = "0.10"
+dirs = { workspace = true }
 hex = "0.4"
 
 # CLI
@@ -73,12 +74,11 @@ workspace = true
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-x509-parser = "0.18"
 tempfile = "3"
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
 # Shared test harness (certs for the QUIC e2e stack; fault-injection for the
 # self-healing tests; production graph unaffected)
-interflow-testkit = { path = "../testkit", version = "0.2", features = ["fault-injection"] }
+interflow-testkit = { path = "../testkit", version = "0.3", features = ["fault-injection"] }
 # e2e assertions on metrics counters (in-process recorder installed for direct snapshot reads)
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 

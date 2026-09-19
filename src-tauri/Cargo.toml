@@ -1,6 +1,6 @@
 [package]
 name = "interflow-gui"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Interflow expose GUI (Tauri 2.0)"
@@ -15,17 +15,29 @@ path = "src/lib.rs"
 name = "interflow-gui"
 path = "src/main.rs"
 
+[[bin]]
+name = "export-bindings"
+path = "src/bin/export_bindings.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-interflow-expose = { path = "../crates/expose", version = "0.2" }
-interflow-mesh = { path = "../crates/mesh", version = "0.2" }
+interflow-core = { path = "../crates/core", version = "0.3" }
+interflow-expose = { path = "../crates/expose", version = "0.3" }
+interflow-mesh = { path = "../crates/mesh", version = "0.3" }
 
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "specta"] }
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
+
+# IPC contract codegen: TS types + typed invoke/event wrappers are generated
+# from the Rust DTOs (src/bindings.ts) — the frontend never hand-writes them.
+# specta and tauri-specta versions are exact-pinned in lockstep by upstream.
+specta = { version = "=2.0.0-rc.25", features = ["derive"] }
+specta-typescript = "0.0.12"
+tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
@@ -35,6 +47,13 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
+
+[dev-dependencies]
+# In-process hub + self-signed certs for the Start/Stop round-trip regression
+# tests (tunnel.rs) — the 2026-09-18 deadlock acceptance gate.
+interflow-testkit = { path = "../crates/testkit", version = "0.3" }
+# Bindings-freshness drift guard test (contract.rs)
+tempfile = "3"
 
 [lints]
 workspace = true

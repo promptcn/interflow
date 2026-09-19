@@ -78,6 +78,23 @@ pub(crate) struct H2Tunnel {
     up_tx: Arc<Mutex<mpsc::Sender<Bytes>>>,
 }
 
+/// How one h2 poll round ended. Cancellation is modeled as its own outcome
+/// instead of being folded into the failure shape: a user Stop observed
+/// mid-drain is neither success nor failure, and feeding it into the retry
+/// accounting produced an orphan "retrying connection in 200ms…" log line
+/// for a backoff the very next await cancelled (the 2026-09-18 GUI
+/// papercut).
+enum PollOutcome {
+    /// The stream was consumed to its end: the connection lived, retry
+    /// pacing resets.
+    Drained,
+    /// The round failed before or during consumption: count it, log, back
+    /// off.
+    Failed,
+    /// Shutdown was observed inside the drain: exit without bookkeeping.
+    Cancelled,
+}
+
 impl H2Tunnel {
     /// Creates the tunnel backend from an established HTTP/2 connection.
     ///
@@ -96,7 +113,6 @@ impl H2Tunnel {
         agent_id: String,
         hub_url: &str,
         sender: SendRequest<H2RequestBody>,
-        auth_token: Option<String>,
         tasks: &SessionTasks,
         liveness: H2Liveness,
     ) -> Self {
@@ -119,7 +135,6 @@ impl H2Tunnel {
         let upload_agent_id = agent_id.clone();
         let upload_hub_url = hub_url.to_string();
         let upload_up_tx = up_tx.clone();
-        let upload_auth = auth_token.clone();
         let upload_shutdown = shutdown.clone();
         tasks.spawn_critical(
             "h2-upload",
@@ -130,7 +145,6 @@ impl H2Tunnel {
                     upload_agent_id,
                     upload_hub_url,
                     upload_up_tx,
-                    upload_auth,
                     upload_shutdown,
                     Some(first_up_rx),
                     liveness.establish_timeout,
@@ -154,7 +168,6 @@ impl H2Tunnel {
                     agent_id_for_poll,
                     hub_url_for_poll,
                     &dispatch_for_poll,
-                    auth_token,
                     token_for_poll,
                     up_tx_for_poll,
                     liveness,
@@ -282,7 +295,6 @@ impl H2Tunnel {
         agent_id: String,
         hub_url: String,
         up_tx_slot: Arc<Mutex<mpsc::Sender<Bytes>>>,
-        auth_token: Option<String>,
         shutdown: CancellationToken,
         mut first_rx: Option<mpsc::Receiver<Bytes>>,
         establish_timeout: Duration,
@@ -310,13 +322,10 @@ impl H2Tunnel {
             };
             let body = StreamBody::new(ChunkHygiene::new(upload_body_stream(rx))).boxed();
 
-            let mut builder = Request::builder()
+            let builder = Request::builder()
                 .method("POST")
                 .uri(format!("{hub_url}/stream/up"))
                 .header("x-agent-id", &agent_id);
-            if let Some(token) = &auth_token {
-                builder = builder.header("Authorization", format!("Bearer {token}"));
-            }
             let req = match builder.body(body) {
                 Ok(r) => r,
                 Err(e) => {
@@ -452,6 +461,14 @@ impl H2Tunnel {
         beat: &Beat,
         beat_every: Duration,
     ) {
+        // Cancellation is not a retry: a Stop observed before the backoff
+        // would log an orphan "retrying upload stream…" line for a sleep the
+        // select then immediately abandons (the poll-loop mirror of this is
+        // `PollOutcome::Cancelled`). The caller's next await observes the
+        // token and exits.
+        if shutdown.is_cancelled() {
+            return;
+        }
         let backoff_ms = compute_backoff_ms(base, consecutive_failures);
         let interval = max.min(Duration::from_millis(backoff_ms));
         warn!("retrying upload stream in {interval:?}...");
@@ -468,7 +485,6 @@ impl H2Tunnel {
         agent_id: String,
         hub_url: String,
         dispatch: &TunnelDispatch,
-        auth_token: Option<String>,
         shutdown: CancellationToken,
         up_tx: Arc<Mutex<mpsc::Sender<Bytes>>>,
         liveness: H2Liveness,
@@ -495,7 +511,7 @@ impl H2Tunnel {
                     error!("hub connection lost: {}", e);
                     break;
                 }
-                match Self::build_poll_request(&agent_id, &hub_url, auth_token.as_deref()) {
+                match Self::build_poll_request(&agent_id, &hub_url) {
                     Ok(req) => Ok(sender_locked.send_request(req)),
                     Err(e) => {
                         error!("failed to prepare request: {}", e);
@@ -543,13 +559,13 @@ impl H2Tunnel {
                     .await
                 }
                 // Request construction failed: treat as one failure and continue the backoff loop
-                Err(()) => false,
+                Err(()) => PollOutcome::Failed,
             };
 
-            if outcome {
-                consecutive_failures = 0;
-            } else {
-                consecutive_failures += 1;
+            match outcome {
+                PollOutcome::Cancelled => break,
+                PollOutcome::Drained => consecutive_failures = 0,
+                PollOutcome::Failed => consecutive_failures += 1,
             }
 
             let backoff_ms = compute_backoff_ms(BASE_INTERVAL, consecutive_failures);
@@ -565,25 +581,18 @@ impl H2Tunnel {
     }
 
     /// Builds the `/poll` request (without the sender; the caller sends it).
-    fn build_poll_request(
-        agent_id: &str,
-        hub_url: &str,
-        auth_token: Option<&str>,
-    ) -> Result<Request<H2RequestBody>> {
-        let mut builder = Request::builder()
+    fn build_poll_request(agent_id: &str, hub_url: &str) -> Result<Request<H2RequestBody>> {
+        let builder = Request::builder()
             .method("GET")
             .uri(format!("{hub_url}/poll"))
             .header("x-agent-id", agent_id);
-        if let Some(token) = auth_token {
-            builder = builder.header("Authorization", format!("Bearer {token}"));
-        }
         builder
             .body(empty_request_body())
             .map_err(|e| InterflowError::connection(format!("failed to build request: {e}")))
     }
 
-    /// Handles the `/poll` response: returns true on successful consumption; false on any failure.
-    /// Returns false immediately when `shutdown` is cancelled (the caller exits the loop).
+    /// Handles the `/poll` response: the outcome classifies how the round
+    /// ended for the caller's retry accounting (see [`PollOutcome`]).
     ///
     /// Hub heartbeat Ping frames are intercepted and answered here (in a
     /// separate task, not blocking the read loop) instead of entering business
@@ -610,17 +619,17 @@ impl H2Tunnel {
         tasks: &SessionTasks,
         beat: &Beat,
         beat_every: Duration,
-    ) -> bool {
+    ) -> PollOutcome {
         let resp = match resp_result {
             Ok(r) => r,
             Err(e) => {
                 error!("failed to send poll request: {}", e);
-                return false;
+                return PollOutcome::Failed;
             }
         };
         if resp.status() != StatusCode::OK {
             tracing::warn!("poll request rejected: {}", resp.status());
-            return false;
+            return PollOutcome::Failed;
         }
         info!("connected to hub streaming endpoint");
         // Fault injection: panic right after the poll stream connects (the
@@ -634,12 +643,12 @@ impl H2Tunnel {
             // interval; long total silence can only be a stall.
             let frame_res = if liveness.poll_watchdog.is_zero() {
                 tokio::select! {
-                    () = shutdown.cancelled() => return false,
+                    () = shutdown.cancelled() => return PollOutcome::Cancelled,
                     f = beat.during(beat_every, body.frame()) => f,
                 }
             } else {
                 tokio::select! {
-                    () = shutdown.cancelled() => return false,
+                    () = shutdown.cancelled() => return PollOutcome::Cancelled,
                     r = beat.during(beat_every, tokio::time::timeout(liveness.poll_watchdog, body.frame())) => {
                         let Ok(f) = r else {
                             warn!(
@@ -651,7 +660,7 @@ impl H2Tunnel {
                             // it terminates the whole session; the supervisor
                             // follows the existing backoff reconnect path
                             shutdown.cancel();
-                            return false;
+                            return PollOutcome::Failed;
                         };
                         f
                     }
@@ -680,7 +689,7 @@ impl H2Tunnel {
         }
         info!("hub stream disconnected, preparing to reconnect");
         buffer.clear();
-        true
+        PollOutcome::Drained
     }
 
     /// Answers a hub heartbeat Ping with a Pong frame over the uplink data
@@ -728,20 +737,22 @@ fn upload_body_stream(
 
 #[async_trait]
 impl TunnelTransport for H2Tunnel {
-    async fn send_open(
+    async fn send_open_with(
         &self,
         stream_id: &str,
         target_agent: &str,
         target_addr: Option<&str>,
         proto: StreamProto,
+        e2e: bool,
     ) -> Result<()> {
         // Open frame payload: "{target_agent}:{target_addr}" (same encoding
         // as the QUIC backend; the hub parses it with split_once(':'); the
         // agent id charset contains no colon).
         let payload = format!("{target_agent}:{}", target_addr.unwrap_or(""));
+        let flags = proto.as_flag() | if e2e { crate::protocol::FLAG_E2E } else { 0 };
         self.send_frame(
             FrameType::Open,
-            proto.as_flag(),
+            flags,
             stream_id,
             &self.agent_id,
             payload.as_bytes(),

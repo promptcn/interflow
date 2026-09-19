@@ -2,7 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { LogLine } from "../api";
 
-export default function LogView({ logs }: { logs: LogLine[] }) {
+export default function LogView({
+  logs,
+  onClear,
+}: {
+  logs: LogLine[];
+  onClear: () => void;
+}) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
 
@@ -26,6 +32,9 @@ export default function LogView({ logs }: { logs: LogLine[] }) {
   return (
     <div className="log-section">
       <div className="log-toolbar">
+        <button disabled={logs.length === 0} onClick={onClear}>
+          Clear logs
+        </button>
         <button disabled={logs.length === 0} onClick={copy}>
           {copied ? "Copied" : "Copy logs"}
         </button>

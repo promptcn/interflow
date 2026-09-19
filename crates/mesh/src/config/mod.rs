@@ -7,13 +7,13 @@ pub mod transport;
 pub mod validate;
 
 pub use agent::{
-    AGENT_CONFIG_VERSION, AgentConfig, AgentInfo, ControlConfig, EgressRule, IngressRule,
-    SecurityConfig, TlsConfig as AgentTlsConfig, TransportKind,
+    AGENT_CONFIG_VERSION, AgentConfig, AgentInfo, ControlConfig, E2eConfig, E2eMode, EgressRule,
+    IngressRule, SecurityConfig, TlsConfig as AgentTlsConfig, TransportKind,
 };
 pub use hub::{
-    AclConfig, AclRule, AuthConfig, AuthMode, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig,
-    HubQuicConfig, HubSecurityConfig, HubTransportConfig, MetricsConfig, MtlsConfig, ServerConfig,
-    StaticTokenConfig, TlsConfig as HubTlsConfig,
+    AclConfig, AclRule, AuthConfig, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig, HubQuicConfig,
+    HubSecurityConfig, HubTransportConfig, MetricsConfig, ServerConfig, TenantConfig,
+    TlsConfig as HubTlsConfig,
 };
 pub use interflow_core::config::LoggingConfig;
 pub use interflow_core::telemetry::LogFormat;

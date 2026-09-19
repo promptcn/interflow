@@ -1,0 +1,31 @@
+# LAN B agent: receives tunnel streams and dials the service on LAN B.
+
+config_version = 3
+
+[agent]
+id = "lan-b"
+hub_url = "https://127.0.0.1:6666"
+
+[tls]
+enabled = true
+ca_path = "certs/tenants/demo-ca.crt"
+client_cert_path = "certs/agents/lan-b.crt"
+client_key_path = "certs/agents/lan-b.key"
+
+[e2e]
+mode = "required"
+
+[control]
+enabled = false
+
+[logging]
+level = "info,interflow=debug"
+format = "plain"
+
+[security]
+allowed_targets = ["127.0.0.1:3000"]
+
+# Optional QUIC transport (must also be enabled on the hub):
+# [agent]
+# transport = "quic"
+# hub_quic_addr = "127.0.0.1:6666"

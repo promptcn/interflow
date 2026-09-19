@@ -141,12 +141,26 @@ pub fn build_mtls_acceptor(
     client_ca_path: &str,
     min_version: TlsMinVersion,
 ) -> Result<TlsAcceptor> {
+    let client_roots = load_ca_roots(client_ca_path)?;
+    build_mtls_acceptor_with_roots(cert_path, key_path, &client_roots, min_version)
+}
+
+/// [`build_mtls_acceptor`] with the client trust roots supplied directly.
+///
+/// The multi-tenant plane merges every tenant's roots into one store —
+/// `core::tls::tenant` owns the derivation of *which* tenant anchored a
+/// chain.
+pub fn build_mtls_acceptor_with_roots(
+    cert_path: &str,
+    key_path: &str,
+    client_roots: &RootCertStore,
+    min_version: TlsMinVersion,
+) -> Result<TlsAcceptor> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let client_roots = load_ca_roots(client_ca_path)?;
 
     let verifier =
-        tokio_rustls::rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+        tokio_rustls::rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots.clone()))
             .build()
             .map_err(|e| InterflowError::config(format!("failed to build client verifier: {e}")))?;
 
@@ -171,11 +185,25 @@ pub fn build_rustls_server_config(
     client_ca: Option<&str>,
     min_version: TlsMinVersion,
 ) -> Result<rustls::ServerConfig> {
+    let roots = match client_ca {
+        Some(path) => Some(load_ca_roots(path)?),
+        None => None,
+    };
+    build_rustls_server_config_with_roots(cert_path, key_path, roots.as_ref(), min_version)
+}
+
+/// [`build_rustls_server_config`] with the client trust roots supplied
+/// directly (the multi-tenant QUIC plane merges every tenant's roots).
+pub fn build_rustls_server_config_with_roots(
+    cert_path: &str,
+    key_path: &str,
+    client_roots: Option<&RootCertStore>,
+    min_version: TlsMinVersion,
+) -> Result<rustls::ServerConfig> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let builder = if let Some(ca_path) = client_ca {
-        let roots = load_ca_roots(ca_path)?;
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+    let builder = if let Some(roots) = client_roots {
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots.clone()))
             .build()
             .map_err(|e| {
                 crate::error::InterflowError::config(format!(
@@ -216,6 +244,17 @@ pub fn extract_cn_from_chain(certs: &[CertificateDer]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Reads the leaf certificate's subject CN from a PEM file.
+///
+/// The file-level counterpart of [`extract_cn_from_chain`], used for the
+/// agent-side startup pre-validation of the identity binding (`agent id ==
+/// certificate CN`) that the hub otherwise only enforces at registration
+/// with a 403. `Err` means the file is unreadable or not a PEM cert chain;
+/// `Ok(None)` means it parsed but carries no CN.
+pub fn extract_cn_from_pem_file(path: &str) -> Result<Option<String>> {
+    Ok(extract_cn_from_chain(&load_certs(path)?))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::panic,
@@ -249,18 +288,26 @@ mod min_version_tests {
     /// `builder_with_protocol_versions`, this floor was silently ignored.
     #[tokio::test]
     async fn min_version_tls13_rejects_tls12_and_accepts_tls13() {
-        // Self-signed server certificate on disk (load_key enforces 0600).
+        // Server certificate on disk, CA-signed via interflow-certs (load_key
+        // enforces 0600).
         let dir = std::env::temp_dir().join(format!("interflow-tls-minver-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
         {
-            let server = rcgen::generate_simple_self_signed(vec!["hub.test".to_string()]).unwrap();
-            let mut f = std::fs::File::create(&cert_path).unwrap();
-            f.write_all(server.cert.pem().as_bytes()).unwrap();
-            let mut f = std::fs::File::create(&key_path).unwrap();
-            f.write_all(server.signing_key.serialize_pem().as_bytes())
+            let ca = interflow_certs::build_ca("minver", interflow_certs::Validity::ca_default())
                 .unwrap();
+            let loaded = interflow_certs::LoadedCa::from_material(&ca).unwrap();
+            let server = loaded
+                .build_server_cert(
+                    &[interflow_certs::SanName::Dns("hub.test".to_owned())],
+                    interflow_certs::Validity::leaf_default(),
+                )
+                .unwrap();
+            let mut f = std::fs::File::create(&cert_path).unwrap();
+            f.write_all(server.cert_pem.as_bytes()).unwrap();
+            let mut f = std::fs::File::create(&key_path).unwrap();
+            f.write_all(server.key_pem.as_bytes()).unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

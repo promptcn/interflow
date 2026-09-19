@@ -61,17 +61,27 @@ use interflow_core::protocol::frame::{
 };
 use interflow_core::tunnel::H2RequestBody;
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
+use interflow_mesh::hub::qualified_agent_id;
 use interflow_testkit::{hub_config_tuned, pick_ephemeral_port, spawn_hub};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
 /// Establish a bare HTTP/2 connection to the hub.
-async fn connect(port: u16) -> SendRequest<H2RequestBody> {
+async fn connect(port: u16, cn: &str) -> SendRequest<H2RequestBody> {
     let (send_request, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
         .handshake::<_, H2RequestBody>(TokioIo::new(
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-                .await
-                .expect("tcp"),
+            interflow_testkit::tls_client_connect(
+                certs(),
+                cn,
+                format!("127.0.0.1:{port}").parse().unwrap(),
+            )
+            .await
+            .expect("tls"),
         ))
         .await
         .expect("handshake");
@@ -298,13 +308,14 @@ async fn open_to_unregistered_target_replies_close_frame() {
     let port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config_tuned(
         port,
+        certs(),
         vec![],
         security(30, 30),
         HeartbeatConfig::default(),
     ))
     .await;
 
-    let mut src = connect(port).await;
+    let mut src = connect(port, "src").await;
     assert_eq!(register(&mut src, "src").await, 200);
 
     let (up_tx, _up_resp) = open_upload(&mut src, "src").await;
@@ -342,15 +353,16 @@ async fn open_flood_to_idle_target_delivers_all_via_control_channel() {
     let port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config_tuned(
         port,
+        certs(),
         vec![],
         security(1, 30),
         HeartbeatConfig::default(),
     ))
     .await;
 
-    let mut src = connect(port).await;
+    let mut src = connect(port, "src").await;
     assert_eq!(register(&mut src, "src").await, 200);
-    let mut tgt = connect(port).await;
+    let mut tgt = connect(port, "tgt").await;
     assert_eq!(register(&mut tgt, "tgt").await, 200);
 
     let (up_tx, _up_resp) = open_upload(&mut src, "src").await;
@@ -439,15 +451,16 @@ async fn data_send_timeout_evicts_and_poll_recreates() {
     let port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config_tuned(
         port,
+        certs(),
         vec![],
         security(1, 30),
         HeartbeatConfig::default(),
     ))
     .await;
 
-    let mut src = connect(port).await;
+    let mut src = connect(port, "src").await;
     assert_eq!(register(&mut src, "src").await, 200);
-    let mut tgt = connect(port).await;
+    let mut tgt = connect(port, "tgt").await;
     assert_eq!(register(&mut tgt, "tgt").await, 200);
 
     let (up_tx, _up_resp) = open_upload(&mut src, "src").await;
@@ -489,11 +502,11 @@ async fn data_send_timeout_evicts_and_poll_recreates() {
 
     // The agent has been evicted
     let agents = wait_agents(&mut src, Duration::from_secs(3), |a| {
-        !a.contains(&"tgt".to_string())
+        !a.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "tgt"))
     })
     .await;
     assert!(
-        !agents.contains(&"tgt".to_string()),
+        !agents.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "tgt")),
         "tgt should be evicted after the timeout: {agents:?}"
     );
 
@@ -506,7 +519,7 @@ async fn data_send_timeout_evicts_and_poll_recreates() {
     );
     let agents = list_agents(&mut src).await;
     assert!(
-        agents.contains(&"tgt".to_string()),
+        agents.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "tgt")),
         "after implicit re-registration, tgt should be back in the registry"
     );
 
@@ -539,13 +552,14 @@ async fn poll_disconnect_grace_evicts() {
     let port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config_tuned(
         port,
+        certs(),
         vec![],
         security(30, 1),
         HeartbeatConfig::default(),
     ))
     .await;
 
-    let mut tgt = connect(port).await;
+    let mut tgt = connect(port, "tgt").await;
     assert_eq!(register(&mut tgt, "tgt").await, 200);
     let resp = poll(&mut tgt, "tgt").await;
     assert_eq!(resp.status(), 200);
@@ -553,11 +567,11 @@ async fn poll_disconnect_grace_evicts() {
 
     // Grace 1s + headroom; nobody re-polls during it → eviction
     let agents = wait_agents(&mut tgt, Duration::from_secs(4), |a| {
-        !a.contains(&"tgt".to_string())
+        !a.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "tgt"))
     })
     .await;
     assert!(
-        !agents.contains(&"tgt".to_string()),
+        !agents.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "tgt")),
         "should be evicted after the grace timeout: {agents:?}"
     );
 
@@ -565,7 +579,7 @@ async fn poll_disconnect_grace_evicts() {
     let resp = poll(&mut tgt, "tgt").await;
     assert_eq!(resp.status(), 200);
     let agents = list_agents(&mut tgt).await;
-    assert!(agents.contains(&"tgt".to_string()));
+    assert!(agents.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "tgt")));
 }
 
 /// Scenario 5 (wedge reproduction): after answering a Pong once, the agent is
@@ -580,9 +594,16 @@ async fn heartbeat_evicts_pong_aware_wedge_and_ends_poll() {
         interval_secs: 1,
         max_missed: 1,
     };
-    let _hub = spawn_hub(hub_config_tuned(port, vec![], security(30, 30), hb)).await;
+    let _hub = spawn_hub(hub_config_tuned(
+        port,
+        certs(),
+        vec![],
+        security(30, 30),
+        hb,
+    ))
+    .await;
 
-    let mut tgt = connect(port).await;
+    let mut tgt = connect(port, "wedge").await;
     assert_eq!(register(&mut tgt, "wedge").await, 200);
     let resp = poll(&mut tgt, "wedge").await;
     assert_eq!(resp.status(), 200);
@@ -594,11 +615,11 @@ async fn heartbeat_evicts_pong_aware_wedge_and_ends_poll() {
     // Wait for the loss-of-contact verdict (deadline = 1*(1+1) = 2s; generous
     // headroom)
     let agents = wait_agents(&mut tgt, Duration::from_secs(8), |a| {
-        !a.contains(&"wedge".to_string())
+        !a.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "wedge"))
     })
     .await;
     assert!(
-        !agents.contains(&"wedge".to_string()),
+        !agents.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "wedge")),
         "heartbeat loss of contact should evict: {agents:?}"
     );
 
@@ -626,9 +647,16 @@ async fn pong_replying_agent_survives_heartbeat() {
         interval_secs: 1,
         max_missed: 1,
     };
-    let _hub = spawn_hub(hub_config_tuned(port, vec![], security(30, 30), hb)).await;
+    let _hub = spawn_hub(hub_config_tuned(
+        port,
+        certs(),
+        vec![],
+        security(30, 30),
+        hb,
+    ))
+    .await;
 
-    let mut tgt = connect(port).await;
+    let mut tgt = connect(port, "good").await;
     assert_eq!(register(&mut tgt, "good").await, 200);
     let (up_tx, _up_resp) = open_upload(&mut tgt, "good").await;
     let resp = poll(&mut tgt, "good").await;
@@ -673,7 +701,7 @@ async fn pong_replying_agent_survives_heartbeat() {
 
     let agents = list_agents(&mut tgt).await;
     assert!(
-        agents.contains(&"good".to_string()),
+        agents.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "good")),
         "an agent that answers as agreed should survive"
     );
 }
@@ -693,9 +721,16 @@ async fn real_agent_survives_aggressive_heartbeat() {
         interval_secs: 1,
         max_missed: 1,
     };
-    let _hub = spawn_hub(hub_config_tuned(port, vec![], security(30, 30), hb)).await;
+    let _hub = spawn_hub(hub_config_tuned(
+        port,
+        certs(),
+        vec![],
+        security(30, 30),
+        hb,
+    ))
+    .await;
 
-    let handle = interflow_mesh::agent::AgentClient::new(agent_config("real-agent", port))
+    let handle = interflow_mesh::agent::AgentClient::new(agent_config("real-agent", port, certs()))
         .expect("agent build")
         .start();
 
@@ -744,9 +779,16 @@ async fn poll_survives_empty_data_frame_budget_past_100_heartbeats() {
         interval_secs: 1,
         max_missed: 3,
     };
-    let _hub = spawn_hub(hub_config_tuned(port, vec![], security(30, 30), hb)).await;
+    let _hub = spawn_hub(hub_config_tuned(
+        port,
+        certs(),
+        vec![],
+        security(30, 30),
+        hb,
+    ))
+    .await;
 
-    let mut agent = connect(port).await;
+    let mut agent = connect(port, "bomb-probe").await;
     assert_eq!(register(&mut agent, "bomb-probe").await, 200);
     let (up_tx, _up_resp) = open_upload(&mut agent, "bomb-probe").await;
     let resp = poll(&mut agent, "bomb-probe").await;
@@ -792,7 +834,10 @@ async fn poll_survives_empty_data_frame_budget_past_100_heartbeats() {
 
     let agents = list_agents(&mut agent).await;
     assert!(
-        agents.contains(&"bomb-probe".to_string()),
+        agents.contains(&qualified_agent_id(
+            interflow_testkit::TEST_TENANT,
+            "bomb-probe"
+        )),
         "the Pong-answering agent must still be registered after 100+ cycles"
     );
 }

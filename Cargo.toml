@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/expose", "crates/mesh", "crates/testkit", "src-tauri"]
+members = ["crates/certs", "crates/core", "crates/expose", "crates/mesh", "crates/testkit", "src-tauri"]
 resolver = "2"
 
 # ============================================================================
@@ -8,6 +8,9 @@ resolver = "2"
 [workspace.dependencies]
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7.19"
+# Home-directory lookup for tilde expansion in config paths (core) and the
+# profile directory (expose)
+dirs = "6"
 
 # ============================================================================
 # Lints — applied uniformly via [workspace.lints]; sub-crates inherit with `[lints] workspace = true`
@@ -44,6 +47,14 @@ option_if_let_else = "allow"
 
 # Safety-critical — effective immediately
 panic = "deny"
+
+# Holding a std/parking_lot lock guard across an await point is the deadlock
+# shape behind the 2026-09-18 GUI Stop hang
+# (docs/bug/2026-09-18-gui-stop-deadlock-start-holds-handle-lock.md) — deny it
+# compile-time. tokio's async Mutex guards are NOT covered by this lint: an
+# async lock is only acceptable where holding it across an await is the point,
+# and must never be re-locked under a guard that survives the await.
+await_holding_lock = "deny"
 
 # Personal project: unwrap/expect are used heavily in infallible spots (Response::builder, etc.);
 # upgrading to deny is more noise than benefit. Apply individual #[warn]/#[deny] locally when needed.

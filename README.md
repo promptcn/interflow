@@ -17,7 +17,7 @@ interflow/
 │   ├── core/      ← HTTP/2 tunnel primitives (protocol / tunnel / registry / acl / tls / pump / telemetry)
 │   ├── expose/    ← Scenario A: consolidated edge component + local expose client + init wizard
 │   └── mesh/      ← Scenario B: pure hub + dual-mode agent (ingress + egress)
-├── examples/      ← reverse-tunnel example configs
+├── examples/      ← generic, runnable scenario examples
 └── Cargo.toml     ← workspace root
 ```
 
@@ -49,23 +49,27 @@ Like ngrok, it exposes a local port under a public domain — but with a fixed d
 ```bash
 # Public server: interactive wizard generates certificates + configuration
 interflow-expose init
-# → generates the CA + hub certificates into ./certs/
+# → generates the tenant CA + hub certificate + one agent client cert
+#   into ./certs/ (tenants/<tenant>-ca.*, hub.*, agents/<agent-id>.*)
 # → emits a routes.toml template and an nginx.conf snippet
-# → prints a one-line command for the local machine
+# → prints the commands for both sides
 
-# Public server: start the edge
+# Public server: start the edge (trusting client certs from the tenant CA)
 interflow-expose edge \
   --listen 0.0.0.0:8443 \
-  --hub-listen 127.0.0.1:16666 \
+  --hub-listen 0.0.0.0:16666 \
   --routes routes.toml \
-  --token <token>
+  --client-ca main=./certs/tenants/main-ca.crt \
+  --hub-cert ./certs/hub.crt --hub-key ./certs/hub.key \
+  --x-forwarded-for required   # behind nginx; see examples/public-domain-to-lan
 
 # Local machine: fill in the profile on first use (with the command printed by init)
 interflow-expose expose 3000 \
-  --hub http://hub.example.com:16666 \
-  --token <token> \
+  --hub https://hub.example.com:16666 \
+  --client-cert ./certs/agents/expose-myapp.crt \
+  --client-key ./certs/agents/expose-myapp.key \
   --agent-id expose-myapp \
-  --ca-path ./certs/ca.crt \
+  --ca-path ./certs/tenants/main-ca.crt \
   --save
 
 # Local machine: afterwards a single command is enough
@@ -121,18 +125,18 @@ A classic site-to-site tunnel: two private networks interconnected through a pub
 
 ```bash
 # Public relay node
-interflow-mesh hub --config hub.toml
+interflow-mesh hub --config examples/site-to-site/hub.toml
 
 # LAN A (ingress: local listener, tunnels traffic to the far end)
-interflow-mesh agent --config agent-a.toml
+interflow-mesh agent --config examples/site-to-site/agent-lan-a.toml
 
 # LAN B (egress: receives traffic from the tunnel, dials the local service)
-interflow-mesh agent --config agent-b.toml
+interflow-mesh agent --config examples/site-to-site/agent-lan-b.toml
 ```
 
-Example configs live in `crates/mesh/examples/` (`hub.toml`, `agent-1.toml`, `agent-2.toml`) and `examples/reverse-tunnel-public/`.
+The runnable quickstart lives in `examples/site-to-site/` (`hub.toml`, `agent-lan-a.toml`, `agent-lan-b.toml`). Start with [`examples/README.md`](examples/README.md) for the scenario index.
 
-Relative paths inside a config file (e.g. `certs/hub.crt`) resolve against the config file's own directory — never against the working directory — so the examples load identically no matter where you launch the binary from. Example certificates are never committed (git-ignored by policy): generate them on demand with `./scripts/gen_certs.sh <certs-dir>` (e.g. `./scripts/gen_certs.sh crates/mesh/examples/certs`). CLI-flag paths (`--config`, `--ca-path`) keep the usual shell semantics.
+Relative paths inside a config file (e.g. `certs/hub.crt`) resolve against the config file's own directory — never against the working directory — so the examples load identically no matter where you launch the binary from. Example certificates are never committed (git-ignored by policy): each scenario provides `generate-certs.sh`. CLI-flag paths (`--config`, `--ca-path`) keep the usual shell semantics.
 
 ### Key design
 
@@ -209,7 +213,7 @@ In the expose scenario there is no toml — the same plane is wired through CLI 
 interflow-expose edge \
   --quic-listen 0.0.0.0:16666 \
   --hub-cert ./certs/hub.crt --hub-key ./certs/hub.key \
-  ... # --listen/--hub-listen/--routes/--token as usual
+  ... # --listen/--hub-listen/--routes/--client-ca as usual
 
 # Local machine: the client dials QUIC instead of h2. The QUIC address can
 # stay implicit — with --hub-quic-addr omitted it derives from the hub URL's
@@ -287,10 +291,13 @@ docker build -t interflow:latest .
 ```
 just test          # all tests
 just lint          # strict clippy (forbid unsafe / deny panic)
-just run-edge      # run the edge (development)
-just run-expose 3000
-just run-hub       # run the mesh hub
-just run-agent <config>
+just example-public-domain-certs
+just example-public-domain-edge
+just example-public-domain-agent 3000
+just example-site-to-site-certs
+just example-site-to-site-hub
+just example-site-to-site-agent-a
+just example-site-to-site-agent-b
 just init          # run the expose init wizard
 ```
 
@@ -308,3 +315,60 @@ just init          # run the expose init wizard
 ## License
 
 Apache-2.0
+
+## Multi-enterprise hub (multi-tenant, since v4)
+
+One hub may carry multiple enterprises, each with its **own CA**. Design and
+rationale: `docs/design/multi-tenant-mtls-only.md` (mTLS is the only
+authentication; tokens no longer exist).
+
+```text
+enterprise A CA (offline key) ──┐
+enterprise B CA (offline key) ──┼──► hub: [[auth.tenants]]  identity = (tenant, CN)
+edge gateway (ephemeral CA)  ──┘    cross-tenant deny by default
+```
+
+One identity per command — the `interflow-mesh certs` subcommand (run it on
+an **operator machine**, never on the hub host; idempotent: existing material
+is validated, never blindly skipped or overwritten):
+
+1. `interflow-mesh certs init --hub-dns <hub-hostname> [--tenant NAME] [--out DIR]`
+   generates the hub certificate + the first tenant CA (`--hub-dns` is the
+   hostname agents dial — omit it only for local development, where the SAN
+   defaults to `localhost, 127.0.0.1`);
+   `interflow-mesh certs tenant new <NAME>` adds a tenant;
+   `interflow-mesh certs agent issue <TENANT> <AGENT_ID>` issues agent
+   certificates (CN == agent_id == file name). CA private keys stay offline;
+   the hub only reads public CA certs.
+2. hub.toml:
+
+   ```toml
+   [auth]
+   rate_limit_per_minute = 30
+
+   [[auth.tenants]]
+   name = "acme"
+   ca_path = "certs/acme-ca.crt"
+
+   [tls]
+   enabled = true
+   cert_path = "certs/hub.crt"
+   key_path = "certs/hub.key"
+   ```
+
+3. agent.toml (`client_cert_path`/`client_key_path` are mandatory; the CN
+   must equal `agent.id`).
+4. expose edge: `--client-ca acme=certs/acme-ca.crt` (repeatable; the edge
+   mints its own per-restart gateway principal in memory).
+5. routes.toml routes carry `tenant`; real client IPs for rate limiting and
+   audit are restored per topology: the standard nginx HTTP `proxy_pass` leg
+   uses `--x-forwarded-for required` (nginx sets `X-Forwarded-For`; stock
+   nginx cannot emit the PROXY protocol on that leg), while a PROXY-v2-
+   capable front (LB / nginx stream) uses `--proxy-protocol required`. Both
+   share `--trusted-proxy` and key governance/audit only — never identity.
+
+**Migration (one-time, no coexistence):** v3 configs fail fast with
+`deny_unknown_fields` errors; reissue certificates, switch configs, then
+enable the real-IP mechanism for your topology. Rotation unit is the tenant —
+one leaked tenant CA never affects the others.
+affects the others.

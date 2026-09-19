@@ -7,6 +7,7 @@ use interflow_core::tunnel::AgentTunnel;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -55,6 +56,8 @@ pub struct IngressHandler {
     tracker: TaskTracker,
     command_rx: Option<mpsc::Receiver<IngressCommand>>,
     guard: ListenerGuard,
+    /// E2e (inner TLS) runtime; `None` = mode off, plain streams only.
+    e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
 }
 
 impl IngressHandler {
@@ -65,6 +68,7 @@ impl IngressHandler {
         session: CancellationToken,
         tracker: TaskTracker,
         command_rx: Option<mpsc::Receiver<IngressCommand>>,
+        e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
     ) -> Self {
         Self {
             agent_id,
@@ -74,6 +78,7 @@ impl IngressHandler {
             tracker,
             command_rx,
             guard: ListenerGuard(HashMap::new()),
+            e2e,
         }
     }
 
@@ -231,6 +236,7 @@ impl IngressHandler {
         let session = self.session.clone();
         let conn_tracker = self.tracker.clone();
         let per_conn_tracker = self.tracker.clone();
+        let e2e = self.e2e.clone();
 
         // Global concurrency cap: guards against a connection flood
         // exhausting the scheduler and file descriptors (combined with
@@ -264,6 +270,7 @@ impl IngressHandler {
                                 let rule = rule_clone.clone();
                                 let agent_id = agent_id.clone();
                                 let session = session.clone();
+                                let e2e = e2e.clone();
 
                                 per_conn_tracker.spawn(async move {
                                     // _permit releases automatically when
@@ -271,7 +278,7 @@ impl IngressHandler {
                                     let _permit = permit;
                                     tokio::select! {
                                         () = session.cancelled() => {}
-                                        r = Self::handle_connection(socket, tunnel, rule, agent_id) => {
+                                        r = Self::handle_connection(socket, tunnel, rule, agent_id, e2e) => {
                                             if let Err(e) = r {
                                                 error!("Connection handling error: {}", e);
                                             }
@@ -298,13 +305,146 @@ impl IngressHandler {
         tunnel: AgentTunnel,
         rule: IngressRule,
         _agent_id: String,
+        e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
     ) -> Result<()> {
         // Stream idle timeout: close the stream when neither direction has
         // data for this long (default tcp 300s, configurable per rule)
         let idle_timeout = rule.effective_idle_timeout();
         let stream_id = uuid::Uuid::new_v4().to_string();
 
-        // Register a dedicated channel (avoids a broadcast storm)
+        let pump_cfg = interflow_core::tunnel::pump::PumpConfig {
+            idle_timeout,
+            write_stall_timeout: CLIENT_WRITE_STALL_TIMEOUT,
+            idle_timeout_counter: "interflow_ingress_stream_idle_timeout",
+            write_stall_counter: "interflow_ingress_client_write_stall",
+            log_label: "ingress",
+        };
+
+        // E2e (inner TLS) mode: the inner client handshake runs between the
+        // Open and the pump; handshake bytes ride ordinary Data frames (the
+        // hub only sees ciphertext). `required` failures close the stream —
+        // never a plaintext fallback (RFC §3/§4).
+        if let Some(rt) = e2e {
+            // Register a dedicated channel (avoids a broadcast storm)
+            let data_rx = tunnel.register_stream(stream_id.clone()).await;
+            if let Err(e) = tunnel
+                .send_open_with(
+                    &stream_id,
+                    &rule.target_agent,
+                    rule.remote_addr.as_deref(),
+                    StreamProto::Tcp,
+                    true,
+                )
+                .await
+            {
+                tunnel.unregister_stream(&stream_id).await;
+                return Err(e);
+            }
+
+            let expected_peer = crate::agent::e2e::bare_agent_id(&rule.target_agent);
+            let connector = match rt.client_connector(expected_peer) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Material assembled at startup; reaching here means it
+                    // went stale mid-session — treat as a required-style
+                    // failure (fail-closed) in every mode.
+                    crate::agent::e2e::record_handshake_failure(
+                        crate::agent::e2e::SIDE_INGRESS,
+                        "protocol",
+                    );
+                    warn!(
+                        "e2e connector build failed for {stream_id} -> {expected_peer}: {e}; closing stream"
+                    );
+                    tunnel.unregister_stream(&stream_id).await;
+                    return Err(e);
+                }
+            };
+
+            let adapter = interflow_core::tunnel::e2e::E2eTunnelIo::ingress(
+                data_rx,
+                tunnel.clone(),
+                stream_id.clone(),
+            );
+            match interflow_core::tunnel::e2e::inner_tls_connect(
+                adapter,
+                connector,
+                rt.handshake_timeout,
+            )
+            .await
+            {
+                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Established(tls, _reason) => {
+                    crate::agent::e2e::record_handshake_ok(crate::agent::e2e::SIDE_INGRESS);
+                    let sid = stream_id.clone();
+                    let t2 = tunnel.clone();
+                    interflow_core::tunnel::pump::pump_duplex(
+                        socket,
+                        tls,
+                        &pump_cfg,
+                        &stream_id,
+                        async move {
+                            // The TLS close_notify rode Data frames; the
+                            // stream Close itself is this side's to send
+                            // (no-op on the peer-close-ended path — the hub
+                            // already reaped the stream).
+                            let _ = t2.send_close(&sid).await;
+                            t2.unregister_stream(&sid).await;
+                        },
+                    )
+                    .await;
+                    return Ok(());
+                }
+                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { parts, error } => {
+                    let reason = crate::agent::e2e::failure_reason_of(&error);
+                    crate::agent::e2e::record_handshake_failure(
+                        crate::agent::e2e::SIDE_INGRESS,
+                        reason,
+                    );
+                    if rt.mode == crate::config::E2eMode::Required {
+                        // Fail-closed: no plaintext leaves this agent. The
+                        // stream Close is sent here (the shuttle never
+                        // closes on TLS-side death — the opportunistic
+                        // fallback depends on the channel staying live).
+                        warn!(
+                            "e2e handshake failed ({reason}: {error}), closing stream {stream_id} (required mode)"
+                        );
+                        let _ = tunnel.send_close(&stream_id).await;
+                        tunnel.unregister_stream(&stream_id).await;
+                        return Err(InterflowError::connection(format!(
+                            "e2e handshake failed: {error}"
+                        )));
+                    }
+                    // Opportunistic fallback: replay the peer bytes buffered
+                    // during the attempt (an old egress relays banner bytes
+                    // straight back), then resume the plain pump.
+                    info!(
+                        "e2e handshake failed ({reason}: {error}), falling back to plaintext stream {stream_id}"
+                    );
+                    let (rd, mut wr) = socket.into_split();
+                    if !parts.buffered.is_empty() {
+                        match tokio::time::timeout(
+                            CLIENT_WRITE_STALL_TIMEOUT,
+                            wr.write_all(&parts.buffered),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            outcome => {
+                                warn!("fallback replay write failed: {outcome:?}");
+                                tunnel.unregister_stream(&stream_id).await;
+                                return Ok(());
+                            }
+                        }
+                    }
+                    interflow_core::tunnel::pump::pump_tcp_stream(
+                        rd, wr, parts.rx, &tunnel, &stream_id, &pump_cfg,
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Plain path (mode off): unchanged behavior.
         let data_rx = tunnel.register_stream(stream_id.clone()).await;
 
         // Send the stream-open signal
@@ -331,18 +471,7 @@ impl IngressHandler {
         // (docs/bug/2026-09-13-select-branch-double-await-joinhandle-panic.md).
         let (rd, wr) = socket.into_split();
         interflow_core::tunnel::pump::pump_tcp_stream(
-            rd,
-            wr,
-            data_rx,
-            &tunnel,
-            &stream_id,
-            &interflow_core::tunnel::pump::PumpConfig {
-                idle_timeout,
-                write_stall_timeout: CLIENT_WRITE_STALL_TIMEOUT,
-                idle_timeout_counter: "interflow_ingress_stream_idle_timeout",
-                write_stall_counter: "interflow_ingress_client_write_stall",
-                log_label: "ingress",
-            },
+            rd, wr, data_rx, &tunnel, &stream_id, &pump_cfg,
         )
         .await;
 

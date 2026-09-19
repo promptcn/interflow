@@ -1,0 +1,30 @@
+[package]
+name = "interflow-certs"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Interflow certificate issuance: tenant CAs, hub server pairs, and agent client certificates — the single rcgen implementation behind `interflow-mesh certs`, the expose init wizard, and the test kit"
+license = "MIT"
+
+[lib]
+name = "interflow_certs"
+path = "src/lib.rs"
+
+[dependencies]
+# Issuance. `Issuer::from_ca_cert_pem` (re-signing leaves from a persisted CA)
+# needs the non-default x509-parser feature; pem is default.
+rcgen = { version = "0.14", features = ["x509-parser"] }
+# Real chain/validity/EKU verification for the idempotency checks (same
+# versions as core's tls module).
+rustls = "0.23"
+rustls-pemfile = "2.2.0"
+x509-parser = "0.18"
+# Explicit validity windows (rcgen's default spans to year 4096).
+time = "0.3"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

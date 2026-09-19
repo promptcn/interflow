@@ -1,7 +1,8 @@
 //! `Edge` fused component: runs a HubServer + EdgeListener in a single process.
 //!
 //! Flow:
-//! 1. Start [`interflow_mesh::hub::HubServer`] (listens on 127.0.0.1:internal_port, static-token auth)
+//! 1. Start [`interflow_mesh::hub::HubServer`] (listens on 127.0.0.1:internal_port, mTLS-only;
+//!    the edge's own gateway principal is minted in memory at startup)
 //! 2. Once the hub is up, start the internal agent (agent_id=`edge`, supervised
 //!    auto-reconnect) and take the session-slot tunnel facade from its handle
 //! 3. Inject the tunnel into [`EdgeListener`] (listens on the public listen_addr), routing by Host to the target agent
@@ -20,6 +21,7 @@
 //! dial stays on h2: the hub relays across transports (h2 source ↔ quic
 //! target), so enabling QUIC requires no change in the EdgeListener path.
 
+pub mod gateway;
 pub mod host_router;
 pub mod listener;
 pub mod reload;
@@ -27,14 +29,19 @@ pub mod reload;
 /// Tests and external crates reference this via `interflow_expose::edge::{Route, RoutesConfig}`.
 pub use host_router::{HostRouter, Route, RoutesConfig};
 
+use crate::edge::gateway::GatewayIdentity;
 use crate::edge::listener::EdgeListener;
 use interflow_core::config::AuditConfig;
+use interflow_core::security::ProxyProtocolConfig;
+use interflow_core::security::ProxyProtocolPolicy;
+use interflow_core::security::XffMode;
+use interflow_core::security::XffPolicy;
 use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker};
+use interflow_core::tls::TenantTrustRoot;
 use interflow_mesh::agent::client::AgentClient;
 use interflow_mesh::config::{
-    AclConfig, AgentTlsConfig as TlsConfig, AuthConfig, AuthMode, ControlConfig,
-    HUB_CONFIG_VERSION, HubConfig, HubQuicConfig, HubSecurityConfig, LoggingConfig, ServerConfig,
-    StaticTokenConfig,
+    AclConfig, AgentTlsConfig as TlsConfig, AuthConfig, ControlConfig, HUB_CONFIG_VERSION,
+    HubConfig, HubQuicConfig, HubSecurityConfig, LoggingConfig, ServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -89,8 +96,11 @@ pub struct EdgeArgs {
     pub hub_listen_addr: SocketAddr,
     /// Host routing table (`routes.toml` path).
     pub routes_path: String,
-    /// Agent token (both edge itself and remote expose clients register with the hub using this token).
-    pub agent_token: String,
+    /// Tenant trust table: `(tenant name, client CA PEM path)` pairs from
+    /// `--client-ca <name>=<path>`. Expose clients authenticate with client
+    /// certificates issued by these CAs; the edge's own gateway principal is
+    /// minted in memory at startup (see [`gateway`]).
+    pub tenant_cas: Vec<(String, String)>,
     /// Optional: hub TLS certificate (if nginx already terminates TLS, edge needs no TLS of its own).
     ///
     /// When [`EdgeArgs::quic_listen`] is set, the certificate additionally
@@ -98,6 +108,11 @@ pub struct EdgeArgs {
     /// cover the hostname clients dial in `hub_quic_addr`, and clients must
     /// trust its issuer (public CA, or a CA distributed via `ca_path`).
     pub hub_tls: Option<EdgeHubTls>,
+    /// Stable gateway identity files (`--gateway-cert/--gateway-key`,
+    /// `(cert path, key path)`): replaces the per-restart mint and opts
+    /// gateway flows into the inner TLS layer (RFC agent-e2e-encryption
+    /// §3.4/§5.3).
+    pub gateway_identity: Option<(String, String)>,
     /// Optional: QUIC listen address for the embedded hub (e.g.
     /// `0.0.0.0:16666`). `Some` enables the QUIC transport for expose
     /// clients; requires [`EdgeArgs::hub_tls`] (QUIC mandates TLS).
@@ -115,6 +130,15 @@ pub struct EdgeArgs {
     /// budget: "an upper bound on surviving without bytes in either direction";
     /// must be ≤ nginx `proxy_read_timeout`.
     pub stream_idle_timeout_secs: u64,
+    /// PROXY protocol negotiation on the public listener (restores real
+    /// client IPs behind a PROXY-v2-capable front; see
+    /// [`x_forwarded_for`][Self::x_forwarded_for] for the standard nginx
+    /// HTTP topology).
+    pub proxy_protocol: ProxyProtocolConfig,
+    /// X-Forwarded-For restoration on the public listener (the standard
+    /// nginx HTTP `proxy_pass` topology — stock nginx cannot emit the PROXY
+    /// protocol on this leg). Shares `proxy_protocol.trusted_proxies`.
+    pub x_forwarded_for: XffMode,
     /// Route-level circuit breaker master switch: agent close reasons
     /// (`connect_failed` / `target_circuit_open`) are counted per host; a
     /// tripped route's new public connections are closed immediately after
@@ -142,8 +166,11 @@ impl Default for EdgeArgs {
             listen_addr: "0.0.0.0:0".parse().expect("valid addr"),
             hub_listen_addr: "127.0.0.1:0".parse().expect("valid addr"),
             routes_path: String::new(),
-            agent_token: String::new(),
+            tenant_cas: Vec::new(),
             hub_tls: None,
+            gateway_identity: None,
+            proxy_protocol: ProxyProtocolConfig::default(),
+            x_forwarded_for: XffMode::Off,
             quic_listen: None,
             audit_path: None,
             new_conn_rate_per_ip_per_minute: 30,
@@ -167,15 +194,72 @@ pub struct EdgeHubTls {
 
 /// Start Edge: spawn hub + dial + run the listener. Blocks the caller.
 pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
-    // 0. QUIC plane prerequisites, before any listener binds: the hub's QUIC
-    //    listener reuses the [tls] certificate set (QUIC mandates TLS), so
-    //    fail fast with a pointed message instead of dying mid-startup inside
-    //    the hub task.
-    if args.quic_listen.is_some() && args.hub_tls.is_none() {
+    // 0. mTLS requires TLS: the embedded hub verifies client certificates
+    //    at the handshake, so --hub-cert/--hub-key are mandatory (QUIC has
+    //    always required them; since the mTLS-only rework the h2 plane does
+    //    too). Fail fast with a pointed message before any listener binds.
+    if args.hub_tls.is_none() {
         return Err(interflow_core::error::InterflowError::config(
-            "enabling the QUIC listener requires --hub-cert and --hub-key (QUIC mandates TLS)",
+            "mTLS requires --hub-cert and --hub-key (client certificates are verified at the TLS handshake)",
         ));
     }
+
+    // 0a. Real-IP restoration is one mechanism per topology: the PROXY
+    //     protocol preamble and the X-Forwarded-For HTTP header describe
+    //     mutually exclusive fronting hops. Allowing both would make the
+    //     effective-IP source ambiguous per connection.
+    if args.proxy_protocol.mode != interflow_core::security::ProxyProtocolMode::Off
+        && args.x_forwarded_for.enabled()
+    {
+        return Err(interflow_core::error::InterflowError::config(
+            "--proxy-protocol and --x-forwarded-for are mutually exclusive: PROXY protocol \
+             suits a PROXY-capable front (LB / nginx stream), X-Forwarded-For suits the \
+             standard nginx HTTP proxy_pass leg — enable exactly one",
+        ));
+    }
+
+    // 0b. Tenant trust roots (CLI `--client-ca name=path`) + the gateway
+    //     principal: the stable identity when `--gateway-cert/--gateway-key`
+    //     was provided (e2e-capable), otherwise the in-memory mint (rotates
+    //     every restart).
+    let mut tenant_roots = Vec::with_capacity(args.tenant_cas.len() + 1);
+    for (name, path) in &args.tenant_cas {
+        let pem = std::fs::read(path).map_err(|e| {
+            interflow_core::error::InterflowError::config(format!(
+                "tenant '{name}' CA read failed ({path}): {e}"
+            ))
+        })?;
+        tenant_roots.push(TenantTrustRoot::from_pem(name, false, &pem)?);
+    }
+    let gateway = if let Some((cert_path, key_path)) = &args.gateway_identity {
+        let identity = gateway::GatewayIdentity::load(cert_path, key_path)?;
+        info!(
+            "gateway principal: stable identity from {cert_path} (gateway flows carry the \
+             inner TLS layer)"
+        );
+        identity
+    } else {
+        info!(
+            "gateway principal: per-restart minted identity (no --gateway-cert; gateway \
+               flows cannot use the inner TLS layer)"
+        );
+        gateway::GatewayIdentity::mint()?
+    };
+    tenant_roots.push(gateway.root.clone());
+    // The per-route inner-TLS material source exists iff the identity is
+    // stable: the minted CA is anchored nowhere, its handshakes could never
+    // verify.
+    let edge_e2e = gateway.is_stable().then(|| {
+        Arc::new(gateway::EdgeE2e::new(
+            gateway.client_cert_pem.clone(),
+            gateway.client_key_pem.clone(),
+            args.tenant_cas.iter().cloned().collect(),
+        ))
+    });
+    info!(
+        "edge trust table: {} tenant CA(s) + gateway principal",
+        args.tenant_cas.len()
+    );
 
     // 1. Load the routing table
     let router = Arc::new(HostRouter::load(&args.routes_path)?);
@@ -221,8 +305,17 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
         );
     }
 
-    // 4. Assemble the hub config and spawn the HubServer
+    // 4. Assemble the hub config and spawn the HubServer. The TLS plane is
+    //    built here from the in-memory trust table (the edge's hub config
+    //    carries no ca_path files for its tenants).
     let hub_cfg = build_hub_config(&args, &audit_cfg);
+    let hub_tls = args.hub_tls.as_ref().expect("checked in step 0");
+    let plane = interflow_core::tls::build_tls_plane(
+        &hub_tls.cert_path,
+        &hub_tls.key_path,
+        &tenant_roots,
+        interflow_core::tls::TlsMinVersion::V1_2,
+    )?;
     let hub_port = args.hub_listen_addr.port();
     // The edge self-dial uses cert pinning (see build_edge_agent_config), so
     // the ServerName takes no part in verification; the URL uses the 127.0.0.1
@@ -233,7 +326,8 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
         format!("http://127.0.0.1:{hub_port}")
     };
 
-    let hub_server = interflow_mesh::hub::HubServer::new(hub_cfg, "<edge-in-memory>".into())?;
+    let hub_server =
+        interflow_mesh::hub::HubServer::with_tls_plane(hub_cfg, "<edge-in-memory>".into(), plane)?;
     let hub_task = tokio::spawn(async move { hub_server.run().await });
     info!(
         "HubServer started (internal listen {})",
@@ -255,7 +349,7 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
     //    trigger was the poll watchdog — which lives inside the poll loop and
     //    dies with it on connection-level errors, leaving a zombie listener
     //    (docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md).
-    let edge_agent_cfg = build_edge_agent_config(&args, &hub_url)?;
+    let edge_agent_cfg = build_edge_agent_config(&args, &hub_url, &gateway)?;
     let agent = AgentClient::new(edge_agent_cfg)?.start();
     let tunnel = agent.tunnel();
     wait_initial_registration(&agent, Duration::from_secs(30)).await?;
@@ -279,6 +373,11 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
             },
         ))
     });
+    let proxy_policy = std::sync::Arc::new(ProxyProtocolPolicy::from_config(&args.proxy_protocol)?);
+    let xff_policy = std::sync::Arc::new(XffPolicy::new(
+        args.x_forwarded_for,
+        &args.proxy_protocol.trusted_proxies,
+    )?);
     let listener = EdgeListener {
         listen_addr: args.listen_addr,
         router,
@@ -289,6 +388,9 @@ pub async fn run(args: EdgeArgs) -> interflow_core::error::Result<()> {
         rate_limiter,
         audit,
         route_breaker,
+        proxy_policy,
+        xff_policy,
+        e2e: edge_e2e,
     };
     let listener_task = listener.run();
     tokio::pin!(listener_task);
@@ -414,25 +516,22 @@ pub async fn watch_agent_health(
     }
 }
 
-/// Build the hub config: anonymous mode (edge itself registers with a static token),
-/// with an ACL allowing edge → any.
+/// Build the hub config: mTLS-only, one trust entry per tenant CA plus the
+/// edge's in-memory gateway principal (the only cross-tenant opener).
+/// Tenant isolation is enforced by the hub's default inter-tenant-deny
+/// policy — no ACL entries are needed for the edge's own routing.
 fn build_hub_config(args: &EdgeArgs, audit_cfg: &AuditConfig) -> HubConfig {
-    // ACL left empty: dynamic routing relies on token auth (AclRule is an
-    // exact agent_id set with no wildcard semantics).
     HubConfig {
         config_version: HUB_CONFIG_VERSION,
         server: ServerConfig {
             listen_addr: args.hub_listen_addr,
+            proxy_protocol: ProxyProtocolConfig::default(), // hub plane: behind nginx stream
         },
+        // The trust table is injected via `with_tls_plane` (in-memory roots);
+        // this config section carries only the rate limit.
         auth: AuthConfig {
-            mode: AuthMode::StaticToken,
-            allow_anonymous: false,
-            rate_limit_per_minute: 0,
-            static_token: Some(StaticTokenConfig {
-                agent: Some(args.agent_token.clone()),
-                admin: None,
-            }),
-            mtls: None,
+            rate_limit_per_minute: 30,
+            tenants: Vec::new(),
         },
         tls: args
             .hub_tls
@@ -475,25 +574,22 @@ fn build_hub_config(args: &EdgeArgs, audit_cfg: &AuditConfig) -> HubConfig {
 fn build_edge_agent_config(
     args: &EdgeArgs,
     hub_url: &str,
+    gateway: &GatewayIdentity,
 ) -> interflow_core::error::Result<interflow_mesh::config::AgentConfig> {
-    let tls = if let Some(hub_tls) = &args.hub_tls {
-        let fingerprint = sha256_of_pem_cert(&hub_tls.cert_path)?;
-        Some(TlsConfig {
-            enabled: true,
-            ca_path: None,
-            client_cert_path: None,
-            client_key_path: None,
-            hub_cert_fingerprint: Some(fingerprint),
-        })
-    } else {
-        None
-    };
+    let hub_tls = args.hub_tls.as_ref().expect("checked in step 0");
+    let fingerprint = sha256_of_pem_cert(&hub_tls.cert_path)?;
+    let tls = Some(TlsConfig {
+        enabled: true,
+        ca_path: None,
+        client_cert_path: Some(gateway.client_cert_pem.clone()),
+        client_key_path: Some(gateway.client_key_pem.clone()),
+        hub_cert_fingerprint: Some(fingerprint),
+    });
 
     Ok(interflow_mesh::config::AgentConfig {
         agent: interflow_mesh::config::AgentInfo {
-            id: "edge".into(),
+            id: gateway::GATEWAY_AGENT.into(),
             hub_url: hub_url.to_string(),
-            auth_token: Some(args.agent_token.clone()),
             ..interflow_mesh::config::AgentInfo::default()
         },
         control: ControlConfig {
@@ -545,7 +641,7 @@ async fn wait_for_tcp(addr: SocketAddr, timeout: std::time::Duration) -> std::io
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::cert_gen;
+    use interflow_certs::SanName;
     use interflow_core::tls::make_pinned_verifier;
     use rustls::client::danger::ServerCertVerifier;
     use rustls::pki_types::{ServerName, UnixTime};
@@ -558,7 +654,13 @@ mod tests {
     #[test]
     fn self_dial_pinned_verifier_accepts_hub_cert() {
         let dir = tempfile::tempdir().unwrap();
-        let certs = cert_gen::generate(dir.path(), "tunnel.example.com").unwrap();
+        let certs = interflow_certs::generate(
+            dir.path(),
+            &[SanName::Dns("tunnel.example.com".to_owned())],
+            "main",
+            &[],
+        )
+        .unwrap();
         let fingerprint = sha256_of_pem_cert(&certs.hub_cert).unwrap();
         assert_eq!(fingerprint.len(), 64, "SHA256 hex should be 64 characters");
 
@@ -594,7 +696,13 @@ mod tests {
     #[test]
     fn self_dial_pinned_verifier_rejects_wrong_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
-        let certs = cert_gen::generate(dir.path(), "tunnel.example.com").unwrap();
+        let certs = interflow_certs::generate(
+            dir.path(),
+            &[SanName::Dns("tunnel.example.com".to_owned())],
+            "main",
+            &[],
+        )
+        .unwrap();
         let wrong_hex = "0".repeat(64);
         let verifier = make_pinned_verifier(&wrong_hex).unwrap();
         let pem = std::fs::read(&certs.hub_cert).unwrap();

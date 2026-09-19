@@ -31,7 +31,7 @@
     dead_code,
     unused_mut
 )]
-use interflow_expose::edge::{EdgeArgs, run};
+use interflow_expose::edge::{EdgeArgs, EdgeHubTls, run};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -81,6 +81,7 @@ async fn agent_offline_closes_fast_without_panic() {
         r#"
 [[routes]]
 host = "test.local"
+tenant = "test"
 agent_id = "ghost-agent"
 remote_addr = "127.0.0.1:9"
 "#,
@@ -88,11 +89,17 @@ remote_addr = "127.0.0.1:9"
     .expect("write routes.toml");
 
     // 2. Start only the edge (hub server + edge agent + listener); do not start the expose client
+    let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let edge_args = EdgeArgs {
         listen_addr: edge_listen,
         hub_listen_addr: hub_listen,
         routes_path: routes_path.to_string_lossy().into_owned(),
-        agent_token: "test-token".into(),
+        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
+        proxy_protocol: Default::default(),
+        hub_tls: Some(EdgeHubTls {
+            cert_path: certs.server_cert_path().display().to_string(),
+            key_path: certs.server_key_path().display().to_string(),
+        }),
         agent_recovery_timeout_secs: 120,
         ..Default::default()
     };

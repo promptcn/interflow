@@ -17,20 +17,27 @@ pub enum ConfigError {
     #[error("config_version mismatch: expected {expected}, actual {actual}")]
     UnsupportedVersion { expected: u32, actual: u32 },
 
-    /// `[auth]` has no credentials configured and no explicit
-    /// `allow_anonymous = true`.
+    /// The tenant trust table is empty (mTLS-only: nobody could register).
     #[error(
-        "[auth] no credentials configured; anonymous access requires an explicit allow_anonymous = true"
+        "[auth.tenants] is empty: at least one tenant CA is required (mTLS is the only authentication mode; see docs/design/multi-tenant-mtls-only.md)"
     )]
-    AuthRequired,
+    TenantsEmpty,
 
-    /// No agent token configured under the `[auth.static_token]` mode.
-    #[error("[auth.static_token] agent token is required (mode = \"static-token\")")]
-    StaticTokenMissing,
+    /// A tenant name violates the charset/length rules.
+    #[error(
+        "[auth.tenants] invalid tenant name {name:?}: [A-Za-z0-9_-], 1-64 chars, no leading '_'"
+    )]
+    TenantNameInvalid { name: String },
 
-    /// No CA configured under the `[auth.mtls]` mode.
-    #[error("[auth.mtls] ca_path is required (mode = \"mtls\")")]
-    MtlsCaMissing,
+    /// Duplicate tenant names in the trust table.
+    #[error("[auth.tenants] duplicate tenant name {name:?}")]
+    TenantNameDuplicate { name: String },
+
+    /// mTLS requires TLS termination; `[tls]` is absent or disabled.
+    #[error(
+        "mTLS requires [tls] to be configured (client certificates are verified at the TLS handshake)"
+    )]
+    TlsRequiredForMtls,
 
     /// TLS is enabled but the certificate or private key is missing.
     #[error("[tls] enabled = true requires both cert_path and key_path")]
@@ -138,6 +145,14 @@ const fn is_loopback(addr: std::net::SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
+/// Tenant names: `[A-Za-z0-9_-]`, 1–64 chars, no leading `_` (reserved for
+/// internal principals such as the expose edge gateway). Delegates to
+/// interflow-certs so the rule has exactly one home — the same check gates
+/// the `certs` CLI's path-qualified names.
+fn valid_tenant_name(s: &str) -> bool {
+    interflow_certs::validate_name("tenant", s).is_ok()
+}
+
 /// Validates the hub configuration.
 ///
 /// `Ok(())` means it passed; `Err(ConfigErrorList)` means there are errors
@@ -153,31 +168,36 @@ pub fn validate_hub(cfg: &HubConfig) -> Result<(), ConfigErrorList> {
         });
     }
 
-    // 2. auth must have credentials or an explicit allow_anonymous
-    if !cfg.auth.has_any_credential() {
-        errs.push(ConfigError::AuthRequired);
+    // 2. mTLS-only: the tenant trust table must be non-empty and well-formed
+    if cfg.auth.tenants.is_empty() {
+        errs.push(ConfigError::TenantsEmpty);
+    }
+    for (i, tenant) in cfg.auth.tenants.iter().enumerate() {
+        if !valid_tenant_name(&tenant.name) {
+            errs.push(ConfigError::TenantNameInvalid {
+                name: tenant.name.clone(),
+            });
+        }
+        if cfg.auth.tenants[i + 1..]
+            .iter()
+            .any(|t| t.name == tenant.name)
+        {
+            errs.push(ConfigError::TenantNameDuplicate {
+                name: tenant.name.clone(),
+            });
+        }
+        if !Path::new(&tenant.ca_path).exists() {
+            errs.push(ConfigError::Invalid(format!(
+                "[auth.tenants] ca_path does not exist: {}",
+                tenant.ca_path
+            )));
+        }
     }
 
-    // 3. mode-specific required fields
-    match cfg.auth.mode {
-        crate::config::AuthMode::StaticToken => {
-            let has_agent = cfg
-                .auth
-                .static_token
-                .as_ref()
-                .is_some_and(|s| s.agent.is_some());
-            if !has_agent && !cfg.auth.allow_anonymous {
-                errs.push(ConfigError::StaticTokenMissing);
-            }
-        }
-        crate::config::AuthMode::Mtls => {
-            if cfg.auth.mtls.is_none() && !cfg.auth.allow_anonymous {
-                errs.push(ConfigError::MtlsCaMissing);
-            }
-        }
-        crate::config::AuthMode::Anonymous => {
-            // already covered by has_any_credential
-        }
+    // 3. mTLS implies TLS: without [tls] there is no handshake to verify
+    // client certificates against
+    if !cfg.tls.as_ref().is_some_and(|tls| tls.enabled) {
+        errs.push(ConfigError::TlsRequiredForMtls);
     }
 
     // 4. TLS completeness + file existence
@@ -206,20 +226,24 @@ pub fn validate_hub(cfg: &HubConfig) -> Result<(), ConfigErrorList> {
         });
     }
 
-    // 6. ACL rule fields
+    // 6. ACL rule fields (tenant-qualified; rules only grant cross-tenant
+    // exceptions — same-tenant needs no rule)
     for rule in &cfg.acl.rules {
-        if !valid_agent_id(&rule.source) {
-            errs.push(ConfigError::InvalidAclRule {
-                source_agent: rule.source.clone(),
-                target_agent: rule.target.clone(),
-                reason: "invalid source (max 128 chars, [A-Za-z0-9_.-])",
-            });
+        let mut bad = None;
+        if !valid_tenant_name(&rule.source_tenant) {
+            bad = Some("invalid source_tenant");
+        } else if !valid_tenant_name(&rule.target_tenant) {
+            bad = Some("invalid target_tenant");
+        } else if !valid_agent_id(&rule.source) {
+            bad = Some("invalid source agent id");
+        } else if !valid_agent_id(&rule.target) {
+            bad = Some("invalid target agent id");
         }
-        if !valid_agent_id(&rule.target) {
+        if let Some(reason) = bad {
             errs.push(ConfigError::InvalidAclRule {
                 source_agent: rule.source.clone(),
                 target_agent: rule.target.clone(),
-                reason: "invalid target (max 128 chars, [A-Za-z0-9_.-])",
+                reason,
             });
         }
     }
@@ -493,6 +517,56 @@ pub fn validate_agent(cfg: &AgentConfig) -> Result<(), ConfigErrorList> {
         }
     }
 
+    // E2e (inner TLS) — RFC docs/design/agent-e2e-encryption.md §5.1.
+    if cfg.e2e.enabled() {
+        // The inner layer presents the regular [tls] client pair and anchors
+        // peers at [tls] ca_path (single-CA model) — both must be in place,
+        // or startup fails fast instead of failing per-stream at runtime.
+        let tls_ready = cfg.tls.as_ref().is_some_and(|tls| {
+            tls.enabled && tls.client_cert_path.is_some() && tls.client_key_path.is_some()
+        });
+        if !tls_ready {
+            errs.push(ConfigError::Invalid(
+                "[e2e] mode != off requires [tls] enabled with client_cert_path + client_key_path \
+                 (the inner layer reuses the same mTLS pair)"
+                    .to_string(),
+            ));
+        }
+        if cfg
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.ca_path.as_ref())
+            .is_none()
+        {
+            errs.push(ConfigError::Invalid(
+                "[e2e] mode != off requires [tls] ca_path (the tenant anchor for verifying \
+                 peers; fingerprint pinning alone cannot anchor the inner layer)"
+                    .to_string(),
+            ));
+        }
+        if cfg.e2e.handshake_timeout_secs == 0 {
+            errs.push(ConfigError::Invalid(
+                "[e2e] handshake_timeout_secs must be > 0 (anti dribble)".to_string(),
+            ));
+        }
+    }
+    // Anchor files are checked whenever configured (off mode included) so a
+    // stale path surfaces at startup, not on the day e2e is switched on.
+    if let Some(gw) = &cfg.e2e.gateway_ca_path
+        && !Path::new(gw).exists()
+    {
+        errs.push(ConfigError::Invalid(format!(
+            "[e2e] gateway_ca_path does not exist: {gw}"
+        )));
+    }
+    for ca in &cfg.e2e.extra_trusted_cas {
+        if !Path::new(ca).exists() {
+            errs.push(ConfigError::Invalid(format!(
+                "[e2e] extra_trusted_cas entry does not exist: {ca}"
+            )));
+        }
+    }
+
     if errs.is_empty() {
         Ok(())
     } else {
@@ -511,23 +585,38 @@ mod tests {
     use super::*;
     use crate::config::*;
 
+    /// A fixture whose TLS + tenant-CA files actually exist on disk (the
+    /// validator checks file existence for the mTLS plane).
     fn base_hub_config() -> HubConfig {
+        let dir = std::env::temp_dir().join(format!(
+            "interflow_validate_hub_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hub.crt"), b"dummy").unwrap();
+        std::fs::write(dir.join("hub.key"), b"dummy").unwrap();
+        std::fs::write(dir.join("tenant-ca.crt"), b"dummy").unwrap();
         HubConfig {
             config_version: HUB_CONFIG_VERSION,
             server: ServerConfig {
                 listen_addr: "127.0.0.1:6666".parse().unwrap(),
+                proxy_protocol: Default::default(),
             },
             auth: AuthConfig {
-                mode: AuthMode::StaticToken,
-                allow_anonymous: false,
                 rate_limit_per_minute: 30,
-                static_token: Some(StaticTokenConfig {
-                    agent: Some("agent-token".to_string()),
-                    admin: None,
-                }),
-                mtls: None,
+                tenants: vec![TenantConfig {
+                    name: "acme".to_string(),
+                    ca_path: dir.join("tenant-ca.crt").display().to_string(),
+                    trusted_gateway: false,
+                }],
             },
-            tls: None,
+            tls: Some(HubTlsConfig {
+                enabled: true,
+                cert_path: dir.join("hub.crt").display().to_string(),
+                key_path: dir.join("hub.key").display().to_string(),
+                min_version: interflow_core::tls::TlsMinVersion::V1_2,
+            }),
             acl: AclConfig::default(),
             security: Default::default(),
             heartbeat: Default::default(),
@@ -545,20 +634,33 @@ mod tests {
     }
 
     #[test]
-    fn missing_auth_rejected() {
+    fn empty_tenant_table_rejected() {
         let mut cfg = base_hub_config();
-        cfg.auth.static_token = None;
-        cfg.auth.allow_anonymous = false;
+        cfg.auth.tenants.clear();
         let err = validate_hub(&cfg).expect_err("should reject");
-        assert!(err.iter().any(|e| matches!(e, ConfigError::AuthRequired)));
+        assert!(err.iter().any(|e| matches!(e, ConfigError::TenantsEmpty)));
     }
 
     #[test]
-    fn allow_anonymous_satisfies_auth() {
+    fn mtls_without_tls_rejected() {
         let mut cfg = base_hub_config();
-        cfg.auth.static_token = None;
-        cfg.auth.allow_anonymous = true;
-        validate_hub(&cfg).expect("should pass");
+        cfg.tls = None;
+        let err = validate_hub(&cfg).expect_err("should reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::TlsRequiredForMtls))
+        );
+    }
+
+    #[test]
+    fn invalid_tenant_name_rejected() {
+        let mut cfg = base_hub_config();
+        cfg.auth.tenants[0].name = "_reserved".to_string();
+        let err = validate_hub(&cfg).expect_err("should reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::TenantNameInvalid { .. }))
+        );
     }
 
     #[test]
@@ -661,6 +763,91 @@ mod tests {
         cfg.agent.poll_idle_timeout_secs = Some(0);
         cfg.agent.task_stall_timeout_secs = Some(0);
         validate_agent(&cfg).expect("documented Some(0) disables stay valid");
+    }
+
+    /// A fully-materialized e2e-required agent config (files exist on disk)
+    /// passes; each missing prerequisite (no tls pair / no tenant CA /
+    /// zero handshake deadline / missing anchor files) is named at startup.
+    #[test]
+    fn agent_e2e_rules() {
+        let dir = std::env::temp_dir().join(format!(
+            "interflow_validate_e2e_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "tenant-ca.crt",
+            "gw-ca.crt",
+            "extra-ca.crt",
+            "a.crt",
+            "a.key",
+        ] {
+            std::fs::write(dir.join(name), b"dummy").unwrap();
+        }
+        let tls = AgentTlsConfig {
+            enabled: true,
+            ca_path: Some(dir.join("tenant-ca.crt").display().to_string()),
+            client_cert_path: Some(dir.join("a.crt").display().to_string()),
+            client_key_path: Some(dir.join("a.key").display().to_string()),
+            hub_cert_fingerprint: None,
+        };
+
+        // Happy shape.
+        let mut cfg = base_agent_config();
+        cfg.tls = Some(tls);
+        cfg.e2e = E2eConfig {
+            mode: E2eMode::Required,
+            handshake_timeout_secs: 10,
+            gateway_ca_path: Some(dir.join("gw-ca.crt").display().to_string()),
+            extra_trusted_cas: vec![dir.join("extra-ca.crt").display().to_string()],
+        };
+        validate_agent(&cfg).expect("fully configured e2e passes");
+
+        // Missing [tls] client pair.
+        let mut bad = cfg.clone();
+        if let Some(bad_tls) = bad.tls.as_mut() {
+            bad_tls.client_cert_path = None;
+            bad_tls.client_key_path = None;
+        }
+        let err = validate_agent(&bad).expect_err("no client pair must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("client_cert_path"))),
+            "{err:?}"
+        );
+
+        // Fingerprint pinning without ca_path cannot anchor the inner layer.
+        let mut bad = cfg.clone();
+        if let Some(bad_tls) = bad.tls.as_mut() {
+            bad_tls.ca_path = None;
+            bad_tls.hub_cert_fingerprint = Some("00".repeat(32));
+        }
+        let err = validate_agent(&bad).expect_err("pin-only must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("ca_path"))),
+            "{err:?}"
+        );
+
+        // Zero handshake deadline.
+        let mut bad = cfg;
+        bad.e2e.handshake_timeout_secs = 0;
+        let err = validate_agent(&bad).expect_err("zero deadline must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("handshake_timeout")))
+        );
+
+        // Missing anchor files are named even in off mode.
+        bad.e2e.mode = E2eMode::Off;
+        bad.e2e.handshake_timeout_secs = 10;
+        bad.e2e.extra_trusted_cas = vec![dir.join("missing-ca.crt").display().to_string()];
+        let err = validate_agent(&bad).expect_err("missing anchor must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("missing-ca.crt")))
+        );
     }
 
     #[test]

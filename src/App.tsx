@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, listenEvent, TunnelState, LogLine, Transport, stateText, stateColor, isRunning } from "./api";
+import { api, onLogLine, onTunnelState, TunnelState, LogLine, Transport, stateText, stateColor, isRunning } from "./api";
 import ConfigForm from "./components/ConfigForm";
 import StatusPanel from "./components/StatusPanel";
 import LogView from "./components/LogView";
@@ -9,7 +9,8 @@ export default function App() {
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [ports, setPorts] = useState<number[]>([]);
   const [hubUrl, setHubUrl] = useState("");
-  const [token, setToken] = useState("");
+  const [clientCert, setClientCert] = useState("");
+  const [clientKey, setClientKey] = useState("");
   const [agentId, setAgentId] = useState("");
   const [caPath, setCaPath] = useState("");
   const [transport, setTransport] = useState<Transport>("h2");
@@ -21,7 +22,8 @@ export default function App() {
       try {
         const profile = await api.loadProfile();
         if (profile.hub_url) setHubUrl(profile.hub_url);
-        if (profile.auth_token) setToken(profile.auth_token);
+        if (profile.client_cert) setClientCert(profile.client_cert);
+        if (profile.client_key) setClientKey(profile.client_key);
         if (profile.agent_id) setAgentId(profile.agent_id);
         if (profile.ca_path) setCaPath(profile.ca_path);
         if (profile.local_ports?.length) setPorts(profile.local_ports);
@@ -35,8 +37,8 @@ export default function App() {
     })();
 
     const unsubs = [
-      listenEvent<TunnelState>("tunnel-state", setState),
-      listenEvent<LogLine>("log", (line) =>
+      onTunnelState(setState),
+      onLogLine((line) =>
         setLogs((prev) => {
           const next = [...prev, line];
           return next.length > 2000 ? next.slice(next.length - 2000) : next;
@@ -50,14 +52,20 @@ export default function App() {
 
   const running = isRunning(state);
   const canStart =
-    !running && ports.length > 0 && hubUrl.trim() !== "" && token.trim() !== "" && agentId.trim() !== "";
+    !running &&
+    ports.length > 0 &&
+    hubUrl.trim() !== "" &&
+    clientCert.trim() !== "" &&
+    clientKey.trim() !== "" &&
+    agentId.trim() !== "";
 
   const start = async () => {
     try {
       await api.startTunnel({
         local_ports: ports,
         hub_url: hubUrl.trim(),
-        auth_token: token,
+        client_cert: clientCert.trim(),
+        client_key: clientKey.trim(),
         agent_id: agentId.trim(),
         ca_path: caPath.trim() === "" ? null : caPath.trim(),
         transport,
@@ -67,7 +75,8 @@ export default function App() {
       try {
         await api.saveProfile({
           hub_url: hubUrl.trim() || null,
-          auth_token: token || null,
+          client_cert: clientCert.trim() || null,
+          client_key: clientKey.trim() || null,
           agent_id: agentId.trim() || null,
           ca_path: caPath.trim() || null,
           local_ports: ports,
@@ -99,8 +108,10 @@ export default function App() {
         setPorts={setPorts}
         hubUrl={hubUrl}
         setHubUrl={setHubUrl}
-        token={token}
-        setToken={setToken}
+        clientCert={clientCert}
+        setClientCert={setClientCert}
+        clientKey={clientKey}
+        setClientKey={setClientKey}
         agentId={agentId}
         setAgentId={setAgentId}
         caPath={caPath}
@@ -114,7 +125,8 @@ export default function App() {
         onSaveProfile={async () => {
           await api.saveProfile({
             hub_url: hubUrl.trim() || null,
-            auth_token: token || null,
+            client_cert: clientCert.trim() || null,
+            client_key: clientKey.trim() || null,
             agent_id: agentId.trim() || null,
             ca_path: caPath.trim() || null,
             local_ports: ports.length > 0 ? ports : null,
@@ -131,7 +143,20 @@ export default function App() {
           Stop
         </button>
       </div>
-      <LogView logs={logs} />
+      <LogView
+        logs={logs}
+        onClear={async () => {
+          // View first (instant feedback), then the backend buffer it
+          // replays from on reload — the other order would let cleared
+          // lines reappear after a webview reload.
+          setLogs([]);
+          try {
+            await api.clearLogs();
+          } catch (e) {
+            console.error("Failed to clear logs:", e);
+          }
+        }}
+      />
     </div>
   );
 }

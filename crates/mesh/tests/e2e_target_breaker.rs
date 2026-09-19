@@ -44,13 +44,18 @@ use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, metrics_harness::counter_value,
     metrics_harness::init_tracing, metrics_harness::metrics_handle,
-    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_agent, spawn_hub,
+    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_hub,
 };
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
@@ -78,7 +83,7 @@ async fn connect_tunnel(
     hub_port: u16,
     agent_id: &str,
 ) -> (AgentTunnel, tokio::task::JoinHandle<()>) {
-    let client = AgentClient::new(agent_config(agent_id, hub_port)).expect("agent build");
+    let client = AgentClient::new(agent_config(agent_id, hub_port, certs())).expect("agent build");
     let conn = client
         .connect_and_register()
         .await
@@ -87,7 +92,6 @@ async fn connect_tunnel(
         agent_id.to_string(),
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
-        None,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
             tokio_util::sync::CancellationToken::new(),
         ),
@@ -242,18 +246,18 @@ async fn b1_dead_target_storm_does_not_starve_healthy() {
     let _ = metrics_handle();
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
     let dead = dead_target().await;
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.max_stream_opens_per_sec = 2;
     eg.stream_open_burst = 4;
     eg.max_incoming_streams = 0;
     eg.egress_target_breaker_failure_threshold = 3;
     eg.egress_target_breaker_window_secs = 10;
     eg.egress_target_breaker_cooldown_secs = 30;
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;
@@ -330,17 +334,17 @@ async fn b2_recovery_after_backend_starts() {
     let _ = metrics_handle();
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
     let dead = dead_target().await;
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.max_stream_opens_per_sec = 0;
     eg.max_incoming_streams = 0;
     eg.egress_target_breaker_failure_threshold = 2;
     eg.egress_target_breaker_window_secs = 10;
     eg.egress_target_breaker_cooldown_secs = 2;
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;
@@ -396,16 +400,16 @@ async fn b3_disabled_breaker_restores_old_behavior() {
     let _ = metrics_handle();
     init_tracing();
     let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, vec![])).await;
+    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (echo_addr, _echo) = echo_server().await;
     let dead = dead_target().await;
 
-    let mut eg = agent_config("eg", hub_port);
+    let mut eg = agent_config("eg", hub_port, certs());
     eg.max_stream_opens_per_sec = 2;
     eg.stream_open_burst = 4;
     eg.max_incoming_streams = 0;
     eg.egress_target_breaker_enabled = false;
-    spawn_agent(eg);
+    interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
     wait_egress_ready(&inj, echo_addr).await;

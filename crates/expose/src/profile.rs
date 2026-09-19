@@ -1,15 +1,16 @@
-//! Profile persistence: saves the hub URL, token, and agent_id to the user
-//! config directory, so subsequent `interflow-expose expose <port>` calls
-//! need no repeated arguments.
+//! Profile persistence: saves the hub URL, client certificate pair, and
+//! agent_id to the user config directory, so subsequent
+//! `interflow-expose expose <port>` calls need no repeated arguments.
 //!
 //! Paths:
 //! - Linux: `~/.config/interflow/profile.toml`
 //! - macOS: `~/Library/Application Support/interflow/profile.toml`
 //! - Windows: `%APPDATA%\interflow\profile.toml`
 //!
-//! Relative `ca_path` values inside the profile anchor to the profile
-//! file's directory (e.g. `~/.config/interflow/certs/ca.crt`), never to the
-//! process working directory.
+//! Relative path values inside the profile (`ca_path`, `client_cert`,
+//! `client_key`) anchor to the profile file's directory (e.g.
+//! `~/.config/interflow/certs/ca.crt`), never to the process working
+//! directory.
 
 use interflow_core::config::paths::anchor;
 use interflow_core::error::{InterflowError, Result};
@@ -23,8 +24,10 @@ use std::path::{Path, PathBuf};
 pub struct Profile {
     /// Hub URL (e.g. `https://hub.example.com:6666`).
     pub hub_url: Option<String>,
-    /// Agent token (the hub's `auth.static_token.agent`).
-    pub auth_token: Option<String>,
+    /// Client certificate PEM path (mTLS identity; CN must equal agent_id).
+    pub client_cert: Option<String>,
+    /// Client key PEM path (0600).
+    pub client_key: Option<String>,
     /// agent_id used by this machine's expose (edge's routes.toml must
     /// reference the same id).
     pub agent_id: Option<String>,
@@ -60,17 +63,23 @@ pub fn load() -> Result<Profile> {
 }
 
 /// Loads a profile from an explicit path. A missing file yields an empty
-/// Profile (not treated as an error). A relative `ca_path` anchors to the
+/// Profile (not treated as an error). Relative path values anchor to the
 /// profile file's directory.
 pub fn load_from(path: &Path) -> Result<Profile> {
     match std::fs::read_to_string(path) {
         Ok(s) => {
             let mut profile: Profile = toml::from_str(&s)?;
-            if let Some(ca) = profile.ca_path.take() {
-                let base = path
-                    .parent()
-                    .map_or_else(|| PathBuf::from("."), ToOwned::to_owned);
-                profile.ca_path = Some(anchor(&base, &ca));
+            let base = path
+                .parent()
+                .map_or_else(|| PathBuf::from("."), ToOwned::to_owned);
+            for field in [
+                &mut profile.ca_path,
+                &mut profile.client_cert,
+                &mut profile.client_key,
+            ] {
+                if let Some(value) = field.take() {
+                    *field = Some(anchor(&base, &value));
+                }
             }
             Ok(profile)
         }

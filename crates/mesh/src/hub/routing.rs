@@ -16,9 +16,11 @@
 
 use crate::config::AclRule;
 use crate::hub::service::HubService;
-use crate::hub::state::{StreamFace, TunnelData, release_stream_slot, try_acquire_stream_slot};
+use crate::hub::state::{
+    PeerIdentity, StreamFace, TunnelData, release_stream_slot, try_acquire_stream_slot,
+};
 use bytes::Bytes;
-use interflow_core::protocol::{FrameType, StreamProto};
+use interflow_core::protocol::{FLAG_E2E, FrameType, StreamProto};
 use interflow_core::security::AuditKind;
 use interflow_core::tunnel::FrameSource;
 use std::sync::atomic::Ordering;
@@ -72,6 +74,74 @@ pub(crate) fn valid_agent_id(s: &str) -> bool {
 
 pub(crate) fn valid_target_addr(s: &str) -> bool {
     s.len() <= MAX_ADDR_LEN && !s.bytes().any(|b| b.is_ascii_control())
+}
+
+/// Qualifies a wire-level Open target: `"{tenant}/{agent}"` passes through
+/// (validated), a bare id resolves into the source's own tenant.
+/// `None` when the qualified form is malformed.
+pub(crate) fn qualify_target(target: &str, source_tenant: &str) -> String {
+    if target.contains('/') {
+        target.to_string()
+    } else {
+        format!("{source_tenant}/{target}")
+    }
+}
+
+/// Validates a qualified agent key `"{tenant}/{agent}"`: both parts
+/// well-formed, the tenant part may carry the internal `_` prefix (the edge
+/// gateway principal).
+pub(crate) fn valid_qualified_agent(s: &str) -> bool {
+    match s.split_once('/') {
+        Some((tenant, agent)) => {
+            !tenant.is_empty()
+                && tenant.len() <= 64
+                && tenant
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && valid_agent_id(agent)
+        }
+        None => false,
+    }
+}
+
+/// The tenant isolation policy (RFC §4 evaluation order), shared by the h2
+/// upload path (`frame_open`) and the QUIC relay open path:
+/// 1. source is a trusted gateway → allow (the expose edge's principal is
+///    the only legitimate cross-tenant opener)
+/// 2. same tenant → allow
+/// 3. explicit cross-tenant `[[acl.rules]]` exception → allow
+/// 4. otherwise deny
+pub(crate) async fn tenant_policy_allows(
+    tls_plane: &crate::hub::state::SharedTlsPlane,
+    config: &crate::hub::state::SharedHubConfig,
+    source_qualified: &str,
+    qualified_target: &str,
+) -> bool {
+    let Some((source_tenant, source_bare)) = PeerIdentity::split_qualified(source_qualified) else {
+        return false;
+    };
+    let Some((target_tenant, target_bare)) = PeerIdentity::split_qualified(qualified_target) else {
+        return false;
+    };
+    // Gateway status comes from the TLS plane's trust table (the same
+    // generation the source connection was authenticated against).
+    let gateway = {
+        let plane = tls_plane
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        plane.verifier.is_gateway_tenant(source_tenant)
+    };
+    if gateway || source_tenant == target_tenant {
+        return true;
+    }
+    let config = config.read().await;
+    config.acl.contains(&AclRule {
+        source_tenant: source_tenant.to_string(),
+        source: source_bare.to_string(),
+        target_tenant: target_tenant.to_string(),
+        target: target_bare.to_string(),
+    })
 }
 
 /// Resolution result of frame-level Data dispatch.
@@ -137,31 +207,40 @@ impl HubService {
         target_agent: &str,
         target_addr: Option<&str>,
         proto: StreamProto,
+        e2e: bool,
     ) -> std::result::Result<(), &'static str> {
-        // ACL check (lock taken only when enabled)
-        if self.limits.acl_enabled.load(Ordering::Relaxed) {
-            let config = self.config.read().await;
-            if !config.acl.is_empty() {
-                let rule = AclRule {
+        // Tenant isolation policy (RFC §4). Both endpoints arrive
+        // tenant-qualified (`"{tenant}/{agent}"`); a bare target is
+        // qualified with the source's own tenant (same-tenant shorthand on
+        // the wire — agents do not know their tenant, and the default is
+        // intra-tenant anyway).
+        let Some((source_tenant, _source_bare)) = PeerIdentity::split_qualified(source_agent)
+        else {
+            return Err("Invalid source identity");
+        };
+        let qualified_target = qualify_target(target_agent, source_tenant);
+
+        if !tenant_policy_allows(
+            &self.tls_plane,
+            &self.config,
+            source_agent,
+            &qualified_target,
+        )
+        .await
+        {
+            metrics::counter!("interflow_hub_acl_denied").increment(1);
+            self.audit.record(
+                AuditKind::StreamDenied {
+                    stream_id: stream_id.to_string(),
                     source: source_agent.to_string(),
-                    target: target_agent.to_string(),
-                };
-                if !config.acl.contains(&rule) {
-                    warn!("ACL denied: {} -> {}", source_agent, target_agent);
-                    metrics::counter!("interflow_hub_acl_denied").increment(1);
-                    self.audit.record(
-                        AuditKind::StreamDenied {
-                            stream_id: stream_id.to_string(),
-                            source: source_agent.to_string(),
-                            reason: format!("acl_denied: target={target_agent}"),
-                        },
-                        Some(source_agent.to_string()),
-                        Some(self.peer_str()),
-                    );
-                    return Err("Access denied by ACL");
-                }
-            }
+                    reason: format!("tenant_denied: target={qualified_target}"),
+                },
+                Some(source_agent.to_string()),
+                Some(self.peer_str()),
+            );
+            return Err("Access denied by tenant policy");
         }
+        let target_agent = qualified_target.as_str();
 
         // Stream count cap check (defends against DDoS / a compromised agent
         // flooding stream opens)
@@ -214,14 +293,15 @@ impl HubService {
             stream_id, source_agent,
         );
 
-        // No target agent: does not count as an active stream; roll back the
-        // count and succeed directly (existing semantics)
-        if target_agent.is_empty() {
-            if max_per_agent > 0 {
-                release_stream_slot(&self.stream_counts, source_agent);
-            }
-            return Ok(());
-        }
+        // An empty target never reaches this point on the h2 plane: the
+        // upload payload gate (`hub/upload.rs`, `valid_agent_id` refuses the
+        // empty string) rejects it with "invalid open payload" before
+        // `frame_open` is called. The QUIC plane rejects empty targets at
+        // the tenant-policy gate instead (no form validation there — a known
+        // plane asymmetry). Both gates are pinned by
+        // `tests/e2e_open_target_contract.rs`. A historical empty-target
+        // no-op branch here was dead code from the pre-streaming-upload
+        // architecture and has been removed.
 
         // Store the active stream (under lock). When the target is a quic
         // agent, first establish a relay stream to obtain the dispatch plane
@@ -245,6 +325,7 @@ impl HubService {
                             source_agent,
                             target_addr,
                             proto,
+                            e2e,
                         )
                         .await
                         .inspect(|_tx| {
@@ -314,7 +395,11 @@ impl HubService {
                 stream_id: stream_id.to_string(),
                 source: FrameSource::Open,
                 stream_type: FrameType::Open,
-                flags: proto.as_flag(),
+                // The hub rebuilds Open flags from the stream proto — the
+                // e2e declaration must be carried through explicitly or it
+                // would be silently stripped (the downgrade attack
+                // e2e-required peers exist to reject).
+                flags: proto.as_flag() | (u8::from(e2e) * FLAG_E2E),
                 data: Bytes::from(open_data),
             };
             if crate::hub::control::deliver_control(&self.agents, target_agent, frame).await {

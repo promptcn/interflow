@@ -25,17 +25,18 @@ impl HubService {
     ) -> Result<Response<HubResponseBody>> {
         let agent_id = agent_id_of(&req)?;
 
-        // Identity binding check
+        // Identity binding check (bare id vs the mTLS identity's CN)
         if let Err(resp) =
             bind_connection_identity(&self.connection_identity, agent_id, "poll").await
         {
             return Ok(*resp);
         }
+        let agent_key = self.qualified_id().await;
 
         // Take the AgentSession Arc (outer read lock is very short-lived)
         let state_arc = {
             let agents = self.agents.read().await;
-            agents.get(agent_id).cloned()
+            agents.get(&agent_key).cloned()
         };
 
         let state_arc = if let Some(a) = state_arc {
@@ -49,7 +50,7 @@ impl HubService {
             // this self-healing path in particular).
             // The identity binding check above already passed, so the
             // authentication level is equivalent to /register.
-            self.implicit_re_register(agent_id).await
+            self.implicit_re_register(&agent_key).await
         };
 
         // Decide under the inner write lock: take the existing rx /
@@ -75,7 +76,7 @@ impl HubService {
                 // survives (liveness and QUIC handle untouched, the active
                 // upload lease keeps running) and the fresh rx is consumed
                 // by this very poll instead of being parked.
-                info!("Agent {} channel closed or lost, recreating", agent_id);
+                info!("Agent {agent_key} channel closed or lost, recreating");
                 let (tx, rx) = mpsc::channel(256);
                 let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
                 state.tx = tx;
@@ -109,7 +110,7 @@ impl HubService {
             generation,
             waker_slot,
             self.handles(),
-            agent_id.to_string(),
+            agent_key.clone(),
         );
         // ChunkHygiene enforces the h2 body chunking invariants (no empty
         // non-final chunks, small chunks coalesced to ≥256B — see
@@ -123,7 +124,7 @@ impl HubService {
             .body(body)
             .expect("status+body response is infallible");
 
-        info!("Agent {} entering streaming receive mode", agent_id);
+        info!("Agent {agent_key} entering streaming receive mode");
         Ok(response)
     }
 }

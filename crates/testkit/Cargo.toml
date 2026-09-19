@@ -1,6 +1,6 @@
 [package]
 name = "interflow-testkit"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Shared test/bench harness for interflow: stack assembly, certificates, impairment injection, metrics (dev-only, not in the production dependency graph)"
@@ -22,15 +22,16 @@ name = "soak"
 path = "src/bin/soak.rs"
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.2" }
-interflow-mesh = { path = "../mesh", version = "0.2" }
+interflow-core = { path = "../core", version = "0.3" }
+interflow-mesh = { path = "../mesh", version = "0.3" }
 
 # Async runtime
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 
-# Certificate generation (self-signed CA / server / client)
-rcgen = "0.14"
+# Certificate issuance — the single rcgen implementation shared with
+# `interflow-mesh certs` and the expose wizard
+interflow-certs = { path = "../certs", version = "0.3" }
 
 # Metrics-snapshot assertion harness (same versions as mesh)
 metrics = "0.24.6"
@@ -51,6 +52,11 @@ toml = "1"
 chrono = "0.4"
 # soak CLI
 clap = { version = "4.6", features = ["derive"] }
+
+# TLS client connections for protocol-level tests (the hub is mTLS-only)
+tokio-rustls = "0.26.4"
+rustls = "0.23"
+rustls-pemfile = "2.2.0"
 
 [dev-dependencies]
 # paused-clock unit tests (impair delay line)

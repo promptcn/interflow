@@ -167,6 +167,22 @@ pub trait TunnelTransport: Send + Sync + 'static {
         target_agent: &str,
         target_addr: Option<&str>,
         proto: StreamProto,
+    ) -> Result<()> {
+        self.send_open_with(stream_id, target_agent, target_addr, proto, false)
+            .await
+    }
+
+    /// [`TunnelTransport::send_open`] with the per-stream e2e (inner TLS)
+    /// declaration: `true` sets [`crate::protocol::FLAG_E2E`] on the Open
+    /// frame, asking the target agent for the agent↔agent TLS layer
+    /// (docs/design/agent-e2e-encryption.md §3.6).
+    async fn send_open_with(
+        &self,
+        stream_id: &str,
+        target_agent: &str,
+        target_addr: Option<&str>,
+        proto: StreamProto,
+        e2e: bool,
     ) -> Result<()>;
 
     /// Sends a data frame (request direction, ingress → hub).

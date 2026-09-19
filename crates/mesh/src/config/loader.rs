@@ -107,12 +107,8 @@ fn map_opt<T>(field: &mut Option<T>, f: impl FnOnce(&T) -> T) {
 /// secret / path fields. Relative `@file:` references resolve against the
 /// config file's directory.
 fn resolve_hub_secrets(cfg: &mut HubConfig, base: &Path) -> Result<()> {
-    if let Some(static_token) = cfg.auth.static_token.as_mut() {
-        try_map_opt(&mut static_token.agent, |t| maybe_resolve(t, base))?;
-        try_map_opt(&mut static_token.admin, |t| maybe_resolve(t, base))?;
-    }
-    if let Some(mtls) = cfg.auth.mtls.as_mut() {
-        mtls.ca_path = maybe_resolve(&mtls.ca_path, base)?;
+    for tenant in &mut cfg.auth.tenants {
+        tenant.ca_path = maybe_resolve(&tenant.ca_path, base)?;
     }
     if let Some(tls) = cfg.tls.as_mut() {
         tls.cert_path = maybe_resolve(&tls.cert_path, base)?;
@@ -126,8 +122,8 @@ fn resolve_hub_secrets(cfg: &mut HubConfig, base: &Path) -> Result<()> {
 /// config file's directory (absolute values pass through). `metrics.path`
 /// is an HTTP route, not a filesystem path, and is deliberately untouched.
 fn anchor_hub_paths(cfg: &mut HubConfig, base: &Path) {
-    if let Some(mtls) = cfg.auth.mtls.as_mut() {
-        mtls.ca_path = anchor(base, &mtls.ca_path);
+    for tenant in &mut cfg.auth.tenants {
+        tenant.ca_path = anchor(base, &tenant.ca_path);
     }
     if let Some(tls) = cfg.tls.as_mut() {
         tls.cert_path = anchor(base, &tls.cert_path);
@@ -140,12 +136,15 @@ fn anchor_hub_paths(cfg: &mut HubConfig, base: &Path) {
 /// secret / path fields. Relative `@file:` references resolve against the
 /// config file's directory.
 fn resolve_agent_secrets(cfg: &mut AgentConfig, base: &Path) -> Result<()> {
-    try_map_opt(&mut cfg.agent.auth_token, |t| maybe_resolve(t, base))?;
     try_map_opt(&mut cfg.control.auth_token, |t| maybe_resolve(t, base))?;
     if let Some(tls) = cfg.tls.as_mut() {
         try_map_opt(&mut tls.ca_path, |p| maybe_resolve(p, base))?;
         try_map_opt(&mut tls.client_cert_path, |p| maybe_resolve(p, base))?;
         try_map_opt(&mut tls.client_key_path, |p| maybe_resolve(p, base))?;
+    }
+    try_map_opt(&mut cfg.e2e.gateway_ca_path, |p| maybe_resolve(p, base))?;
+    for ca in &mut cfg.e2e.extra_trusted_cas {
+        *ca = maybe_resolve(ca, base)?;
     }
     Ok(())
 }
@@ -156,6 +155,10 @@ fn anchor_agent_paths(cfg: &mut AgentConfig, base: &Path) {
         map_opt(&mut tls.ca_path, |p| anchor(base, p));
         map_opt(&mut tls.client_cert_path, |p| anchor(base, p));
         map_opt(&mut tls.client_key_path, |p| anchor(base, p));
+    }
+    map_opt(&mut cfg.e2e.gateway_ca_path, |p| anchor(base, p));
+    for ca in &mut cfg.e2e.extra_trusted_cas {
+        *ca = anchor(base, ca);
     }
 }
 
@@ -174,17 +177,16 @@ mod tests {
             std::fs::write(certs.join(name), b"dummy").unwrap();
         }
         let toml = r#"
-config_version = 3
+config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:16666"
 
 [auth]
-mode = "mtls"
-allow_anonymous = false
 rate_limit_per_minute = 30
 
-  [auth.mtls]
+  [[auth.tenants]]
+  name = "acme"
   ca_path = "certs/ca.crt"
 
 [tls]
@@ -223,8 +225,12 @@ path = "./audit.jsonl"
             tls.key_path,
             dir.join("certs/hub.key").display().to_string()
         );
-        let mtls = cfg.auth.mtls.as_ref().unwrap();
-        assert_eq!(mtls.ca_path, dir.join("certs/ca.crt").display().to_string());
+        let tenant = cfg.auth.tenants.first().unwrap();
+        assert_eq!(tenant.name, "acme");
+        assert_eq!(
+            tenant.ca_path,
+            dir.join("certs/ca.crt").display().to_string()
+        );
         assert_eq!(
             cfg.audit.path.as_deref().unwrap(),
             dir.join("audit.jsonl").display().to_string()
@@ -248,7 +254,6 @@ config_version = 3
 [agent]
 id = "agent-x"
 hub_url = "https://127.0.0.1:16666"
-auth_token = "dev-token"
 
 [tls]
 enabled = true

@@ -1,0 +1,12 @@
+# Optional expose-agent profile. start-expose.sh passes the equivalent CLI
+# flags explicitly; copy this file to the platform config location only if you
+# prefer running `interflow-expose expose <port>` without arguments.
+#
+# Relative paths are anchored to this file's directory. If you install the
+# profile elsewhere, copy certs/ with it or change these paths to absolute.
+
+hub_url = "https://hub.example.com:16666"
+agent_id = "lan-agent"
+client_cert = "certs/agents/lan-agent.crt"
+client_key = "certs/agents/lan-agent.key"
+ca_path = "certs/tenants/demo-ca.crt"

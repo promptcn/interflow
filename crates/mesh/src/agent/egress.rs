@@ -280,6 +280,8 @@ pub struct EgressHandler {
     /// Request-direction new-stream events (handed over by dispatch,
     /// take-once).
     incoming: mpsc::Receiver<IncomingStream>,
+    /// E2e (inner TLS) runtime; `None` = mode off, plain streams only.
+    e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
 }
 
 /// Exit categories of the read task (backend -> hub): the basis on which the
@@ -335,6 +337,7 @@ impl EgressHandler {
         tracker: TaskTracker,
         command_rx: Option<mpsc::Receiver<EgressCommand>>,
         incoming: mpsc::Receiver<IncomingStream>,
+        e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
     ) -> Self {
         Self {
             agent_id,
@@ -347,6 +350,7 @@ impl EgressHandler {
             tracker,
             command_rx,
             incoming,
+            e2e,
         }
     }
 
@@ -363,6 +367,7 @@ impl EgressHandler {
         let runtime = self.runtime;
         let session = self.session;
         let tracker = self.tracker;
+        let e2e = self.e2e;
         let store = self.store;
 
         for rule in &rules {
@@ -452,6 +457,7 @@ impl EgressHandler {
                             &session,
                             &tracker,
                             &send_health,
+                            e2e.as_ref(),
                         )
                         .await;
                     } else {
@@ -498,6 +504,7 @@ impl EgressHandler {
         session: &CancellationToken,
         tracker: &TaskTracker,
         send_health: &Arc<SendPathHealth>,
+        e2e: Option<&Arc<crate::agent::e2e::E2eRuntime>>,
     ) {
         let IncomingStream { open, frames } = stream;
         let stream_id = open.stream_id.clone();
@@ -507,14 +514,46 @@ impl EgressHandler {
 
         let proto = StreamProto::from_frame_flags(open.flags);
 
-        // Open payload = "{target_agent}:{target_addr}" (the hub uses
-        // target_agent for routing; egress cares only about target_addr; it
-        // may be empty = no dynamic target).
+        // Open payload = "{source_agent}:{target_addr}" (the hub rewrites
+        // the initiator's qualified id in; egress cares about target_addr
+        // for dialing and source_agent for the e2e identity binding; either
+        // part may be empty = absent).
         let payload = String::from_utf8_lossy(&open.data);
-        let dynamic_target = payload
-            .split_once(':')
-            .filter(|&(_, target)| !target.is_empty())
-            .map(|(_, target)| target.to_string());
+        let (src_agent, dynamic_target) =
+            payload.split_once(':').map_or(("", None), |(src, target)| {
+                (src, (!target.is_empty()).then(|| target.to_string()))
+            });
+
+        // E2e declaration on the stream (Open `FLAG_E2E`; TCP only — UDP
+        // streams stay phase-1 plaintext, RFC §7).
+        let e2e_requested =
+            proto == StreamProto::Tcp && open.flags & interflow_core::protocol::FLAG_E2E != 0;
+
+        // Downgrade rejection (RFC §4/A5): in `required` mode a TCP stream
+        // without the e2e declaration is a stripped flag or an old/foreign
+        // initiator — closed fail-closed before any policy/dial work, never
+        // a plaintext forward.
+        if matches!(e2e, Some(rt) if rt.mode == crate::config::E2eMode::Required)
+            && proto == StreamProto::Tcp
+            && !e2e_requested
+        {
+            crate::agent::e2e::record_handshake_failure(
+                crate::agent::e2e::SIDE_EGRESS,
+                crate::agent::e2e::REASON_NOT_NEGOTIATED,
+            );
+            warn!(
+                "e2e required: rejecting non-e2e TCP stream {stream_id} (stripped FLAG_E2E or legacy peer), source={src_agent}"
+            );
+            Self::finish(
+                tunnel,
+                &stream_id,
+                CloseReason::E2eHandshakeFailed,
+                true,
+                &runtime.active,
+            )
+            .await;
+            return;
+        }
 
         let matched_rule = rules.iter().find(|r| r.target_protocol == proto);
         let target = dynamic_target.or_else(|| {
@@ -652,6 +691,9 @@ impl EgressHandler {
                     Arc::clone(runtime),
                     session.clone(),
                     Arc::clone(send_health),
+                    e2e.cloned(),
+                    e2e_requested,
+                    src_agent.to_string(),
                 ));
             }
             StreamProto::Udp => {
@@ -704,7 +746,93 @@ impl EgressHandler {
         runtime: Arc<EgressRuntime>,
         session: CancellationToken,
         send_health: Arc<SendPathHealth>,
+        e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
+        e2e_requested: bool,
+        src_agent: String,
     ) {
+        // 0. E2e (inner TLS) handshake phase — dial-after-handshake (RFC
+        //    §3.3): the backend DNS resolve/TCP connect below runs only
+        //    after the peer is cryptographically confirmed, so a malicious
+        //    hub cannot drive a plaintext dial into the LAN with a
+        //    redirected stream. `required` failures close here with zero
+        //    dial; `opportunistic` failures resume the plain path below
+        //    with the buffered peer bytes replayed to the backend.
+        let mut preloaded: Bytes = Bytes::new();
+        let e2e_tls = if let Some(rt) = &e2e
+            && e2e_requested
+        {
+            let adapter = interflow_core::tunnel::e2e::E2eTunnelIo::egress(
+                std::mem::replace(&mut frames, mpsc::channel(1).1),
+                tunnel.clone(),
+                stream_id.clone(),
+            );
+            let expected_client = crate::agent::e2e::bare_agent_id(&src_agent);
+            let acceptor = match rt.server_acceptor(expected_client) {
+                Ok(a) => a,
+                Err(e) => {
+                    // Startup-assembled material gone stale mid-session:
+                    // fail closed in every mode.
+                    crate::agent::e2e::record_handshake_failure(
+                        crate::agent::e2e::SIDE_EGRESS,
+                        "protocol",
+                    );
+                    error!(
+                        "e2e acceptor build failed for {stream_id} (source {src_agent}): {e}; closing stream"
+                    );
+                    Self::finish(
+                        &tunnel,
+                        &stream_id,
+                        CloseReason::E2eHandshakeFailed,
+                        true,
+                        &runtime.active,
+                    )
+                    .await;
+                    return;
+                }
+            };
+            match interflow_core::tunnel::e2e::inner_tls_accept(
+                adapter,
+                acceptor,
+                rt.handshake_timeout,
+            )
+            .await
+            {
+                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Established(tls, reason) => {
+                    crate::agent::e2e::record_handshake_ok(crate::agent::e2e::SIDE_EGRESS);
+                    Some((tls, reason))
+                }
+                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { parts, error } => {
+                    let reason = crate::agent::e2e::failure_reason_of(&error);
+                    crate::agent::e2e::record_handshake_failure(
+                        crate::agent::e2e::SIDE_EGRESS,
+                        reason,
+                    );
+                    if rt.mode == crate::config::E2eMode::Required {
+                        warn!(
+                            "e2e handshake failed ({reason}: {error}), closing stream {stream_id} without dial (required mode)"
+                        );
+                        Self::finish(
+                            &tunnel,
+                            &stream_id,
+                            CloseReason::E2eHandshakeFailed,
+                            true,
+                            &runtime.active,
+                        )
+                        .await;
+                        return;
+                    }
+                    info!(
+                        "e2e handshake failed ({reason}: {error}), falling back to plaintext stream {stream_id}"
+                    );
+                    frames = parts.rx;
+                    preloaded = parts.buffered;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // 1. Resolve-then-check-then-connect: tokio::net::lookup_host
         //    resolves (IP literals trigger no DNS) -> filter out
         //    SSRF-blocklist IPs -> connect to the already-resolved address
@@ -817,7 +945,80 @@ impl EgressHandler {
             "Backend connection established: {} -> {}",
             stream_id, target_addr
         );
+
+        // 1b. E2e-established streams pump through the inner TLS layer: all
+        //     tunnel bytes are ciphertext from here on. The stream close on
+        //     the backend-EOF path goes out via the pump's TLS shutdown
+        //     epilogue (the adapter's close_response); the peer-close path
+        //     needs none — so only the counter/gauge bookkeeping follows.
+        if let Some((tls, close_reason)) = e2e_tls {
+            let sid = stream_id.clone();
+            let t2 = tunnel.clone();
+            let outcome = interflow_core::tunnel::pump::pump_duplex(
+                stream,
+                tls,
+                &interflow_core::tunnel::pump::PumpConfig {
+                    // Egress TCP forwarders have no per-stream idle budget
+                    // by design (an SSE-style backend may stay legitimately
+                    // silent); MAX encodes "no idle teardown".
+                    idle_timeout: Duration::MAX,
+                    write_stall_timeout: write_timeout,
+                    idle_timeout_counter: "interflow_agent_e2e_egress_stream_idle_timeout",
+                    write_stall_counter: "interflow_agent_e2e_egress_backend_write_stall",
+                    log_label: "egress-e2e",
+                },
+                &stream_id,
+                async move { t2.unregister_incoming_stream(&sid).await },
+            )
+            .await;
+            let reason = close_reason.get().unwrap_or(CloseReason::CloseFrame);
+            debug!(
+                "e2e stream {stream_id} ended: {:?} (relayed={})",
+                reason, outcome.response_relayed
+            );
+            // Unified wind-down: the TLS close_notify rode Data frames; the
+            // stream Close response is sent here when we ended the stream
+            // (peer-initiated ends need no echo — the hub already reaped it).
+            let echo_close =
+                !matches!(reason, CloseReason::CloseFrame | CloseReason::SessionClosed);
+            Self::finish(&tunnel, &stream_id, reason, echo_close, &runtime.active).await;
+            return;
+        }
+
         let (read_half, mut write_half) = stream.into_split();
+
+        // 1c. Opportunistic fallback replay: peer bytes buffered during the
+        //     failed handshake attempt go to the backend before anything
+        //     else (ordering preserved).
+        if !preloaded.is_empty() {
+            match tokio::time::timeout(write_timeout, write_half.write_all(&preloaded)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!("Fallback replay write to backend failed: {e}");
+                    Self::finish(
+                        &tunnel,
+                        &stream_id,
+                        CloseReason::BackendClosed,
+                        true,
+                        &runtime.active,
+                    )
+                    .await;
+                    return;
+                }
+                Err(_) => {
+                    error!("Fallback replay write stalled, killing stream: {stream_id}");
+                    Self::finish(
+                        &tunnel,
+                        &stream_id,
+                        CloseReason::BackendWriteTimeout,
+                        true,
+                        &runtime.active,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
 
         // 2. Read task (backend -> hub): cancel/session force exit (when the
         //    backend goes silent the read blocks in read_buf; polling a flag

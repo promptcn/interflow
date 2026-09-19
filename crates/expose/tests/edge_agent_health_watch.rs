@@ -61,9 +61,10 @@ async fn spawn_black_hole() -> std::net::SocketAddr {
 /// silent — exactly the "recovery wedged" class the outer watch exists for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wedged_supervisor_trips_the_watch() {
+    let certs = interflow_testkit::certs::TestCerts::generate("health", "healthy");
     let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let black_hole = spawn_black_hole().await;
-    let mut cfg = agent_config("wedged", black_hole.port());
+    let mut cfg = agent_config("wedged", black_hole.port(), &certs);
     cfg.agent.hub_url = format!("http://{black_hole}");
     // Effectively unbounded establish: the connect hangs inside
     // run_session, no state change ever follows the initial Connecting.
@@ -96,9 +97,10 @@ async fn wedged_supervisor_trips_the_watch() {
 /// within its timeout instead of hanging edge startup forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wedged_first_registration_fails_startup_boundedly() {
+    let certs = interflow_testkit::certs::TestCerts::generate("health", "healthy");
     let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let black_hole = spawn_black_hole().await;
-    let mut cfg = agent_config("wedged-startup", black_hole.port());
+    let mut cfg = agent_config("wedged-startup", black_hole.port(), &certs);
     cfg.agent.hub_url = format!("http://{black_hole}");
     cfg.agent.connect_timeout_secs = 10_000;
     let agent = AgentClient::new(cfg).unwrap().start();
@@ -125,10 +127,11 @@ async fn wedged_first_registration_fails_startup_boundedly() {
 /// trip (restart churn would not help; this is normal operation).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn struggling_but_alive_supervisor_never_trips_the_watch() {
+    let certs = interflow_testkit::certs::TestCerts::generate("health", "healthy");
     let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     // A port with nothing listening: every attempt fails fast.
     let dead_port = pick_ephemeral_port();
-    let mut cfg = agent_config("struggling", dead_port);
+    let mut cfg = agent_config("struggling", dead_port, &certs);
     cfg.agent.hub_url = format!("http://127.0.0.1:{dead_port}");
     cfg.agent.connect_timeout_secs = 2;
     let agent = AgentClient::new(cfg).unwrap().start();
@@ -152,10 +155,12 @@ async fn struggling_but_alive_supervisor_never_trips_the_watch() {
 /// Healthy shape: Connected state, the watch stays silent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn healthy_agent_never_trips_the_watch() {
+    let _certs = interflow_testkit::certs::TestCerts::generate("health", "healthy");
+    let certs = interflow_testkit::certs::TestCerts::generate("health", "healthy");
     let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(interflow_testkit::hub_config(hub_port, vec![])).await;
-    let agent = spawn_agent_registered(agent_config("healthy", hub_port)).await;
+    let _hub = spawn_hub(interflow_testkit::hub_config(hub_port, &certs, vec![])).await;
+    let agent = spawn_agent_registered(agent_config("healthy", hub_port, &certs)).await;
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(2),
@@ -177,14 +182,15 @@ async fn healthy_agent_never_trips_the_watch() {
 /// process exits, systemd restarts) — not spin on it, not stay silent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dead_supervisor_trips_the_watch_via_stream_end() {
+    let certs = interflow_testkit::certs::TestCerts::generate("health", "healthy");
     let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
 
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(interflow_testkit::hub_config(hub_port, vec![])).await;
+    let _hub = spawn_hub(interflow_testkit::hub_config(hub_port, &certs, vec![])).await;
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::AgentSuperviseLoopTick));
-    let mut cfg = agent_config("doomed-supervisor", hub_port);
+    let mut cfg = agent_config("doomed-supervisor", hub_port, &certs);
     cfg.agent.connect_timeout_secs = 2;
     let agent = AgentClient::new(cfg).unwrap().start();
 

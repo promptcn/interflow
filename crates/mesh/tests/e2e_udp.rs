@@ -24,12 +24,17 @@
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_mesh::config::{EgressRule, HeartbeatConfig, HubSecurityConfig, IngressRule};
 use interflow_testkit::{
-    acl, agent_config, hub_config, hub_config_tuned, pick_ephemeral_port, spawn_agent, spawn_hub,
+    agent_config, hub_config, hub_config_tuned, pick_ephemeral_port, spawn_agent, spawn_hub,
     spawn_udp_echo, spawn_udp_echo_first_delayed, udp_client, udp_echo_round_trip, udp_egress_rule,
     udp_ingress_rule, udp_round_trip_once,
 };
 use std::net::SocketAddr;
 use std::time::Duration;
+
+fn certs() -> &'static interflow_testkit::certs::TestCerts {
+    static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
+    C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
 
 fn random_payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 31 % 251) as u8).collect()
@@ -41,14 +46,14 @@ fn random_payload(len: usize) -> Vec<u8> {
 async fn udp_echo_round_trip_basic() {
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![acl("ingress", "egress")])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
         format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -77,14 +82,14 @@ async fn udp_echo_round_trip_basic() {
 async fn udp_multiple_concurrent_clients() {
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![acl("ingress", "egress")])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
         format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -129,16 +134,16 @@ async fn udp_multiple_concurrent_clients() {
 async fn udp_agent_restart_recovers() {
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![acl("ingress", "egress")])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
 
     let handle1 = start_agent(egress_cfg.clone());
     wait_state(&handle1, Duration::from_secs(10)).await;
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
         format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -181,14 +186,14 @@ async fn udp_agent_restart_recovers() {
 async fn udp_large_datagrams_no_truncation() {
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![acl("ingress", "egress")])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
         format!("127.0.0.1:{ingress_port}").parse().unwrap(),
@@ -229,13 +234,14 @@ async fn udp_idle_session_recycled_and_slot_released() {
     };
     let _hub = spawn_hub(hub_config_tuned(
         hub_port,
-        vec![acl("ingress", "egress")],
+        certs(),
+        Vec::new(),
         security,
         HeartbeatConfig::default(),
     ))
     .await;
 
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![EgressRule {
         udp_idle_timeout_secs: Some(6),
         ..udp_egress_rule("echo", echo_addr)
@@ -243,7 +249,7 @@ async fn udp_idle_session_recycled_and_slot_released() {
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         idle_timeout_secs: Some(6),
         ..udp_ingress_rule(
@@ -306,9 +312,9 @@ async fn udp_late_reply_after_recycle_does_not_wedge() {
     // session is recycled before the reply arrives
     let (echo_addr, _echo) = spawn_udp_echo_first_delayed(Duration::from_secs(3)).await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![acl("ingress", "egress")])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![EgressRule {
         udp_idle_timeout_secs: Some(1),
         ..udp_egress_rule("echo", echo_addr)
@@ -316,7 +322,7 @@ async fn udp_late_reply_after_recycle_does_not_wedge() {
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         idle_timeout_secs: Some(1),
         ..udp_ingress_rule(
@@ -362,14 +368,14 @@ async fn udp_late_reply_after_recycle_does_not_wedge() {
 async fn udp_rate_limit_drops_burst() {
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![acl("ingress", "egress")])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         udp_per_ip_pps: 5,
         udp_per_ip_bytes_per_sec: 0,
@@ -423,14 +429,14 @@ async fn udp_rate_limit_drops_burst() {
 async fn udp_rate_limit_high_pps_all_pass() {
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, vec![acl("ingress", "egress")])).await;
+    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
 
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         udp_per_ip_pps: 1000,
         udp_per_ip_bytes_per_sec: 0,
@@ -487,13 +493,14 @@ async fn udp_hub_eviction_then_recovery() {
     };
     let _hub = spawn_hub(hub_config_tuned(
         hub_port,
-        vec![acl("ingress", "egress")],
+        certs(),
+        Vec::new(),
         security,
         heartbeat,
     ))
     .await;
 
-    let mut egress_cfg = agent_config("egress", hub_port);
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
 
     // Hold the handle manually for a graceful shutdown (triggers poll
@@ -502,7 +509,7 @@ async fn udp_hub_eviction_then_recovery() {
     wait_state(&handle1, Duration::from_secs(10)).await;
 
     let ingress_port = pick_ephemeral_port();
-    let mut ingress_cfg = agent_config("ingress", hub_port);
+    let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
         format!("127.0.0.1:{ingress_port}").parse().unwrap(),

@@ -32,5 +32,6 @@ pub mod upload;
 pub use server::HubServer;
 pub use state::{
     ActiveStream, AgentSession, HubCore, HubHandles, HubLimits, QuicAgentConn, SharedActiveStreams,
-    SharedAgents, SharedHubConfig, SharedStreamCounts, SharedTlsAcceptor, StreamFace, TunnelData,
+    SharedAgents, SharedHubConfig, SharedStreamCounts, SharedTlsPlane, StreamFace, TunnelData,
+    qualified_agent_id,
 };
