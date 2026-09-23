@@ -450,9 +450,12 @@ async fn wedged_upload_rebuilds_via_stall_watchdog() {
     );
 
     // The wedged uplink must be noticed: the session ends (state leaves
-    // Connected) within a heartbeat-derived window, then recovers.
+    // Connected) within a heartbeat-derived window, then recovers. The
+    // budget is deliberately generous: on slow shared CI runners the
+    // watchdog's ticks get starved long past the ~2s aging window (the
+    // detection still happens — just late); 15s was observed flaking there.
     assert!(
-        wait_session_rebuilt(&front, 1, Duration::from_secs(15)).await,
+        wait_session_rebuilt(&front, 1, Duration::from_secs(60)).await,
         "a wedged upload task must end the session (sessions established: {} — stall not detected)",
         front.sessions_established()
     );
