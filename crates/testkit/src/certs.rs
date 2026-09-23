@@ -2,7 +2,7 @@
 //! demand (CN = agent id).
 //!
 //! Issuance goes through `interflow-certs` — the same implementation behind
-//! `interflow-mesh certs` and the expose init wizard — so test certificates
+//! internal issuance — so test certificates
 //! have production shape (ServerAuth/ClientAuth EKU, explicit validity).
 //!
 //! Directory isolation: each generation uses its own temp directory (an
@@ -19,8 +19,10 @@ pub struct TestCerts {
     /// `OnceLock`); re-issuing would rewrite the same files concurrently and
     /// hand a reader a half-written PEM.
     issued: std::sync::Mutex<std::collections::HashMap<String, (PathBuf, PathBuf)>>,
-    ca_pem: String,
-    ca_key: String,
+    /// The retained signing context — leaf issuance (named clients,
+    /// revocation material) signs in memory instead of re-parsing the
+    /// persisted CA PEM on every call.
+    ca: interflow_certs::LoadedCa,
     server_cert: String,
     server_key: String,
     client_cert: String,
@@ -48,10 +50,9 @@ impl TestCerts {
             std::env::temp_dir().join(format!("interflow-{tag}-{}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("cert dir: {e}"));
 
-        let ca = interflow_certs::build_ca(tag, interflow_certs::Validity::ca_default())
-            .unwrap_or_else(|e| panic!("test CA: {e}"));
-        let loaded = interflow_certs::LoadedCa::from_material(&ca)
-            .unwrap_or_else(|e| panic!("test CA load: {e}"));
+        let loaded =
+            interflow_certs::LoadedCa::generate(tag, interflow_certs::Validity::ca_default())
+                .unwrap_or_else(|e| panic!("test CA: {e}"));
         // Server: SAN covers localhost + 127.0.0.1 (SNI works with either IP
         // or hostname — the local-development dial forms).
         let server = loaded
@@ -64,11 +65,13 @@ impl TestCerts {
         let client = loaded
             .build_client_cert(client_cn, interflow_certs::Validity::leaf_default())
             .unwrap_or_else(|e| panic!("test client cert: {e}"));
+        let crl = loaded
+            .build_empty_crl()
+            .unwrap_or_else(|e| panic!("test CRL: {e}"));
 
         let certs = TestCerts {
             issued: std::sync::Mutex::new(std::collections::HashMap::new()),
-            ca_pem: ca.cert_pem,
-            ca_key: ca.key_pem,
+            ca: loaded,
             server_cert: server.cert_pem,
             server_key: server.key_pem,
             client_cert: client.cert_pem,
@@ -76,7 +79,8 @@ impl TestCerts {
             dir,
         };
 
-        write_file(&certs.dir.join("ca.pem"), &certs.ca_pem, false);
+        write_file(&certs.dir.join("ca.pem"), certs.ca.cert_pem(), false);
+        write_file(&certs.dir.join("ca.crl"), &crl, false);
         write_file(&certs.dir.join("server.pem"), &certs.server_cert, false);
         write_file(&certs.dir.join("server.key"), &certs.server_key, true);
         certs
@@ -85,6 +89,11 @@ impl TestCerts {
     /// CA certificate path (the agent-side `ca_path`).
     pub fn ca_path(&self) -> PathBuf {
         self.dir.join("ca.pem")
+    }
+
+    /// Valid CRL path for the test tenant CA.
+    pub fn crl_path(&self) -> PathBuf {
+        self.dir.join("ca.crl")
     }
 
     /// Server certificate path (the hub-side `cert_path`).
@@ -121,9 +130,8 @@ impl TestCerts {
 
     /// Issues (uncached) a client certificate under `cn`.
     fn issue_client_cert(&self, cn: &str) -> (PathBuf, PathBuf) {
-        let loaded = interflow_certs::LoadedCa::from_pem_pair(&self.ca_pem, &self.ca_key)
-            .unwrap_or_else(|e| panic!("test CA reload: {e}"));
-        let pair = loaded
+        let pair = self
+            .ca
             .build_client_cert(cn, interflow_certs::Validity::leaf_default())
             .unwrap_or_else(|e| panic!("test client cert: {e}"));
 
@@ -138,6 +146,30 @@ impl TestCerts {
             true,
         );
         (cert_path, key_path)
+    }
+
+    /// Issues an uncached client pair and a CRL revoking exactly that leaf.
+    pub fn revoked_client_material(&self, cn: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let leaf = self
+            .ca
+            .build_client_cert(cn, interflow_certs::Validity::leaf_default())
+            .unwrap_or_else(|e| panic!("revoked client: {e}"));
+        let crl = self
+            .ca
+            .build_crl_revoking(&leaf.serial_number)
+            .unwrap_or_else(|e| panic!("revoked CRL: {e}"));
+        let cert_path = write_file(
+            &self.dir.join(format!("revoked-{cn}.pem")),
+            &leaf.cert_pem,
+            false,
+        );
+        let key_path = write_file(
+            &self.dir.join(format!("revoked-{cn}.key")),
+            &leaf.key_pem,
+            true,
+        );
+        let crl_path = write_file(&self.dir.join(format!("revoked-{cn}.crl")), &crl, false);
+        (cert_path, key_path, crl_path)
     }
 }
 
@@ -156,7 +188,7 @@ pub async fn tls_client_connect(
 
 /// Path-parameterized variant of [`tls_client_connect`]: connects with an
 /// arbitrary certificate triple and server name (used to handshake-test
-/// material issued by `interflow-mesh certs`).
+/// operator-issued material).
 pub async fn tls_client_connect_with(
     ca_path: &Path,
     client_cert_path: &Path,

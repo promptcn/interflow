@@ -1,21 +1,29 @@
 //! The e2e (agent↔agent inner TLS) runtime: startup assembly of the shared
 //! material plus the per-stream role entry points used by ingress/egress.
 //!
-//! RFC docs/design/agent-e2e-encryption.md. Everything here is
+//! RFC (internal design notes). Everything here is
 //! startup-only (no hot reload): the material is the `[tls]` client pair
-//! plus the merged anchor set (`[tls] ca_path` ∪ `[e2e] gateway_ca_path` ∪
-//! `[e2e] extra_trusted_cas` — the same file the agent already holds for
-//! the hub plane; no new key material is introduced).
+//! plus the merged anchor set. Anchor selection: when dedicated inner
+//! anchors (`[inner_tls] ingress_ca_path` / `extra_trusted_cas`) are
+//! configured, exactly those anchor the inner plane — pack-driven
+//! bootstrap uses this to keep the outer hub anchor (the realm issuer)
+//! out of the agent↔agent plane. Otherwise the single-CA model applies:
+//! `[tls] ca_path` anchors both planes, the same file the agent already
+//! holds for the hub plane; no new key material is introduced either way.
 
-use crate::config::{AgentConfig, E2eMode};
+use crate::config::AgentConfig;
 use interflow_core::error::Result;
 use interflow_core::tls::{
-    InnerTlsMaterial, classify_handshake_error, inner_client_config, inner_server_config,
+    InnerTlsMaterial, classify_handshake_error, inner_client_config, inner_quic_client_config,
+    inner_server_config_unbound,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::rustls::ClientConfig;
 
 /// Metric family: successful inner handshakes.
 pub(crate) const METRIC_HANDSHAKES: &str = "interflow_agent_e2e_handshakes_total";
@@ -57,68 +65,109 @@ pub(crate) fn bare_agent_id(id: &str) -> &str {
     id.rsplit_once('/').map_or(id, |(_, bare)| bare)
 }
 
-/// Per-agent e2e state assembled once at startup; `None` (via
-/// [`E2eRuntime::from_config`]) when the mode is off.
+/// Per-agent mandatory inner-TLS state assembled once at startup.
 pub struct E2eRuntime {
-    /// The configured mode (fail-closed semantics only exist for
-    /// `required`; `opportunistic` is the migration window).
-    pub mode: E2eMode,
     /// Handshake deadline for both roles (RFC §3.5).
     pub handshake_timeout: Duration,
     material: Arc<InnerTlsMaterial>,
+    source_principal: String,
+    quic_client_configs: Arc<Mutex<HashMap<String, Arc<ClientConfig>>>>,
 }
 
 impl E2eRuntime {
-    /// Assembles the runtime from the validated agent config; `Ok(None)`
-    /// when e2e is off. The prerequisites (tls pair + ca_path) are enforced
-    /// by config validation — fail here is a startup error, not per-stream.
-    pub fn from_config(cfg: &AgentConfig) -> Result<Option<Arc<Self>>> {
-        if !cfg.e2e.enabled() {
-            return Ok(None);
-        }
+    /// Assembles the runtime from the validated agent config. The
+    /// prerequisites (tls pair + ca_path) are enforced by config validation;
+    /// failure here is a startup error, not per-stream.
+    pub fn from_config(cfg: &AgentConfig) -> Result<Arc<Self>> {
         let Some(tls) = cfg.tls.as_ref() else {
             return Err(interflow_core::error::InterflowError::config(
-                "[e2e] enabled without [tls] (validator bypassed?)",
+                "inner TLS requires [tls] (validator bypassed?)",
             ));
         };
         let (Some(cert), Some(key)) = (&tls.client_cert_path, &tls.client_key_path) else {
             return Err(interflow_core::error::InterflowError::config(
-                "[e2e] enabled without the [tls] client pair (validator bypassed?)",
+                "inner TLS requires the [tls] client pair (validator bypassed?)",
             ));
         };
         let mut anchors: Vec<String> = Vec::new();
-        if let Some(ca) = &tls.ca_path {
-            anchors.push(ca.clone());
+        if cfg.inner_tls.ingress_ca_path.is_some() || !cfg.inner_tls.extra_trusted_cas.is_empty() {
+            // Dedicated inner anchors are authoritative: the outer hub
+            // anchor (`[tls] ca_path`) must not leak into the peer plane.
+            if let Some(gw) = &cfg.inner_tls.ingress_ca_path {
+                anchors.push(gw.clone());
+            }
+            anchors.extend(cfg.inner_tls.extra_trusted_cas.iter().cloned());
+        } else {
+            // Single-CA model (engine default): the hub-plane CA anchors
+            // both planes.
+            if let Some(ca) = &tls.ca_path {
+                anchors.push(ca.clone());
+            }
         }
-        if let Some(gw) = &cfg.e2e.gateway_ca_path {
-            anchors.push(gw.clone());
-        }
-        anchors.extend(cfg.e2e.extra_trusted_cas.iter().cloned());
         let refs: Vec<&str> = anchors.iter().map(String::as_str).collect();
-        let material = InnerTlsMaterial::from_paths(&refs, cert, key)?;
-        Ok(Some(Arc::new(Self {
-            mode: cfg.e2e.mode,
-            handshake_timeout: Duration::from_secs(cfg.e2e.handshake_timeout_secs),
+        let mut crls = Vec::new();
+        for path in &cfg.inner_tls.crl_paths {
+            crls.push(interflow_core::tls::load_crl(path)?);
+        }
+        let material = InnerTlsMaterial::from_paths_with_crls(&refs, cert, key, &crls)?;
+        Ok(Arc::new(Self {
+            handshake_timeout: Duration::from_secs(cfg.inner_tls.handshake_timeout_secs),
             material: Arc::new(material),
-        })))
+            source_principal: bare_agent_id(&cfg.agent.id).to_owned(),
+            quic_client_configs: Arc::default(),
+        }))
     }
 
     /// Inner TLS client connector for one stream (ingress role): the
     /// expected peer CN is the Open target's bare agent id.
-    pub fn client_connector(&self, expected_peer_cn: &str) -> Result<TlsConnector> {
+    pub(crate) fn client_connector(&self, expected_peer_cn: &str) -> Result<TlsConnector> {
         Ok(TlsConnector::from(Arc::new(inner_client_config(
             &self.material,
             expected_peer_cn,
         )?)))
     }
 
-    /// Inner TLS server acceptor for one stream (egress role): the
-    /// expected client CN is the Open frame's declared source agent.
-    pub fn server_acceptor(&self, expected_client_cn: &str) -> Result<TlsAcceptor> {
-        Ok(TlsAcceptor::from(Arc::new(inner_server_config(
+    /// Source-opaque inner TLS acceptor. Chain verification still happens in
+    /// the handshake; the encrypted [`InnerStreamHello`] binds CN and
+    /// fingerprint immediately after establishment.
+    pub fn server_acceptor_unbound(&self) -> Result<TlsAcceptor> {
+        Ok(TlsAcceptor::from(Arc::new(inner_server_config_unbound(
             &self.material,
-            expected_client_cn,
         )?)))
+    }
+
+    /// Startup-assembled inner TLS material used by the UDP inner QUIC layer.
+    pub(crate) const fn material(&self) -> &Arc<InnerTlsMaterial> {
+        &self.material
+    }
+
+    pub(crate) fn source_principal(&self) -> &str {
+        &self.source_principal
+    }
+
+    /// Returns a reusable inner QUIC client config for one expected peer.
+    ///
+    /// Cloning rustls config preserves its session-store `Arc`, so association
+    /// rebuilds can resume while the CN-specific cache remains isolated.
+    pub(crate) fn quic_client_config(&self, expected_peer_cn: &str) -> Result<ClientConfig> {
+        let mut cache = self
+            .quic_client_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(config) = cache.get(expected_peer_cn) {
+            return Ok((**config).clone());
+        }
+        let config = Arc::new(inner_quic_client_config(&self.material, expected_peer_cn)?);
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(expected_peer_cn.to_owned(), Arc::clone(&config));
+        Ok((*config).clone())
+    }
+
+    /// Fingerprint of the leaf certificate this principal presents.
+    pub fn local_fingerprint(&self) -> [u8; 32] {
+        self.material.leaf_fingerprint()
     }
 }
 

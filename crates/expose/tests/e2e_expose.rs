@@ -21,87 +21,35 @@
     dead_code,
     unused_mut
 )]
-use interflow_expose::client::ExposeArgs;
-use interflow_expose::edge::{EdgeArgs, EdgeHubTls, HostRouter, Route, RoutesConfig};
+use interflow_expose::client::{ExposeArgs, LocalService};
+use interflow_expose::edge::{
+    ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, HostRouter, IngressPrincipal, Route,
+    WorkspaceTrust,
+};
 use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-/// Echo backend for tests: writes back whatever it reads.
-async fn spawn_echo() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
-    let addr = listener.local_addr().expect("echo addr");
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                loop {
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if sock.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
-/// Grabs an ephemeral port (bound then released immediately; there is a tiny
-/// race between tests but this is usually good enough).
-fn pick_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("addr").port()
-}
-
-/// Repeatedly TCP-connects to `addr` until success or timeout.
-async fn wait_for_tcp(addr: SocketAddr, timeout: Duration) -> std::io::Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(e);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-}
+use tokio::net::TcpStream;
 
 /// HostRouter unit test: normalization, case handling, port handling.
 #[tokio::test]
 async fn host_router_routes_by_host() {
-    let echo_addr = spawn_echo().await;
-
     let router = Arc::new(
-        HostRouter::from_config(&RoutesConfig {
-            routes: vec![Route {
-                host: "test.local".into(),
-                tenant: "test".into(),
-                agent_id: "expose-test".into(),
-                remote_addr: echo_addr,
-            }],
-            logging: None,
-        })
+        HostRouter::from_routes(&[Route {
+            host: "test.local".into(),
+            workspace: "test".into(),
+            agent_id: "expose-test".into(),
+            service_id: "web".into(),
+        }])
         .unwrap(),
     );
 
     assert_eq!(router.len(), 1);
     let r = router.lookup("test.local").expect("route found");
     assert_eq!(r.agent_id, "expose-test");
-    assert_eq!(r.remote_addr, echo_addr);
+    assert_eq!(r.service_id, "web");
 
     // Port normalization
     assert!(router.lookup("test.local:8443").is_some());
@@ -125,75 +73,81 @@ async fn full_edge_expose_round_trip() {
 
     // 1. echo backend
     // 1. echo backend
-    let echo_addr = spawn_echo().await;
+    let echo_addr = interflow_testkit::echo_server().await.0;
 
     // 2. Grab ports
-    let edge_port = pick_port();
-    let hub_port = pick_port();
+    let edge_port = interflow_testkit::pick_ephemeral_port();
+    let hub_port = interflow_testkit::pick_ephemeral_port();
     let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
     let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
     // 3. Temp routes.toml
-    let routes_content = format!(
-        r#"
-[[routes]]
-host = "test.local"
-tenant = "test"
-agent_id = "expose-test"
-remote_addr = "{echo_addr}"
-"#
-    );
-    let routes_path = std::env::temp_dir().join(format!(
-        "interflow_test_routes_{}.toml",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::write(&routes_path, &routes_content).expect("write routes.toml");
-
     // 4. Spawn edge (hub server + edge agent + listener)
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
-    let edge_args = EdgeArgs {
+    let (principal_cert, principal_key) = certs.named_client_cert("edge");
+    let edge_config = EdgeConfig {
         listen_addr: edge_listen,
-        hub_listen_addr: hub_listen,
-        routes_path: routes_path.to_string_lossy().into_owned(),
-        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
-        proxy_protocol: Default::default(),
-        hub_tls: Some(EdgeHubTls {
-            cert_path: certs.server_cert_path().display().to_string(),
-            key_path: certs.server_key_path().display().to_string(),
-        }),
-        agent_recovery_timeout_secs: 120,
-        ..Default::default()
+        control_listen_addr: hub_listen,
+        control_tls: ControlEndpointTls {
+            cert: certs.server_cert_path(),
+            key: certs.server_key_path(),
+        },
+        workspace_trust: vec![WorkspaceTrust {
+            workspace: "test".to_string(),
+            ca: certs.ca_path(),
+        }],
+        principals: vec![IngressPrincipal {
+            workspace: "test".to_string(),
+            cert: principal_cert,
+            key: principal_key,
+        }],
+        routes: vec![Route {
+            host: "test.local".to_string(),
+            workspace: "test".to_string(),
+            agent_id: "expose-test".to_string(),
+            service_id: "web".to_string(),
+        }],
+        listener: EdgeListenerPolicy {
+            ..EdgeListenerPolicy::default()
+        },
+        agent_recovery_timeout: Duration::from_secs(120),
+        ..EdgeConfig::default()
     };
-    let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_args));
+    let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_config));
 
     // 5. Wait for the hub listener to be ready
-    wait_for_tcp(hub_listen, Duration::from_secs(5))
+    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
         .await
         .expect("hub should start within 5s");
     // Wait for the edge listener to be ready
-    wait_for_tcp(edge_listen, Duration::from_secs(5))
+    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
         .await
         .expect("edge listener should start within 5s");
 
     // 6. Spawn the expose client (connects to the edge's hub, agent_id=expose-test, egress to echo)
     let (client_cert, client_key) = certs.client_paths();
     let client_args = ExposeArgs {
-        local_ports: vec![echo_addr.port()],
+        log_name: None,
+        services: vec![LocalService {
+            id: "web".into(),
+            target_addr: echo_addr,
+            overridden: false,
+        }],
         hub_url: format!("https://127.0.0.1:{hub_port}"),
         client_cert: Some(client_cert.display().to_string()),
         client_key: Some(client_key.display().to_string()),
         agent_id: "expose-test".into(),
+        ingress_ca_path: Some(certs.ca_path().display().to_string()),
         ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
     };
-    let client_handle =
-        tokio::task::spawn(
-            async move { interflow_expose::client::start(&client_args)?.join().await },
-        );
-
-    // 7. Wait for the agent to register with the hub (no health-check channel; a simple sleep)
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let client = interflow_expose::client::start(&client_args).expect("expose client start");
+    assert!(
+        interflow_testkit::wait_agent_connected(&client, Duration::from_secs(5)).await,
+        "expose client should register within 5s"
+    );
+    let client_handle = tokio::task::spawn(async move { client.join().await });
 
     // 8. Send an HTTP/1.1 request to the edge listener
     let mut sock = TcpStream::connect(edge_listen)
@@ -210,7 +164,6 @@ remote_addr = "{echo_addr}"
         tokio::time::timeout(Duration::from_secs(3), sock.read_exact(&mut response)).await;
     edge_handle.abort();
     client_handle.abort();
-    let _ = std::fs::remove_file(&routes_path);
 
     read_result
         .expect("read should not timeout")
@@ -222,5 +175,152 @@ remote_addr = "{echo_addr}"
         response.as_slice(),
         request.as_ref(),
         "response should equal echoed request"
+    );
+}
+
+/// A tiny backend that answers every connection with its own marker —
+/// unlike the byte-echo server, this makes *which* backend served a
+/// request observable.
+async fn marker_backend(marker: &'static str) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = sock.write_all(marker.as_bytes()).await;
+        }
+    });
+    addr
+}
+
+/// Two services on one agent, selected **by id** across the edge: each
+/// host reaches its own service's backend even though the route order and
+/// the rule order deliberately disagree — the regression guard for the
+/// pre-id era's positional `Vec<u16>` contract (backlog 2026-09-23, pit 1:
+/// once per-service addresses exist, positional pairing silently crosses).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_services_route_by_id_not_position() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,interflow=debug".into()),
+        )
+        .try_init();
+
+    // Two distinguishable backends.
+    let alpha_addr = marker_backend("BACKEND-ALPHA\n").await;
+    let beta_addr = marker_backend("BACKEND-BETA\n").await;
+
+    let edge_port = interflow_testkit::pick_ephemeral_port();
+    let hub_port = interflow_testkit::pick_ephemeral_port();
+    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
+    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
+
+    // Routes deliberately in the OPPOSITE order of the agent's rules: any
+    // positional pairing would cross-wire the hosts.
+    let certs = interflow_testkit::certs::TestCerts::generate("e2e2", "expose-test");
+    let (principal_cert, principal_key) = certs.named_client_cert("edge");
+    let edge_config = EdgeConfig {
+        listen_addr: edge_listen,
+        control_listen_addr: hub_listen,
+        control_tls: ControlEndpointTls {
+            cert: certs.server_cert_path(),
+            key: certs.server_key_path(),
+        },
+        workspace_trust: vec![WorkspaceTrust {
+            workspace: "test".to_string(),
+            ca: certs.ca_path(),
+        }],
+        principals: vec![IngressPrincipal {
+            workspace: "test".to_string(),
+            cert: principal_cert,
+            key: principal_key,
+        }],
+        routes: vec![
+            Route {
+                host: "beta.local".to_string(),
+                workspace: "test".to_string(),
+                agent_id: "expose-test".to_string(),
+                service_id: "beta".to_string(),
+            },
+            Route {
+                host: "alpha.local".to_string(),
+                workspace: "test".to_string(),
+                agent_id: "expose-test".to_string(),
+                service_id: "alpha".to_string(),
+            },
+        ],
+        listener: EdgeListenerPolicy::default(),
+        agent_recovery_timeout: Duration::from_secs(120),
+        ..EdgeConfig::default()
+    };
+    let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_config));
+    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
+        .await
+        .expect("hub should start within 5s");
+    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
+        .await
+        .expect("edge listener should start within 5s");
+
+    // Agent rules declared alpha-first; the routes above are beta-first.
+    let (client_cert, client_key) = certs.client_paths();
+    let client_args = ExposeArgs {
+        log_name: None,
+        services: vec![
+            LocalService {
+                id: "alpha".into(),
+                target_addr: alpha_addr,
+                overridden: false,
+            },
+            LocalService {
+                id: "beta".into(),
+                target_addr: beta_addr,
+                overridden: false,
+            },
+        ],
+        hub_url: format!("https://127.0.0.1:{hub_port}"),
+        client_cert: Some(client_cert.display().to_string()),
+        client_key: Some(client_key.display().to_string()),
+        agent_id: "expose-test".into(),
+        ingress_ca_path: Some(certs.ca_path().display().to_string()),
+        ca_path: Some(certs.ca_path().display().to_string()),
+        transport: TransportKind::H2,
+        hub_quic_addr: None,
+    };
+    let client = interflow_expose::client::start(&client_args).expect("expose client start");
+    assert!(
+        interflow_testkit::wait_agent_connected(&client, Duration::from_secs(5)).await,
+        "expose client should register within 5s"
+    );
+    let client_handle = tokio::task::spawn(async move { client.join().await });
+
+    let fetch = |host: &'static str| async move {
+        let mut sock = TcpStream::connect(edge_listen).await.expect("connect edge");
+        let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        sock.write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(3), sock.read(&mut buf))
+            .await
+            .expect("read should not timeout")
+            .expect("read should succeed");
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    };
+
+    let alpha_response = fetch("alpha.local").await;
+    let beta_response = fetch("beta.local").await;
+    edge_handle.abort();
+    client_handle.abort();
+
+    assert!(
+        alpha_response.contains("BACKEND-ALPHA"),
+        "alpha.local must reach the alpha service's backend, got {alpha_response:?}"
+    );
+    assert!(
+        beta_response.contains("BACKEND-BETA"),
+        "beta.local must reach the beta service's backend, got {beta_response:?}"
     );
 }

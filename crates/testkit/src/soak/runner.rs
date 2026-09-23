@@ -1,8 +1,9 @@
 //! Soak scenario orchestration: a long-running regression gate over a real
 //! process topology (backlog §1.7).
 //!
-//! System under test = three real processes (`interflow-mesh hub` + one egress
-//! and one ingress `interflow-mesh agent`, with real TOML configs + TLS
+//! System under test = three real processes (`interflow-soak-node hub` + one
+//! egress and one ingress `interflow-soak-node agent`, with real JSON
+//! engine-config handoffs + TLS
 //! certificates + SIGTERM graceful shutdown); load generation and observation
 //! stay in this process: the phased SSE backend, N consumer streams, the
 //! impairment proxies (egress↔hub link), per-PID RSS sampling, and hub
@@ -58,10 +59,11 @@ use crate::backend::{
 };
 use crate::impair::{DropPattern, ImpairConfig, ImpairKind, TcpImpairProxy, UdpImpairProxy};
 use crate::metrics::{LatencyStats, fmt_ms, latency_stats};
+use crate::soak::error::{SoakError, SoakResult};
 use crate::soak::phases::{PhaseTimeline, SerializedSpan, run_phases};
 use crate::soak::proc::{
     MeshProcess, churn_agent_config, egress_agent_config, hub_config, ingress_agent_config,
-    spawn_mesh, write_toml,
+    spawn_mesh, write_json,
 };
 use crate::soak::{rss, scrape};
 use crate::stack::{pick_ephemeral_port, wait_for_tcp};
@@ -177,8 +179,8 @@ pub struct SoakArgs {
     #[arg(long, default_value_t = 16)]
     fd_growth_bound: u64,
 
-    /// Path to the interflow-mesh binary (default target/release/interflow-mesh)
-    #[arg(long)]
+    /// Path to the soak-node binary (default target/release/interflow-soak-node)
+    #[arg(long = "soak-node-bin")]
     mesh_bin: Option<PathBuf>,
 
     /// Random seed (impair proxies)
@@ -211,38 +213,38 @@ impl SoakArgs {
 }
 
 /// Cross-parameter constraint validation (the precondition for the gate's semantics).
-fn validate(args: &SoakArgs) -> Result<(), String> {
+fn validate(args: &SoakArgs) -> SoakResult<()> {
     if args.chunk_bytes < CHUNK_HEADER {
-        return Err(format!(
+        return Err(SoakError::Args(format!(
             "chunk size must be at least {CHUNK_HEADER} bytes (header)"
-        ));
+        )));
     }
     if args.streams == 0 {
-        return Err("streams must be at least 1".into());
+        return Err(SoakError::Args("streams must be at least 1".to_string()));
     }
     if args.silence_secs >= args.idle_timeout_secs {
-        return Err(format!(
+        return Err(SoakError::Args(format!(
             "silent window ({}s) must be < idle budget ({}s): silence ended by a legitimate stream teardown is not the bug this gate is meant to catch",
             args.silence_secs, args.idle_timeout_secs
-        ));
+        )));
     }
     if args.silence_secs + 30 >= args.stall_bound_secs {
-        return Err(format!(
+        return Err(SoakError::Args(format!(
             "silent window ({}s) + 30s recovery margin must be < stall bound ({}s), otherwise the silence itself would falsely trigger a failure",
             args.silence_secs, args.stall_bound_secs
-        ));
+        )));
     }
     if args.cycle_secs <= args.silence_secs {
-        return Err(format!(
+        return Err(SoakError::Args(format!(
             "cycle ({}s) must be > silent window ({}s), otherwise there is no normal sending window",
             args.cycle_secs, args.silence_secs
-        ));
+        )));
     }
     if args.duration_secs < args.cycle_secs {
-        return Err(format!(
+        return Err(SoakError::Args(format!(
             "duration ({}s) must cover at least one full cycle ({}s)",
             args.duration_secs, args.cycle_secs
-        ));
+        )));
     }
     Ok(())
 }
@@ -266,26 +268,26 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-fn resolve_mesh_bin(arg: Option<&Path>) -> Result<PathBuf, String> {
+fn resolve_soak_node_bin(arg: Option<&Path>) -> SoakResult<PathBuf> {
     if let Some(p) = arg {
         return if p.is_file() {
             Ok(p.to_path_buf())
         } else {
-            Err(format!(
-                "file specified by --mesh-bin does not exist: {}",
+            Err(SoakError::Env(format!(
+                "file specified by --soak-node-bin does not exist: {}",
                 p.display()
-            ))
+            )))
         };
     }
-    let default = workspace_root().join("target/release/interflow-mesh");
+    let default = workspace_root().join("target/release/interflow-soak-node");
     if default.is_file() {
         return Ok(default);
     }
-    Err(format!(
-        "interflow-mesh binary not found ({}). Run `cargo build --release -p interflow-mesh` first \
-         or pass a path via --mesh-bin (just soak builds it automatically)",
+    Err(SoakError::Env(format!(
+        "interflow-soak-node binary not found ({}). Run `cargo build --release -p interflow-testkit --bin interflow-soak-node` first \
+         or pass a path via --soak-node-bin (just soak builds it automatically)",
         default.display()
-    ))
+    )))
 }
 
 /// (run directory, artifact path). A relative `--out` path is resolved against the workspace root.
@@ -411,11 +413,11 @@ struct TransportResult {
     assertions: Vec<AssertionOut>,
 }
 
-fn failed_result(name: &str, args: &SoakArgs, err: String) -> TransportResult {
+fn failed_result(name: &str, args: &SoakArgs, err: impl std::fmt::Display) -> TransportResult {
     TransportResult {
         transport: name.to_string(),
         pass: false,
-        error: Some(err),
+        error: Some(err.to_string()),
         duration_secs: args.duration_secs,
         streams: args.streams,
         chunks_verified: 0,
@@ -541,19 +543,21 @@ async fn consumer(
 
 /// Data-path readiness probe: a temporary stream receives the first chunk (proof the full path is
 /// ready, frame boundary seq=0).
-async fn probe_first_chunk(addr: SocketAddr, chunk_bytes: usize) -> Result<(), String> {
+async fn probe_first_chunk(addr: SocketAddr, chunk_bytes: usize) -> SoakResult<()> {
     let mut sock = TcpStream::connect(addr)
         .await
-        .map_err(|e| format!("probe connect: {e}"))?;
+        .map_err(|e| SoakError::Probe(format!("connect: {e}")))?;
     let mut buf = vec![0u8; chunk_bytes];
-    sock.read_exact(&mut buf)
-        .await
-        .map_err(|e| format!("probe first-chunk read failed (data path not ready): {e}"))?;
+    sock.read_exact(&mut buf).await.map_err(|e| {
+        SoakError::Probe(format!(
+            "first-chunk read failed (data path not ready): {e}"
+        ))
+    })?;
     let (_, seq) = decode_chunk(&buf);
     if seq != 0 {
-        return Err(format!(
+        return Err(SoakError::Args(format!(
             "probe first chunk seq={seq} (expected 0, frame boundary not aligned)"
-        ));
+        )));
     }
     Ok(())
 }
@@ -810,7 +814,7 @@ async fn log_tails(procs: &[Arc<Mutex<MeshProcess>>]) -> String {
 /// Returns per-process (name, result).
 async fn teardown_procs(
     procs: &[Arc<Mutex<MeshProcess>>],
-) -> Vec<(&'static str, Result<Option<i32>, String>)> {
+) -> Vec<(&'static str, SoakResult<Option<i32>>)> {
     let mut results = Vec::new();
     for idx in [1usize, 2, 0] {
         if let Some(p) = procs.get(idx) {
@@ -1001,9 +1005,9 @@ async fn run_scenario(
         backend_addr,
         args.idle_timeout_secs,
     );
-    if let Err(e) = write_toml(&scenario_dir.join("hub.toml"), &hub_cfg)
-        .and_then(|()| write_toml(&scenario_dir.join("egress.toml"), &egress_cfg))
-        .and_then(|()| write_toml(&scenario_dir.join("ingress.toml"), &ingress_cfg))
+    if let Err(e) = write_json(&scenario_dir.join("hub.json"), &hub_cfg)
+        .and_then(|()| write_json(&scenario_dir.join("egress.json"), &egress_cfg))
+        .and_then(|()| write_json(&scenario_dir.join("ingress.json"), &ingress_cfg))
     {
         return failed_result(name, args, e);
     }
@@ -1033,22 +1037,22 @@ async fn run_scenario(
             extra_env,
         )
     };
-    let startup: Result<(), String> = async {
-        let hub = spawn_one("hub", "hub.toml", "hub.log", "hub", &[])?;
+    let startup: SoakResult<()> = async {
+        let hub = spawn_one("hub", "hub.json", "hub.log", "hub", &[])?;
         procs.push(Arc::new(Mutex::new(hub)));
         wait_for_tcp(hub_addr, Duration::from_secs(30))
             .await
-            .map_err(|e| format!("hub listener not ready: {e}"))?;
+            .map_err(|e| SoakError::msg(format!("hub listener not ready: {e}")))?;
         wait_for_tcp(metrics_addr, Duration::from_secs(20))
             .await
-            .map_err(|e| format!("hub metrics not ready: {e}"))?;
-        let egress = spawn_one("agent", "egress.toml", "egress.log", "egress", &[])?;
+            .map_err(|e| SoakError::msg(format!("hub metrics not ready: {e}")))?;
+        let egress = spawn_one("agent", "egress.json", "egress.log", "egress", &[])?;
         procs.push(Arc::new(Mutex::new(egress)));
-        let ingress = spawn_one("agent", "ingress.toml", "ingress.log", "ingress", &[])?;
+        let ingress = spawn_one("agent", "ingress.json", "ingress.log", "ingress", &[])?;
         procs.push(Arc::new(Mutex::new(ingress)));
         wait_for_tcp(ingress_addr, Duration::from_secs(60))
             .await
-            .map_err(|e| format!("ingress local listener not ready: {e}"))?;
+            .map_err(|e| SoakError::msg(format!("ingress local listener not ready: {e}")))?;
         Ok(())
     }
     .await;
@@ -1077,7 +1081,7 @@ async fn run_scenario(
                 probe_first_chunk(ingress_addr, args.chunk_bytes),
             )
             .await
-            .map_err(|_| "probe timed out after 30s".to_string())
+            .map_err(|_| SoakError::Probe("timed out after 30s".to_string()))
             .and_then(|r| r);
             match r {
                 Ok(()) => break 'probe Ok(()),
@@ -1116,8 +1120,8 @@ async fn run_scenario(
         .parse()
         .expect("churn addr");
     let churn_cfg = churn_agent_config(hub_addr, transport, &certs, churn_addr, backend_addr);
-    let churn_config_path = scenario_dir.join("churn.toml");
-    if let Err(e) = write_toml(&churn_config_path, &churn_cfg) {
+    let churn_config_path = scenario_dir.join("churn.json");
+    if let Err(e) = write_json(&churn_config_path, &churn_cfg) {
         teardown_procs(&procs).await;
         backend_task.abort();
         if let Some(p) = tcp_proxy {
@@ -1780,7 +1784,7 @@ pub async fn run(mut args: SoakArgs) -> SoakOutcome {
             artifact_path: None,
         };
     }
-    let mesh_bin = match resolve_mesh_bin(args.mesh_bin.as_deref()) {
+    let mesh_bin = match resolve_soak_node_bin(args.mesh_bin.as_deref()) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{e}");

@@ -15,16 +15,13 @@ ignore = [
     # scenarios never touch them; remove once tauri upstream switches to the GTK4
     # bindings.
     "RUSTSEC-2024-0370",
-    "RUSTSEC-2024-0411",
-    "RUSTSEC-2024-0412",
-    "RUSTSEC-2024-0413", # proc-macro-error (transitive via tauri)
-    "RUSTSEC-2024-0414",
-    "RUSTSEC-2024-0415",
-    "RUSTSEC-2024-0416",
-    "RUSTSEC-2024-0417",
-    "RUSTSEC-2024-0418",
-    "RUSTSEC-2024-0419",
-    "RUSTSEC-2024-0420",
+    # proc-macro-error2: unmaintained upstream with no safe upgrade (the
+    # advisory itself lists none). Transitively via interflow-identity →
+    # age → i18n-embed-fl. A proc-macro executes only at build time (macro
+    # expansion for age's localized error strings) — it is not compiled into
+    # any shipped runtime binary. Re-evaluate when age drops i18n-embed-fl or
+    # the chain migrates to manyhow / proc-macro2-diagnostics.
+    "RUSTSEC-2026-0173",
     # paste: unmaintained upstream with no safe replacement; it is a transitive
     # macro dependency of the Tauri/Specta GUI build and is not present in the
     # mesh/expose runtime graph. Re-evaluate when specta/tauri migrate off it.

@@ -25,10 +25,10 @@ carried over HTTP/2 and QUIC):
 - **`interflow-mesh`** (site-to-site): a public **hub** — a pure stream
   router that never terminates public TLS and never parses HTTP — plus
   symmetric **agents**: ingress listeners in LAN A, egress dialers in LAN B.
-- **`interflow-expose`** (public domain → LAN service): a consolidated
-  **edge** on the public server (tunnel server and L4 HTTP/1 listener in one
-  process, behind a TLS-terminating fronting proxy) and a local expose
-  client that dials the backend.
+- **`interflow`** (public domain → LAN service): a consolidated
+  **ingress** on the public server (control endpoint and L4 HTTP/1 listener
+  in one process, behind a TLS-terminating fronting proxy) and a local
+  agent that dials the backend. Nodes run from role-bound Credential Packs.
 
 Assets the model protects:
 
@@ -46,14 +46,16 @@ Assets the model protects:
 1. **Credentials are the trust boundary.** An agent is whatever holds a
    valid mTLS client certificate — on both the h2 and QUIC planes the leaf
    certificate's CN *is* the agent identity and the anchoring tenant CA
-   *is* the tenant (since the v4 mTLS-only rework there is no other
+   *is* the tenant (the mTLS-only model has no other
    credential; see
-   [§6.5](#65-tenant-isolation-multi-tenant-hubs-since-v4)). Possession of
+   [§6.5](#65-tenant-isolation-multi-tenant-hubs)). Possession of
    an agent credential is not treated as a vulnerability (see
    [SECURITY.md](SECURITY.md#out-of-scope) — rotate it); what this model
    does is bound what the position can do ([§5](#5-attacker-position-holder-of-agent-credentials)).
-2. **The relay host is inside the trust boundary.** Agent↔hub sessions are
-   TLS, but the relay terminates that TLS and routes plaintext frames (see
+2. **The relay host is inside the transport trust boundary but outside the
+   payload trust boundary.** Agent↔hub sessions are TLS, but the relay
+   terminates that TLS; the model therefore requires agent↔agent inner TLS for TCP
+   and inner QUIC for UDP (see
    [§6](#6-attacker-position-the-relay-host-hub-or-edge-operator)).
 3. **The LAN behind an egress agent is reachable exactly as far as the egress
    rules and the hub ACL allow.** Stream-open authorization happens at the
@@ -71,7 +73,7 @@ The model enumerates four positions, ordered by how much they hold:
 | 2 | Holder of agent credentials (compromised credential) | [§5](#5-attacker-position-holder-of-agent-credentials) |
 | 3 | The relay host operator (hub or edge) | [§6](#6-attacker-position-the-relay-host-hub-or-edge-operator) |
 | 4 | Local actor on an agent host (control API) | [§7](#7-attacker-position-local-actor-on-an-agent-host--the-control-api-surface) |
-| 5 | A malicious or compromised **tenant** (multi-tenant hub) | [§6.5](#65-tenant-isolation-multi-tenant-hubs-since-v4) |
+| 5 | A malicious or compromised **tenant** (multi-tenant hub) | [§6.5](#65-tenant-isolation-multi-tenant-hubs) |
 
 ## 4. Attacker position: public unauthenticated client
 
@@ -106,31 +108,46 @@ defenses are resource-shape defenses:
 
 - **Bounded Host peek**: at most 8 KiB read and a 10 s timeout while looking
   for the `Host` header; a connection that dribbles its first bytes is
-  closed (`HOST_PEEK_BYTES` / `HOST_PEEK_TIMEOUT`,
+  closed (`HTTP_HEAD_MAX_BYTES` / `HOST_PEEK_TIMEOUT`,
   `crates/expose/src/edge/mod.rs` and `listener.rs`). Unknown hosts are
   closed (no route).
+- **Pre-handshake budget (ACME mode)**: the per-IP gate below runs *before*
+  the TLS accept — keyed on the TCP peer IP (80/443 direct, no front proxy)
+  — so a dribbled or flooding ClientHello cannot outwait the gate; the
+  ClientHello read and the handshake completion each carry a 10 s deadline
+  (`TLS_HANDSHAKE_TIMEOUT`, counted in `interflow_edge_tls_handshake_timeout`),
+  and a ClientHello whose SNI is outside the certificate/route host set is
+  closed right after the acceptor (`interflow_edge_sni_rejected`). The
+  dedicated :80 HTTP-01/redirect face runs the same per-IP gate before
+  spawning a task, from the same tracker/limiter instances.
 - **Client write-stall bound**: after acceptance, a client that stops
   reading (full send buffer) is closed after 10 s
   (`CLIENT_WRITE_STALL_TIMEOUT`, `crates/expose/src/edge/listener.rs`).
 - **Per-IP new-connection rate limit** (default 30/min), which defeats
   connect→peek→disconnect loops that would otherwise bypass the
   concurrency cap, plus a **global concurrent-connection cap**
-  (`ConnTracker`, `crates/core/src/security/conn_limit.rs`).
+  (`ConnTracker`, `crates/core/src/security/conn_limit.rs`). In ACME mode
+  one shared budget covers both public ports (:80 and :443) — the limits
+  keep one meaning per client IP across the whole public face.
 - **L4 passthrough**: beyond the bounded Host peek the edge parses no HTTP —
   request content is carried untouched and is the backend's concern, not
   the edge's. This keeps the edge's own parser surface near zero.
-- **Stream idle budget**: a stream silent in both directions for
-  `--stream-idle-timeout-secs` (default 300, refuses 0) is closed — the
-  same budget bounds how long any single public connection can pin memory.
-- **QUIC plane (opt-in)**: with `--quic-listen` the embedded hub opens a
-  public QUIC listener for expose clients. It is the same hardening as the
-  mesh hub's QUIC face — TLS is mandatory (the listener refuses to start
-  without `--hub-cert`/`--hub-key`), clients authenticate with mTLS client
+- **Stream idle budget**: a stream silent in both directions for the
+  `EdgeListenerPolicy` stream idle timeout (fixed default 300 s) is closed —
+  the same budget bounds how long any single public connection can pin
+  memory.
+- **QUIC plane (opt-in, engine capability)**: the embedded hub can open a
+  public QUIC listener for expose clients (`EdgeConfig.quic_listen`). It is
+  the same hardening as the
+  mesh hub's QUIC face — TLS is mandatory (the control-endpoint certificate
+  pair from the pack; no plaintext mode), clients authenticate with mTLS client
   certificates at the handshake (the registration Hello frame carries
   capability bits, not a credential), and handshake failures / idle
   connections are counted and evicted — so the
   added public surface inherits §4.1 rather than introducing a new trust
-  path. The nginx-fronted HTTP/1 surface above is unaffected either way.
+  path. The pack-driven product path does not open this listener today
+  (h2 only; an ingress-side QUIC listener is on the manifest roadmap). The
+  nginx-fronted HTTP/1 surface above is unaffected either way.
 
 ### 4.3 Reaching a mesh ingress listener directly
 
@@ -151,6 +168,9 @@ bounded (`crates/core/src/security/rate_limit.rs`, defaults from
 - **Inbound, per source IP, dual bucket**: packet rate (default 50 pps) and
   byte rate (default 10 KiB/s). A single datagram larger than the
   per-second byte quota is deterministically dropped, never queued.
+- **Request carrier, per inner QUIC association**: encrypted inner-QUIC bytes
+  are budgeted separately from public plaintext bytes, including conservative
+  packet/AEAD overhead.
 - **Return path, per session**: byte rate toward the public side (default
   256 KiB/s) — even a fully spoofed inbound side cannot turn a session into
   a large amplification relay.
@@ -212,46 +232,47 @@ thresholds hurting legitimate traffic" apart from "under flood".
 ## 6. Attacker position: the relay host (hub or edge operator)
 
 The hub never terminates public TLS and never parses HTTP — but it does
-terminate the agent↔hub TLS and handle the frame stream. What the relay
-host can do to tunnel payloads therefore depends on the tenant's e2e
-(`[e2e]`) configuration (docs/design/agent-e2e-encryption.md):
+terminate the agent↔hub TLS and route the frame stream. This outer
+TLS is only transport authentication: every data-plane payload also has an
+agent-to-agent inner layer.
 
-- **`[e2e] mode = "off"` (default): per-hop TLS only.** Tunneled payloads
-  are readable and modifiable by whoever controls the relay host —
-  confidentiality and integrity are per hop (agent ↔ relay, relay ↔
-  agent). Operating a site-to-site mesh through a public relay in this
-  mode means trusting that relay with plaintext; pick the hub host
-  accordingly, or run the hub on infrastructure you control.
-- **`[e2e] mode = "required"` (per tenant): per-hop TLS + an inner
-  agent↔agent TLS 1.3 layer.** After the Open frame, the two agents run an
-  mTLS handshake *inside* the tunnel stream (handshake bytes ride ordinary
-  Data frames) and all payload bytes are ciphertext to the relay: it can
-  neither read, modify, inject, nor impersonate (leaf CN must equal the
-  stream's declared peer, chain must anchor to the tenant's configured
-  anchors), and the egress dials the LAN backend only after that handshake
-  verifies — a malicious relay's content-level capabilities degrade to
-  availability attacks (drop/delay/reorder streams), which are outside
-  this layer's promise. Stream metadata (source/target agents, target
-  address, size/timing) remains visible to the relay by routing necessity.
-  `opportunistic` mode exists only as a migration window and provides no
-  security claim (an active downgrade is indistinguishable from an old
-  peer).
+- **TCP streams use inner TLS 1.3.** After the Open frame, the two agents
+  run an mTLS handshake *inside* the tunnel stream; handshake bytes ride
+  ordinary Data frames and the LAN target travels in the encrypted inner
+  hello.
+- **UDP streams use an inner QUIC association.** Each ingress/target pair
+  keeps one long-lived association; the association handshake uses the
+  same tenant anchors, CRLs, TLS 1.3, and leaf-CN binding. Random
+  session ids multiplex UDP clients, the target selector travels on an
+  encrypted control stream, and datagrams ride QUIC DATAGRAM frames.
+  Large datagrams are explicitly fragmented and reassembled at the agents.
+- In both cases the egress performs DNS resolution and the LAN dial only
+  after the inner peer verifies. A relay can still drop, delay, reorder,
+  or close traffic. Protocol v3 keeps semantic tenant/agent names out of
+  data-plane frames and hub audit/tracing: frames carry only per-connection
+  circuit tokens, source-session route tokens, and random stream ids.
+  A live routing hub still has
+  the in-memory token mappings and still learns which circuits communicate
+  plus size/timing; it does not learn the payload or LAN target address.
+  Traffic-analysis resistance (including timing and padding) remains a
+  non-goal.
 
-UDP streams remain on per-hop TLS in every mode (phase-1 boundary of the
-RFC above): a tenant with UDP rules keeps its plaintext-to-relay exposure
-for those streams and shows up as an audit item.
+The same model applies to scenario A's ingress. Two public-HTTPS forms:
 
-The same model applies to scenario A's edge: the public TLS termination
-belongs to the fronting proxy, the proxy→edge hop is plaintext HTTP/1 by
-design and must stay on the same host or a trusted network segment, and
-gateway flows carry the inner layer only when the edge runs with the
-stable gateway identity (`--gateway-cert/--gateway-key`; without it the
-per-restart minted principal cannot be anchored anywhere, and
-`required`-mode egresses reject gateway streams by design).
+- In **fronted mode** (frontend-proxy / manual) the public TLS termination
+  belongs to the fronting proxy, the proxy→ingress hop is plaintext HTTP/1 by
+  design and must stay on the same host or a trusted network segment.
+- In **ACME mode** (the product default) the ingress terminates public HTTPS
+  itself (HTTP-01 + TLS-ALPN-01, automatic renewal); ports 80/443 must reach
+  it directly with no front proxy. The ACME account/cert state lives under
+  the pack's `state/acme` directory.
 
-### 6.5 Tenant isolation (multi-tenant hubs, since v4)
+Every ingress flow performs inner TLS with a workspace-scoped principal (one
+session per authorized workspace); a failed handshake closes the stream.
 
-Since the v4 mTLS-only rework (docs/design/multi-tenant-mtls-only.md), a hub
+### 6.5 Tenant isolation (multi-tenant hubs)
+
+Under the mTLS-only model, a hub
 may carry multiple tenants, each with its own client CA:
 
 - **Identity** is `(tenant, agent_id)` — the tenant is derived from which
@@ -259,10 +280,12 @@ may carry multiple tenants, each with its own client CA:
   claimable), the agent id from the leaf CN. A tenant CA's private key
   leaking mints identities for **that tenant only**; rotation unit = tenant.
 - **Cross-tenant streams are denied by default**; same-tenant streams are
-  allowed by default; `[[acl.rules]]` grant explicit cross-tenant
-  exceptions. The expose edge's in-process `_edge` gateway principal is the
-  only always-cross-tenant opener (it is the route origin for every public
-  connection and rotates its ephemeral CA each restart).
+  allowed by default; `[[acl.rules]]` grant explicit cross-tenant exceptions.
+  The expose ingress runs one workspace-scoped principal per authorized
+  workspace and opens streams **only within that workspace** — the ingress
+  is no longer a cross-tenant opener at all (the shared `_edge` principal
+  and its dedicated gateway CA were retired with the identity-first
+  engine).
 - **Token authentication no longer exists** (agent or admin): client
   certificates are the only credential, on both the h2 and QUIC planes. A
   SIGHUP reload rebuilds the mTLS acceptor from the tenant table — a reload
@@ -272,20 +295,23 @@ may carry multiple tenants, each with its own client CA:
 - **Real client IPs** are restored per topology and key rate limits,
   connection caps, audit and metrics **only** — never identity or ACL
   decisions (identity is exclusively mTLS). The mechanisms are mutually
-  exclusive and share one `--trusted-proxy` set: **PROXY protocol v2**
-  (`ppp` crate, v1 rejected; LB / nginx-stream fronts, preamble read
+  exclusive and share one trusted-proxy set (loopback by default):
+  **PROXY protocol v2**
+  (`ppp` crate, v1 rejected; LB / nginx-stream fronts, `[server]
+  proxy_protocol` on the hub; preamble read
   pre-peek; an untrusted source sending a PROXY signature is hard-rejected)
   and **X-Forwarded-For** on the edge's standard nginx HTTP `proxy_pass`
-  leg (stock nginx cannot emit PROXY there): only the right-most chain
+  leg (stock nginx cannot emit PROXY there; the mode is derived from the
+  deployment — `required` in the fronted topology, `off` with ACME
+  direct): only the right-most chain
   entry appended by a trusted proxy is used, left-side (client-forged)
   entries are ignored, and `required` rejects a trusted proxy that sends no
   parseable header. With XFF active, per-IP gating for a trusted proxy is
   deferred until the request head is buffered; the fronting nginx's own
   `limit_req`/`limit_conn` cover that leg in the meantime.
-- Residual: the §6 relay-host plaintext exposure is now conditional —
-  closed for TCP streams of `required` tenants by the agent↔agent inner
-  TLS layer (docs/design/agent-e2e-encryption.md, implemented), still open
-  for `off` tenants, `opportunistic` windows, and UDP streams (phase 2).
+- Residual: the §6 relay-host content exposure is closed for TCP and
+  UDP data planes by agent↔agent inner TLS / inner QUIC. Availability and
+  traffic-analysis exposure remain as stated above.
 
 ### Supply-chain note (the `ppp` dependency)
 
@@ -348,11 +374,27 @@ Named deliberately; this section is part of the document, not a footnote:
 3. **No local rate limiting on TCP ingress listeners** ([§4.3](#43-reaching-a-mesh-ingress-listener-directly)):
    keep ingress on internal interfaces; direct public exposure is
    unsupported until that changes.
-4. **No built-in public TLS termination on the edge yet.** Scenario A
-   expects a fronting proxy for TLS today; handshake-time resource defenses
-   (handshake deadlines, global handshake-rate budgets, SNI/Host consistency
-   checks) are designed but arrive together with edge TLS support — they are
-   not present capabilities.
+4. **Edge TLS termination (ACME mode) carries pre-handshake resource
+   defenses.** Two public-HTTPS forms ship today: fronted (the proxy owns
+   TLS; the proxy→edge hop stays plaintext HTTP/1 on a trusted segment,
+   [§6](#6-attacker-position-the-relay-host-hub-or-edge-operator)) and ACME
+   — the product default — which terminates HTTPS itself (HTTP-01 +
+   TLS-ALPN-01, automatic renewal, `crates/expose/src/edge/acme.rs`; ports
+   80/443 direct, no front proxy). The former pre-handshake residuals are
+   closed (pre-TLS connection gating, landed 2026-09-21): the
+   per-IP rate limit and concurrency caps (`gate_connection`) now run
+   **before** the TLS accept on the TCP peer IP, the ClientHello read and
+   the handshake completion each carry a 10 s deadline
+   (`interflow_edge_tls_handshake_timeout`), an SNI outside the
+   certificate/route host set is closed right after the acceptor
+   (`interflow_edge_sni_rejected`), and the dedicated :80 HTTP-01/redirect
+   listener runs the same per-IP gate from the same tracker/limiter
+   instances before spawning a task (its request head stays bounded by a
+   10 s timeout, 8 KiB buffer and 100-header limit, with parsing and Host
+   reflection hardening, and
+   rejections counted in `interflow_edge_acme_http01_rejected_total`). What
+   remains on the expose public face are the class-level residuals below
+   (§8.1, §8.2), not edge-specific gaps.
 5. **The GUI (`src/` + `src-tauri/`) builds in CI and ships as release
    artifacts (DMG / AppImage / deb / NSIS / MSI), but has not had a dedicated
    security review; its surface is outside this document's reviewed scope.

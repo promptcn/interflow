@@ -1,7 +1,7 @@
 //! E2E: stream lifecycle across session teardown (regression suite for the
 //! 2026-09-14 fd-leak eradication).
 //!
-//! Background (docs/bug/2026-09-14-egress-fd-leak-session-rebuild.md): the
+//! Background: the
 //! egress forwarder was a bare `tokio::spawn` unaware of the session token;
 //! its only exit condition (`frames.recv() == None`) was pinned open by the
 //! sender in the dispatch table — after a session rebuild the forwarder hung
@@ -40,7 +40,11 @@
     unused_mut
 )]
 use interflow_core::protocol::StreamProto;
+use interflow_core::tls::{InnerTlsMaterial, inner_client_config};
 use interflow_core::tunnel::AgentTunnel;
+use interflow_core::tunnel::InnerStreamHello;
+use interflow_core::tunnel::TargetSelector;
+use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_testkit::{
     agent_config, hub_config, metrics_harness::counter_value, metrics_harness::eventually,
@@ -51,7 +55,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
@@ -128,7 +132,7 @@ async fn connect_tunnel(hub_port: u16, agent_id: &str) -> AgentTunnel {
         .await
         .expect("connect+register");
     AgentTunnel::from_sender(
-        agent_id.to_string(),
+        conn.negotiated.circuit_token,
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
@@ -137,6 +141,45 @@ async fn connect_tunnel(hub_port: u16, agent_id: &str) -> AgentTunnel {
         interflow_core::tunnel::H2Liveness::HEARTBEAT_DISABLED,
     )
     .expect("tunnel")
+}
+
+/// Open a production-shaped TCP stream and complete inner TLS + selector.
+async fn open_inner_tls(
+    inj: &AgentTunnel,
+    agent_id: &str,
+    sid: interflow_core::protocol::StreamId,
+    target: &str,
+) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
+    let rx = inj.register_stream(sid).await;
+    inj.send_open_with(sid, "eg", StreamProto::Tcp, true)
+        .await
+        .expect("inner-TLS open");
+    let (cert, key) = certs().named_client_cert(agent_id);
+    let ca = certs().ca_path().display().to_string();
+    let material = InnerTlsMaterial::from_paths(
+        &[ca.as_str()],
+        &cert.display().to_string(),
+        &key.display().to_string(),
+    )
+    .expect("inner material");
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+        inner_client_config(&material, "eg").expect("inner connector"),
+    ));
+    let adapter = E2eTunnelIo::ingress(rx, inj.clone(), sid);
+    let mut tls = match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
+        E2eHandshakeOutcome::Established(tls, _) => tls,
+        E2eHandshakeOutcome::Failed { error } => panic!("inner TLS handshake: {error}"),
+    };
+    InnerStreamHello {
+        source_principal: agent_id.to_owned(),
+        source_fingerprint: material.leaf_fingerprint(),
+        selector: TargetSelector::Address(target.to_owned()),
+        correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+    }
+    .write(&mut tls)
+    .await
+    .expect("inner hello");
+    tls
 }
 
 // ---------------------------------------------------------------------------
@@ -165,13 +208,12 @@ async fn session_rebuild_releases_silent_streams_without_accumulation() {
         // hub)
         let inj = connect_tunnel(hub_port, "inj").await;
 
-        // Open K silent streams (done at Open — after the egress dials the
-        // backend, no traffic in either direction)
+        // Open K silent streams (established at inner TLS/selector — after the
+        // egress dials the backend, no traffic in either direction)
+        let mut silent_streams = Vec::new();
         for i in 0..STREAMS_PER_ROUND {
-            let sid = format!("r{round}-s{i}");
-            inj.send_open(&sid, "eg", Some(&silent_addr.to_string()), StreamProto::Tcp)
-                .await
-                .expect("open");
+            let sid = interflow_testkit::opaque_stream_id(&format!("r{round}-s{i}"));
+            silent_streams.push(open_inner_tls(&inj, "inj", sid, &silent_addr.to_string()).await);
         }
 
         // All silent streams reach the backend (active = K: the previous
@@ -185,7 +227,10 @@ async fn session_rebuild_releases_silent_streams_without_accumulation() {
 
         // Trigger session termination: gracefully stop the hub (GOAWAY/drain
         // → agent notices the disconnect → teardown)
-        hub.shutdown().await.expect("hub graceful shutdown");
+        hub.shutdown_graceful()
+            .await
+            .expect("hub graceful shutdown");
+        drop(silent_streams);
 
         // * Core assertion (must fail before the fix): session teardown
         // releases all silent streams' backend connections.
@@ -277,30 +322,27 @@ async fn session_rebuild_releases_silent_streams_without_accumulation() {
     };
     let inj = connect_tunnel(hub_port, "inj2").await;
     {
-        let mut rx = inj.register_stream("post-rebuild".to_string()).await;
-        inj.send_open(
-            "post-rebuild",
-            "eg",
-            Some(&echo_addr.to_string()),
-            StreamProto::Tcp,
+        let mut tls = open_inner_tls(
+            &inj,
+            "inj2",
+            interflow_testkit::opaque_stream_id("post-rebuild"),
+            &echo_addr.to_string(),
         )
-        .await
-        .expect("open after rebuild");
-        inj.send_data("post-rebuild", bytes::Bytes::from_static(b"still-alive"))
+        .await;
+        tls.write_all(b"still-alive")
             .await
             .expect("send after rebuild");
+        tls.flush().await.expect("flush after rebuild");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let mut got = Vec::new();
         while got.len() < b"still-alive".len() {
-            let td = tokio::time::timeout_at(deadline, rx.recv())
+            let mut chunk = [0u8; b"still-alive".len()];
+            let n = tokio::time::timeout_at(deadline, tls.read(&mut chunk))
                 .await
                 .expect("reply timed out after rebuild")
-                .expect("channel alive");
-            assert!(
-                !matches!(td.stream_type, interflow_core::protocol::FrameType::Close),
-                "new stream closed prematurely after rebuild"
-            );
-            got.extend_from_slice(&td.data);
+                .expect("inner reply after rebuild");
+            assert_ne!(n, 0, "new stream closed prematurely after rebuild");
+            got.extend_from_slice(&chunk[..n]);
         }
         assert_eq!(got, b"still-alive", "data corruption after rebuild");
     }
@@ -317,5 +359,5 @@ async fn session_rebuild_releases_silent_streams_without_accumulation() {
         "the shutdown path likewise must not have child tasks that ignore the token"
     );
 
-    hub.shutdown().await.expect("final hub shutdown");
+    hub.shutdown_graceful().await.expect("final hub shutdown");
 }

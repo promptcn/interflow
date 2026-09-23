@@ -28,11 +28,11 @@ fi
 echo "Starting build for x86_64-pc-windows-gnu using cargo-zigbuild..."
 # cargo-zigbuild handles the cross-compilation setup automatically
 cargo zigbuild --release --target x86_64-pc-windows-gnu \
-    --bin interflow-mesh --bin interflow-expose
+    --bin interflow --bin interflow-mesh --bin interflow-registrar
 
 # Copy the artifacts
 mkdir -p artifacts
-for BIN in interflow-mesh interflow-expose; do
+for BIN in interflow interflow-mesh interflow-registrar; do
     OUTPUT_FILE="artifacts/${BIN}-windows-x86_64.exe"
     cp "target/x86_64-pc-windows-gnu/release/${BIN}.exe" "$OUTPUT_FILE"
     echo "Built: $PWD/$OUTPUT_FILE"

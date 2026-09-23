@@ -239,6 +239,7 @@ async fn quic_mtls_valid_client_cert() {
         tenants: vec![TenantConfig {
             name: interflow_testkit::TEST_TENANT.to_string(),
             ca_path: certs().ca_path().display().to_string(),
+            crl_path: Some(certs().crl_path().display().to_string()),
             trusted_gateway: false,
         }],
     };
@@ -316,6 +317,7 @@ async fn quic_mtls_cn_mismatch_rejected() {
         tenants: vec![TenantConfig {
             name: interflow_testkit::TEST_TENANT.to_string(),
             ca_path: certs().ca_path().display().to_string(),
+            crl_path: Some(certs().crl_path().display().to_string()),
             trusted_gateway: false,
         }],
     };

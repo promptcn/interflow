@@ -1,10 +1,10 @@
 //! The agent↔agent inner TLS layer (e2e encryption of tunnel payloads).
 //!
-//! Design (docs/design/agent-e2e-encryption.md §3.2): after the Open frame
+//! Design: after the Open frame
 //! and before any payload flows, the two agents run a TLS 1.3 handshake
 //! *inside* the tunnel stream (handshake bytes ride the stream as ordinary
 //! Data frames; the hub only ever sees ciphertext). Both sides present their
-//! regular v4 client certificate pair (leaf CN == agent id, no SAN, EKU
+//! regular agent client certificate pair (leaf CN == agent id, no SAN, EKU
 //! ClientAuth) — which is exactly why peer verification uses
 //! **client-cert semantics** ([`WebPkiClientVerifier`]: chain anchoring,
 //! validity, EKU — no SAN/server-name matching, same standard as the hub's
@@ -25,6 +25,7 @@
 //! replay must yield nothing but a key the attacker cannot open).
 
 use crate::error::{InterflowError, Result};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::RootCertStore;
@@ -32,7 +33,7 @@ use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::SignatureScheme;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tokio_rustls::rustls::pki_types::PrivateKeyDer;
-use tokio_rustls::rustls::pki_types::UnixTime;
+use tokio_rustls::rustls::pki_types::{CertificateRevocationListDer, UnixTime};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::server::danger::ClientCertVerifier;
 use tokio_rustls::rustls::version::TLS13;
@@ -43,6 +44,8 @@ use super::server::extract_cn_from_chain;
 /// identity binding is the CN check (agent ids may contain `_` and are not
 /// valid DNS names); the verifier ignores this value.
 pub const INNER_SERVER_NAME: &str = "interflow-inner";
+/// ALPN used by the UDP inner QUIC association.
+pub const INNER_QUIC_ALPN: &str = "interflow-inner-quic-v1";
 
 /// One side's complete inner-TLS material: the anchor set for verifying
 /// peers plus our own certificate pair for presenting ourselves.
@@ -57,7 +60,9 @@ pub struct InnerTlsMaterial {
     /// The merged anchor set (own-tenant CA ∪ gateway anchor ∪ extra
     /// cross-tenant anchors) for verifying the peer's chain.
     pub roots: RootCertStore,
-    /// Our certificate pair (the regular v4 client pair; leaf CN == agent
+    /// CRLs applied to every inner peer verification.
+    pub crls: Vec<CertificateRevocationListDer<'static>>,
+    /// Our certificate pair (the regular agent client pair; leaf CN == agent
     /// id), presented to the peer during the inner handshake.
     pub cert_chain: Vec<CertificateDer<'static>>,
     /// The private key of [`Self::cert_chain`]'s leaf.
@@ -69,6 +74,15 @@ impl InnerTlsMaterial {
     /// into the anchor set (multi-certificate PEM semantics, same as the
     /// hub-plane CA loading), and `cert_path`/`key_path` is our own pair.
     pub fn from_paths(anchor_paths: &[&str], cert_path: &str, key_path: &str) -> Result<Self> {
+        Self::from_paths_with_crls(anchor_paths, cert_path, key_path, &[])
+    }
+
+    pub fn from_paths_with_crls(
+        anchor_paths: &[&str],
+        cert_path: &str,
+        key_path: &str,
+        crls: &[CertificateRevocationListDer<'static>],
+    ) -> Result<Self> {
         let mut roots = RootCertStore::empty();
         for path in anchor_paths {
             for cert in super::server::load_certs(path)? {
@@ -84,9 +98,15 @@ impl InnerTlsMaterial {
         let key = super::server::load_key(key_path)?;
         Ok(Self {
             roots,
+            crls: crls.to_vec(),
             cert_chain,
             key,
         })
+    }
+
+    /// SHA-256 fingerprint of the leaf certificate presented by this side.
+    pub fn leaf_fingerprint(&self) -> [u8; 32] {
+        Sha256::digest(self.cert_chain.first().map_or(&[][..], |c| c.as_ref())).into()
     }
 }
 
@@ -97,14 +117,14 @@ impl InnerTlsMaterial {
 /// One type serves both roles (the ingress verifies the egress's server
 /// certificate via [`ServerCertVerifier`], the egress verifies the
 /// ingress's client certificate via [`ClientCertVerifier`]) because the
-/// presented certificates are ordinary v4 client pairs on both sides.
+/// presented certificates are ordinary agent client pairs on both sides.
 #[derive(Debug)]
 pub(super) struct InnerPeerVerifier {
     /// The wrapped rustls verifier doing chain/validity/EKU verification
     /// against the material's anchor set.
     webpki: Arc<dyn ClientCertVerifier>,
     /// The agent id the stream declared for the peer (identity binding).
-    expected_cn: String,
+    expected_cn: Option<String>,
 }
 
 impl InnerPeerVerifier {
@@ -120,24 +140,41 @@ impl InnerPeerVerifier {
         self.webpki
             .verify_client_cert(end_entity, intermediates, UnixTime::now())?;
         let cn = extract_cn_from_chain(std::slice::from_ref(end_entity)).unwrap_or_default();
-        if cn.eq_ignore_ascii_case(&self.expected_cn) {
+        if self
+            .expected_cn
+            .as_ref()
+            .is_none_or(|expected| cn.eq_ignore_ascii_case(expected))
+        {
             Ok(())
         } else {
             Err(tokio_rustls::rustls::Error::General(format!(
                 "inner TLS: peer certificate CN '{cn}' does not match the stream's declared peer '{}'",
-                self.expected_cn
+                self.expected_cn.as_deref().unwrap_or("")
             )))
         }
     }
 
     /// Builds the verifier for an expected peer CN over an anchor set.
-    fn new(roots: &RootCertStore, expected_cn: &str) -> Result<Self> {
-        let webpki = WebPkiClientVerifier::builder(Arc::new(roots.clone()))
-            .build()
-            .map_err(|e| InterflowError::config(format!("inner TLS verifier build failed: {e}")))?;
+    #[cfg(test)]
+    fn new(roots: &RootCertStore, expected_cn: Option<&str>) -> Result<Self> {
+        Self::new_with_crls(roots, expected_cn, &[])
+    }
+
+    fn new_with_crls(
+        roots: &RootCertStore,
+        expected_cn: Option<&str>,
+        crls: &[CertificateRevocationListDer<'static>],
+    ) -> Result<Self> {
+        let mut builder = WebPkiClientVerifier::builder(Arc::new(roots.clone()));
+        if !crls.is_empty() {
+            builder = builder.with_crls(crls.to_vec());
+        }
+        let webpki = builder.build().map_err(|e| {
+            InterflowError::config("inner TLS verifier build failed".to_string()).with_source(e)
+        })?;
         Ok(Self {
             webpki,
-            expected_cn: expected_cn.to_string(),
+            expected_cn: expected_cn.map(str::to_string),
         })
     }
 }
@@ -240,16 +277,50 @@ pub fn inner_client_config(
     material: &InnerTlsMaterial,
     expected_peer_cn: &str,
 ) -> Result<ClientConfig> {
-    let verifier = Arc::new(InnerPeerVerifier::new(&material.roots, expected_peer_cn)?);
+    let verifier = Arc::new(InnerPeerVerifier::new_with_crls(
+        &material.roots,
+        Some(expected_peer_cn),
+        &material.crls,
+    )?);
     let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
-        .map_err(|e| InterflowError::config(format!("inner TLS client config error: {e}")))?;
+        .map_err(|e| {
+            InterflowError::config("inner TLS client config error".to_string()).with_source(e)
+        })?;
     // Placeholder server name is shared across all peers: a resumed session
     // would skip certificate verification. Disable resumption outright
     // (listed as future work in the RFC §10.8).
     config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
+    Ok(config)
+}
+
+/// Derives the inner **QUIC** client config for one expected peer.
+///
+/// The inner peer verifier still checks the full certificate chain and leaf CN
+/// on every full handshake. Resumption is keyed by a 128-bit deterministic SNI
+/// derived from that expected CN, so a session established for one peer cannot
+/// be replayed against another peer. 0-RTT remains disabled.
+pub fn inner_quic_client_config(
+    material: &InnerTlsMaterial,
+    expected_peer_cn: &str,
+) -> Result<ClientConfig> {
+    let verifier = Arc::new(InnerPeerVerifier::new_with_crls(
+        &material.roots,
+        Some(expected_peer_cn),
+        &material.crls,
+    )?);
+    let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
+        .map_err(|e| {
+            InterflowError::config("inner QUIC client config error".to_string()).with_source(e)
+        })?;
+    config.alpn_protocols = vec![INNER_QUIC_ALPN.as_bytes().to_vec()];
+    config.resumption = tokio_rustls::rustls::client::Resumption::in_memory_sessions(64);
+    config.enable_early_data = false;
     Ok(config)
 }
 
@@ -259,11 +330,44 @@ pub fn inner_server_config(
     material: &InnerTlsMaterial,
     expected_client_cn: &str,
 ) -> Result<ServerConfig> {
-    let verifier = Arc::new(InnerPeerVerifier::new(&material.roots, expected_client_cn)?);
+    let verifier = Arc::new(InnerPeerVerifier::new_with_crls(
+        &material.roots,
+        Some(expected_client_cn),
+        &material.crls,
+    )?);
     ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_client_cert_verifier(verifier)
         .with_single_cert(material.cert_chain.clone(), material.key.clone_key())
-        .map_err(|e| InterflowError::config(format!("inner TLS server config error: {e}")))
+        .map_err(|e| {
+            InterflowError::config("inner TLS server config error".to_string()).with_source(e)
+        })
+}
+
+/// A stable DNS-shaped SNI that uniquely partitions resumption by expected CN.
+pub fn inner_quic_server_name(expected_peer_cn: &str) -> String {
+    let digest = Sha256::digest(expected_peer_cn.as_bytes());
+    format!("inner-{}", hex::encode(&digest[..16]))
+}
+
+/// Derives an inner TLS **server** config that accepts any CN anchored to the
+/// configured trust set.
+///
+/// inner TLS hides the source principal behind an opaque circuit token, so the
+/// egress cannot pre-bind the expected CN. Chain validation is still mandatory
+/// at handshake time; the encrypted inner hello then requires the claimed
+/// principal and fingerprint to match the certificate that was just verified.
+pub fn inner_server_config_unbound(material: &InnerTlsMaterial) -> Result<ServerConfig> {
+    let verifier = Arc::new(InnerPeerVerifier::new_with_crls(
+        &material.roots,
+        None,
+        &material.crls,
+    )?);
+    ServerConfig::builder_with_protocol_versions(&[&TLS13])
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(material.cert_chain.clone(), material.key.clone_key())
+        .map_err(|e| {
+            InterflowError::config("inner TLS server config error".to_string()).with_source(e)
+        })
 }
 
 /// Buckets an inner-handshake failure into a metrics reason label.
@@ -355,6 +459,7 @@ mod tests {
             let _ = roots.add(cert);
         }
         InnerTlsMaterial {
+            crls: Vec::new(),
             roots,
             cert_chain: fx.cert_a.clone(),
             key: fx.key_a.clone_key(),
@@ -387,7 +492,7 @@ mod tests {
         expected_cn: &str,
         chain: &[CertificateDer<'static>],
     ) -> std::result::Result<(), tokio_rustls::rustls::Error> {
-        let verifier = InnerPeerVerifier::new(&mat.roots, expected_cn).unwrap();
+        let verifier = InnerPeerVerifier::new(&mat.roots, Some(expected_cn)).unwrap();
         let (leaf, intermediates) = chain.split_first().unwrap();
         verifier.verify_chain_and_cn(leaf, intermediates)
     }
@@ -479,6 +584,7 @@ mod tests {
             &leaf2.key_pem,
         );
         let mat_2 = InnerTlsMaterial {
+            crls: Vec::new(),
             roots: mat.roots.clone(), // same tenant anchor set
             cert_chain: cert_2,
             key: key_2,

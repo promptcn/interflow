@@ -11,6 +11,30 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  product-language:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: design generation labels must not leak into product language
+        run: python3 scripts/check_product_language.py
+
+  version-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: enforce version and rotation model
+        run: python3 scripts/check_version_contract.py
+
+  machete:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+      - name: unused dependencies
+        run: cargo machete
+
   fmt:
     runs-on: ubuntu-24.04
     steps:
@@ -37,12 +61,29 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    services:
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:latest
+        ports:
+          - 14000:14000
+        env:
+          PEBBLE_VA_NOSLEEP: "1"
+          PEBBLE_VA_ALWAYS_VALID: "1"
+          PEBBLE_WFE_NONCEREJECT: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install pebble directory trust anchor
+        run: |
+          docker cp $(docker ps -qf ancestor=ghcr.io/letsencrypt/pebble):/test/certs/pebble.minica.pem /tmp/pebble.minica.pem
+          # The rustls client in the ACME runtime reads an explicit CA file;
+          # exporting SSL_CERT_FILE additionally covers any system-root path.
       - name: cargo test
         run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast
+        env:
+          INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
+          INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
 
   gui:
     name: gui (tauri)

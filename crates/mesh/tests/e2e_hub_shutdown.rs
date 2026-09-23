@@ -41,7 +41,7 @@ fn certs() -> &'static interflow_testkit::certs::TestCerts {
 async fn hub_run_until_returns_and_releases_port() {
     let hub_port = pick_ephemeral_port();
     let cfg = hub_config(hub_port, certs(), vec![]);
-    let server = HubServer::new(cfg, "<test>".to_string()).expect("hub build");
+    let server = HubServer::new(cfg).expect("hub build");
 
     let token = CancellationToken::new();
     let hub_task = {
@@ -80,7 +80,7 @@ async fn hub_shutdown_drains_registered_agent() {
     let (echo_addr, _echo) = echo_server().await;
 
     let cfg = hub_config(hub_port, certs(), Vec::new());
-    let server = HubServer::new(cfg, "<test>".to_string()).expect("hub build");
+    let server = HubServer::new(cfg).expect("hub build");
     let token = CancellationToken::new();
     let hub_task = {
         let token = token.clone();
@@ -151,7 +151,7 @@ async fn hub_shutdown_closes_quic_endpoint() {
     let hub_port = pick_ephemeral_port();
 
     let cfg = hub_quic_config(hub_port, certs(), Vec::new());
-    let server = HubServer::new(cfg, "<test>".to_string()).expect("hub build");
+    let server = HubServer::new(cfg).expect("hub build");
     let token = CancellationToken::new();
     let hub_task = {
         let token = token.clone();

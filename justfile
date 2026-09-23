@@ -28,74 +28,68 @@ test-e2e:
 bench-loss:
     cargo bench -p interflow-mesh --bench loss_hol
 
-# soak long-run guardrail (real process topology: hub/agent binaries + impairment proxy + six assertions;
+# soak long-run guardrail (real process topology: soak-node hub/agent processes + impairment proxy + six assertions;
 # run several rounds nightly / before releases. Smoke test: `just soak -- --quick`; see --help for options)
 soak:
-    cargo build --release -p interflow-mesh --features fault-injection
+    cargo build --release -p interflow-testkit --features fault-injection --bin interflow-soak-node
     cargo run --release -p interflow-testkit --bin soak
+
+# Unused-dependency gate (cargo-machete; install: cargo install cargo-machete --locked)
+machete:
+    cargo machete
 
 # Check dependencies for vulnerabilities
 deny:
     cargo deny check 2>/dev/null || cargo install cargo-deny --locked && cargo deny check
 
+version-contract:
+    python3 scripts/check_version_contract.py
+
+# User-facing language guard: product surfaces never speak in design
+# generation numbers (the dated archive under docs/ is exempt).
+product-language:
+    python3 scripts/check_product_language.py
+
+# Retired-surface guard: user-facing docs never mention CLI flags / binary
+# names / config shapes that no longer exist (docs/ archives and ADRs are
+# exempt). Ships with the public export; private-only paths are skipped.
+doc-surfaces:
+    python3 scripts/check_doc_surfaces.py
+
 # Local CI-equivalent checks
-ci: fmt-check lint test
+ci: fmt-check lint test product-language doc-surfaces
     @echo "Local CI passed"
 
-# Release build (produces the interflow-mesh and interflow-expose binaries)
+# Release build (produces the interflow, interflow-mesh, interflow-registrar binaries)
 build-release:
     cargo build --release --locked
 
 # ===== Generic examples =====
 
 # Scenario A: public domain → LAN service
-example-public-domain-certs hub_dns='127.0.0.1':
-    cargo build --release --bin interflow-mesh
-    INTERFLOW_MESH_BIN="{{justfile_directory()}}/target/release/interflow-mesh" \
-        "{{justfile_directory()}}/examples/public-domain-to-lan/generate-certs.sh" \
-        --hub-dns "{{ hub_dns }}"
+example-public-domain-plan:
+    cargo build --release --bin interflow
+    "{{justfile_directory()}}/target/release/interflow" setup \
+        --realm example \
+        --control-endpoint 127.0.0.1:16666 \
+        --registrar-endpoint https://127.0.0.1:18666 \
+        --host app.example.com \
+        --agent lan-agent \
+        --service web \
+        --service-address 127.0.0.1:3000 \
+        --out "{{justfile_directory()}}/examples/public-domain-to-lan/interflow.local.toml"
+    "{{justfile_directory()}}/target/release/interflow" plan apply \
+        --manifest "{{justfile_directory()}}/examples/public-domain-to-lan/interflow.local.toml" \
+        --issuer "{{justfile_directory()}}/examples/public-domain-to-lan/issuer" \
+        --out "{{justfile_directory()}}/examples/public-domain-to-lan/dist"
 
-example-public-domain-edge:
-    cargo run --release -p interflow-expose -- edge \
-        --listen 0.0.0.0:8443 \
-        --hub-listen 0.0.0.0:16666 \
-        --routes examples/public-domain-to-lan/routes.toml \
-        --client-ca demo=examples/public-domain-to-lan/certs/tenants/demo-ca.crt \
-        --hub-cert examples/public-domain-to-lan/certs/hub.crt \
-        --hub-key examples/public-domain-to-lan/certs/hub.key \
-        --x-forwarded-for required \
-        --audit-path /tmp/interflow-example-edge-audit.jsonl
+example-public-domain-ingress:
+    cargo run --release --bin interflow -- ingress run \
+        --pack examples/public-domain-to-lan/dist/packs/ingress-edge
 
-example-public-domain-agent port='3000' hub_url='https://127.0.0.1:16666':
-    cargo run --release -p interflow-expose -- expose {{ port }} \
-        --hub {{ hub_url }} \
-        --client-cert examples/public-domain-to-lan/certs/agents/lan-agent.crt \
-        --client-key examples/public-domain-to-lan/certs/agents/lan-agent.key \
-        --agent-id lan-agent \
-        --ca-path examples/public-domain-to-lan/certs/tenants/demo-ca.crt
-
-# Interactive initialization (generate certificates / write profile / print nginx snippet)
-init:
-    cargo run -p interflow-expose -- init
-
-# Scenario B: LAN A ↔ LAN B
-example-site-to-site-certs hub_dns='127.0.0.1':
-    cargo build --release --bin interflow-mesh
-    INTERFLOW_MESH_BIN="{{justfile_directory()}}/target/release/interflow-mesh" \
-        "{{justfile_directory()}}/examples/site-to-site/generate-certs.sh" \
-        --hub-dns "{{ hub_dns }}"
-
-example-site-to-site-hub:
-    cargo run --release -p interflow-mesh -- hub \
-        --config examples/site-to-site/hub.toml
-
-example-site-to-site-agent-a:
-    cargo run --release -p interflow-mesh -- agent \
-        --config examples/site-to-site/agent-lan-a.toml
-
-example-site-to-site-agent-b:
-    cargo run --release -p interflow-mesh -- agent \
-        --config examples/site-to-site/agent-lan-b.toml
+example-public-domain-agent:
+    cargo run --release --bin interflow -- agent run \
+        --pack examples/public-domain-to-lan/dist/packs/agent-lan-agent
 
 # ===== Common =====
 

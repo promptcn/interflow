@@ -1,0 +1,19 @@
+[Unit]
+Description=Interflow ingress node edge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+TimeoutStartSec=30s
+ExecStart=/usr/local/bin/interflow ingress run --pack /srv/interflow/packs/ingress-edge
+Restart=always
+RestartSec=5
+User=interflow
+Group=interflow
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/interflow/packs/ingress-edge
+
+[Install]
+WantedBy=multi-user.target

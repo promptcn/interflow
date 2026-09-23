@@ -1,5 +1,5 @@
 //! E2E: tunnel request send-establishment timeout (regression tests for
-//! docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md §4.2).
+//! (internal design notes) §4.2).
 //!
 //! Failure form under test: a `/poll` or `/stream/up` request that never
 //! reaches response headers. Before the fix, the request future was raced
@@ -44,7 +44,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use interflow_core::error::InterflowError;
 use interflow_core::protocol::frame::{DecodeOutcome, FrameType, encode_frame};
-use interflow_core::tunnel::PING_SOURCE;
+use interflow_core::tls::{TlsMinVersion, build_mtls_acceptor};
 use interflow_mesh::agent::AgentState;
 use interflow_testkit::{agent_config, spawn_agent_registered};
 use std::future::Future;
@@ -90,13 +90,28 @@ async fn spawn_fake_hub(hang: Hang) -> FakeHub {
         hang,
         counts: counts.clone(),
     };
+    let acceptor = build_mtls_acceptor(
+        &certs().server_cert_path().display().to_string(),
+        &certs().server_key_path().display().to_string(),
+        &certs().ca_path().display().to_string(),
+        TlsMinVersion::V1_3,
+    )
+    .expect("fake hub mTLS acceptor");
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
             let svc = svc.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
+                let stream = match acceptor.accept(stream).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        eprintln!("fake hub TLS handshake error: {e}");
+                        return;
+                    }
+                };
                 let conn = http2::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), svc);
                 if let Err(e) = conn.await {
@@ -154,7 +169,7 @@ impl Service<Request<Incoming>> for FakeHubSvc {
                     counts.registers.fetch_add(1, Ordering::SeqCst);
                     // Caps: 1s heartbeat cadence (the watchdog override in
                     // the test config neutralizes this)
-                    let caps = r#"{"heartbeat":{"interval_secs":1,"max_missed":2}}"#;
+                    let caps = r#"{"circuit_token":"12078a05e14f4e2c99b1679be1df7c30","heartbeat":{"interval_secs":1,"max_missed":2}}"#;
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(CONTENT_TYPE, "application/json")
@@ -174,8 +189,15 @@ impl Service<Request<Incoming>> for FakeHubSvc {
                         StreamBody::new(futures::stream::poll_fn(move |_cx: &mut Context<'_>| {
                             if !fired.swap(true, Ordering::SeqCst) {
                                 let mut buf = BytesMut::new();
-                                encode_frame(FrameType::Ping, 0, "", PING_SOURCE, &[], &mut buf)
-                                    .expect("ping encode");
+                                encode_frame(
+                                    FrameType::Ping,
+                                    interflow_core::protocol::FLAG_HUB_ORIGIN,
+                                    interflow_core::protocol::StreamId::ZERO,
+                                    interflow_core::protocol::CircuitToken::ZERO,
+                                    &[],
+                                    &mut buf,
+                                )
+                                .expect("ping encode");
                                 Poll::Ready(Some(Ok(HttpFrame::data(buf.freeze()))))
                             } else {
                                 Poll::Pending
@@ -282,10 +304,7 @@ async fn upload_request_never_answering_rebuilds_session() {
     .await;
 
     let mut cfg = agent_config("hang-upload", fake.addr.port(), certs());
-    cfg.agent.hub_url = format!("http://{}", fake.addr);
-    // The fake hub speaks plain h2 (no TLS terminator); the mTLS fixture
-    // must be stripped for these protocol-level cases.
-    cfg.tls = None;
+    cfg.agent.hub_url = format!("https://{}", fake.addr);
     cfg.agent.request_establish_timeout_secs = Some(1);
     // Keep the watchdog far away so the ONLY thing that can fire here is the
     // establish bound.
@@ -306,10 +325,7 @@ async fn poll_request_never_answering_rebuilds_session() {
     .await;
 
     let mut cfg = agent_config("hang-poll", fake.addr.port(), certs());
-    cfg.agent.hub_url = format!("http://{}", fake.addr);
-    // The fake hub speaks plain h2 (no TLS terminator); the mTLS fixture
-    // must be stripped for these protocol-level cases.
-    cfg.tls = None;
+    cfg.agent.hub_url = format!("https://{}", fake.addr);
     cfg.agent.request_establish_timeout_secs = Some(1);
     cfg.agent.poll_idle_timeout_secs = Some(30);
     let agent = spawn_agent_registered(cfg).await;

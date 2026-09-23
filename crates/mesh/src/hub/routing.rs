@@ -5,38 +5,33 @@
 //! metadata in HTTP headers) was retired, and this module was refactored from
 //! "HTTP header parsing + handling" into pure frame-level dispatch, called by
 //! the `/stream/up` reader task of [`crate::hub::upload`]:
-//! - Direction semantics now come from the frame layer: response-direction
-//!   frames carry `source_agent = "_response_"`
-//!   (the `x-direction` header is retired);
+//! - Direction semantics come from the frame layer's flags
+//!   (`FLAG_RESPONSE` / `FLAG_HUB_ORIGIN`);
 //! - Frame-level rejections (ACL / stream limits / target unreachable) no
-//!   longer have a per-frame HTTP status; instead a `"_close_"` frame
-//!   carrying `CLOSE:{sid}:{reason}` goes back via the sender's `/poll`
-//!   channel — the pump side reuses the existing Close stream-teardown path
-//!   (consistent with the existing "stream not found" convention).
+//!   longer have a per-frame HTTP status; instead a hub-origin Close frame
+//!   (stream id in the header, u8 reason code in the payload) goes back via
+//!   the sender's `/poll` channel — the pump side reuses the existing Close
+//!   stream-teardown path (consistent with the existing "stream not found"
+//!   convention).
 
 use crate::config::AclRule;
 use crate::hub::service::HubService;
-use crate::hub::state::{
-    PeerIdentity, StreamFace, TunnelData, release_stream_slot, try_acquire_stream_slot,
-};
+use crate::hub::state::{PeerIdentity, StreamFace, TunnelData, release_stream_slot};
 use bytes::Bytes;
-use interflow_core::protocol::{FLAG_E2E, FrameType, StreamProto};
+use interflow_core::protocol::{
+    CircuitToken, CloseReason, FLAG_E2E, FLAG_RESPONSE, FrameOrigin, FrameType, RouteToken,
+    StreamId, StreamProto,
+};
 use interflow_core::security::AuditKind;
-use interflow_core::tunnel::FrameSource;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-/// Maximum stream_id length (128B), character allowlist `[A-Za-z0-9_-]`.
-pub(crate) const MAX_STREAM_ID_LEN: usize = 128;
 /// Maximum agent_id length (128B), character allowlist `[A-Za-z0-9_.-]`.
 pub(crate) const MAX_AGENT_ID_LEN: usize = 128;
-/// Maximum target_addr length (256B), control characters forbidden.
-pub(crate) const MAX_ADDR_LEN: usize = 256;
 
-/// Frame direction (determined at the wire layer by the `"_response_"`
-/// sentinel).
+/// Frame direction (determined at the wire layer by `FLAG_RESPONSE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
     /// Request direction (initiated by ingress → target agent).
@@ -55,25 +50,14 @@ impl Direction {
     }
 }
 
-pub(crate) fn valid_stream_id(s: &str) -> bool {
-    s.len() <= MAX_STREAM_ID_LEN
-        && !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
 pub(crate) fn valid_agent_id(s: &str) -> bool {
     // Forbid the _ prefix: the wire layer reserves sentinels (_response_
-    // etc.) that reuse the source_agent field
+    // etc.) that reuse the source-circuit field
     !s.starts_with('_')
         && s.len() <= MAX_AGENT_ID_LEN
         && !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-}
-
-pub(crate) fn valid_target_addr(s: &str) -> bool {
-    s.len() <= MAX_ADDR_LEN && !s.bytes().any(|b| b.is_ascii_control())
 }
 
 /// Qualifies a wire-level Open target: `"{tenant}/{agent}"` passes through
@@ -144,12 +128,157 @@ pub(crate) async fn tenant_policy_allows(
     })
 }
 
+/// Verdict of the shared stream-admission gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamAdmission {
+    /// Policy and caps satisfied; the per-agent slot is acquired.
+    Admitted,
+    /// Tenant isolation policy denied the Open.
+    TenantDenied,
+    /// The global active-stream cap is exhausted.
+    GlobalStreamLimit,
+    /// The per-agent active-stream cap is exhausted.
+    PerAgentStreamLimit,
+}
+
+/// The single stream-admission gate shared by the h2 upload path
+/// ([`HubService::frame_open`]) and the QUIC relay open path: tenant
+/// isolation policy + global/per-agent stream caps, with metrics and audit.
+///
+/// `peer` carries the connection's remote address on the h2 plane; the QUIC
+/// plane currently reports `None` — an explicit, visible difference rather
+/// than a hidden one.
+pub(crate) async fn admit_stream(
+    hub: &crate::hub::state::HubState,
+    stream_id: StreamId,
+    source_circuit: &CircuitToken,
+    source_agent: &str,
+    qualified_target: &str,
+    peer: Option<&str>,
+) -> StreamAdmission {
+    if !tenant_policy_allows(&hub.tls_plane, &hub.config, source_agent, qualified_target).await {
+        metrics::counter!("interflow_hub_acl_denied").increment(1);
+        hub.audit.record(
+            AuditKind::StreamDenied {
+                stream_id: stream_id.to_string(),
+                source_circuit: source_circuit.to_hex(),
+                source_ip: None,
+                reason: "tenant_denied".to_string(),
+            },
+            Some(source_circuit.to_hex()),
+            peer.map(str::to_string),
+        );
+        return StreamAdmission::TenantDenied;
+    }
+
+    // Stream count caps (defend against DDoS / a compromised agent flooding
+    // stream opens). Read from atomics to avoid taking the config RwLock
+    // read lock on every Open.
+    let max_per_agent = hub
+        .limits
+        .max_streams_per_agent
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let max_total = hub
+        .limits
+        .max_streams_total
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if max_total > 0 && hub.active_streams.read().await.len() >= max_total {
+        metrics::counter!("interflow_hub_stream_limit_denied", "scope" => "total").increment(1);
+        hub.audit.record(
+            AuditKind::StreamDenied {
+                stream_id: stream_id.to_string(),
+                source_circuit: source_circuit.to_hex(),
+                source_ip: None,
+                reason: "global_stream_limit".into(),
+            },
+            Some(source_circuit.to_hex()),
+            peer.map(str::to_string),
+        );
+        return StreamAdmission::GlobalStreamLimit;
+    }
+    if max_per_agent > 0
+        && !crate::hub::state::try_acquire_stream_slot(
+            &hub.stream_counts,
+            source_agent,
+            max_per_agent,
+        )
+    {
+        metrics::counter!("interflow_hub_stream_limit_denied", "scope" => "per_agent").increment(1);
+        hub.audit.record(
+            AuditKind::StreamDenied {
+                stream_id: stream_id.to_string(),
+                source_circuit: source_circuit.to_hex(),
+                source_ip: None,
+                reason: "per_agent_stream_limit".into(),
+            },
+            Some(source_circuit.to_hex()),
+            peer.map(str::to_string),
+        );
+        return StreamAdmission::PerAgentStreamLimit;
+    }
+    StreamAdmission::Admitted
+}
+
+/// Issues a source-session-scoped opaque route lease after the control-plane
+/// target has been qualified and authorized. Route issuance is only a cache
+/// optimization: every Open re-runs the same policy gate.
+pub(crate) async fn issue_route(
+    hub: &crate::hub::state::HubState,
+    source_agent: &str,
+    source_circuit: CircuitToken,
+    target: &str,
+) -> std::result::Result<RouteToken, &'static str> {
+    let Some((source_tenant, _)) = PeerIdentity::split_qualified(source_agent) else {
+        return Err("Invalid source identity");
+    };
+    let qualified_target = qualify_target(target, source_tenant);
+    if !valid_qualified_agent(&qualified_target) {
+        return Err("Invalid route target");
+    }
+    if !tenant_policy_allows(&hub.tls_plane, &hub.config, source_agent, &qualified_target).await {
+        metrics::counter!("interflow_hub_acl_denied").increment(1);
+        hub.audit.record(
+            AuditKind::StreamDenied {
+                stream_id: String::new(),
+                source_circuit: source_circuit.to_hex(),
+                source_ip: None,
+                reason: "route_denied".to_string(),
+            },
+            Some(source_circuit.to_hex()),
+            None,
+        );
+        return Err("Access denied by tenant policy");
+    }
+    let route = RouteToken::random().map_err(|_| "Route token unavailable")?;
+    let session_arc = {
+        let agents = hub.agents.read().await;
+        agents.get(source_agent).cloned()
+    };
+    let Some(session_arc) = session_arc else {
+        return Err("Source circuit not registered");
+    };
+    let session = session_arc.write().await;
+    if session.circuit != source_circuit {
+        return Err("Source circuit not registered");
+    }
+    drop(session);
+    hub.route_leases.write().await.insert(
+        route,
+        (
+            source_circuit,
+            source_agent.to_string(),
+            qualified_target.clone(),
+        ),
+    );
+    Ok(route)
+}
+
 /// Resolution result of frame-level Data dispatch.
 enum DataRoute {
-    /// Normal route: recipient, frame source, flags, dispatch sink.
+    /// Normal route: recipient, frame origin, flags, dispatch sink.
     Deliver {
         recipient: String,
-        frame_source: FrameSource,
+        origin: FrameOrigin,
         flags: u8,
         sink: Option<mpsc::Sender<TunnelData>>,
     },
@@ -166,7 +295,7 @@ impl HubService {
     /// a lock.
     pub(crate) async fn lookup_tx(&self, agent_id: &str) -> Option<mpsc::Sender<TunnelData>> {
         let state_arc = {
-            let agents = self.agents.read().await;
+            let agents = self.state.agents.read().await;
             agents.get(agent_id).cloned()
         };
         if let Some(state_arc) = state_arc {
@@ -183,11 +312,12 @@ impl HubService {
     /// meantime, the eviction is automatically voided.
     pub(crate) async fn evict_agent_by_id(&self, agent_id: &str, reason: &'static str) {
         let expected = {
-            let agents = self.agents.read().await;
+            let agents = self.state.agents.read().await;
             agents.get(agent_id).cloned()
         };
         if let Some(expected) = expected {
-            crate::hub::heartbeat::evict_agent(&self.handles(), agent_id, &expected, reason).await;
+            crate::hub::heartbeat::evict_agent(&self.state.clone(), agent_id, &expected, reason)
+                .await;
         }
     }
 
@@ -202,10 +332,11 @@ impl HubService {
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn frame_open(
         &self,
+        source_state: &tokio::sync::RwLock<crate::hub::state::AgentSession>,
         source_agent: &str,
-        stream_id: &str,
-        target_agent: &str,
-        target_addr: Option<&str>,
+        source_circuit: CircuitToken,
+        stream_id: StreamId,
+        route: RouteToken,
         proto: StreamProto,
         e2e: bool,
     ) -> std::result::Result<(), &'static str> {
@@ -214,83 +345,44 @@ impl HubService {
         // qualified with the source's own tenant (same-tenant shorthand on
         // the wire — agents do not know their tenant, and the default is
         // intra-tenant anyway).
-        let Some((source_tenant, _source_bare)) = PeerIdentity::split_qualified(source_agent)
+        let Some((_source_tenant, _source_bare)) = PeerIdentity::split_qualified(source_agent)
         else {
             return Err("Invalid source identity");
         };
-        let qualified_target = qualify_target(target_agent, source_tenant);
+        let qualified_target = {
+            let session = source_state.read().await;
+            if session.circuit != source_circuit {
+                return Err("Source circuit not registered");
+            }
+            drop(session);
+            self.state.route_leases.read().await.get(&route).cloned()
+        }
+        .ok_or("Unknown route token")?;
+        let qualified_target = match qualified_target {
+            lease if lease.1 == source_agent => lease.2,
+            _ => return Err("Unknown route token"),
+        };
 
-        if !tenant_policy_allows(
-            &self.tls_plane,
-            &self.config,
+        match admit_stream(
+            &self.state,
+            stream_id,
+            &source_circuit,
             source_agent,
             &qualified_target,
+            Some(&self.peer_str()),
         )
         .await
         {
-            metrics::counter!("interflow_hub_acl_denied").increment(1);
-            self.audit.record(
-                AuditKind::StreamDenied {
-                    stream_id: stream_id.to_string(),
-                    source: source_agent.to_string(),
-                    reason: format!("tenant_denied: target={qualified_target}"),
-                },
-                Some(source_agent.to_string()),
-                Some(self.peer_str()),
-            );
-            return Err("Access denied by tenant policy");
+            StreamAdmission::Admitted => {}
+            StreamAdmission::TenantDenied => return Err("Access denied by tenant policy"),
+            StreamAdmission::GlobalStreamLimit => return Err("Global stream limit reached"),
+            StreamAdmission::PerAgentStreamLimit => return Err("Per-agent stream limit reached"),
         }
         let target_agent = qualified_target.as_str();
 
-        // Stream count cap check (defends against DDoS / a compromised agent
-        // flooding stream opens)
-        // Read from atomics to avoid taking the config RwLock read lock on
-        // every Open
-        let max_per_agent = self
-            .limits
-            .max_streams_per_agent
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let max_total = self
-            .limits
-            .max_streams_total
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if max_total > 0 {
-            let current = self.active_streams.read().await.len();
-            if current >= max_total {
-                metrics::counter!("interflow_hub_stream_limit_denied", "scope" => "total")
-                    .increment(1);
-                self.audit.record(
-                    AuditKind::StreamDenied {
-                        stream_id: stream_id.to_string(),
-                        source: source_agent.to_string(),
-                        reason: "global_stream_limit".into(),
-                    },
-                    Some(source_agent.to_string()),
-                    Some(self.peer_str()),
-                );
-                return Err("Global stream limit reached");
-            }
-        }
-        if max_per_agent > 0
-            && !try_acquire_stream_slot(&self.stream_counts, source_agent, max_per_agent)
-        {
-            metrics::counter!("interflow_hub_stream_limit_denied", "scope" => "per_agent")
-                .increment(1);
-            self.audit.record(
-                AuditKind::StreamDenied {
-                    stream_id: stream_id.to_string(),
-                    source: source_agent.to_string(),
-                    reason: "per_agent_stream_limit".into(),
-                },
-                Some(source_agent.to_string()),
-                Some(self.peer_str()),
-            );
-            return Err("Per-agent stream limit reached");
-        }
-
         debug!(
-            "Stream opened: stream_id={}, source={}, target={target_agent}, addr={target_addr:?}",
-            stream_id, source_agent,
+            "Stream opened: stream_id={} (opaque data-plane identifiers only)",
+            stream_id,
         );
 
         // An empty target never reaches this point on the h2 plane: the
@@ -309,32 +401,39 @@ impl HubService {
         // channel notifications.
         // quic target: open a relay stream (failure rolls back like a
         // notification failure, same discipline as the poll path)
-        let target_sink = {
+        let (target_sink, target_circuit) = {
             let target_state = {
-                let agents = self.agents.read().await;
+                let agents = self.state.agents.read().await;
                 agents.get(target_agent).cloned()
             };
             match target_state {
                 Some(state) => {
-                    let quic_conn = { state.read().await.quic.clone() };
+                    let (quic_conn, target_circuit) = {
+                        let session = state.read().await;
+                        (session.quic.clone(), session.circuit)
+                    };
                     match quic_conn {
                         Some(qc) => crate::hub::quic::open_relay_stream(
-                            &self.core(),
+                            &self.state.clone(),
                             &qc,
                             stream_id,
-                            source_agent,
-                            target_addr,
+                            source_circuit,
+                            target_circuit,
                             proto,
                             e2e,
                         )
                         .await
                         .inspect(|_tx| {
-                            debug!("QUIC relay established: target={target_agent}, stream_id={stream_id}");
-                        }),
-                        None => None, // h2 target: goes via poll
+                            debug!("QUIC relay established: stream_id={stream_id}");
+                        })
+                        .map_or((None, target_circuit), |tx| (Some(tx), target_circuit)),
+                        None => (None, target_circuit), // h2 target: goes via poll
                     }
                 }
-                None => None,
+                None => (
+                    None,
+                    CircuitToken::random().map_err(|_| "Circuit token unavailable")?,
+                ),
             }
         };
 
@@ -345,29 +444,37 @@ impl HubService {
             .map_or(StreamFace::Poll, StreamFace::Relay);
         let datagram_ok = matches!(proto, StreamProto::Udp)
             && target_face.is_relay()
-            && self.config.read().await.transport.quic.datagram_enabled;
+            && self
+                .state
+                .config
+                .read()
+                .await
+                .transport
+                .quic
+                .datagram_enabled;
         let stream = crate::hub::ActiveStream {
             source_agent: source_agent.to_string(),
             target_agent: target_agent.to_string(),
-            target_addr: target_addr.map(str::to_string),
+            source_circuit,
+            target_circuit,
             proto,
             target: target_face.clone(),
             source: StreamFace::Poll, // h2 source: return path goes via poll
             datagram_ok,
         };
         {
-            let mut streams = self.active_streams.write().await;
-            streams.insert(stream_id.to_string(), stream);
+            let mut streams = self.state.active_streams.write().await;
+            streams.insert(stream_id, stream);
         }
         metrics::gauge!("interflow_hub_streams_active").increment(1.0);
         metrics::counter!("interflow_hub_streams_total", "direction" => "request").increment(1);
-        self.audit.record(
+        self.state.audit.record(
             AuditKind::StreamOpened {
                 stream_id: stream_id.to_string(),
-                source: source_agent.to_string(),
-                target: target_agent.to_string(),
+                source_circuit: source_circuit.to_hex(),
+                route: route.to_hex(),
             },
-            Some(source_agent.to_string()),
+            Some(source_circuit.to_hex()),
             Some(self.peer_str()),
         );
 
@@ -389,28 +496,26 @@ impl HubService {
         let notify_result: std::result::Result<(), &'static str> = if target_face.is_relay() {
             Ok(())
         } else {
-            let addr_str = target_addr.unwrap_or_default();
-            let open_data = format!("{source_agent}:{addr_str}");
+            // The requester's circuit rides the header field (the former
+            // `_open_` sentinel + payload hex are gone), payload empty.
             let frame = TunnelData {
-                stream_id: stream_id.to_string(),
-                source: FrameSource::Open,
+                stream_id,
+                origin: FrameOrigin::Agent(source_circuit),
                 stream_type: FrameType::Open,
                 // The hub rebuilds Open flags from the stream proto — the
                 // e2e declaration must be carried through explicitly or it
                 // would be silently stripped (the downgrade attack
                 // e2e-required peers exist to reject).
                 flags: proto.as_flag() | (u8::from(e2e) * FLAG_E2E),
-                data: Bytes::from(open_data),
+                data: Bytes::new(),
             };
-            if crate::hub::control::deliver_control(&self.agents, target_agent, frame).await {
-                debug!("Notified {target_agent} of stream open: stream_id={stream_id}");
+            if crate::hub::control::deliver_control(&self.state.agents, target_agent, frame).await {
+                debug!("Notified target of stream open: stream_id={stream_id}");
                 Ok(())
             } else {
                 // Not registered / a QUIC session (the poll plane is
                 // ineffective for it) / session already ended
-                error!(
-                    "Failed to send Open notification: target={target_agent}, stream_id={stream_id}"
-                );
+                error!("Failed to send Open notification: stream_id={stream_id}");
                 Err("Target agent not registered")
             }
         };
@@ -419,20 +524,18 @@ impl HubService {
             // Roll back the just-inserted active stream + release the stream
             // slot + correct metrics/audit
             {
-                let mut streams = self.active_streams.write().await;
-                if streams.remove(stream_id).is_some() {
+                let mut streams = self.state.active_streams.write().await;
+                if streams.remove(&stream_id).is_some() {
                     metrics::gauge!("interflow_hub_streams_active").decrement(1.0);
                 }
             }
-            if max_per_agent > 0 {
-                release_stream_slot(&self.stream_counts, source_agent);
-            }
-            self.audit.record(
+            release_stream_slot(&self.state.stream_counts, source_agent);
+            self.state.audit.record(
                 AuditKind::StreamClosed {
                     stream_id: stream_id.to_string(),
-                    source: source_agent.to_string(),
+                    source_circuit: source_circuit.to_hex(),
                 },
-                Some(source_agent.to_string()),
+                Some(source_circuit.to_hex()),
                 None,
             );
             return Err(reason);
@@ -453,12 +556,13 @@ impl HubService {
     pub(crate) async fn frame_data(
         &self,
         agent_id: &str,
-        stream_id: &str,
+        circuit: CircuitToken,
+        stream_id: StreamId,
         direction: Direction,
         data: Bytes,
     ) -> std::result::Result<(), &'static str> {
         debug!(
-            "Data frame received: stream_id={}, source={agent_id}",
+            "Data frame received: stream_id={}, source={circuit}",
             stream_id
         );
 
@@ -468,41 +572,37 @@ impl HubService {
         // (source == target) converges naturally: both directions'
         // recipient/frame-source conclusions match the explicit branches.
         let route = {
-            let streams = self.active_streams.read().await;
-            match streams.get(stream_id) {
+            let streams = self.state.active_streams.read().await;
+            match streams.get(&stream_id) {
                 None => DataRoute::Missing,
                 Some(stream) => {
-                    let proto_flag = stream.proto.as_flag();
                     let forged = match direction {
-                        Direction::Response => stream.target_agent != agent_id,
-                        Direction::Request => stream.source_agent != agent_id,
+                        Direction::Response => stream.target_circuit != circuit,
+                        Direction::Request => stream.source_circuit != circuit,
                     };
                     if forged {
                         error!(
-                            "Forgery check: {}-direction frame from {agent_id} does not match the stream owner",
+                            "Forgery check: {}-direction frame does not match the stream owner",
                             direction.label()
                         );
                         DataRoute::Forged
                     } else if direction == Direction::Response {
-                        debug!(
-                            "Route direction: {agent_id} -> {} (response path)",
-                            stream.source_agent
-                        );
+                        debug!("Route direction: response path");
                         DataRoute::Deliver {
                             recipient: stream.source_agent.clone(),
-                            frame_source: FrameSource::Response,
-                            flags: proto_flag,
+                            origin: FrameOrigin::Response,
+                            // UDP/E2E only ride Open; relaying Data with
+                            // the stream's proto bits would violate the
+                            // contract and kill the receiving decode.
+                            flags: FLAG_RESPONSE,
                             sink: stream.source.relay_sender().cloned(),
                         }
                     } else {
-                        debug!(
-                            "Route direction: {agent_id} -> {} (request path)",
-                            stream.target_agent
-                        );
+                        debug!("Route direction: request path");
                         DataRoute::Deliver {
                             recipient: stream.target_agent.clone(),
-                            frame_source: FrameSource::Agent(agent_id.into()),
-                            flags: proto_flag,
+                            origin: FrameOrigin::Agent(circuit),
+                            flags: 0,
                             sink: stream.target.relay_sender().cloned(),
                         }
                     }
@@ -510,13 +610,13 @@ impl HubService {
             }
         };
 
-        let (recipient, frame_source, frame_flags, recipient_sink) = match route {
+        let (recipient, origin, frame_flags, recipient_sink) = match route {
             DataRoute::Deliver {
                 recipient,
-                frame_source,
+                origin,
                 flags,
                 sink,
-            } => (recipient, frame_source, flags, sink),
+            } => (recipient, origin, flags, sink),
             DataRoute::Missing => {
                 // Stream does not exist (late frame / already swept): notify
                 // the sender so it disconnects the local connection
@@ -532,8 +632,8 @@ impl HubService {
         metrics::counter!("interflow_hub_frames_rx", "type" => "data").increment(1);
 
         let data_frame = TunnelData {
-            stream_id: stream_id.to_string(),
-            source: frame_source,
+            stream_id,
+            origin,
             stream_type: FrameType::Data,
             flags: frame_flags,
             data,
@@ -550,44 +650,46 @@ impl HubService {
         // h2 peer: lookup_tx → poll channel (existing path).
         if let Some(sink) = recipient_sink {
             let send_timeout = Duration::from_secs(
-                self.limits
+                self.state
+                    .limits
                     .channel_send_timeout_secs
                     .load(Ordering::Relaxed),
             );
             match tokio::time::timeout(send_timeout, sink.send(data_frame)).await {
                 Ok(Ok(())) => {
-                    debug!("Data relayed to {recipient} (QUIC)");
+                    debug!("Data relayed over QUIC");
                     Ok(())
                 }
                 Ok(Err(_)) => {
-                    error!("QUIC relay channel closed: {recipient}");
+                    error!("QUIC relay channel closed");
                     Err("Target agent channel closed")
                 }
                 Err(_) => {
-                    error!("QUIC relay send timed out (>{send_timeout:?}): {recipient}");
+                    error!("QUIC relay send timed out (>{send_timeout:?})");
                     Err("Target agent stalled")
                 }
             }
         } else {
             let Some(tx) = self.lookup_tx(&recipient).await else {
-                error!("Receiving agent {recipient} has no data channel");
+                error!("Receiving endpoint has no data channel");
                 return Err("Target agent not registered");
             };
             let send_timeout = Duration::from_secs(
-                self.limits
+                self.state
+                    .limits
                     .channel_send_timeout_secs
                     .load(Ordering::Relaxed),
             );
             match tokio::time::timeout(send_timeout, tx.send(data_frame)).await {
                 Ok(Ok(())) => {
-                    debug!("Data sent to {recipient}");
+                    debug!("Data sent to receiving endpoint");
                     Ok(())
                 }
                 Ok(Err(e)) => {
                     // Channel closed: the agent was just evicted or
                     // re-registered. Fail honestly so upstream disconnects;
                     // never fake success and throw data into a black hole.
-                    error!("Failed to send data (channel closed): {recipient} : {e}");
+                    error!("Failed to send data (channel closed): {e}");
                     Err("Target agent channel closed")
                 }
                 Err(_) => {
@@ -597,7 +699,7 @@ impl HubService {
                     // senders), and subsequent requests take the fast-fail
                     // "agent does not exist" path.
                     error!(
-                        "Send data timed out (>{send_timeout:?}): {recipient} channel has no consumer, evicting the agent"
+                        "Send data timed out (>{send_timeout:?}): channel has no consumer, evicting the endpoint"
                     );
                     self.evict_agent_by_id(&recipient, "send_timeout").await;
                     Err("Target agent stalled")
@@ -613,10 +715,11 @@ impl HubService {
     /// 2026-09-16).
     pub(crate) async fn frame_close(
         &self,
-        agent_id: &str,
-        stream_id: &str,
+        _agent_id: &str,
+        circuit: CircuitToken,
+        stream_id: StreamId,
         direction: Direction,
-        reason: &str,
+        reason: &CloseReason,
     ) {
         debug!("Stream closed: stream_id={stream_id}, reason={reason}");
 
@@ -624,18 +727,16 @@ impl HubService {
         // (directional authorization: request direction must be the source,
         // response direction must be the target — otherwise drop as forgery)
         let (notify_agent, owner_agent) = {
-            let streams = self.active_streams.read().await;
-            let Some(stream) = streams.get(stream_id) else {
+            let streams = self.state.active_streams.read().await;
+            let Some(stream) = streams.get(&stream_id) else {
                 return;
             };
             let authorized = match direction {
-                Direction::Response => stream.target_agent == agent_id,
-                Direction::Request => stream.source_agent == agent_id,
+                Direction::Response => stream.target_circuit == circuit,
+                Direction::Request => stream.source_circuit == circuit,
             };
             if !authorized {
-                warn!(
-                    "Forgery check: Close frame from {agent_id} does not own either end of stream {stream_id}"
-                );
+                warn!("Forgery check: Close frame does not own either end of stream {stream_id}");
                 return;
             }
             let notify = if direction == Direction::Response {
@@ -649,16 +750,16 @@ impl HubService {
         // Remove the active stream + decrement the count in the same
         // critical section (prevents drift)
         {
-            let mut streams = self.active_streams.write().await;
-            if streams.remove(stream_id).is_some() {
+            let mut streams = self.state.active_streams.write().await;
+            if streams.remove(&stream_id).is_some() {
                 metrics::gauge!("interflow_hub_streams_active").decrement(1.0);
-                release_stream_slot(&self.stream_counts, &owner_agent);
-                self.audit.record(
+                release_stream_slot(&self.state.stream_counts, &owner_agent);
+                self.state.audit.record(
                     AuditKind::StreamClosed {
                         stream_id: stream_id.to_string(),
-                        source: agent_id.to_string(),
+                        source_circuit: circuit.to_hex(),
                     },
-                    Some(agent_id.to_string()),
+                    Some(circuit.to_hex()),
                     None,
                 );
             }
@@ -677,18 +778,18 @@ impl HubService {
         //   semantic here).
         if direction == Direction::Response {
             crate::hub::control::deliver_response_close(
-                &self.agents,
+                &self.state.agents,
                 &notify_agent,
                 stream_id,
-                reason,
+                reason.clone(),
             )
             .await;
         } else {
             crate::hub::control::deliver_close_via_control(
-                &self.agents,
+                &self.state.agents,
                 &notify_agent,
                 stream_id,
-                reason,
+                reason.clone(),
             )
             .await;
         }
@@ -705,7 +806,7 @@ impl HubService {
     /// channel: a full channel meant a **silent drop**, the egress
     /// forwarder never saw a Close, and the backend fd lingered for the
     /// whole session (EMFILE,
-    /// docs/bug/2026-09-14-intrasession-orphan-stream-fd-leak.md). The drop
+    /// (internal design notes)). The drop
     /// was harmless to stream state (the hub side had already torn the
     /// stream down) but harmful to the peer's fd — after control/data plane
     /// separation, "delivery while online".
@@ -714,9 +815,20 @@ impl HubService {
     /// frames) carry "termination first" semantics; the only FIFO-sensitive
     /// case, a normal response-direction close, does not go through this
     /// function (see `frame_close`).
-    pub(crate) async fn notify_sender_close(&self, agent_id: &str, stream_id: &str, reason: &str) {
-        crate::hub::control::deliver_close_via_control(&self.agents, agent_id, stream_id, reason)
-            .await;
+    pub(crate) async fn notify_sender_close(
+        &self,
+        agent_id: &str,
+        stream_id: StreamId,
+        reason: &str,
+    ) {
+        let code = crate::hub::control::close_reason_of(reason);
+        let _ = crate::hub::control::deliver_close_via_control(
+            &self.state.agents,
+            agent_id,
+            stream_id,
+            code,
+        )
+        .await;
     }
 }
 
@@ -730,28 +842,14 @@ impl HubService {
 mod tests {
     use super::*;
     use crate::hub::state::SharedStreamCounts;
+    use crate::hub::state::try_acquire_stream_slot;
     use std::collections::HashMap;
     use std::sync::Arc;
-
-    #[test]
-    fn stream_id_validation() {
-        assert!(valid_stream_id("abc"));
-        assert!(valid_stream_id("a-b_c"));
-        assert!(!valid_stream_id(""));
-        assert!(!valid_stream_id("a/b"));
-        assert!(!valid_stream_id("a b"));
-    }
 
     #[test]
     fn agent_id_validation_allows_dot() {
         assert!(valid_agent_id("agent-1.local"));
         assert!(!valid_agent_id("agent 1"));
-    }
-
-    #[test]
-    fn target_addr_rejects_control_chars() {
-        assert!(valid_target_addr("127.0.0.1:3000"));
-        assert!(!valid_target_addr("a\nb"));
     }
 
     fn make_counts() -> SharedStreamCounts {

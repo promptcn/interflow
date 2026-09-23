@@ -1,8 +1,12 @@
 //! Structural contract for user-facing examples.
 //!
-//! `examples/` is public, neutral, self-contained documentation. Real Promptcn
-//! material belongs under the private `deployments/` tree, and Cargo package
-//! `examples/` directories are reserved for Rust example targets.
+//! `examples/` is the public product-scenario index: neutral, self-contained
+//! documentation. Real Promptcn material belongs under the private
+//! `deployments/` tree, and Cargo package `examples/` directories are
+//! reserved for Rust example targets. The engine-level site-to-site example
+//! (pack path only) lives beside the engine at
+//! `crates/mesh/dev-examples/` and carries the same shape and neutrality
+//! contract.
 
 #![allow(
     clippy::all,
@@ -84,11 +88,13 @@ fn visit_files(root: &Path, callback: &mut dyn FnMut(&Path)) {
     for entry in std::fs::read_dir(root).unwrap_or_else(|e| panic!("read {}: {e}", root.display()))
     {
         let path = entry.expect("directory entry").path();
+        // Generated local state, never shipped: the openssl cert tree plus
+        // the pack-path outputs (offline issuer store, rendered packs).
         if path.is_dir()
             && path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name == "certs")
+                .is_some_and(|name| matches!(name, "certs" | "issuer" | "dist"))
         {
             continue;
         }
@@ -102,89 +108,90 @@ fn examples_tree_is_public_neutral_and_complete() {
     let examples = root.join("examples");
     assert_eq!(
         entries(&examples),
-        ["README.md", "public-domain-to-lan", "site-to-site"],
-        "examples must remain the fixed public scenario index"
+        ["README.md", "public-domain-to-lan"],
+        "examples must remain the fixed public product-scenario index"
     );
 
     check_scenario_shape(
         &examples.join("public-domain-to-lan"),
         &[
             "README.md",
-            "generate-certs.sh",
+            "interflow.toml",
             "nginx.conf",
-            "profile.toml",
-            "routes.toml",
-            "start-edge.sh",
-            "start-expose.sh",
+            "start-agent.sh",
+            "start-ingress.sh",
         ],
     );
     check_scenario_shape(
-        &examples.join("site-to-site"),
+        &root.join("crates/mesh/dev-examples/site-to-site"),
         &[
             "README.md",
-            "agent-lan-a.toml",
-            "agent-lan-b.toml",
-            "generate-certs.sh",
-            "hub.toml",
+            "apply.sh",
+            "interflow.toml",
             "start-agent-lan-a.sh",
             "start-agent-lan-b.sh",
             "start-hub.sh",
         ],
     );
 
+    // Both public-facing example trees ship in the public export and carry
+    // the same neutrality contract.
+    let public_roots = [examples, root.join("crates/mesh/dev-examples/site-to-site")];
     let forbidden_extensions = ["key", "crt", "csr", "srl", "pem", "p12"];
-    visit_files(&examples, &mut |path| {
-        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-        assert!(
-            !forbidden_extensions.contains(&extension),
-            "certificate material must never ship in examples: {}",
-            path.display()
-        );
-    });
+    for public_root in &public_roots {
+        visit_files(public_root, &mut |path| {
+            let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+            assert!(
+                !forbidden_extensions.contains(&extension),
+                "certificate material must never ship in examples: {}",
+                path.display()
+            );
+        });
 
-    // Construct private markers so this exported test source cannot itself trip
-    // the public-export literal grep gates.
-    let private_domain = ["promptcn", ".com"].concat();
-    let private_machines = [
-        ["leo-", "mac"].concat(),
-        ["leo-", "desktop"].concat(),
-        ["agent-", "pzy"].concat(),
-    ];
-    visit_files(&examples, &mut |path| {
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        assert!(
-            !text.contains(&private_domain),
-            "private domain in {}",
-            path.display()
-        );
-        for marker in &private_machines {
+        // Construct private markers so this exported test source cannot itself trip
+        // the public-export literal grep gates.
+        let private_domain = ["promptcn", ".com"].concat();
+        let private_machines = [
+            ["leo-", "mac"].concat(),
+            ["leo-", "desktop"].concat(),
+            ["agent-", "pzy"].concat(),
+        ];
+        visit_files(public_root, &mut |path| {
+            let text = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             assert!(
-                !text.contains(marker),
-                "private machine {marker} in {}",
+                !text.contains(&private_domain),
+                "private domain in {}",
                 path.display()
             );
-        }
-        for token in text.split(|c: char| !c.is_ascii_digit() && c != '.') {
-            let octets: Vec<u8> = token
-                .split('.')
-                .map(|part| part.parse::<u8>().ok())
-                .collect::<Option<_>>()
-                .unwrap_or_default();
-            if octets.len() != 4 {
-                continue;
+            for marker in &private_machines {
+                assert!(
+                    !text.contains(marker),
+                    "private machine {marker} in {}",
+                    path.display()
+                );
             }
-            let private = matches!(
-                octets[..],
-                [10, _, _, _] | [172, 16..=31, _, _] | [192, 168, _, _]
-            );
-            assert!(
-                !private,
-                "non-loopback private address {token} in {}",
-                path.display()
-            );
-        }
-    });
+            for token in text.split(|c: char| !c.is_ascii_digit() && c != '.') {
+                let octets: Vec<u8> = token
+                    .split('.')
+                    .map(|part| part.parse::<u8>().ok())
+                    .collect::<Option<_>>()
+                    .unwrap_or_default();
+                if octets.len() != 4 {
+                    continue;
+                }
+                let private = matches!(
+                    octets[..],
+                    [10, _, _, _] | [172, 16..=31, _, _] | [192, 168, _, _]
+                );
+                assert!(
+                    !private,
+                    "non-loopback private address {token} in {}",
+                    path.display()
+                );
+            }
+        });
+    }
 }
 
 #[test]

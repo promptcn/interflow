@@ -1,7 +1,7 @@
 //! E2E: the agent↔agent inner TLS layer (e2e encryption) — adversarial
-//! regressions for docs/design/agent-e2e-encryption.md §8.1 (A1–A8).
+//! regressions for (internal design notes) §8.1 (A1–A8).
 //!
-//! Mechanics: a real hub + real agents (both e2e modes) for the positive
+//! Mechanics: a real hub + real agents for the positive
 //! paths; for the attack paths a **raw-tunnel endpoint** plays the
 //! malicious/compromised party at frame level — exactly the capabilities
 //! the threat model grants the hub-position attacker (see Open frames,
@@ -32,7 +32,7 @@ use interflow_core::tunnel::e2e::{
 };
 use interflow_core::tunnel::{AgentTunnel, IncomingStream, TunnelData};
 use interflow_mesh::agent::AgentClient;
-use interflow_mesh::config::{AgentConfig, E2eConfig, E2eMode};
+use interflow_mesh::config::{AgentConfig, InnerTlsConfig};
 use interflow_testkit::{
     agent_config, hub_config,
     metrics_harness::{init_tracing, metrics_handle, wait_counter_at_least},
@@ -72,11 +72,10 @@ const FAILS_INGRESS: &str = "interflow_agent_e2e_handshake_failures_total";
 const FAILS_EGRESS: &str = "interflow_agent_e2e_handshake_failures_total";
 const OK_INGRESS: &str = "interflow_agent_e2e_handshakes_total";
 
-fn e2e_config(mode: E2eMode, timeout_secs: u64) -> E2eConfig {
-    E2eConfig {
-        mode,
+fn e2e_config(timeout_secs: u64) -> InnerTlsConfig {
+    InnerTlsConfig {
         handshake_timeout_secs: timeout_secs,
-        ..E2eConfig::default()
+        ..InnerTlsConfig::default()
     }
 }
 
@@ -121,7 +120,7 @@ async fn connect_tunnel(
         .await
         .expect("connect+register");
     let tunnel = AgentTunnel::from_sender(
-        agent_id.to_string(),
+        conn.negotiated.circuit_token,
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
@@ -210,13 +209,21 @@ async fn spawn_responder_for(
         inner_server_config(&server_material, expected_client_cn).expect("acceptor"),
     ));
     tokio::spawn(async move {
-        let adapter = E2eTunnelIo::egress(tapped, tunnel.clone(), sid.clone());
+        let adapter = E2eTunnelIo::egress(tapped, tunnel.clone(), sid);
         match inner_tls_accept(adapter, acceptor, Duration::from_secs(10)).await {
             E2eHandshakeOutcome::Established(mut tls, _) => {
                 let mut buf = vec![0u8; 4096];
                 if echo {
                     match tls.read(&mut buf).await {
                         Ok(0) | Err(_) => {}
+                        Ok(_) if buf.starts_with(b"IFSTREAM") => {
+                            // The egress sends the encrypted selector first; echo the
+                            // actual application bytes that follow it.
+                            if let Ok(m) = tls.read(&mut buf).await {
+                                let _ = tls.write_all(&buf[..m]).await;
+                                let _ = tls.shutdown().await;
+                            }
+                        }
                         Ok(n) => {
                             let _ = tls.write_all(&buf[..n]).await;
                             let _ = tls.shutdown().await;
@@ -228,10 +235,10 @@ async fn spawn_responder_for(
                     let _ = tls.read(&mut sink).await;
                 }
             }
-            E2eHandshakeOutcome::Failed { parts, .. } => {
-                // Drain so the attacker keeps consuming (realistic peer).
-                let mut rx = parts.rx;
-                while rx.recv().await.is_some() {}
+            E2eHandshakeOutcome::Failed { .. } => {
+                // Keep the malicious peer alive briefly (realistic source);
+                // the failed receiver is deliberately not recoverable.
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
     });
@@ -239,11 +246,16 @@ async fn spawn_responder_for(
 }
 
 /// The egress-role config for a real agent with e2e + a TCP rule.
-fn egress_agent_config(id: &str, hub_port: u16, target: SocketAddr, e2e: E2eConfig) -> AgentConfig {
+fn egress_agent_config(
+    id: &str,
+    hub_port: u16,
+    target: SocketAddr,
+    e2e: InnerTlsConfig,
+) -> AgentConfig {
     let mut cfg = agent_config(id, hub_port, certs());
     cfg.egress = vec![interflow_testkit::tcp_egress_rule("r", target)];
     cfg.security.allowed_targets = vec![target.to_string()];
-    cfg.e2e = e2e;
+    cfg.inner_tls = e2e;
     cfg
 }
 
@@ -253,7 +265,7 @@ fn ingress_agent_config(
     hub_port: u16,
     listen: SocketAddr,
     target_agent: &str,
-    e2e: E2eConfig,
+    e2e: InnerTlsConfig,
 ) -> AgentConfig {
     let mut cfg = agent_config(id, hub_port, certs());
     cfg.ingress = vec![interflow_testkit::tcp_ingress_rule(
@@ -262,7 +274,7 @@ fn ingress_agent_config(
         target_agent,
         None,
     )];
-    cfg.e2e = e2e;
+    cfg.inner_tls = e2e;
     cfg
 }
 
@@ -319,7 +331,7 @@ async fn p1_required_full_chain_round_trip() {
         "eg",
         hub_port,
         echo_addr,
-        e2e_config(E2eMode::Required, 5),
+        e2e_config(5),
     ))
     .await;
 
@@ -332,7 +344,7 @@ async fn p1_required_full_chain_round_trip() {
         hub_port,
         ingress_addr,
         "eg",
-        e2e_config(E2eMode::Required, 5),
+        e2e_config(5),
     ))
     .await;
 
@@ -368,8 +380,7 @@ async fn p2_quic_plane_smoke() {
     .await;
     let (echo_addr, _echo) = interflow_testkit::echo_server().await;
 
-    let mut eg_cfg =
-        egress_agent_config("eg", hub_port, echo_addr, e2e_config(E2eMode::Required, 5));
+    let mut eg_cfg = egress_agent_config("eg", hub_port, echo_addr, e2e_config(5));
     eg_cfg.agent.transport = interflow_mesh::config::TransportKind::Quic;
     eg_cfg.agent.hub_quic_addr = Some(format!("127.0.0.1:{hub_port}"));
     let eg = spawn_agent_registered(eg_cfg).await;
@@ -377,13 +388,7 @@ async fn p2_quic_plane_smoke() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ingress_addr = listener.local_addr().unwrap();
     drop(listener);
-    let mut in_cfg = ingress_agent_config(
-        "in",
-        hub_port,
-        ingress_addr,
-        "eg",
-        e2e_config(E2eMode::Required, 5),
-    );
+    let mut in_cfg = ingress_agent_config("in", hub_port, ingress_addr, "eg", e2e_config(5));
     in_cfg.agent.transport = interflow_mesh::config::TransportKind::Quic;
     in_cfg.agent.hub_quic_addr = Some(format!("127.0.0.1:{hub_port}"));
     let in_handle = spawn_agent_registered(in_cfg).await;
@@ -396,14 +401,6 @@ async fn p2_quic_plane_smoke() {
         .expect("echo within 10s")
         .expect("read exact");
     assert_eq!(&got, b"quic-plane");
-
-    // Observation bit: both QUIC registrations declared the capability.
-    wait_counter_at_least(
-        "interflow_quic_agents_e2e_capable_registered",
-        2,
-        Duration::from_secs(5),
-    )
-    .await;
     drop(sock);
     drop(eg);
     drop(in_handle);
@@ -426,7 +423,7 @@ async fn required_ingress_against(victim: &str, timeout_secs: u64) -> (u16, Sock
         hub_port,
         ingress_addr,
         victim,
-        e2e_config(E2eMode::Required, timeout_secs),
+        e2e_config(timeout_secs),
     ))
     .await;
     std::mem::forget(in_handle); // lives for the test; cleaned with the process
@@ -551,13 +548,8 @@ async fn a4a_same_tenant_wrong_cn_fails_and_real_egress_zero_dial() {
     let (backend, total, _active) = counting_backend().await;
 
     // The real egress: required, would dial the backend if a stream landed.
-    let eg = spawn_agent_registered(egress_agent_config(
-        "eg",
-        hub_port,
-        backend,
-        e2e_config(E2eMode::Required, 5),
-    ))
-    .await;
+    let eg =
+        spawn_agent_registered(egress_agent_config("eg", hub_port, backend, e2e_config(5))).await;
     std::mem::forget(eg);
 
     // The ingress targets `victim`; the hub (honestly) routes there — the
@@ -570,7 +562,7 @@ async fn a4a_same_tenant_wrong_cn_fails_and_real_egress_zero_dial() {
         hub_port,
         ingress_addr,
         "victim",
-        e2e_config(E2eMode::Required, 5),
+        e2e_config(5),
     ))
     .await;
     std::mem::forget(in_handle);
@@ -632,22 +624,17 @@ async fn a4c_forged_src_agent_rejected_zero_dial() {
     let hub_port = pick_ephemeral_port();
     spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (backend, total, _active) = counting_backend().await;
-    let eg = spawn_agent_registered(egress_agent_config(
-        "eg",
-        hub_port,
-        backend,
-        e2e_config(E2eMode::Required, 5),
-    ))
-    .await;
+    let eg =
+        spawn_agent_registered(egress_agent_config("eg", hub_port, backend, e2e_config(5))).await;
     std::mem::forget(eg);
 
     let (attacker, _h) = connect_tunnel(hub_port, "rogue").await;
     let backend_str = backend.to_string();
     tokio::spawn(async move {
-        let sid = "forge-1".to_string();
-        let rx = attacker.register_stream(sid.clone()).await;
+        let sid = interflow_testkit::opaque_stream_id("forge-1");
+        let rx = attacker.register_stream(sid).await;
         attacker
-            .send_open_with(&sid, "eg", Some(&backend_str), StreamProto::Tcp, true)
+            .send_open_with(sid, "eg", StreamProto::Tcp, true)
             .await
             .unwrap();
         // Present a valid tenant cert whose CN != the declared source
@@ -656,21 +643,24 @@ async fn a4c_forged_src_agent_rejected_zero_dial() {
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
             inner_client_config(&client_material, "eg").unwrap(),
         ));
-        let adapter = E2eTunnelIo::ingress(rx, attacker.clone(), sid.clone());
-        let mut rx = match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
-            E2eHandshakeOutcome::Established(tls, _) => {
-                let mut tls = tls;
-                let _ = tls.write_all(b"dial-me").await;
+        let adapter = E2eTunnelIo::ingress(rx, attacker.clone(), sid);
+        match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
+            E2eHandshakeOutcome::Established(mut tls, _) => {
+                let hello = interflow_core::tunnel::InnerStreamHello {
+                    source_principal: "rogue".to_owned(),
+                    source_fingerprint: client_material.leaf_fingerprint(),
+                    selector: interflow_core::tunnel::TargetSelector::Address(backend_str),
+                    correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+                };
+                let _ = hello.write(&mut tls).await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                None
             }
             // TLS 1.3 lets the client finish its side first; the egress's
             // rejection arrives as a read error. Either way THIS side could
             // not have smuggled a plaintext dial (asserted below).
-            E2eHandshakeOutcome::Failed { parts, .. } => Some(parts.rx),
-        };
-        if let Some(rx) = rx.as_mut() {
-            while rx.recv().await.is_some() {}
+            E2eHandshakeOutcome::Failed { .. } => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
     });
 
@@ -698,23 +688,16 @@ async fn a5_stripped_flag_is_rejected_not_plaintext() {
     let hub_port = pick_ephemeral_port();
     spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (backend, total, _active) = counting_backend().await;
-    let eg = spawn_agent_registered(egress_agent_config(
-        "eg",
-        hub_port,
-        backend,
-        e2e_config(E2eMode::Required, 5),
-    ))
-    .await;
+    let eg =
+        spawn_agent_registered(egress_agent_config("eg", hub_port, backend, e2e_config(5))).await;
     std::mem::forget(eg);
 
     let (inj, _h) = connect_tunnel(hub_port, "stripper").await;
-    let sid = "strip-1".to_string();
-    let mut rx = inj.register_stream(sid.clone()).await;
+    let sid = interflow_testkit::opaque_stream_id("strip-1");
+    let mut rx = inj.register_stream(sid).await;
     // Deliberately WITHOUT the e2e flag: what the egress sees after a
     // strip-at-the-hub downgrade.
-    inj.send_open(&sid, "eg", Some(&backend.to_string()), StreamProto::Tcp)
-        .await
-        .unwrap();
+    inj.send_open(sid, "eg", StreamProto::Tcp).await.unwrap();
 
     let closed = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
@@ -735,11 +718,10 @@ async fn a5_stripped_flag_is_rejected_not_plaintext() {
     assert_eq!(total.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
-/// A5b: the same flagless open toward an `opportunistic` egress falls back
-/// to plaintext (that mode's documented semantics — asserted as behavior,
-/// not endorsed).
+/// A5b: the same flagless open is rejected on every egress; historical
+/// migration modes are not deployable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a5b_opportunistic_egress_allows_flagless_plaintext() {
+async fn a5b_legacy_plaintext_is_always_rejected() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
@@ -750,35 +732,41 @@ async fn a5b_opportunistic_egress_allows_flagless_plaintext() {
         "eg",
         hub_port,
         echo_addr,
-        e2e_config(E2eMode::Opportunistic, 5),
+        e2e_config(5),
     ))
     .await;
     std::mem::forget(eg);
 
     let (inj, _h) = connect_tunnel(hub_port, "legacy").await;
-    let sid = "legacy-1".to_string();
-    let mut rx = inj.register_stream(sid.clone()).await;
-    inj.send_open(&sid, "eg", Some(&echo_addr.to_string()), StreamProto::Tcp)
-        .await
-        .unwrap();
-    inj.send_data(&sid, Bytes::from_static(b"plain-old"))
+    let sid = interflow_testkit::opaque_stream_id("legacy-1");
+    let mut rx = inj.register_stream(sid).await;
+    inj.send_open(sid, "eg", StreamProto::Tcp).await.unwrap();
+    inj.send_data(sid, Bytes::from_static(b"plain-old"))
         .await
         .unwrap();
 
-    let mut got = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    while got.len() < b"plain-old".len() {
-        let td = tokio::time::timeout_at(deadline, rx.recv())
-            .await
-            .expect("echo within 8s")
-            .expect("channel alive");
-        match td.stream_type {
-            FrameType::Data => got.extend_from_slice(&td.data),
-            FrameType::Close => panic!("legacy stream was closed: {got:?}"),
-            _ => {}
+    let closed = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let td = rx.recv().await.expect("channel alive");
+            assert_ne!(
+                td.stream_type,
+                FrameType::Data,
+                "plaintext leaked: {:?}",
+                td.data
+            );
+            if matches!(td.stream_type, FrameType::Close) {
+                break;
+            }
         }
-    }
-    assert_eq!(&got, b"plain-old");
+    })
+    .await;
+    assert!(closed.is_ok(), "legacy plaintext stream must close");
+    wait_counter_at_least(
+        "interflow_agent_e2e_handshake_failures_total{side=\"egress\",reason=\"not_negotiated\"}",
+        1,
+        Duration::from_secs(5),
+    )
+    .await;
 }
 
 /// A6: `required` ingress vs a silent legacy peer — the handshake deadline
@@ -818,10 +806,10 @@ async fn a6_required_vs_silent_peer_times_out() {
     .await;
 }
 
-/// A6b: `opportunistic` ingress vs a plaintext-banner peer — the fallback
-/// replays the banner to the visitor (migration-window semantics).
+/// A6b: there is no fallback. A plaintext peer closes the visitor connection at
+/// the handshake deadline; no banner or visitor payload is served in plaintext.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a6b_opportunistic_falls_back_to_banner() {
+async fn a6b_plaintext_banner_peer_never_falls_back() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
@@ -835,17 +823,12 @@ async fn a6b_opportunistic_falls_back_to_banner() {
         hub_port,
         ingress_addr,
         "victim",
-        e2e_config(E2eMode::Opportunistic, 2),
+        e2e_config(2),
     ))
     .await;
     std::mem::forget(in_handle);
 
     let (attacker, _h) = connect_tunnel(hub_port, "victim").await;
-    // Old-peer shape: a plain echo that never speaks TLS. TLS-shaped
-    // frames (the synthetic ClientHello / rustls failure alert) get no
-    // answer — a real backend ignores unparseable input — so the only
-    // thing that kills the handshake is silence + the deadline; the
-    // fallback then serves everything the visitor actually sends.
     tokio::spawn(async move {
         let mut incoming = attacker.take_incoming_streams().await.unwrap();
         while let Some(IncomingStream { open, frames }) = incoming.recv().await {
@@ -859,41 +842,23 @@ async fn a6b_opportunistic_falls_back_to_banner() {
                         && !td.data.is_empty()
                         && !tls_shaped
                     {
-                        let _ = attacker.send_data_response(&sid, td.data.clone()).await;
+                        let _ = attacker.send_data_response(sid, td.data.clone()).await;
                     }
                 }
             });
         }
     });
 
-    // Deadline path first: with only silence answering the ClientHello,
-    // the opportunistic ingress falls back at its (short) deadline.
-    let deadline_started = std::time::Instant::now();
+    let started = std::time::Instant::now();
     let mut sock = dial_listener(ingress_addr).await;
     let probe = b"fallback-probe";
     sock.write_all(probe).await.unwrap();
-    let mut got = Vec::new();
-    let mut buf = [0u8; 256];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while got.len() < probe.len() {
-        let n = tokio::time::timeout_at(deadline, sock.read(&mut buf))
-            .await
-            .expect("probe echoed after the fallback")
-            .expect("stream alive");
-        if n == 0 {
-            panic!("fallback stream closed early after {n} bytes: {got:?}");
-        }
-        got.extend_from_slice(&buf[..n]);
-    }
+    let got = read_available(&mut sock, Duration::from_secs(6)).await;
     assert!(
-        got.ends_with(probe),
-        "the resumed plaintext stream must carry the probe, got {got:?}"
+        !got.windows(probe.len()).any(|w| w == probe),
+        "plaintext fallback served: {got:?}"
     );
-    assert!(
-        deadline_started.elapsed() >= Duration::from_secs(2),
-        "the fallback landed via the handshake deadline (config 2s), took {:?}",
-        deadline_started.elapsed()
-    );
+    assert!(started.elapsed() >= Duration::from_secs(2));
     wait_counter_at_least(FAILS_INGRESS, 1, Duration::from_secs(5)).await;
 }
 
@@ -926,7 +891,7 @@ async fn gateway_stream_against_egress(
     let client = AgentClient::new(cfg).expect("gateway agent build");
     let conn = client.connect_and_register().await.expect("register");
     let tunnel = AgentTunnel::from_sender(
-        "edge".to_string(),
+        conn.negotiated.circuit_token,
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
@@ -936,13 +901,13 @@ async fn gateway_stream_against_egress(
     )
     .expect("tunnel");
 
-    let sid = format!("gw-{egress_id}");
-    let rx = tunnel.register_stream(sid.clone()).await;
+    let sid = interflow_testkit::opaque_stream_id(&format!("gw-{egress_id}"));
+    let rx = tunnel.register_stream(sid).await;
     // Cross-tenant addressing is the tenant-qualified form (exactly what
     // the edge's listener builds from routes.toml: "{tenant}/{agent}").
     let qualified = format!("test/{egress_id}");
     tunnel
-        .send_open_with(&sid, &qualified, Some(target), StreamProto::Tcp, true)
+        .send_open_with(sid, &qualified, StreamProto::Tcp, true)
         .await
         .unwrap();
     // Inner client material: present the gateway pair, anchor at the TARGET
@@ -954,16 +919,25 @@ async fn gateway_stream_against_egress(
     let connector = tokio_rustls::TlsConnector::from(Arc::new(
         inner_client_config(&gw_material, egress_id).unwrap(),
     ));
-    let adapter = E2eTunnelIo::ingress(rx, tunnel.clone(), sid.clone());
+    let adapter = E2eTunnelIo::ingress(rx, tunnel.clone(), sid);
     match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
-        E2eHandshakeOutcome::Established(tls, _) => Some(tls),
+        E2eHandshakeOutcome::Established(mut tls, _) => {
+            let hello = interflow_core::tunnel::InnerStreamHello {
+                source_principal: "edge".to_owned(),
+                source_fingerprint: gw_material.leaf_fingerprint(),
+                selector: interflow_core::tunnel::TargetSelector::Address(target.to_owned()),
+                correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+            };
+            hello.write(&mut tls).await.ok()?;
+            Some(tls)
+        }
         E2eHandshakeOutcome::Failed { .. } => None,
     }
 }
 
 /// A7 full chain: egress `required` WITH the gateway anchor — the gateway
 /// stream completes the inner handshake (data flows) and the backend dials.
-/// A7 anchor-missing: same egress WITHOUT `gateway_ca_path` — rejected,
+/// A7 anchor-missing: same egress WITHOUT `ingress_ca_path` — rejected,
 /// zero dial. Both shapes in one stack (one hub, two egresses).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a7_gateway_anchor_full_chain_and_missing_anchor() {
@@ -989,19 +963,15 @@ async fn a7_gateway_anchor_full_chain_and_missing_anchor() {
         .push(interflow_mesh::config::TenantConfig {
             name: "_edge".to_string(),
             ca_path: gw_ca.clone(),
+            crl_path: None,
             trusted_gateway: true,
         });
     spawn_hub(hub_cfg).await;
 
     let (echo_addr, _echo) = interflow_testkit::echo_server().await;
     // Egress WITH the anchor.
-    let mut anchored = egress_agent_config(
-        "eg-anchored",
-        hub_port,
-        echo_addr,
-        e2e_config(E2eMode::Required, 5),
-    );
-    anchored.e2e.gateway_ca_path = Some(gw_ca.clone());
+    let mut anchored = egress_agent_config("eg-anchored", hub_port, echo_addr, e2e_config(5));
+    anchored.inner_tls.ingress_ca_path = Some(gw_ca.clone());
     let eg1 = spawn_agent_registered(anchored).await;
     std::mem::forget(eg1);
     // Egress WITHOUT the anchor.
@@ -1009,7 +979,7 @@ async fn a7_gateway_anchor_full_chain_and_missing_anchor() {
         "eg-bare",
         hub_port,
         echo_addr,
-        e2e_config(E2eMode::Required, 5),
+        e2e_config(5),
     ))
     .await;
     std::mem::forget(eg2);
@@ -1026,6 +996,7 @@ async fn a7_gateway_anchor_full_chain_and_missing_anchor() {
     .await
     .expect("anchored egress must accept the gateway stream");
     tls.write_all(b"gw-payload").await.unwrap();
+    tls.flush().await.unwrap();
     let mut got = vec![0u8; b"gw-payload".len()];
     tokio::time::timeout(Duration::from_secs(8), tls.read_exact(&mut got))
         .await
@@ -1095,7 +1066,7 @@ async fn a8_handshake_dribble_hits_deadline() {
                 drib.extend_from_slice(&66u16.to_be_bytes());
                 for chunk in drib.chunks(4) {
                     if attacker
-                        .send_data_response(&sid, Bytes::copy_from_slice(chunk))
+                        .send_data_response(sid, Bytes::copy_from_slice(chunk))
                         .await
                         .is_err()
                     {

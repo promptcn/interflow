@@ -1,6 +1,6 @@
 //! Interflow core tunnel primitives.
 //!
-//! HTTP/2 tunnel primitives shared by `interflow-expose` and
+//! HTTP/2 tunnel primitives shared by the ingress engine and
 //! `interflow-mesh`: protocol frames, tunnel connections, the agent
 //! registry, ACL, TLS, byte pumps, telemetry, and shared configuration.
 

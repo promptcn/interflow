@@ -31,7 +31,9 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use interflow_core::error::InterflowError;
 use interflow_core::protocol::frame::{DecodeOutcome, FrameType, decode_frame, encode_frame};
+use interflow_core::protocol::{CircuitToken, CloseReason, FLAG_HUB_ORIGIN, RouteToken, StreamId};
 use interflow_core::tunnel::H2RequestBody;
+use interflow_core::tunnel::negotiation::{RegisterResponse, RouteResponse};
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
 use interflow_mesh::hub::qualified_agent_id;
 use interflow_testkit::{hub_config_tuned, pick_ephemeral_port, spawn_hub};
@@ -73,7 +75,7 @@ async fn connect(port: u16, cn: &str) -> SendRequest<H2RequestBody> {
     send_request
 }
 
-async fn register(snd: &mut SendRequest<H2RequestBody>, id: &str) -> hyper::StatusCode {
+async fn register(snd: &mut SendRequest<H2RequestBody>, id: &str) -> CircuitToken {
     snd.ready().await.expect("ready");
     let req = Request::builder()
         .method("POST")
@@ -81,13 +83,41 @@ async fn register(snd: &mut SendRequest<H2RequestBody>, id: &str) -> hyper::Stat
         .header("x-agent-id", id)
         .body(interflow_core::tunnel::empty_request_body())
         .unwrap();
-    snd.send_request(req).await.expect("register").status()
+    let resp = snd.send_request(req).await.expect("register");
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.expect("register body");
+    RegisterResponse::parse(&body.to_bytes())
+        .expect("capability")
+        .circuit_token
+}
+
+async fn route(
+    snd: &mut SendRequest<H2RequestBody>,
+    circuit: CircuitToken,
+    target: &str,
+) -> RouteToken {
+    snd.ready().await.expect("ready");
+    let body = http_body_util::Full::new(Bytes::copy_from_slice(target.as_bytes()))
+        .map_err(|never| match never {})
+        .boxed();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/route")
+        .header("x-circuit-token", circuit.to_hex())
+        .body(body)
+        .unwrap();
+    let resp = snd.send_request(req).await.expect("route");
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.expect("route body");
+    serde_json::from_slice::<RouteResponse>(&body.to_bytes())
+        .expect("route token")
+        .route_token
 }
 
 /// Open a streaming upload; status assertions are made by the caller.
 async fn open_upload(
     snd: &mut SendRequest<H2RequestBody>,
-    id: &str,
+    circuit: CircuitToken,
 ) -> (mpsc::Sender<Bytes>, Response<hyper::body::Incoming>) {
     snd.ready().await.expect("ready");
     let (tx, mut rx) = mpsc::channel::<Bytes>(64);
@@ -102,7 +132,7 @@ async fn open_upload(
     let req = Request::builder()
         .method("POST")
         .uri("/stream/up")
-        .header("x-agent-id", id)
+        .header("x-circuit-token", circuit.to_hex())
         .body(body)
         .unwrap();
     let resp = snd.send_request(req).await.expect("upload request");
@@ -111,19 +141,22 @@ async fn open_upload(
 
 async fn open_upload_ok(
     snd: &mut SendRequest<H2RequestBody>,
-    id: &str,
+    circuit: CircuitToken,
 ) -> (mpsc::Sender<Bytes>, Response<hyper::body::Incoming>) {
-    let (tx, resp) = open_upload(snd, id).await;
+    let (tx, resp) = open_upload(snd, circuit).await;
     assert_eq!(resp.status(), 200, "upload should succeed");
     (tx, resp)
 }
 
-async fn poll(snd: &mut SendRequest<H2RequestBody>, id: &str) -> Response<hyper::body::Incoming> {
+async fn poll(
+    snd: &mut SendRequest<H2RequestBody>,
+    circuit: CircuitToken,
+) -> Response<hyper::body::Incoming> {
     snd.ready().await.expect("ready");
     let req = Request::builder()
         .method("GET")
         .uri("/poll")
-        .header("x-agent-id", id)
+        .header("x-circuit-token", circuit.to_hex())
         .body(interflow_core::tunnel::empty_request_body())
         .unwrap();
     snd.send_request(req).await.expect("poll")
@@ -141,24 +174,23 @@ async fn list_agents(snd: &mut SendRequest<H2RequestBody>) -> Vec<String> {
     serde_json::from_slice(&body).expect("agents json")
 }
 
-fn encode_up(ft: FrameType, sid: &str, src: &str, payload: &[u8]) -> Bytes {
+fn encode_up(ft: FrameType, sid: StreamId, src: CircuitToken, payload: &[u8]) -> Bytes {
     let mut buf = BytesMut::new();
     encode_frame(ft, 0, sid, src, payload, &mut buf).expect("encode");
     buf.freeze()
 }
 
-/// Read the poll body until a `CLOSE:{sid}:` rejection notice appears
-/// (returns the full payload).
-async fn wait_close_note(body: &mut hyper::body::Incoming, sid: &str) -> String {
-    let prefix = format!("CLOSE:{sid}:");
+/// Read the poll body until the hub-origin Close rejection for `sid`
+/// appears; returns the reason token (metrics spelling).
+async fn wait_close_note(body: &mut hyper::body::Incoming, sid: StreamId) -> String {
     let mut buf = BytesMut::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let frame_res = tokio::time::timeout_at(deadline, body.frame()).await;
         match frame_res {
-            Err(_) => panic!("timed out waiting for {prefix}"),
+            Err(_) => panic!("timed out waiting for close note on {sid}"),
             Ok(None) | Ok(Some(Err(_))) => {
-                panic!("poll ended early, {prefix} never received")
+                panic!("poll ended early, close note for {sid} never received")
             }
             Ok(Some(Ok(frame))) => {
                 let Ok(data) = frame.into_data() else {
@@ -167,10 +199,10 @@ async fn wait_close_note(body: &mut hyper::body::Incoming, sid: &str) -> String 
                 buf.extend_from_slice(&data);
                 while let DecodeOutcome::Ok(f) = decode_frame(&mut buf) {
                     if matches!(f.frame_type, FrameType::Close)
-                        && f.source_agent == "_close_"
-                        && String::from_utf8_lossy(&f.payload).starts_with(&prefix)
+                        && f.flags & FLAG_HUB_ORIGIN != 0
+                        && f.stream_id == sid
                     {
-                        return String::from_utf8_lossy(&f.payload).to_string();
+                        return CloseReason::from_payload(&f.payload).as_str().to_owned();
                     }
                 }
             }
@@ -193,11 +225,11 @@ async fn second_upload_same_agent_gets_409() {
     .await;
 
     let mut a = connect(port, "dup").await;
-    assert_eq!(register(&mut a, "dup").await, 200);
-    let (tx1, resp1) = open_upload_ok(&mut a, "dup").await;
+    let dup_circuit = register(&mut a, "dup").await;
+    let (tx1, resp1) = open_upload_ok(&mut a, dup_circuit).await;
 
     // Second upload on the same connection: the lease is occupied → 409
-    let (_tx2, resp2) = open_upload(&mut a, "dup").await;
+    let (_tx2, resp2) = open_upload(&mut a, dup_circuit).await;
     assert_eq!(
         resp2.status(),
         409,
@@ -210,7 +242,7 @@ async fn second_upload_same_agent_gets_409() {
     drop(resp1);
     drop(tx1);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let (_tx3, resp3) = open_upload(&mut a, "dup").await;
+    let (_tx3, resp3) = open_upload(&mut a, dup_circuit).await;
     assert_eq!(
         resp3.status(),
         200,
@@ -234,14 +266,14 @@ async fn register_preempts_active_upload() {
 
     // Connection A: register + active upload
     let mut a = connect(port, "agent-x").await;
-    assert_eq!(register(&mut a, "agent-x").await, 200);
-    let (_tx_a, resp_a) = open_upload_ok(&mut a, "agent-x").await;
+    let circuit_a = register(&mut a, "agent-x").await;
+    let (_tx_a, resp_a) = open_upload_ok(&mut a, circuit_a).await;
     let mut body_a = resp_a.into_body();
 
     // Connection B: re-register the same identity (preemption: generation +1,
     // the old lease is cancelled)
     let mut b = connect(port, "agent-x").await;
-    assert_eq!(register(&mut b, "agent-x").await, 200);
+    let circuit_b = register(&mut b, "agent-x").await;
 
     // A's upload response should end (lease cancelled → reader exits →
     // END_STREAM)
@@ -260,7 +292,7 @@ async fn register_preempts_active_upload() {
     );
 
     // B can establish its own upload
-    let (_tx_b, resp_b) = open_upload(&mut b, "agent-x").await;
+    let (_tx_b, resp_b) = open_upload(&mut b, circuit_b).await;
     assert_eq!(
         resp_b.status(),
         200,
@@ -283,33 +315,43 @@ async fn forged_source_frame_rejected_upload_survives() {
     .await;
 
     let mut a = connect(port, "real").await;
-    assert_eq!(register(&mut a, "real").await, 200);
+    let real_circuit = register(&mut a, "real").await;
     let mut other = connect(port, "other").await;
-    assert_eq!(register(&mut other, "other").await, 200);
+    let other_circuit = register(&mut other, "other").await;
+    let other_route = route(&mut a, real_circuit, "other").await;
 
-    let (up_tx, _up_resp) = open_upload_ok(&mut a, "real").await;
-    let poll_resp = poll(&mut a, "real").await;
+    let (up_tx, _up_resp) = open_upload_ok(&mut a, real_circuit).await;
+    let poll_resp = poll(&mut a, real_circuit).await;
+    let s1 = interflow_testkit::opaque_stream_id("s1");
+    let s2 = interflow_testkit::opaque_stream_id("s2");
     let mut poll_body = poll_resp.into_body();
 
-    // Forged frame: the connection identity is real, the frame claims other
+    // Forged frame: the connection identity is real, the frame claims the
+    // other agent's circuit (raw bytes in the header field).
     up_tx
-        .send(encode_up(FrameType::Data, "s1", "other", b"evil"))
+        .send(encode_up(FrameType::Data, s1, other_circuit, b"evil"))
         .await
         .expect("send forged frame");
 
-    let note = wait_close_note(&mut poll_body, "s1").await;
-    assert!(
-        note.contains("spoofed"),
-        "rejection reason should say spoofed: {note}"
+    let note = wait_close_note(&mut poll_body, s1).await;
+    assert_eq!(
+        note,
+        CloseReason::SecurityDenied.as_str(),
+        "a spoofed source must map to the security-denied code"
     );
 
     // The upload is still alive: a legitimate Open (to a registered target) is
     // dispatched normally
     up_tx
-        .send(encode_up(FrameType::Open, "s2", "real", b"other:"))
+        .send(encode_up(
+            FrameType::Open,
+            s2,
+            real_circuit,
+            &other_route.to_bytes(),
+        ))
         .await
         .expect("send legit open");
-    let other_poll = poll(&mut other, "other").await;
+    let other_poll = poll(&mut other, other_circuit).await;
     let mut other_body = other_poll.into_body();
     let mut got_open = false;
     let mut buf = BytesMut::new();
@@ -324,7 +366,7 @@ async fn forged_source_frame_rejected_upload_survives() {
                 };
                 buf.extend_from_slice(&data);
                 while let DecodeOutcome::Ok(f) = decode_frame(&mut buf) {
-                    if matches!(f.frame_type, FrameType::Open) && f.stream_id == "s2" {
+                    if matches!(f.frame_type, FrameType::Open) && f.stream_id == s2 {
                         got_open = true;
                         break;
                     }
@@ -354,8 +396,8 @@ async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
     let _hub = spawn_hub(hub_config_tuned(port, certs(), vec![], security(), hb)).await;
 
     let mut a = connect(port, "wedge").await;
-    assert_eq!(register(&mut a, "wedge").await, 200);
-    let (up_tx, up_resp) = open_upload_ok(&mut a, "wedge").await;
+    let wedge_circuit = register(&mut a, "wedge").await;
+    let (up_tx, up_resp) = open_upload_ok(&mut a, wedge_circuit).await;
     let mut up_body = up_resp.into_body();
     // Registry keys are tenant-qualified (`"{tenant}/{agent}"`); build the
     // expected key through the production single source, never by hand.
@@ -365,7 +407,15 @@ async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
     // then go silent → eviction
     {
         let mut pong = BytesMut::new();
-        encode_frame(FrameType::Pong, 0, "", "wedge", &[], &mut pong);
+        encode_frame(
+            FrameType::Pong,
+            0,
+            StreamId::ZERO,
+            wedge_circuit,
+            &[],
+            &mut pong,
+        )
+        .expect("encode pong");
         up_tx.send(pong.freeze()).await.expect("send pong");
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -398,7 +448,7 @@ async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
 
     // Rebuild the upload → implicit re-registration (the same self-healing as
     // /poll)
-    let (_up_tx2, up_resp2) = open_upload(&mut a, "wedge").await;
+    let (_up_tx2, up_resp2) = open_upload(&mut a, wedge_circuit).await;
     assert_eq!(
         up_resp2.status(),
         200,

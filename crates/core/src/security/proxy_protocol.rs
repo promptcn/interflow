@@ -19,7 +19,7 @@
 //!
 //! The derived IP is used for **resource governance and audit only** — never
 //! for identity or ACL decisions (identity is exclusively mTLS, RFC
-//! `docs/design/multi-tenant-mtls-only.md` §5.2).
+//! `(internal design notes)` §5.2).
 //!
 //! Parsing is delegated to the `ppp` crate (the ecosystem's de-facto
 //! standard; single dependency `thiserror`). Version 1 (text) headers are
@@ -151,7 +151,8 @@ impl ProxyProtocolPolicy {
         let mut trusted = Vec::with_capacity(cfg.trusted_proxies.len());
         for entry in &cfg.trusted_proxies {
             let net: IpNetwork = entry.trim().parse().map_err(|e| {
-                InterflowError::config(format!("invalid trusted proxy CIDR '{entry}': {e}"))
+                InterflowError::config(format!("invalid trusted proxy CIDR '{entry}'"))
+                    .with_source(e)
             })?;
             trusted.push(net);
         }

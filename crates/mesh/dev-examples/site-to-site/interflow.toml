@@ -1,0 +1,37 @@
+# Site-to-site deployment manifest — the single source of truth.
+# Product path: edit, then run `interflow plan apply`; start the nodes with
+# `interflow-mesh hub/agent --pack`. The TOML + openssl files in this
+# directory are the expert alternative, not a prerequisite.
+[realm]
+id = "demo"
+
+[registrar]
+endpoint = "https://registrar.example.com"  # serves renewal + CRLs in production
+
+[mesh.hub.central]
+listen = "0.0.0.0:6666"
+# The address agents dial — also the hostname SAN of the hub credential.
+# Local smoke uses the loopback IP; a real deployment uses
+# endpoint = "hub.example.com:6666".
+endpoint = "127.0.0.1:6666"
+
+[workspace.main]
+
+[agent.lan-a]
+workspace = "main"
+
+# LAN A forwards a local listener through the hub to LAN B.
+[[agent.lan-a.mesh_ingress]]
+name = "to-lan-b"
+listen = "127.0.0.1:3001"
+target_agent = "lan-b"
+remote_addr = "127.0.0.1:3000"
+
+[agent.lan-b]
+workspace = "main"
+
+# LAN B dials this address on its own network for peers (also its egress
+# allowlist — nothing else can be reached through it).
+[[agent.lan-b.mesh_egress]]
+name = "web"
+target_addr = "127.0.0.1:3000"

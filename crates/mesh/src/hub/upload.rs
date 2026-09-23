@@ -17,22 +17,22 @@
 //!   self-healing path of `/poll`).
 //!
 //! Error signaling: frame-level rejections (ACL / limits / target unreachable /
-//! stream not found) go back as `"_close_"` frames (`CLOSE:{sid}:{reason}`) on
-//! the sender's `/poll` channel; a single anomalous frame does not tear down
-//! the upload; only wire decoding errors (invalid magic / version / fields)
-//! end the entire upload stream.
+//! stream not found) go back as hub-origin Close frames (stream id in the
+//! header, u8 reason code in the payload) on the sender's `/poll` channel; a
+//! single anomalous frame does not tear down the upload; only wire decoding
+//! errors (invalid magic / version / fields / contract violations) end the
+//! entire upload stream.
 
-use crate::hub::routing::{Direction, valid_agent_id, valid_stream_id, valid_target_addr};
-use crate::hub::service::{HubService, agent_id_of, bind_connection_identity, text_response};
-use crate::hub::state::{AgentSession, HubResponseBody};
+use crate::hub::routing::Direction;
+use crate::hub::service::{HubService, circuit_token_of, text_response};
+use crate::hub::state::HubResponseBody;
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::{Frame as HttpFrame, Incoming};
 use hyper::{Request, Response, StatusCode};
 use interflow_core::error::{InterflowError, Result};
 use interflow_core::protocol::frame as wire;
-use interflow_core::protocol::{FrameType, StreamProto};
-use interflow_core::tunnel::RESPONSE_SOURCE;
+use interflow_core::protocol::{CircuitToken, CloseReason, FrameType, RouteToken, StreamProto};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -52,30 +52,26 @@ impl HubService {
         &self,
         req: Request<Incoming>,
     ) -> Result<Response<HubResponseBody>> {
-        // Owned: `req` is consumed below (`into_body`) while the qualified
-        // key outlives the whole streaming read. The bare header id is only
-        // used for the identity binding check; all registry/stream-table
-        // operations use the tenant-qualified key.
-        let bare_id = agent_id_of(&req)?.to_string();
+        let circuit = circuit_token_of(&req)?;
         let agent_key = self.qualified_id().await;
 
-        // Identity binding check (the same gate as /poll)
-        if let Err(resp) =
-            bind_connection_identity(&self.connection_identity, &bare_id, "upload").await
-        {
-            return Ok(*resp);
+        if self.circuit().await != Some(circuit) {
+            return Ok(text_response(StatusCode::UNAUTHORIZED, "Circuit mismatch"));
         }
 
         // Take the AgentSession (outer read lock is very short-lived);
         // unregistered → implicit rebuild (same self-healing as /poll)
         let state_arc = {
-            let agents = self.agents.read().await;
+            let agents = self.state.agents.read().await;
             agents.get(&agent_key).cloned()
         };
         let state_arc = match state_arc {
             Some(a) => a,
             None => self.implicit_re_register(&agent_key).await,
         };
+        if state_arc.read().await.circuit != circuit {
+            return Ok(text_response(StatusCode::UNAUTHORIZED, "Circuit mismatch"));
+        }
 
         // Acquire the upload lease: an active upload in the same generation
         // → 409; a stale cancelled lease is replaced directly
@@ -83,7 +79,9 @@ impl HubService {
             let mut state = state_arc.write().await;
             match &state.up_lease {
                 Some(l) if !l.is_cancelled() => {
-                    warn!("Agent {agent_key} attempted upload but no lease available (in use)");
+                    warn!(
+                        "Agent circuit={circuit} attempted upload but no lease available (in use)"
+                    );
                     return Ok(text_response(StatusCode::CONFLICT, "Upload busy"));
                 }
                 _ => {
@@ -101,7 +99,7 @@ impl HubService {
         tokio::spawn(upload_reader(
             reader_svc,
             agent_key.clone(),
-            bare_id,
+            circuit,
             state_arc,
             lease,
             req.into_body(),
@@ -118,32 +116,70 @@ impl HubService {
             .body(body)
             .expect("status+body response is infallible");
 
-        info!("Agent {agent_key} entering streaming upload mode");
+        info!("Agent circuit={circuit} entering streaming upload mode");
         Ok(response)
     }
 
     /// Dispatches a single uplink frame (called by the reader task).
     ///
-    /// Anti-spoofing: the frame's `source_agent` must equal the connection
-    /// identity (request direction) or be the `"_response_"` sentinel
-    /// (response direction); Open's target and address fields are validated
-    /// against the same allowlist as the routing layer. Rejections do not
-    /// tear down the upload.
-    async fn dispatch_up_frame(&self, agent_key: &str, agent_id: &str, frame: wire::DecodedFrame) {
-        let direction = if frame.source_agent == RESPONSE_SOURCE {
+    /// Anti-spoofing and anti-impersonation: an agent-origin frame must carry
+    /// exactly this TLS connection's registration circuit (request direction)
+    /// or the response-direction flag (`FLAG_RESPONSE` + zero circuit);
+    /// `FLAG_HUB_ORIGIN` and the hub-only frame types are rejected outright
+    /// (the codec already refuses structurally inconsistent shapes — this is
+    /// the role check on top). Open payloads must be a route token owned by
+    /// that source session.
+    ///
+    /// Returns `false` when the frame is a protocol violation that must end
+    /// the whole upload stream (hub and agent deploy as one paired build —
+    /// there is no version-skew case to tolerate).
+    async fn dispatch_up_frame(
+        &self,
+        agent_key: &str,
+        state_arc: &Arc<RwLock<crate::hub::state::AgentSession>>,
+        circuit: CircuitToken,
+        frame: wire::DecodedFrame,
+    ) -> bool {
+        let hub_origin = frame.flags & interflow_core::protocol::FLAG_HUB_ORIGIN != 0;
+        if hub_origin {
+            warn!(
+                "upload frame spoofing: agent set HUB_ORIGIN (stream_id={})",
+                frame.stream_id
+            );
+            metrics::counter!("interflow_hub_auth_failures", "reason" => "up_frame_hub_origin")
+                .increment(1);
+            return false;
+        }
+        if matches!(
+            frame.frame_type,
+            FrameType::HelloAck
+                | FrameType::Ping
+                | FrameType::OpenAck
+                | FrameType::RouteAck
+                | FrameType::Error
+        ) {
+            warn!(
+                "upload frame spoofing: hub-only type {:?} from agent (stream_id={})",
+                frame.frame_type, frame.stream_id
+            );
+            metrics::counter!("interflow_hub_auth_failures", "reason" => "up_frame_hub_only_type")
+                .increment(1);
+            return false;
+        }
+        let direction = if frame.flags & interflow_core::protocol::FLAG_RESPONSE != 0 {
             Direction::Response
-        } else if frame.source_agent == agent_id {
+        } else if frame.circuit == circuit {
             Direction::Request
         } else {
             warn!(
-                "upload frame spoofing: connection identity {agent_id}, frame claims {} (stream_id={})",
-                frame.source_agent, frame.stream_id
+                "upload frame spoofing: circuit mismatch (stream_id={})",
+                frame.stream_id
             );
             metrics::counter!("interflow_hub_auth_failures", "reason" => "up_frame_spoofed")
                 .increment(1);
-            self.notify_sender_close(agent_key, &frame.stream_id, "spoofed source")
+            self.notify_sender_close(agent_key, frame.stream_id, "spoofed source")
                 .await;
-            return;
+            return true;
         };
 
         // Data-plane Pong (root fix, 2026-09-13): heartbeat replies travel
@@ -152,85 +188,91 @@ impl HubService {
         // complete data-plane heartbeat loop. Control frames carry no stream
         // semantics and are handled before the stream_id validation.
         if frame.frame_type == FrameType::Pong {
+            // The Pong's circuit field must re-identify this connection
+            // (anti-spoof; the codec guarantees a nonzero circuit on Pong).
+            if frame.circuit != circuit {
+                warn!("upload Pong circuit mismatch (got {})", frame.circuit);
+                metrics::counter!("interflow_hub_auth_failures", "reason" => "pong_circuit_mismatch")
+                    .increment(1);
+                return false;
+            }
             let state_arc = {
-                let agents = self.agents.read().await;
+                let agents = self.state.agents.read().await;
                 agents.get(agent_key).cloned()
             };
             if let Some(state_arc) = state_arc {
                 state_arc.write().await.last_pong = Instant::now();
                 metrics::counter!("interflow_hub_pong_received", "path" => "upload").increment(1);
-                debug!("agent {agent_key} heartbeat Pong (upload data stream)");
+                debug!("agent circuit={circuit} heartbeat Pong (upload data stream)");
             }
-            return;
+            return true;
         }
 
-        if !valid_stream_id(&frame.stream_id) {
-            debug!(
-                "upload frame stream_id invalid: {:?}, dropping",
-                frame.stream_id
-            );
-            return;
-        }
+        // The codec's contract table already guarantees a nonzero stream id
+        // on the traffic types (a zero id decodes as an error upstream).
 
         match frame.frame_type {
             FrameType::Open => {
-                // payload = "{target_agent}:{target_addr}" (same encoding as
-                // the QUIC backend)
-                let payload = String::from_utf8_lossy(&frame.payload).to_string();
-                let (target_agent, target_addr) = match payload.split_once(':') {
-                    Some((t, a)) => (t.to_string(), (!a.is_empty()).then(|| a.to_string())),
-                    None => (payload, None),
-                };
-                if !(valid_agent_id(&target_agent)
-                    || crate::hub::routing::valid_qualified_agent(&target_agent))
-                    || target_addr
-                        .as_deref()
-                        .is_some_and(|a| !valid_target_addr(a))
-                {
-                    self.notify_sender_close(agent_key, &frame.stream_id, "invalid open payload")
+                let route = (frame.payload.len() == 16)
+                    .then(|| RouteToken::from_bytes(frame.payload[..16].try_into().expect("16B")))
+                    .filter(|t| !t.is_zero());
+                let Some(route) = route else {
+                    self.notify_sender_close(agent_key, frame.stream_id, "invalid open payload")
                         .await;
-                    return;
-                }
+                    return true;
+                };
                 let proto = StreamProto::from_frame_flags(frame.flags);
                 let e2e = frame.flags & interflow_core::protocol::FLAG_E2E != 0;
                 if let Err(reason) = self
                     .frame_open(
+                        state_arc,
                         agent_key,
-                        &frame.stream_id,
-                        &target_agent,
-                        target_addr.as_deref(),
+                        circuit,
+                        frame.stream_id,
+                        route,
                         proto,
                         e2e,
                     )
                     .await
                 {
-                    self.notify_sender_close(agent_key, &frame.stream_id, reason)
+                    self.notify_sender_close(agent_key, frame.stream_id, reason)
                         .await;
                 }
+                true
             }
             FrameType::Data => {
                 if let Err(reason) = self
-                    .frame_data(agent_key, &frame.stream_id, direction, frame.payload)
+                    .frame_data(
+                        agent_key,
+                        circuit,
+                        frame.stream_id,
+                        direction,
+                        frame.payload,
+                    )
                     .await
                 {
-                    self.notify_sender_close(agent_key, &frame.stream_id, reason)
+                    self.notify_sender_close(agent_key, frame.stream_id, reason)
                         .await;
                 }
+                true
             }
             FrameType::Close => {
-                let reason = crate::hub::control::close_reason_of(&frame.payload);
-                self.frame_close(agent_key, &frame.stream_id, direction, &reason)
+                let reason = CloseReason::from_payload(&frame.payload);
+                self.frame_close(agent_key, circuit, frame.stream_id, direction, &reason)
                     .await;
+                true
             }
-            // Other control frames (Hello/Ping/Error etc.) do not travel on
-            // the upload stream — the Ping heartbeat is dispatched via /poll
-            // (Pong is handled in the data-plane Pong branch above); silently
-            // ignored for forward compatibility.
+            // Control frames (Hello/Ping/Error etc.) do not travel on the
+            // upload stream — the Ping heartbeat is dispatched via /poll
+            // (Pong is handled in the data-plane Pong branch above). A
+            // paired-build agent never sends them here, so their presence is
+            // a protocol violation: end the upload stream.
             other => {
-                debug!(
-                    "upload stream ignored non-traffic frame: type={other:?}, stream_id={}",
+                warn!(
+                    "upload stream protocol violation: non-traffic frame type={other:?}, stream_id={}",
                     frame.stream_id
                 );
+                false
             }
         }
     }
@@ -251,8 +293,8 @@ impl HubService {
 async fn upload_reader(
     svc: HubService,
     agent_key: String,
-    agent_id: String,
-    state_arc: Arc<RwLock<AgentSession>>,
+    circuit: CircuitToken,
+    state_arc: Arc<RwLock<crate::hub::state::AgentSession>>,
     lease: Arc<CancellationToken>,
     mut body: Incoming,
     end_tx: oneshot::Sender<()>,
@@ -270,11 +312,16 @@ async fn upload_reader(
                     loop {
                         match wire::decode_frame(&mut buf) {
                             wire::DecodeOutcome::Ok(f) => {
-                                svc.dispatch_up_frame(&agent_key, agent_id.as_str(), f).await;
+                                if !svc
+                                    .dispatch_up_frame(&agent_key, &state_arc, circuit, f)
+                                    .await
+                                {
+                                    break 'outer "non_traffic_frame";
+                                }
                             }
                             wire::DecodeOutcome::Pending => break,
                             wire::DecodeOutcome::Error => {
-                                warn!("upload stream protocol frame invalid: agent={agent_key}");
+                                warn!("upload stream protocol frame invalid: circuit={circuit}");
                                 break 'outer "protocol_error";
                             }
                             wire::DecodeOutcome::UnknownType { must_understand, .. } => {
@@ -299,7 +346,7 @@ async fn upload_reader(
             st.up_lease = None;
         }
     }
-    debug!("agent {agent_key} upload stream ended: {why}");
+    debug!("agent circuit={circuit} upload stream ended: {why}");
     drop(end_tx); // → response body END_STREAM → agent rebuilds the upload
 }
 

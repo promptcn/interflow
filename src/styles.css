@@ -1,6 +1,12 @@
 :root {
   font-family: -apple-system, "PingFang SC", "Segoe UI", sans-serif;
   color-scheme: light dark;
+  /* Type scale — three tiers + display sizes at call sites. Bump the
+     tiers here, never piecemeal at call sites (2026-09-23: everything
+     felt one notch too small). */
+  --text-micro: 12px; /* badges, tags, proto pills */
+  --text-small: 13px; /* hints, mono summaries, logs, secondary chrome */
+  --text-base: 14px; /* labels, body text, headers' chrome */
 }
 
 * {
@@ -15,34 +21,343 @@ body {
   height: 100vh;
 }
 
+/* Machine frame: the header anchors which machine this GUI manages (nodes
+   are identities, not machines — the machine is the container, the faces
+   hang below it). */
+.app-frame {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.machine-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 10px 16px 0;
+  font-size: var(--text-base);
+}
+
+.machine-header .machine-title {
+  font-weight: 700;
+}
+
+.machine-header .machine-host {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  opacity: 0.7;
+}
+
+/* The one interruption channel: GUI errors show up here, dismissable —
+   default-quiet instead of a permanent log pane. */
+.error-banner {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin: 8px 16px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 69, 58, 0.55);
+  background: rgba(255, 69, 58, 0.12);
+  color: #ff453a;
+  font-size: var(--text-base);
+}
+
+.error-banner > span {
+  flex: 1;
+  word-break: break-word;
+}
+
+/* Both faces stay mounted and merely hide — switching faces preserves
+   editor and navigation state. */
 .app {
+  flex: 1;
+  min-height: 0;
+  padding: 12px 16px 16px;
+  display: flex;
+}
+
+.face {
+  flex: 1;
   display: flex;
   flex-direction: column;
   gap: 12px;
-  height: 100vh;
-  padding: 16px;
+  min-width: 0;
+  min-height: 0;
 }
 
-.status-panel {
+.face.hidden {
+  display: none;
+}
+
+.empty-state {
+  flex: 1;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
-  border-radius: 8px;
-  background: rgba(127, 127, 127, 0.12);
-  font-weight: 500;
+  justify-content: center;
+  text-align: center;
+  padding: 24px;
+  opacity: 0.65;
+  font-size: var(--text-base);
 }
 
-.status-panel .dot {
+.dot {
   width: 10px;
   height: 10px;
   border-radius: 50%;
   flex-shrink: 0;
+  display: inline-block;
 }
 
-.status-panel .hint {
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.kind-badge {
+  flex-shrink: 0;
+  font-size: var(--text-micro);
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(127, 127, 127, 0.45);
+  opacity: 0.85;
+}
+
+.kind-badge.kind-hub {
+  border-color: #0a84ff;
+  color: #0a84ff;
+}
+
+.kind-badge.kind-ingress {
+  border-color: #bf5af2;
+  color: #bf5af2;
+}
+
+.kind-badge.kind-mesh_agent {
+  border-color: #ff9f0a;
+  color: #ff9f0a;
+}
+
+.kind-badge.kind-expose_agent {
+  border-color: #34c759;
+  color: #34c759;
+}
+
+/* ------------------------------------------------------------------ */
+/* Overview: the card grid (both faces' landing layer)                  */
+/* ------------------------------------------------------------------ */
+
+.overview {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.overview-status {
+  padding: 0 2px;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  align-content: start;
+}
+
+.node-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(127, 127, 127, 0.35);
+  background: rgba(127, 127, 127, 0.06);
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+
+.node-card:hover {
+  border-color: rgba(127, 127, 127, 0.6);
+}
+
+.node-card:focus-visible {
+  outline: 2px solid #0a84ff;
+  outline-offset: 1px;
+}
+
+.node-card.failed {
+  border-color: rgba(255, 69, 58, 0.65);
+}
+
+.node-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.node-card-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+}
+
+.node-card-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: var(--text-small);
+  min-height: 18px;
+}
+
+.node-card-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: auto;
+  min-height: 30px;
+}
+
+.node-card-state {
+  font-size: var(--text-small);
+  opacity: 0.75;
+}
+
+.node-card-tag {
+  font-size: var(--text-micro);
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(127, 127, 127, 0.4);
+  opacity: 0.8;
+  white-space: nowrap;
+}
+
+.node-card-foot button {
   margin-left: auto;
-  font-size: 12px;
+}
+
+.add-card {
+  border: 1px dashed rgba(127, 127, 127, 0.5);
+  border-radius: 10px;
+  background: transparent;
+  min-height: 118px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 12px;
+  color: inherit;
+  font-size: var(--text-base);
+}
+
+.add-card:hover {
+  border-color: rgba(127, 127, 127, 0.8);
+}
+
+/* ------------------------------------------------------------------ */
+/* Detail page: one level below the cards                               */
+/* ------------------------------------------------------------------ */
+
+.detail-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.detail-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.detail-topbar h2 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.detail-topbar .dot {
+  width: 12px;
+  height: 12px;
+}
+
+.detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+/* One titled concern per panel — the hierarchy the old single-form pane
+   lacked. `grow` lets the logs section take the leftover height. */
+.section {
+  border: 1px solid rgba(127, 127, 127, 0.3);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(127, 127, 127, 0.04);
+}
+
+.section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.section-head h3 {
+  margin: 0;
+  font-size: var(--text-small);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.65;
+}
+
+.section-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.section.grow {
+  flex: 1;
+  min-height: 260px;
+}
+
+.section.grow .section-body {
+  flex: 1;
+  min-height: 0;
+}
+
+.hint {
+  font-size: var(--text-small);
   opacity: 0.65;
 }
 
@@ -59,9 +374,9 @@ body {
 }
 
 .row label {
-  width: 72px;
+  width: 130px;
   flex-shrink: 0;
-  font-size: 13px;
+  font-size: var(--text-base);
   opacity: 0.8;
 }
 
@@ -75,35 +390,8 @@ body {
   min-width: 0;
 }
 
-.port-input {
-  max-width: 90px;
-}
-
-.ports {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  flex: 1;
-}
-
-.port-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: rgba(127, 127, 127, 0.18);
-  font-size: 13px;
-}
-
-.chip-x {
-  border: none;
-  background: none;
-  padding: 0;
-  cursor: pointer;
-  color: inherit;
-  opacity: 0.6;
+.row input:read-only {
+  opacity: 0.7;
 }
 
 button {
@@ -127,9 +415,165 @@ button.primary {
   font-weight: 600;
 }
 
+button.danger {
+  border-color: rgba(255, 69, 58, 0.55);
+  color: #ff453a;
+}
+
 .actions {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.transport-toggle {
+  display: flex;
+  gap: 6px;
+}
+
+.transport-toggle button.selected {
+  background: rgba(52, 199, 89, 0.2);
+  border-color: #34c759;
+  font-weight: 600;
+}
+
+/* Mesh rules (read-only pack truth, mesh agents only). */
+.mesh-rule-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mesh-rule {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: var(--text-base);
+}
+
+.mesh-rule-proto {
+  font-size: var(--text-micro);
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(127, 127, 127, 0.4);
+  opacity: 0.8;
+  text-transform: uppercase;
+}
+
+.mesh-rule-name {
+  margin-left: auto;
+}
+
+/* ------------------------------------------------------------------ */
+/* Dialogs                                                              */
+/* ------------------------------------------------------------------ */
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.dialog {
+  width: 560px;
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+  padding: 18px;
+  border-radius: 12px;
+  background: light-dark(#fff, #1e1e1e);
+  border: 1px solid rgba(127, 127, 127, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dialog h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.confirm-message {
+  margin: 0;
+  font-size: var(--text-base);
+  white-space: pre-wrap;
+}
+
+.inspection {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.1);
+}
+
+.inspection-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.inspection dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 4px 10px;
+  font-size: var(--text-base);
+}
+
+.inspection dt {
+  opacity: 0.65;
+}
+
+.inspection dd {
+  margin: 0;
+  word-break: break-all;
+}
+
+.inspection .prefs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid rgba(127, 127, 127, 0.3);
+  padding-top: 8px;
+}
+
+.dialog-error {
+  color: #ff453a;
+  font-size: var(--text-base);
+  white-space: pre-wrap;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Logs                                                                 */
+/* ------------------------------------------------------------------ */
+
+.log-scope-row {
+  display: flex;
+  gap: 6px;
+}
+
+.log-scope-row button {
+  padding: 3px 10px;
+  font-size: var(--text-small);
+}
+
+.log-scope-row button.selected {
+  background: rgba(52, 199, 89, 0.2);
+  border-color: #34c759;
+  font-weight: 600;
 }
 
 .log-section {
@@ -146,11 +590,18 @@ button.primary {
   gap: 8px;
 }
 
+.log-toolbar button {
+  padding: 2px 10px;
+  font-size: var(--text-small);
+}
+
 .log-view {
   flex: 1;
-  overflow-y: auto;
+  /* Both axes: log lines never wrap, so the whole block scrolls
+     horizontally and the column layout stays aligned. */
+  overflow: auto;
   font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12px;
+  font-size: var(--text-small);
   padding: 10px;
   border-radius: 8px;
   background: rgba(127, 127, 127, 0.1);
@@ -161,8 +612,13 @@ button.primary {
   display: flex;
   gap: 8px;
   padding: 1px 0;
-  white-space: pre-wrap;
-  word-break: break-all;
+  /* No wrap: a tracing line (timestamp + level + node + target + fields)
+     stays on one screen line; `max-content` sizes the line to its longest
+     member, `min-width: 100%` keeps short lines' layout filling the view. */
+  white-space: pre;
+  word-break: normal;
+  width: max-content;
+  min-width: 100%;
 }
 
 .log-ts {
@@ -176,6 +632,14 @@ button.primary {
   width: 44px;
   flex-shrink: 0;
   font-weight: 600;
+}
+
+.log-node {
+  width: 110px;
+  flex-shrink: 0;
+  opacity: 0.7;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .log-target {
@@ -198,13 +662,176 @@ button.primary {
   color: #ff9f0a;
 }
 
-.transport-toggle {
+/* ------------------------------------------------------------------ */
+/* Face toggle + deploy (operator) face                                 */
+/* ------------------------------------------------------------------ */
+
+.face-toggle {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 4px;
+}
+
+.face-toggle button {
+  min-width: auto;
+  padding: 2px 12px;
+}
+
+.face-toggle button.selected {
+  background: var(--accent, #0a84ff);
+  color: #fff;
+}
+
+.deploy-face {
+  flex: 1;
   display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.deploy-nav {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.deploy-nav-toggle {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.deploy-nav-toggle button {
+  min-width: auto;
+  padding: 2px 12px;
+}
+
+.deploy-nav-toggle button.selected {
+  background: var(--accent, #0a84ff);
+  color: #fff;
+}
+
+.pack-overview {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.pack-toolbar .row input {
+  max-width: 420px;
+}
+
+.manifest-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.manifest-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.manifest-editor {
+  min-height: 320px;
+  flex: none;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: var(--text-small);
+  resize: vertical;
+  white-space: pre;
+  border-radius: 8px;
+  border: 1px solid rgba(127, 127, 127, 0.4);
+  background: transparent;
+  color: inherit;
+  padding: 10px;
+}
+
+.deploy-actions {
+  justify-content: flex-end;
+}
+
+/* The deploy face's single command-output surface (validate/apply/rotate/
+   revoke/seal), collapsible, shared by both views. */
+.output-strip {
+  flex-shrink: 0;
+  border-top: 1px solid rgba(127, 127, 127, 0.3);
+  padding-top: 6px;
+  display: flex;
+  flex-direction: column;
   gap: 6px;
 }
 
-.transport-toggle button.selected {
-  background: rgba(52, 199, 89, 0.2);
-  border-color: #34c759;
-  font-weight: 600;
+.output-strip-toggle {
+  align-self: flex-start;
+  font-size: var(--text-small);
+  padding: 2px 8px;
+}
+
+.deploy-output {
+  max-height: 200px;
+  overflow: auto;
+  font-size: var(--text-micro);
+  white-space: pre-wrap;
+  margin: 0;
+  opacity: 0.85;
+}
+
+.template-builder {
+  border: 1px dashed rgba(128, 128, 128, 0.4);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.import-sealed {
+  border-top: 1px dashed rgba(128, 128, 128, 0.4);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Service-address rows (node detail): id label + input + inline reset. */
+.row label.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+.address-edit {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.address-edit input {
+  flex: 1;
+  min-width: 0;
+}
+
+.address-edit input.invalid {
+  border-color: #ff453a;
+}
+
+button.link {
+  padding: 2px 6px;
+  border: none;
+  background: none;
+  font-size: var(--text-small);
+  text-decoration: underline;
+  opacity: 0.7;
+}
+
+.field-error {
+  font-size: var(--text-small);
+  color: #ff453a;
 }

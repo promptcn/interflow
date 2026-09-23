@@ -2,7 +2,7 @@
 //! notifications (Open / `_close_`).
 //!
 //! Before the 2026-09-14 in-session orphan-stream root fix
-//! (docs/bug/2026-09-14-intrasession-orphan-stream-fd-leak.md), hub → agent
+//!, hub → agent
 //! close notifications shared the same capacity-256 poll data channel as
 //! business Data frames: when a traffic burst filled the channel,
 //! `try_send` silently dropped `_close_`, the egress forwarder never saw a
@@ -43,8 +43,7 @@
 
 use crate::hub::state::{SharedAgents, TunnelData};
 use bytes::Bytes;
-use interflow_core::protocol::FrameType;
-use interflow_core::tunnel::FrameSource;
+use interflow_core::protocol::{CloseReason, FLAG_HUB_ORIGIN, FrameOrigin, FrameType, StreamId};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
@@ -125,14 +124,14 @@ async fn control_send(
         ch.ctrl_backlog
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         debug!(
-            "Control notification failed (agent {agent_id} session already ended, its streams released with teardown)"
+            "Control notification failed (endpoint session already ended, its streams released with teardown)"
         );
         return false;
     }
     if backlog >= CONTROL_BACKLOG_SENTINEL {
         metrics::counter!("interflow_hub_control_backlog_exceeded_total").increment(1);
         error!(
-            "agent {agent_id} control channel backlog {backlog} (poll most likely stalled and eviction chain not triggered),\
+            "endpoint control channel backlog {backlog} (poll most likely stalled and eviction chain not triggered),\
              killing the old session and continuing dispatch"
         );
         // Death nudge: advance the generation + close the control channel +
@@ -153,32 +152,42 @@ async fn control_send(
     true
 }
 
-/// Builds a `_close_` notification frame (payload convention
-/// `CLOSE:{sid}:{reason}`, consistent with the existing wire semantics).
-pub(crate) fn close_frame(stream_id: &str, reason: &str) -> TunnelData {
+/// Builds a hub Close notification frame (`FLAG_HUB_ORIGIN`, the stream id
+/// in the header, the u8 reason code in the payload — the former
+/// `CLOSE:{sid}:{reason}` text container is gone).
+pub(crate) fn close_frame(stream_id: StreamId, reason: &CloseReason) -> TunnelData {
     TunnelData {
-        stream_id: stream_id.to_string(),
-        source: FrameSource::Close,
+        stream_id,
+        origin: FrameOrigin::Hub,
         stream_type: FrameType::Close,
-        flags: 0,
-        data: Bytes::from(format!("CLOSE:{stream_id}:{reason}")),
+        flags: FLAG_HUB_ORIGIN,
+        data: Bytes::from(vec![reason.as_code()]),
     }
 }
 
-/// Defensive extraction of the close reason from an agent→hub Close payload.
-///
-/// The reason is a short machine token emitted by the egress forwarder
-/// (`CloseReason::as_str()`, e.g. `connect_failed`); empty = ordinary
-/// close. A pre-2026-09-16 agent sends an empty payload. Anything odd-shaped
-/// (a hostile agent) is pruned to a bounded `[A-Za-z0-9_.-]` token before it
-/// is embedded into the downstream `CLOSE:{sid}:{reason}` convention.
-pub(crate) fn close_reason_of(payload: &[u8]) -> String {
-    String::from_utf8_lossy(payload)
-        .chars()
-        .take_while(|c| *c != ':')
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-        .take(64)
-        .collect()
+/// Maps a hub-internal rejection diagnostic to the Close reason code sent
+/// on the wire. The strings stay hub-internal (logs/metrics); the wire only
+/// ever carries the shared code table.
+pub(crate) fn close_reason_of(diagnostic: &str) -> CloseReason {
+    match diagnostic {
+        // Identity / forgery family.
+        "spoofed source" | "Invalid source identity" | "Source circuit not registered" => {
+            CloseReason::SecurityDenied
+        }
+        // Routing family: unknown route / bad payload / missing target or stream.
+        "Unknown route token"
+        | "invalid open payload"
+        | "Target agent not registered"
+        | "Stream not found" => CloseReason::NoTarget,
+        // Policy family.
+        "Access denied by tenant policy" => CloseReason::SecurityDenied,
+        // Capacity family.
+        "Global stream limit reached" | "Per-agent stream limit reached" => CloseReason::LocalLimit,
+        // Downstream delivery family.
+        "Target agent channel closed" => CloseReason::BackendClosed,
+        "Target agent stalled" => CloseReason::DispatchPoison,
+        _ => CloseReason::CloseFrame,
+    }
 }
 
 /// Delivers one lifecycle notification frame (Open / `_close_`) to an h2
@@ -193,9 +202,7 @@ pub(crate) async fn deliver_control(
     frame: TunnelData,
 ) -> bool {
     let Some(ch) = lookup_channels(agents, agent_id).await else {
-        debug!(
-            "Control notification skipped: agent {agent_id} not registered or is a QUIC session"
-        );
+        debug!("Control notification skipped: endpoint not registered or is a QUIC session");
         return false;
     };
     control_send(agents, agent_id, &ch, frame).await
@@ -210,10 +217,10 @@ pub(crate) async fn deliver_control(
 pub(crate) async fn deliver_close_via_control(
     agents: &SharedAgents,
     agent_id: &str,
-    stream_id: &str,
-    reason: &str,
+    stream_id: StreamId,
+    reason: CloseReason,
 ) -> bool {
-    deliver_control(agents, agent_id, close_frame(stream_id, reason)).await
+    deliver_control(agents, agent_id, close_frame(stream_id, &reason)).await
 }
 
 /// `_close_` with response-direction semantics (backend EOF): data-channel
@@ -229,18 +236,16 @@ pub(crate) async fn deliver_close_via_control(
 pub(crate) async fn deliver_response_close(
     agents: &SharedAgents,
     agent_id: &str,
-    stream_id: &str,
-    reason: &str,
+    stream_id: StreamId,
+    reason: CloseReason,
 ) -> bool {
     let Some(ch) = lookup_channels(agents, agent_id).await else {
-        debug!(
-            "Response close notification skipped: agent {agent_id} not registered or is a QUIC session"
-        );
+        debug!("Response close notification skipped: endpoint not registered or is a QUIC session");
         return false;
     };
     let sent = tokio::time::timeout(
         RESPONSE_CLOSE_FIFO_TIMEOUT,
-        ch.data_tx.send(close_frame(stream_id, reason)),
+        ch.data_tx.send(close_frame(stream_id, &reason)),
     )
     .await;
     // FIFO preserved: under normal congestion the Close succeeds by queueing
@@ -252,9 +257,9 @@ pub(crate) async fn deliver_response_close(
     // termination takes priority, fall back to the control channel and count
     metrics::counter!("interflow_hub_close_notify_fifo_fallback_total").increment(1);
     warn!(
-        "agent {agent_id} data channel stalled/closed, response close falling back to control channel: stream_id={stream_id}"
+        "endpoint data channel stalled/closed, response close falling back to control channel: stream_id={stream_id}"
     );
-    control_send(agents, agent_id, &ch, close_frame(stream_id, reason)).await
+    control_send(agents, agent_id, &ch, close_frame(stream_id, &reason)).await
 }
 
 #[cfg(test)]
@@ -273,11 +278,14 @@ mod tests {
     use tokio::sync::RwLock;
 
     async fn registered_agent(agents: &SharedAgents, id: &str) {
+        let circuit =
+            interflow_core::protocol::CircuitToken::from_hex("12078a05e14f4e2c99b1679be1df7c30")
+                .unwrap();
         // A fresh session keeps its rx "not yet taken by poll"; control
         // sends do not depend on data-channel consumption.
         agents.write().await.insert(
             id.to_string(),
-            Arc::new(RwLock::new(AgentSession::new(None))),
+            Arc::new(RwLock::new(AgentSession::new(circuit, None))),
         );
     }
 
@@ -294,10 +302,18 @@ mod tests {
         {
             let state_arc = agents.read().await.get("egress-1").cloned().unwrap();
             let st = state_arc.read().await;
-            for i in 0..256 {
+            for i in 0..256u64 {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&i.to_be_bytes());
+                bytes[15] = 1;
                 let frame = TunnelData {
-                    stream_id: format!("fill-{i}"),
-                    source: FrameSource::Agent("x".into()),
+                    stream_id: StreamId::from_bytes(bytes),
+                    origin: FrameOrigin::Agent(
+                        interflow_core::protocol::CircuitToken::from_hex(
+                            "12078a05e14f4e2c99b1679be1df7c30",
+                        )
+                        .unwrap(),
+                    ),
                     stream_type: FrameType::Data,
                     flags: 0,
                     data: Bytes::from_static(b"x"),
@@ -310,8 +326,15 @@ mod tests {
             assert!(
                 st.tx
                     .try_send(TunnelData {
-                        stream_id: "more".into(),
-                        source: FrameSource::Agent("x".into()),
+                        stream_id: StreamId::from_bytes([
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9
+                        ]),
+                        origin: FrameOrigin::Agent(
+                            interflow_core::protocol::CircuitToken::from_hex(
+                                "12078a05e14f4e2c99b1679be1df7c30",
+                            )
+                            .unwrap(),
+                        ),
                         stream_type: FrameType::Data,
                         flags: 0,
                         data: Bytes::new(),
@@ -323,7 +346,15 @@ mod tests {
 
         // Control channel delivery: immediate, no waiting, no dropping
         let started = Instant::now();
-        assert!(deliver_close_via_control(&agents, "egress-1", "s-1", "").await);
+        assert!(
+            deliver_close_via_control(
+                &agents,
+                "egress-1",
+                StreamId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                CloseReason::CloseFrame
+            )
+            .await
+        );
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "delivery must be immediate"
@@ -338,7 +369,10 @@ mod tests {
             .expect("control channel must have the frame enqueued")
             .expect("channel alive");
         assert_eq!(frame.stream_type, FrameType::Close);
-        assert_eq!(frame.stream_id, "s-1");
+        assert_eq!(
+            frame.stream_id,
+            StreamId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        );
     }
 
     /// Unregistered agent: returns false (the peer has no session; its
@@ -346,6 +380,14 @@ mod tests {
     #[tokio::test]
     async fn control_delivery_missing_agent_is_false() {
         let agents: SharedAgents = Arc::new(RwLock::new(HashMap::new()));
-        assert!(!deliver_close_via_control(&agents, "ghost", "s-1", "").await);
+        assert!(
+            !deliver_close_via_control(
+                &agents,
+                "ghost",
+                StreamId::from_bytes([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+                CloseReason::CloseFrame
+            )
+            .await
+        );
     }
 }

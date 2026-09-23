@@ -45,3 +45,18 @@ pub mod stack;
 pub use backend::*;
 pub use config::*;
 pub use stack::*;
+
+/// Deterministic canonical opaque stream id for bare-wire tests.
+pub fn opaque_stream_id(label: &str) -> interflow_core::protocol::StreamId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash as _, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    label.hash(&mut hasher);
+    let value = hasher.finish() | 1;
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&value.to_be_bytes());
+    bytes[8..].copy_from_slice(&value.to_le_bytes());
+    // The OR-1 lineage guarantees nonzero.
+    interflow_core::protocol::StreamId::from_bytes(bytes)
+}

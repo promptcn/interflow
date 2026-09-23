@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # Multi-stage build: compile the rust workspace → run on distroless.
 #
-# Builds `interflow-mesh` by default (site-to-site hub/agent). For `interflow-expose`:
-#   docker build --build-arg BINARY=interflow-expose -t interflow-expose:latest .
+# Builds `interflow-mesh` by default (site-to-site hub/agent). For the
+# unified CLI (ingress/agent from Credential Packs):
+#   docker build --build-arg BINARY=interflow -t interflow:latest .
 #
 # Run the mesh hub (mount config and certificates; relative paths inside
 # the config resolve against the config file's directory, i.e.
@@ -19,11 +20,12 @@
 #     -v $PWD/certs:/etc/interflow/certs:ro \
 #     interflow:latest agent --config /etc/interflow/agent.toml
 #
-# Run the expose edge (public entry point):
+# Run the ingress from its Credential Pack (issue it on an operator machine
+# with `interflow plan apply`; the pack directory carries identity + trust):
 #   docker run -d \
-#     -p 8443:8443 \
-#     -v $PWD/routes.toml:/etc/interflow/routes.toml:ro \
-#     interflow-expose:latest edge --listen 0.0.0.0:8443 --routes /etc/interflow/routes.toml --token $TOKEN
+#     -p 8443:8443 -p 16666:16666 \
+#     -v $PWD/dist/packs/ingress-edge:/etc/interflow/pack:ro \
+#     interflow:latest ingress run --pack /etc/interflow/pack
 
 ARG BINARY=interflow-mesh
 
@@ -55,7 +57,7 @@ ARG BINARY
 # Non-root, minimal image, no shell — reduces the attack surface
 COPY --from=builder /app /usr/local/bin/app
 
-# mesh hub defaults to 6666; expose edge defaults to 8443
+# mesh hub defaults to 6666; the ingress listener defaults to 8443
 EXPOSE 6666 8443 9100
 
 USER nonroot:nonroot

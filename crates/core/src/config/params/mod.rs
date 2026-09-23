@@ -22,7 +22,6 @@
 
 pub mod breaker;
 pub mod liveness;
-pub mod ops;
 pub mod shutdown;
 pub mod transport;
 
@@ -32,7 +31,6 @@ pub use liveness::{
     HeartbeatCadence, RECOVERY_MARGIN_SECS, TASK_STALL_FALLBACK_SECS, WATCHDOG_MARGIN_SECS,
     recovery_budget,
 };
-pub use ops::SIGHUP_RELOAD_DEBOUNCE;
 pub use shutdown::ShutdownBudget;
 pub use transport::{
     DEFAULT_CLIENT_WRITE_STALL_TIMEOUT, DEFAULT_H2_CONNECTION_WINDOW,

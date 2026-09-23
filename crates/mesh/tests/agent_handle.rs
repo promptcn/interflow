@@ -84,7 +84,7 @@ async fn start_connect_and_graceful_shutdown() {
     // (state_rx was consumed with the handle; use the supervisor join's
     // return value + event-stream closure to determine it)
 
-    let _ = hub.shutdown().await;
+    let _ = hub.shutdown_graceful().await;
 }
 
 #[tokio::test]
@@ -122,7 +122,7 @@ async fn no_hub_then_reconnect() {
     .await;
 
     handle.shutdown_graceful().await.expect("graceful shutdown");
-    let _ = hub.shutdown().await;
+    let _ = hub.shutdown_graceful().await;
 }
 
 #[tokio::test]

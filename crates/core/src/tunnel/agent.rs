@@ -7,7 +7,7 @@
 //! [`AgentTunnel::from_transport`] with zero consumer changes.
 
 use crate::error::{InterflowError, Result};
-use crate::protocol::StreamProto;
+use crate::protocol::{CloseReason, StreamId, StreamProto};
 use crate::tunnel::h2::{H2RequestBody, H2Tunnel};
 use crate::tunnel::session_tasks::SessionTasks;
 use crate::tunnel::transport::{IncomingStream, TunnelData, TunnelTransport};
@@ -24,7 +24,7 @@ use std::time::Duration;
 /// indefinitely), so exceeding the bound means the request path is dead in a
 /// form the receive-side watchdog can never see (it only starts once headers
 /// arrive) — including hyper SendRequest hang edge states after connection
-/// death (docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md §4.2).
+/// death.
 pub const DEFAULT_REQUEST_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// h2 session liveness parameters (the product of hub registration capability negotiation; see the `negotiation` module).
@@ -34,7 +34,7 @@ pub const DEFAULT_REQUEST_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(15);
 /// (proving the agent→hub data plane). A stall in either direction is
 /// converted into session rebuild / eviction by each end's own liveness
 /// detection, eliminating the "control plane alive, data plane dead" blind
-/// spot (docs/bug/2026-09-13-data-plane-stall-no-eviction.md).
+/// spot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct H2Liveness {
     /// Poll receive-side watchdog: receiving no frames at all (heartbeat
@@ -99,14 +99,14 @@ impl AgentTunnel {
     /// is cancelled the background poll exits. `liveness` decides the
     /// data-plane heartbeat shape (see [`H2Liveness`]).
     pub fn from_sender(
-        agent_id: String,
+        circuit: crate::protocol::CircuitToken,
         hub_url: &str,
         sender: SendRequest<H2RequestBody>,
         tasks: &SessionTasks,
         liveness: H2Liveness,
     ) -> Result<Self> {
         Ok(Self {
-            inner: std::sync::Arc::new(H2Tunnel::new(agent_id, hub_url, sender, tasks, liveness)),
+            inner: std::sync::Arc::new(H2Tunnel::new(circuit, hub_url, sender, tasks, liveness)),
         })
     }
 
@@ -127,13 +127,13 @@ impl AgentTunnel {
     /// Registers the dedicated channel for a response-direction stream
     pub async fn register_stream(
         &self,
-        stream_id: String,
+        stream_id: StreamId,
     ) -> tokio::sync::mpsc::Receiver<TunnelData> {
         self.inner.register_stream(stream_id).await
     }
 
     /// Unregisters the dedicated channel for a response-direction stream
-    pub async fn unregister_stream(&self, stream_id: &str) {
+    pub async fn unregister_stream(&self, stream_id: StreamId) {
         self.inner.unregister_stream(stream_id).await;
     }
 
@@ -145,7 +145,7 @@ impl AgentTunnel {
     }
 
     /// Unregisters the request-direction stream channel (called when a forwarder exits; idempotent).
-    pub async fn unregister_incoming_stream(&self, stream_id: &str) {
+    pub async fn unregister_incoming_stream(&self, stream_id: StreamId) {
         self.inner.unregister_incoming_stream(stream_id).await;
     }
 
@@ -163,56 +163,56 @@ impl AgentTunnel {
     /// Sends an open-stream signal to the hub (`proto` declares the stream's carrying protocol).
     pub async fn send_open(
         &self,
-        stream_id: &str,
+        stream_id: StreamId,
         target_agent: &str,
-        target_addr: Option<&str>,
         proto: StreamProto,
     ) -> Result<()> {
-        self.inner
-            .send_open(stream_id, target_agent, target_addr, proto)
-            .await
+        self.inner.send_open(stream_id, target_agent, proto).await
     }
 
     /// [`AgentTunnel::send_open`] with the per-stream e2e (inner TLS)
     /// declaration (`FLAG_E2E` on the Open frame).
     pub async fn send_open_with(
         &self,
-        stream_id: &str,
+        stream_id: StreamId,
         target_agent: &str,
-        target_addr: Option<&str>,
         proto: StreamProto,
         e2e: bool,
     ) -> Result<()> {
         self.inner
-            .send_open_with(stream_id, target_agent, target_addr, proto, e2e)
+            .send_open_with(stream_id, target_agent, proto, e2e)
             .await
     }
 
     /// Sends data to the hub (request direction, ingress → hub).
-    pub async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    pub async fn send_data(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         self.inner.send_data(stream_id, data).await
     }
 
     /// Sends data to the hub (response direction, egress → hub).
-    pub async fn send_data_response(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    pub async fn send_data_response(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         self.inner.send_data_response(stream_id, data).await
     }
 
     /// Sends a close signal to the hub (request direction).
-    pub async fn send_close(&self, stream_id: &str) -> Result<()> {
+    pub async fn send_close(&self, stream_id: StreamId) -> Result<()> {
         self.inner.send_close(stream_id).await
     }
 
     /// Sends a close signal to the hub (response direction). `reason`
-    /// travels in the Close payload (empty = ordinary close); see
+    /// travels as the u8 Close payload code; see
     /// [`TunnelTransport::send_close_response`].
-    pub async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()> {
+    pub async fn send_close_response(
+        &self,
+        stream_id: StreamId,
+        reason: CloseReason,
+    ) -> Result<()> {
         self.inner.send_close_response(stream_id, reason).await
     }
 }
 
 /// Hot-swappable session slot: the embedder-facing tunnel backend
-/// (docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md).
+///.
 ///
 /// Holds the transport of the *current* hub session. The agent supervisor
 /// installs a fresh backend on every session establishment and withdraws it
@@ -293,47 +293,49 @@ fn slot_empty_error() -> InterflowError {
 impl TunnelTransport for SlotBackend {
     async fn send_open_with(
         &self,
-        stream_id: &str,
+        stream_id: StreamId,
         target_agent: &str,
-        target_addr: Option<&str>,
         proto: StreamProto,
         e2e: bool,
     ) -> Result<()> {
         self.backend()
             .ok_or_else(slot_empty_error)?
-            .send_open_with(stream_id, target_agent, target_addr, proto, e2e)
+            .send_open_with(stream_id, target_agent, proto, e2e)
             .await
     }
 
-    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    async fn send_data(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         self.backend()
             .ok_or_else(slot_empty_error)?
             .send_data(stream_id, data)
             .await
     }
 
-    async fn send_data_response(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    async fn send_data_response(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         self.backend()
             .ok_or_else(slot_empty_error)?
             .send_data_response(stream_id, data)
             .await
     }
 
-    async fn send_close(&self, stream_id: &str) -> Result<()> {
+    async fn send_close(&self, stream_id: StreamId) -> Result<()> {
         self.backend()
             .ok_or_else(slot_empty_error)?
             .send_close(stream_id)
             .await
     }
 
-    async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()> {
+    async fn send_close_response(&self, stream_id: StreamId, reason: CloseReason) -> Result<()> {
         self.backend()
             .ok_or_else(slot_empty_error)?
             .send_close_response(stream_id, reason)
             .await
     }
 
-    async fn register_stream(&self, stream_id: String) -> tokio::sync::mpsc::Receiver<TunnelData> {
+    async fn register_stream(
+        &self,
+        stream_id: StreamId,
+    ) -> tokio::sync::mpsc::Receiver<TunnelData> {
         match self.backend() {
             // Empty slot: hand out an already-sealed channel — the consumer's
             // read half sees closure immediately (no stream can be established
@@ -343,7 +345,7 @@ impl TunnelTransport for SlotBackend {
         }
     }
 
-    async fn unregister_stream(&self, stream_id: &str) {
+    async fn unregister_stream(&self, stream_id: StreamId) {
         if let Some(backend) = self.backend() {
             backend.unregister_stream(stream_id).await;
         }
@@ -359,7 +361,7 @@ impl TunnelTransport for SlotBackend {
         }
     }
 
-    async fn unregister_incoming_stream(&self, stream_id: &str) {
+    async fn unregister_incoming_stream(&self, stream_id: StreamId) {
         if let Some(backend) = self.backend() {
             backend.unregister_incoming_stream(stream_id).await;
         }

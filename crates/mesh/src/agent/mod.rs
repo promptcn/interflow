@@ -5,7 +5,6 @@ pub mod egress;
 pub mod handle;
 pub mod ingress;
 pub mod ingress_udp;
-pub mod persist;
 pub mod restart;
 pub mod rules;
 pub mod ssrf_deny;

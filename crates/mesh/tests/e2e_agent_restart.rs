@@ -129,13 +129,17 @@ async fn poll_drop_returns_rx_for_next_poll() {
         .unwrap();
     let resp = send_request.send_request(req).await.expect("register");
     assert!(resp.status().is_success(), "register: {}", resp.status());
+    let body = resp.into_body().collect().await.expect("register body");
+    let circuit = interflow_core::tunnel::negotiation::RegisterResponse::parse(&body.to_bytes())
+        .expect("register capability")
+        .circuit_token;
 
     // First poll: get the streaming body then drop it immediately (simulating
     // a connection break)
     let req = Request::builder()
         .method("GET")
         .uri("/poll")
-        .header("x-agent-id", "poll-agent")
+        .header("x-circuit-token", circuit.to_hex())
         .body(Empty::new())
         .unwrap();
     let resp = send_request.send_request(req).await.expect("poll 1");
@@ -150,7 +154,7 @@ async fn poll_drop_returns_rx_for_next_poll() {
     let req = Request::builder()
         .method("GET")
         .uri("/poll")
-        .header("x-agent-id", "poll-agent")
+        .header("x-circuit-token", circuit.to_hex())
         .body(Empty::new())
         .unwrap();
     let resp = send_request.send_request(req).await.expect("poll 2");
@@ -173,7 +177,7 @@ async fn poll_drop_returns_rx_for_next_poll() {
 /// overwrite the new channel; the new connection's poll should get 200.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_rx_return_after_reregister_is_discarded() {
-    use http_body_util::Empty;
+    use http_body_util::{BodyExt, Empty};
     use hyper::Request;
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
@@ -202,20 +206,30 @@ async fn stale_rx_return_after_reregister_is_discarded() {
         send_request
     }
 
+    async fn register(
+        sender: &mut hyper::client::conn::http2::SendRequest<Empty<bytes::Bytes>>,
+    ) -> interflow_core::protocol::CircuitToken {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/register")
+            .header("x-agent-id", "gen-agent")
+            .body(Empty::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.expect("register");
+        assert!(resp.status().is_success());
+        let body = resp.into_body().collect().await.expect("register body");
+        interflow_core::tunnel::negotiation::RegisterResponse::parse(&body.to_bytes())
+            .expect("register capability")
+            .circuit_token
+    }
+
     // Connection A: register + poll (kept hanging)
     let mut conn_a = connect(hub_port).await;
-    let req = Request::builder()
-        .method("POST")
-        .uri("/register")
-        .header("x-agent-id", "gen-agent")
-        .body(Empty::new())
-        .unwrap();
-    let resp = conn_a.send_request(req).await.expect("register A");
-    assert!(resp.status().is_success());
+    let circuit_a = register(&mut conn_a).await;
     let req = Request::builder()
         .method("GET")
         .uri("/poll")
-        .header("x-agent-id", "gen-agent")
+        .header("x-circuit-token", circuit_a.to_hex())
         .body(Empty::new())
         .unwrap();
     let poll_a = conn_a.send_request(req).await.expect("poll A");
@@ -224,14 +238,7 @@ async fn stale_rx_return_after_reregister_is_discarded() {
     // Connection B: register with the same id (channel rebuilt in place,
     // generation+1)
     let mut conn_b = connect(hub_port).await;
-    let req = Request::builder()
-        .method("POST")
-        .uri("/register")
-        .header("x-agent-id", "gen-agent")
-        .body(Empty::new())
-        .unwrap();
-    let resp = conn_b.send_request(req).await.expect("register B");
-    assert!(resp.status().is_success());
+    register(&mut conn_b).await;
 
     // Disconnect A (triggers the stale return, which the generation mechanism
     // should discard)
@@ -241,10 +248,11 @@ async fn stale_rx_return_after_reregister_is_discarded() {
     // Connection C: its poll should get the channel rebuilt by B (200), not
     // A's stale receiver
     let mut conn_c = connect(hub_port).await;
+    let circuit_c = register(&mut conn_c).await;
     let req = Request::builder()
         .method("GET")
         .uri("/poll")
-        .header("x-agent-id", "gen-agent")
+        .header("x-circuit-token", circuit_c.to_hex())
         .body(Empty::new())
         .unwrap();
     let resp = conn_c.send_request(req).await.expect("poll C");
@@ -253,6 +261,71 @@ async fn stale_rx_return_after_reregister_is_discarded() {
         200,
         "poll after the channel rebuild should succeed"
     );
+}
+
+/// Data-plane circuits rotate on every registration. Preempting the same
+/// semantic agent from a new TLS connection must invalidate the old circuit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn re_registration_rotates_and_invalidates_circuit() {
+    use http_body_util::{BodyExt, Empty};
+    use hyper::Request;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let hub_port = pick_ephemeral_port();
+    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+
+    async fn connect(
+        hub_port: u16,
+    ) -> (
+        hyper::client::conn::http2::SendRequest<Empty<bytes::Bytes>>,
+        interflow_core::protocol::CircuitToken,
+    ) {
+        let (mut send_request, conn) =
+            hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+                .handshake::<_, Empty<bytes::Bytes>>(TokioIo::new(
+                    interflow_testkit::tls_client_connect(
+                        certs(),
+                        "rotate-agent",
+                        format!("127.0.0.1:{hub_port}").parse().unwrap(),
+                    )
+                    .await
+                    .expect("tls"),
+                ))
+                .await
+                .expect("handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/register")
+            .header("x-agent-id", "rotate-agent")
+            .body(Empty::new())
+            .unwrap();
+        send_request.ready().await.expect("ready");
+        let resp = send_request.send_request(req).await.expect("register");
+        assert!(resp.status().is_success());
+        let body = resp.into_body().collect().await.expect("register body");
+        let circuit =
+            interflow_core::tunnel::negotiation::RegisterResponse::parse(&body.to_bytes())
+                .expect("capability")
+                .circuit_token;
+        (send_request, circuit)
+    }
+
+    let (mut old, old_circuit) = connect(hub_port).await;
+    let (_new, new_circuit) = connect(hub_port).await;
+    assert_ne!(old_circuit, new_circuit);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/poll")
+        .header("x-circuit-token", old_circuit.to_hex())
+        .body(Empty::new())
+        .unwrap();
+    let resp = old.send_request(req).await.expect("old poll");
+    assert_eq!(resp.status(), 401, "the old circuit must be invalidated");
 }
 
 /// Wait until the agent state satisfies `pred` or the timeout elapses

@@ -1,7 +1,7 @@
 //! TCP tunnel stream pump: bidirectional socket ↔ tunnel-frame transfer,
 //! shared by the expose edge and mesh ingress.
 //!
-//! Design motivation (docs/bug/2026-09-13-select-branch-double-await-joinhandle-panic.md):
+//! Design motivation:
 //! the old implementation `tokio::spawn`ed the read/write halves separately,
 //! then `select!`ed two `&mut JoinHandle`s and awaited the winning handle
 //! again inside the branch body — polling a JoinHandle already polled to
@@ -32,7 +32,7 @@
 //! cross-hop race (an HTTP/1.1 keepalive client hangs up first, the hub tears
 //! the stream on our request-direction close, and the reason token never
 //! lands) — callers deriving health signals from the stream must not depend
-//! on that timing (docs/bug/2026-09-17-edge-route-breaker-stuck-open.md).
+//! on that timing.
 //!
 //! For reference: the egress UDP pump (mesh/src/agent/egress.rs) must spawn
 //! (it shares last_active idle supervision etc., which is not isomorphic);
@@ -41,13 +41,13 @@
 //! correct paradigm for spawn-style supervision loops.
 
 use crate::error::Result;
-use crate::protocol::CloseReason;
-use crate::protocol::FrameType;
+use crate::protocol::{CloseReason, FrameType, StreamId};
 use crate::tunnel::AgentTunnel;
 use crate::tunnel::transport::TunnelData;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -102,10 +102,10 @@ impl SharedProgress {
 #[async_trait]
 pub trait StreamPumpTarget: Send + Sync {
     /// Sends a data frame to the peer (request direction).
-    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()>;
+    async fn send_data(&self, stream_id: StreamId, data: Bytes) -> Result<()>;
 
     /// Notifies the peer of stream teardown (request-direction Close).
-    async fn send_close(&self, stream_id: &str) -> Result<()>;
+    async fn send_close(&self, stream_id: StreamId) -> Result<()>;
 
     /// Unregisters this stream's response-direction channel in dispatch
     /// (idempotent).
@@ -116,7 +116,7 @@ pub trait StreamPumpTarget: Send + Sync {
     /// `None`. This coupling was implicit (undocumented, untested) until the
     /// 2026-09-16 one-way-idle postmortem; it is now part of the trait
     /// contract and mirrored by the pump unit-test mock.
-    async fn unregister_stream(&self, stream_id: &str);
+    async fn unregister_stream(&self, stream_id: StreamId);
 }
 
 // Fully-qualified calls forward to AgentTunnel's inherent methods (inherent
@@ -126,15 +126,15 @@ pub trait StreamPumpTarget: Send + Sync {
 #[allow(clippy::use_self)]
 #[async_trait]
 impl StreamPumpTarget for AgentTunnel {
-    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    async fn send_data(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         Self::send_data(self, stream_id, data).await
     }
 
-    async fn send_close(&self, stream_id: &str) -> Result<()> {
+    async fn send_close(&self, stream_id: StreamId) -> Result<()> {
         Self::send_close(self, stream_id).await
     }
 
-    async fn unregister_stream(&self, stream_id: &str) {
+    async fn unregister_stream(&self, stream_id: StreamId) {
         Self::unregister_stream(self, stream_id).await;
     }
 }
@@ -158,6 +158,14 @@ pub struct PumpConfig {
     /// Log prefix ("edge" / "ingress").
     pub log_label: &'static str,
 }
+
+/// Duplex half-close drain window.
+///
+/// After the local endpoint FINs, the tunnel read half keeps consuming an
+/// in-flight request tail before dispatch is cut; a silent peer is then closed
+/// out boundedly (the historical TCP-forwarder drain contract, retained under
+/// inner TLS).
+pub const DUPLEX_LOCAL_EOF_DRAIN: Duration = Duration::from_secs(5);
 
 /// How one pumped stream ended, assembled from **local observation only** —
 /// immune to the cross-hop delivery race of the peer's Close reason token.
@@ -202,7 +210,7 @@ pub async fn pump_tcp_stream<R, W, T>(
     wr: W,
     mut data_rx: mpsc::Receiver<TunnelData>,
     target: &T,
-    stream_id: &str,
+    stream_id: StreamId,
     cfg: &PumpConfig,
 ) -> StreamOutcome
 where
@@ -279,7 +287,7 @@ where
                 Ok(Some(msg)) => {
                     progress.touch();
                     if matches!(msg.stream_type, FrameType::Close) {
-                        outcome.close_reason = Some(parse_close_reason(stream_id, &msg.data));
+                        outcome.close_reason = Some(parse_close_reason(&msg.data));
                         break;
                     }
                     if !msg.data.is_empty() {
@@ -347,11 +355,10 @@ where
 /// The hub emits `CLOSE:{sid}:{reason}` (empty reason = ordinary close);
 /// anything that does not carry this prefix (a late/foreign frame) is
 /// treated as a reason-less close.
-pub(crate) fn parse_close_reason(stream_id: &str, data: &[u8]) -> CloseReason {
-    let prefix = format!("CLOSE:{stream_id}:");
-    String::from_utf8_lossy(data)
-        .strip_prefix(&prefix)
-        .map_or(CloseReason::CloseFrame, CloseReason::from_token)
+/// Extracts the reason from a Close payload (`[reason_code u8]`;
+/// malformed payloads are the ordinary close).
+pub(crate) const fn parse_close_reason(data: &[u8]) -> CloseReason {
+    CloseReason::from_payload(data)
 }
 
 /// Pumps one e2e (inner TLS) stream between two full duplex endpoints.
@@ -363,19 +370,17 @@ pub(crate) fn parse_close_reason(stream_id: &str, data: &[u8]) -> CloseReason {
 /// write-stall budget guards writes toward `local` (the only sink that can
 /// stall — the tunnel side is a channel send with backpressure).
 ///
-/// `cut_delivery` is invoked exactly once before the pump returns (both
-/// end paths): it must stop dispatch from delivering new frames for the
-/// stream — the ingress unregisters its response channel, the egress its
-/// incoming-stream channel (the same contract
-/// [`StreamPumpTarget::unregister_stream`] documents for the plain pump).
-/// On the local-EOF path it is what converges the drain half: the channel
-/// closure surfaces as the tunnel side's EOF.
+/// `cut_delivery` is invoked exactly once before the pump returns (both end
+/// paths): it must stop dispatch from delivering new frames for the stream —
+/// the ingress unregisters its response channel, the egress its incoming-stream
+/// channel. On the local-EOF path it runs only after the bounded drain below.
 ///
 /// End-of-stream choreography (mirroring [`pump_tcp_stream`]'s close-out
 /// semantics):
-/// - `local` EOF first → `tunnel.shutdown()` (TLS close_notify rides Data
-///   frames, then the adapter's Close) and the tunnel→local half drains
-///   what is already in flight;
+/// - `local` EOF first → the tunnel write half stays open for the late request
+///   drain window (`local_eof_drain`; egress uses five seconds, public client
+///   endpoints use zero), then dispatch is cut and the caller's stream-close
+///   epilogue owns teardown; `local_eof_reason` is the authoritative outcome;
 /// - tunnel EOF first (peer Close / channel closure surfaced as EOF by the
 ///   TLS layer) → `local` is shut down and the pump returns.
 ///
@@ -385,7 +390,9 @@ pub async fn pump_duplex<L, T, F>(
     local: L,
     tunnel: T,
     cfg: &PumpConfig,
-    stream_id: &str,
+    local_eof_reason: CloseReason,
+    local_eof_drain: Duration,
+    stream_id: StreamId,
     cut_delivery: F,
 ) -> StreamOutcome
 where
@@ -395,6 +402,8 @@ where
 {
     let label = cfg.log_label;
     let progress = SharedProgress::new();
+    let response_relayed = Arc::new(AtomicBool::new(false));
+    let relay_observer = Arc::clone(&response_relayed);
     // Each half owns the crossed halves of the two endpoints (the same
     // single-reader/single-writer split the plain pump gets for free from
     // `TcpStream::into_split`).
@@ -435,9 +444,12 @@ where
                 Err(_) => {}
             }
         }
-        // Local direction ended: send the TLS close_notify through the
-        // tunnel (Data frames), then the adapter's stream close.
-        let _ = tunnel_wr.shutdown().await;
+        // Local direction ended: keep the tunnel write half open for the
+        // bounded drain window (late request tail). The caller's dispatch cut
+        // and stream close epilogue own final teardown; shutting down here
+        // would race a Close back through the tunnel half and misclassify the
+        // authoritative local EOF.
+        tokio::time::sleep(local_eof_drain).await;
     };
 
     // tunnel → local: sole observer of the outcome facts.
@@ -464,7 +476,10 @@ where
                     match tokio::time::timeout(cfg.write_stall_timeout, local_wr.write_all(&chunk))
                         .await
                     {
-                        Ok(Ok(())) => outcome.response_relayed = true,
+                        Ok(Ok(())) => {
+                            outcome.response_relayed = true;
+                            relay_observer.store(true, Ordering::Release);
+                        }
                         Ok(Err(e)) => {
                             debug!("{label} failed to write local endpoint: {e}");
                             break;
@@ -501,18 +516,35 @@ where
         out = &mut tunnel_half => HalfDone::Tunnel(out),
         () = &mut local_half => HalfDone::Local,
     };
-    // Dispatch stops delivering for this stream before the pump returns —
-    // on the local-EOF path that closure is what converges the drain half.
-    (&mut cut_delivery).await;
 
     match done {
         // Tunnel side ended (peer Close / EOF): the local endpoint is
         // dropped with this function — nothing more to relay.
-        HalfDone::Tunnel(outcome) => outcome,
+        HalfDone::Tunnel(outcome) => {
+            // Dispatch stops delivering for this stream before the pump returns.
+            (&mut cut_delivery).await;
+            outcome
+        }
         // Local endpoint EOF: drain the tunnel→local direction until the
-        // peer's Close arrives (our close_notify went out in the local
-        // half's epilogue; the cut channel closure ends the drain).
-        HalfDone::Local => (&mut tunnel_half).await,
+        // peer's Close arrives, then cut dispatch boundedly even if a peer
+        // withholds it.
+        HalfDone::Local => {
+            let outcome = match tokio::time::timeout(local_eof_drain, &mut tunnel_half).await {
+                Ok(mut outcome) => {
+                    // The local endpoint initiated the close; its EOF is the
+                    // authoritative outcome even if the peer's ordinary Close
+                    // races back through the tunnel half.
+                    outcome.close_reason = Some(local_eof_reason);
+                    outcome
+                }
+                Err(_) => StreamOutcome {
+                    close_reason: Some(local_eof_reason),
+                    response_relayed: response_relayed.load(Ordering::Acquire),
+                },
+            };
+            (&mut cut_delivery).await;
+            outcome
+        }
     }
 }
 
@@ -560,16 +592,16 @@ mod tests {
 
     #[async_trait]
     impl StreamPumpTarget for MockTarget {
-        async fn send_data(&self, _stream_id: &str, data: Bytes) -> Result<()> {
+        async fn send_data(&self, _stream_id: StreamId, data: Bytes) -> Result<()> {
             self.data.lock().unwrap().push(data);
             Ok(())
         }
-        async fn send_close(&self, stream_id: &str) -> Result<()> {
-            self.closes.lock().unwrap().push(stream_id.to_string());
+        async fn send_close(&self, stream_id: StreamId) -> Result<()> {
+            self.closes.lock().unwrap().push(stream_id.to_hex());
             Ok(())
         }
-        async fn unregister_stream(&self, stream_id: &str) {
-            self.unregisters.lock().unwrap().push(stream_id.to_string());
+        async fn unregister_stream(&self, stream_id: StreamId) {
+            self.unregisters.lock().unwrap().push(stream_id.to_hex());
             // Dispatch contract: cut frame delivery for this stream.
             *self.response_tx.lock().unwrap() = None;
         }
@@ -577,8 +609,8 @@ mod tests {
 
     fn td(ftype: FrameType, data: &[u8]) -> TunnelData {
         TunnelData {
-            stream_id: "s1".to_string(),
-            source: crate::tunnel::transport::FrameSource::Response,
+            stream_id: StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            origin: crate::protocol::FrameOrigin::Response,
             data: Bytes::copy_from_slice(data),
             stream_type: ftype,
             flags: 0,
@@ -606,15 +638,29 @@ mod tests {
         let (rd, wr) = tokio::io::split(sock);
         let (tx, rx) = mpsc::channel(8);
         let target = MockTarget::default();
-        tx.send(td(FrameType::Close, b"CLOSE:s1:connect_failed"))
-            .await
-            .unwrap();
+        tx.send(td(
+            FrameType::Close,
+            &[CloseReason::ConnectFailed.as_code()],
+        ))
+        .await
+        .unwrap();
 
-        let outcome = pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        let outcome = pump_tcp_stream(
+            rd,
+            wr,
+            rx,
+            &target,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            &test_cfg(),
+        )
+        .await;
 
         assert_eq!(outcome.close_reason, Some(CloseReason::ConnectFailed));
         assert!(!outcome.response_relayed);
-        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        assert_eq!(
+            target.unregister_events(),
+            vec!["12078a05e14f4e2c99b1679be1df7c31".to_string()]
+        );
         // After the pump returns the write half is dropped: the client reads EOF
         let mut buf = [0u8; 1];
         assert_eq!(peer.read(&mut buf).await.unwrap(), 0);
@@ -631,10 +677,21 @@ mod tests {
         let target = MockTarget::default();
         tx.send(td(FrameType::Close, b"")).await.unwrap();
 
-        let outcome = pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        let outcome = pump_tcp_stream(
+            rd,
+            wr,
+            rx,
+            &target,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            &test_cfg(),
+        )
+        .await;
 
         assert_eq!(outcome.close_reason, Some(CloseReason::CloseFrame));
-        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        assert_eq!(
+            target.unregister_events(),
+            vec!["12078a05e14f4e2c99b1679be1df7c31".to_string()]
+        );
     }
 
     /// Regression (the exact shape of the 2026-09-17 stuck-OPEN bug): an
@@ -661,7 +718,15 @@ mod tests {
             .unwrap();
         peer.shutdown().await.unwrap();
 
-        let outcome = pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        let outcome = pump_tcp_stream(
+            rd,
+            wr,
+            rx,
+            &target,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            &test_cfg(),
+        )
+        .await;
 
         assert_eq!(outcome.close_reason, None);
         assert!(
@@ -685,7 +750,15 @@ mod tests {
         peer.write_all(b"req").await.unwrap();
         peer.shutdown().await.unwrap();
 
-        let outcome = pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        let outcome = pump_tcp_stream(
+            rd,
+            wr,
+            rx,
+            &target,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            &test_cfg(),
+        )
+        .await;
 
         assert_eq!(outcome.close_reason, None);
         assert!(!outcome.response_relayed);
@@ -711,11 +784,25 @@ mod tests {
         peer.write_all(b"req").await.unwrap();
         peer.shutdown().await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        pump_tcp_stream(
+            rd,
+            wr,
+            rx,
+            &target,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            &test_cfg(),
+        )
+        .await;
 
         assert_eq!(target.sent_data(), vec![Bytes::from_static(b"req")]);
-        assert_eq!(target.close_calls(), vec!["s1".to_string()]);
-        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        assert_eq!(
+            target.close_calls(),
+            vec!["12078a05e14f4e2c99b1679be1df7c31".to_string()]
+        );
+        assert_eq!(
+            target.unregister_events(),
+            vec!["12078a05e14f4e2c99b1679be1df7c31".to_string()]
+        );
         let mut got = Vec::new();
         peer.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"resp-1resp-2");
@@ -733,9 +820,20 @@ mod tests {
         // write_all hangs → stall timeout
         tx.send(td(FrameType::Data, &[7u8; 64])).await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        pump_tcp_stream(
+            rd,
+            wr,
+            rx,
+            &target,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            &test_cfg(),
+        )
+        .await;
 
-        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        assert_eq!(
+            target.unregister_events(),
+            vec!["12078a05e14f4e2c99b1679be1df7c31".to_string()]
+        );
     }
 
     /// Channel closed (dispatch poisoning / peer teardown / already
@@ -748,9 +846,20 @@ mod tests {
         drop(tx);
         let target = MockTarget::default();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        pump_tcp_stream(
+            rd,
+            wr,
+            rx,
+            &target,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            &test_cfg(),
+        )
+        .await;
 
-        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        assert_eq!(
+            target.unregister_events(),
+            vec!["12078a05e14f4e2c99b1679be1df7c31".to_string()]
+        );
     }
 
     /// Peer gone: a socket write error closes out the pump.
@@ -763,9 +872,20 @@ mod tests {
         let target = MockTarget::default();
         tx.send(td(FrameType::Data, b"x")).await.unwrap();
 
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &test_cfg()).await;
+        pump_tcp_stream(
+            rd,
+            wr,
+            rx,
+            &target,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            &test_cfg(),
+        )
+        .await;
 
-        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        assert_eq!(
+            target.unregister_events(),
+            vec!["12078a05e14f4e2c99b1679be1df7c31".to_string()]
+        );
     }
 
     /// Regression (caught by the soak gate's first full-duration run,
@@ -802,7 +922,15 @@ mod tests {
         let started = tokio::time::Instant::now();
         let t = Arc::clone(&target);
         let pump = tokio::spawn(async move {
-            pump_tcp_stream(rd, wr, rx, &*t, "s1", &cfg).await;
+            pump_tcp_stream(
+                rd,
+                wr,
+                rx,
+                &*t,
+                StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+                &cfg,
+            )
+            .await;
         });
 
         // Mid-run probe at 3× the idle budget with response frames flowing:
@@ -825,7 +953,10 @@ mod tests {
             elapsed >= Duration::from_millis(450),
             "pump died after {elapsed:?} — one-way idle tore down an actively served push stream"
         );
-        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        assert_eq!(
+            target.unregister_events(),
+            vec!["12078a05e14f4e2c99b1679be1df7c31".to_string()]
+        );
     }
 
     /// The shared budget still expires: with no traffic in either direction
@@ -842,7 +973,15 @@ mod tests {
         cfg.idle_timeout = Duration::from_millis(120);
 
         let started = tokio::time::Instant::now();
-        pump_tcp_stream(rd, wr, rx, &target, "s1", &cfg).await;
+        pump_tcp_stream(
+            rd,
+            wr,
+            rx,
+            &target,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            &cfg,
+        )
+        .await;
         let elapsed = started.elapsed();
         drop(tx);
 
@@ -850,7 +989,10 @@ mod tests {
             elapsed >= Duration::from_millis(100) && elapsed <= Duration::from_millis(250),
             "idle teardown fired at {elapsed:?}, expected ~120ms"
         );
-        assert_eq!(target.unregister_events(), vec!["s1".to_string()]);
+        assert_eq!(
+            target.unregister_events(),
+            vec!["12078a05e14f4e2c99b1679be1df7c31".to_string()]
+        );
     }
 
     // ---- pump_duplex (e2e streams) ----
@@ -865,7 +1007,16 @@ mod tests {
         tunnel_peer.write_all(b"resp-data").await.unwrap();
         drop(tunnel_peer); // peer Close → tunnel EOF
 
-        let outcome = pump_duplex(local, tunnel, &test_cfg(), "s1", async {}).await;
+        let outcome = pump_duplex(
+            local,
+            tunnel,
+            &test_cfg(),
+            CloseReason::CloseFrame,
+            Duration::ZERO,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            async {},
+        )
+        .await;
         assert!(
             outcome.response_relayed,
             "tunnel bytes must reach the local end"
@@ -879,7 +1030,7 @@ mod tests {
     /// Local endpoint EOF: its bytes flow to the tunnel side, the shutdown
     /// propagates, and the pump returns after draining the reverse
     /// direction (no unregister — that stays with the caller).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn duplex_local_eof_forwards_and_returns() {
         let (local, mut local_peer) = duplex(64 * 1024);
         let (tunnel, mut tunnel_peer) = duplex(64 * 1024);
@@ -894,7 +1045,16 @@ mod tests {
             got
         });
 
-        let outcome = pump_duplex(local, tunnel, &test_cfg(), "s1", async {}).await;
+        let outcome = pump_duplex(
+            local,
+            tunnel,
+            &test_cfg(),
+            CloseReason::CloseFrame,
+            Duration::ZERO,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            async {},
+        )
+        .await;
         assert!(!outcome.response_relayed);
         assert_eq!(tunnel_side.await.unwrap(), b"req-data");
     }
@@ -907,7 +1067,16 @@ mod tests {
         let (tunnel, mut tunnel_peer) = duplex(64 * 1024);
         tunnel_peer.write_all(&[7u8; 64]).await.unwrap();
 
-        pump_duplex(local, tunnel, &test_cfg(), "s1", async {}).await;
+        pump_duplex(
+            local,
+            tunnel,
+            &test_cfg(),
+            CloseReason::CloseFrame,
+            Duration::ZERO,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            async {},
+        )
+        .await;
         // Reaching here at all is the assertion: the stall budget fired
         // instead of hanging forever on write_all.
     }

@@ -32,25 +32,16 @@ const HARD_DENY_HOSTNAMES: &[&str] = &[
 ];
 
 /// Extract the host part from a target string (strips the port and square
-/// brackets).
+/// brackets) via the shared authority parser.
 ///
 /// Accepts: `host` / `host:port` / `[::1]` / `[::1]:port` / `1.2.3.4` /
-/// `1.2.3.4:port`
-fn extract_host(target: &str) -> &str {
+/// `1.2.3.4:port`. Forms the parser rejects (bare unbracketed IPv6,
+/// malformed brackets, garbage ports) are returned whole: the deny
+/// comparison simply misses them and the dial path rejects them — fail
+/// closed downstream, same as before.
+fn extract_host(target: &str) -> String {
     let t = target.trim();
-    // [ipv6]:port or [ipv6]
-    if t.starts_with('[') {
-        if let Some(end) = t.find(']') {
-            return &t[1..end];
-        }
-        return t; // malformed; leave it to the later parsing
-    }
-    // host:port (an unbracketed IPv6 should not reach here, since it
-    // contains multiple colons)
-    match t.rsplit_once(':') {
-        Some((host, port)) if !port.contains(':') => host,
-        _ => t,
-    }
+    interflow_util::parse_authority(t).map_or_else(|_| t.to_owned(), |parsed| parsed.host)
 }
 
 /// Check at the string level whether a target hits the SSRF blocklist.
@@ -58,10 +49,10 @@ fn extract_host(target: &str) -> &str {
 /// - After stripping the port/brackets, compare case-insensitively against
 ///   `HARD_DENY_HOSTNAMES`
 /// - If the host parses as an `IpAddr`, also check `is_ip_ssrf_blocked`
-pub fn is_ssrf_blocked(target: &str) -> bool {
+pub(crate) fn is_ssrf_blocked(target: &str) -> bool {
     let host = extract_host(target);
     let lower = host.to_ascii_lowercase();
-    if HARD_DENY_HOSTNAMES.iter().any(|h| h == &lower) {
+    if HARD_DENY_HOSTNAMES.contains(&lower.as_str()) {
         return true;
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -187,5 +178,20 @@ mod tests {
         assert_eq!(extract_host("[fe80::1]"), "fe80::1");
         assert_eq!(extract_host("example.com:443"), "example.com");
         assert_eq!(extract_host("example.com"), "example.com");
+        // surrounding whitespace is trimmed
+        assert_eq!(extract_host("  example.com:443\r\n"), "example.com");
+    }
+
+    #[test]
+    fn unparseable_targets_pass_through_whole_and_still_fail_closed() {
+        // Forms the authority parser rejects keep the old defer semantics:
+        // returned whole, missed by the string deny list, and rejected by
+        // the dial path's own parsing. The bare IPv6 still parses as an
+        // IpAddr for the IP-level check.
+        assert_eq!(extract_host("::1"), "::1");
+        assert_eq!(extract_host("[malformed"), "[malformed");
+        assert!(!is_ssrf_blocked("[malformed"));
+        // bare unbracketed IPv6 still reaches the IP-level check
+        assert!(is_ssrf_blocked("::ffff:169.254.169.254"));
     }
 }

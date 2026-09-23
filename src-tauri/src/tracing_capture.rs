@@ -20,6 +20,11 @@ pub struct LogLine {
     pub level: String,
     pub target: String,
     pub message: String,
+    /// Node attribution: the `node` field the engine crates (and the node
+    /// manager itself) attach to their events — the pack's node name.
+    /// `None` = not attributable to one node (shown only in the all-nodes
+    /// view).
+    pub node: Option<String>,
 }
 
 /// Rust-side ring buffer (replayed when the frontend starts/reconnects).
@@ -71,29 +76,41 @@ impl GuiLogLayer {
     }
 }
 
-struct MessageVisitor {
-    message: String,
+pub struct MessageVisitor {
+    pub message: String,
+    pub node: Option<String>,
+}
+
+impl MessageVisitor {
+    pub const fn new() -> Self {
+        Self {
+            message: String::new(),
+            node: None,
+        }
+    }
 }
 
 impl Visit for MessageVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{value:?}");
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "node" => self.node = Some(format!("{value:?}")),
+            _ => {}
         }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
+        match field.name() {
+            "message" => self.message = value.to_string(),
+            "node" => self.node = Some(value.to_string()),
+            _ => {}
         }
     }
 }
 
 impl<S: Subscriber> Layer<S> for GuiLogLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let mut visitor = MessageVisitor {
-            message: String::new(),
-        };
+        let mut visitor = MessageVisitor::new();
         event.record(&mut visitor);
         if visitor.message.is_empty() {
             return;
@@ -103,6 +120,7 @@ impl<S: Subscriber> Layer<S> for GuiLogLayer {
             level: level_name(*event.metadata().level()),
             target: event.metadata().target().to_string(),
             message: visitor.message,
+            node: visitor.node,
         });
     }
 }
@@ -122,7 +140,7 @@ fn level_name(level: Level) -> String {
 /// Sharing the formatter is what lets GUI lines correlate with hub-side
 /// journalctl lines at microsecond precision. No new dependency — `SystemTime`
 /// is the fmt layer's default timer.
-fn rfc3339_now() -> String {
+pub fn rfc3339_now() -> String {
     use tracing_subscriber::fmt::format::Writer;
     use tracing_subscriber::fmt::time::FormatTime;
     let mut buf = String::new();

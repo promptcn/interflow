@@ -3,9 +3,12 @@
 //!
 //! Scenario 1 (`required`): behind a trusted loopback proxy, the per-IP
 //! rate limit keys on the right-most XFF entry — one client exhausts its
-//! budget while a different client is isolated from it.
+//! budget (answered with a real `429 Too Many Requests` + `Retry-After`,
+//! not the zero-byte close that made the fronting nginx synthesize 502s)
+//! while a different client is isolated from it.
 //! Scenario 2 (`required`): a trusted proxy that sends no header is
-//! rejected fail-closed (zero-byte close).
+//! rejected fail-closed (zero-byte close — that rejection predates the
+//! gate and stays silent).
 //! Scenario 3 (untrusted peer): XFF from a non-trusted source is ignored —
 //! the TCP peer is the effective IP and the request still routes.
 //! The audit log asserts the effective IP (not the proxy's loopback) is
@@ -23,44 +26,15 @@
     unused_mut
 )]
 use interflow_core::security::{ProxyProtocolConfig, ProxyProtocolMode, XffMode};
-use interflow_expose::client::ExposeArgs;
-use interflow_expose::edge::{EdgeArgs, EdgeHubTls};
+use interflow_expose::client::{ExposeArgs, LocalService};
+use interflow_expose::edge::{
+    ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, Route, WorkspaceTrust,
+};
 use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-async fn spawn_echo() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
-    let addr = listener.local_addr().expect("echo addr");
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                loop {
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if sock.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
-fn pick_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("addr").port()
-}
+use tokio::net::TcpStream;
 
 /// Stack configuration knobs shared by the scenarios.
 struct StackOpts {
@@ -72,25 +46,11 @@ struct StackOpts {
 /// Starts edge + expose client + echo backend; returns (edge_listen,
 /// audit_path). Certificates reuse the production test kit (real mTLS).
 async fn spawn_stack(opts: StackOpts) -> (SocketAddr, std::path::PathBuf) {
-    let echo_addr = spawn_echo().await;
-    let edge_port = pick_port();
-    let hub_port = pick_port();
+    let echo_addr = interflow_testkit::echo_server().await.0;
+    let edge_port = interflow_testkit::pick_ephemeral_port();
+    let hub_port = interflow_testkit::pick_ephemeral_port();
     let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
     let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
-
-    let routes_content = r#"
-[[routes]]
-host = "test.local"
-tenant = "test"
-agent_id = "expose-test"
-remote_addr = "127.0.0.1:9"
-"#
-    .replace("127.0.0.1:9", &echo_addr.to_string());
-    let routes_path = std::env::temp_dir().join(format!(
-        "interflow_test_routes_xff_{}.toml",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::write(&routes_path, routes_content).expect("write routes.toml");
 
     let audit_path = std::env::temp_dir().join(format!(
         "interflow_test_edge_xff_{}.jsonl",
@@ -98,25 +58,43 @@ remote_addr = "127.0.0.1:9"
     ));
 
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
-    let edge_args = EdgeArgs {
+    let (principal_cert, principal_key) = certs.named_client_cert("edge");
+    let edge_config = EdgeConfig {
         listen_addr: edge_listen,
-        hub_listen_addr: hub_listen,
-        routes_path: routes_path.to_string_lossy().into_owned(),
-        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
-        proxy_protocol: ProxyProtocolConfig {
-            mode: ProxyProtocolMode::Off,
-            trusted_proxies: opts.trusted_proxies,
+        control_listen_addr: hub_listen,
+        control_tls: ControlEndpointTls {
+            cert: certs.server_cert_path(),
+            key: certs.server_key_path(),
         },
-        x_forwarded_for: opts.xff,
-        hub_tls: Some(EdgeHubTls {
-            cert_path: certs.server_cert_path().display().to_string(),
-            key_path: certs.server_key_path().display().to_string(),
-        }),
-        audit_path: Some(audit_path.display().to_string()),
-        new_conn_rate_per_ip_per_minute: opts.rate_per_ip_per_min,
-        ..Default::default()
+        workspace_trust: vec![WorkspaceTrust {
+            workspace: "test".to_string(),
+            ca: certs.ca_path(),
+        }],
+        principals: vec![IngressPrincipal {
+            workspace: "test".to_string(),
+            cert: principal_cert,
+            key: principal_key,
+        }],
+        routes: vec![Route {
+            host: "test.local".to_string(),
+            workspace: "test".to_string(),
+            agent_id: "expose-test".to_string(),
+            service_id: "web".to_string(),
+        }],
+        audit_path: Some(audit_path.clone()),
+        listener: EdgeListenerPolicy {
+            proxy_protocol: ProxyProtocolConfig {
+                mode: ProxyProtocolMode::Off,
+                trusted_proxies: opts.trusted_proxies.clone(),
+            },
+            x_forwarded_for: opts.xff,
+            new_conn_rate_per_ip_per_minute: opts.rate_per_ip_per_min,
+            ..EdgeListenerPolicy::default()
+        },
+        agent_recovery_timeout: Duration::from_secs(120),
+        ..EdgeConfig::default()
     };
-    tokio::task::spawn(interflow_expose::edge::run(edge_args));
+    tokio::task::spawn(interflow_expose::edge::run(edge_config));
 
     // Wait for the hub listener, then let the edge listener come up without
     // consuming any of its rate-limit tokens.
@@ -135,36 +113,55 @@ remote_addr = "127.0.0.1:9"
 
     let (client_cert, client_key) = certs.client_paths();
     let client_args = ExposeArgs {
-        local_ports: vec![echo_addr.port()],
+        log_name: None,
+        services: vec![LocalService {
+            id: "web".into(),
+            target_addr: echo_addr,
+            overridden: false,
+        }],
         hub_url: format!("https://127.0.0.1:{hub_port}"),
         client_cert: Some(client_cert.display().to_string()),
         client_key: Some(client_key.display().to_string()),
         agent_id: "expose-test".into(),
+        ingress_ca_path: Some(certs.ca_path().display().to_string()),
         ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
     };
-    tokio::task::spawn(async move { interflow_expose::client::start(&client_args)?.join().await });
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let _ = std::fs::remove_file(&routes_path);
+    let client = interflow_expose::client::start(&client_args).expect("expose client start");
+    assert!(
+        interflow_testkit::wait_agent_connected(&client, Duration::from_secs(5)).await,
+        "expose client should register within 5s"
+    );
+    tokio::task::spawn(async move { client.join().await });
     (edge_listen, audit_path)
 }
 
 /// Sends one HTTP request with an optional X-Forwarded-For header; returns
-/// whether any response bytes arrived (echo backend mirrors the request, so
-/// success = bytes, denial = zero-byte close).
-async fn send_request(edge: SocketAddr, xff: Option<&str>) -> bool {
+/// whatever response bytes arrived (the echo backend mirrors the request, so
+/// success = the echoed request; a rate-limit denial = a `429 …` answer;
+/// `None` = zero-byte close).
+async fn send_request(edge: SocketAddr, xff: Option<&str>) -> Option<String> {
     let Ok(mut sock) = TcpStream::connect(edge).await else {
-        return false;
+        return None;
     };
     let xff_line = xff.map_or(String::new(), |v| format!("X-Forwarded-For: {v}\r\n"));
     let req = format!("GET / HTTP/1.1\r\nHost: test.local\r\n{xff_line}Connection: close\r\n\r\n");
-    if sock.write_all(req.as_bytes()).await.is_err() {
-        return false;
+    sock.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = [0u8; 512];
+    let n = sock.read(&mut buf).await.ok()?;
+    if n == 0 {
+        return None;
     }
-    let mut buf = [0u8; 128];
-    matches!(sock.read(&mut buf).await, Ok(n) if n > 0)
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// Whether the answer bytes are the echo backend's mirror (i.e. the request
+/// was routed) — anything else (429 answer, bare close) is a denial.
+async fn request_routes(edge: SocketAddr, xff: Option<&str>) -> bool {
+    send_request(edge, xff)
+        .await
+        .is_some_and(|a| !a.starts_with("HTTP/1.1 429"))
 }
 
 /// Polls the audit JSONL until it contains `needle` (line-buffered writer
@@ -195,18 +192,28 @@ async fn required_keys_rate_limit_on_rightmost_xff_entry() {
     // client, right entry appended by our trusted test "proxy").
     for _ in 0..3 {
         assert!(
-            send_request(edge, Some("6.6.6.6, 198.51.100.7")).await,
+            request_routes(edge, Some("6.6.6.6, 198.51.100.7")).await,
             "first three connections should pass"
         );
     }
-    // Budget exhausted for that effective IP only.
+    // Budget exhausted for that effective IP only — the denial is answered
+    // with a real 429 (this is the deferred gate: the request head is fully
+    // buffered by the time the XFF key resolves, so a complete HTTP answer
+    // is possible), quoting one refill interval (ceil(60/3)=20s).
+    let denial = send_request(edge, Some("6.6.6.6, 198.51.100.7"))
+        .await
+        .expect("rate-limit denial must be answered with bytes, not a bare close");
     assert!(
-        !send_request(edge, Some("6.6.6.6, 198.51.100.7")).await,
-        "4th connection from the same effective IP should be rate limited"
+        denial.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "4th connection over quota must be answered 429, got: {denial}"
+    );
+    assert!(
+        denial.to_ascii_lowercase().contains("retry-after: 20"),
+        "Retry-After must quote one refill interval (ceil(60/3)=20s): {denial}"
     );
     // A different client is isolated from the exhausted budget.
     assert!(
-        send_request(edge, Some("203.0.113.9")).await,
+        request_routes(edge, Some("203.0.113.9")).await,
         "a different XFF client must not share the budget"
     );
 
@@ -227,8 +234,8 @@ async fn required_rejects_trusted_proxy_without_header() {
     .await;
 
     assert!(
-        !send_request(edge, None).await,
-        "trusted proxy without X-Forwarded-For must be rejected fail-closed"
+        send_request(edge, None).await.is_none(),
+        "trusted proxy without X-Forwarded-For must be rejected fail-closed (silent close)"
     );
     assert!(
         await_audit_contains(&audit, "x_forwarded_for_required").await,
@@ -248,7 +255,7 @@ async fn untrusted_peer_ignores_the_header_and_still_routes() {
     .await;
 
     assert!(
-        send_request(edge, Some("6.6.6.6, 198.51.100.7")).await,
+        request_routes(edge, Some("6.6.6.6, 198.51.100.7")).await,
         "untrusted peer forges XFF: request still routes, keyed on the peer"
     );
 }

@@ -6,16 +6,14 @@
 //! - (P2b) `QuicTunnel`: QUIC native streams carrying custom frames
 //!
 //! Design constraints:
-//! - The "request direction" (initiated by ingress) and the "response direction"
-//!   (egress return path) are distinguished by the `x-direction` header in the
-//!   h2 backend; the QUIC backend writes frames for both onto the same
-//!   bidirectional stream, so there is no direction concept;
+//! - Direction and origin live in the frame flags (`FLAG_RESPONSE`,
+//!   `FLAG_HUB_ORIGIN`) rather than in-band sentinel strings; the dispatch
+//!   layer derives them into a [`FrameOrigin`];
 //! - Two consumption forms on the inbound side (2026-09-12 refactor; lossy
 //!   broadcast was removed):
-//!   - **Response direction** (source is the [`RESPONSE_SOURCE`] /
-//!     [`CLOSE_SOURCE`] sentinel): a dedicated channel registered via
-//!     `register_stream` (ingress return path / expose edge), end-to-end
-//!     backpressure;
+//!   - **Response direction** (`FLAG_RESPONSE`): a dedicated channel
+//!     registered via `register_stream` (ingress return path / expose
+//!     edge), end-to-end backpressure;
 //!   - **Request direction** (everything else, including loopback): dispatch
 //!     creates a dedicated channel on Open and hands it to egress via
 //!     `take_incoming_streams` (consumed by the per-stream forwarder).
@@ -39,100 +37,24 @@
 //!   path.
 
 use crate::error::Result;
-use crate::protocol::{FrameType, StreamProto};
+use crate::protocol::{CloseReason, FrameOrigin, FrameType, StreamId, StreamProto};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock, mpsc};
 use tracing::{debug, warn};
 
-/// Sentinel `source_agent` for response-direction frames (egress → hub return path; rewritten by the hub when relaying).
-pub const RESPONSE_SOURCE: &str = "_response_";
-
-/// Sentinel `source_agent` for close-notification frames (hub notifies the sender of stream teardown, `CLOSE:{sid}:{reason}`).
-pub const CLOSE_SOURCE: &str = "_close_";
-
-/// Sentinel `source_agent` for Open-notification frames (hub → h2 target, delivered via the poll channel).
-pub const OPEN_SOURCE: &str = "_open_";
-
-/// Sentinel `source_agent` for heartbeat Ping frames (hub → agent, delivered via the poll channel).
-pub const PING_SOURCE: &str = "_ping_";
-
-/// Semantics of a frame's `source_agent`: a real agent id or a reserved sentinel.
-///
-/// The same string field on the wire carries control semantics (`"_response_"`
-/// etc.); this type makes "direction / close / open / heartbeat"
-/// distinguishable at the type level, so encoding a sentinel as an agent id
-/// (or vice versa) is impossible. `Arc<str>` makes clones reference-counted,
-/// with zero allocation on the hot path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FrameSource {
-    /// A real agent id.
-    Agent(Arc<str>),
-    /// Response direction (egress → hub return path).
-    Response,
-    /// Close notification (hub → sender).
-    Close,
-    /// Open notification (hub → h2 target).
-    Open,
-    /// Heartbeat Ping (hub → agent).
-    Ping,
-}
-
-impl FrameSource {
-    /// The wire string.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Agent(id) => id,
-            Self::Response => RESPONSE_SOURCE,
-            Self::Close => CLOSE_SOURCE,
-            Self::Open => OPEN_SOURCE,
-            Self::Ping => PING_SOURCE,
-        }
-    }
-
-    /// Parses from a wire string: anything other than the four reserved sentinels is treated as an agent id.
-    pub fn parse(s: &str) -> Self {
-        match s {
-            RESPONSE_SOURCE => Self::Response,
-            CLOSE_SOURCE => Self::Close,
-            OPEN_SOURCE => Self::Open,
-            PING_SOURCE => Self::Ping,
-            _ => Self::Agent(Arc::from(s)),
-        }
-    }
-
-    /// The real agent id (sentinels return `None`).
-    pub fn agent_id(&self) -> Option<&str> {
-        match self {
-            Self::Agent(id) => Some(id),
-            _ => None,
-        }
-    }
-
-    /// Whether this is a real agent (not a sentinel).
-    pub const fn is_agent(&self) -> bool {
-        matches!(self, Self::Agent(_))
-    }
-}
-
-impl fmt::Display for FrameSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// Tunnel data
 #[derive(Debug, Clone)]
 pub struct TunnelData {
     /// The stream id.
-    pub stream_id: String,
-    /// The frame source: a real agent or a sentinel (direction / close / open / heartbeat semantics).
-    pub source: FrameSource,
+    pub stream_id: StreamId,
+    /// The frame origin: an agent circuit, the response direction, or the hub
+    /// (derived from the frame flags — replaces the former sentinel strings).
+    pub origin: FrameOrigin,
     /// The payload.
     pub data: Bytes,
     /// The frame type.
@@ -148,7 +70,8 @@ pub struct TunnelData {
 /// forwarder) stalls, dispatch applies a bounded wait with poisoning as the
 /// fallback.
 pub struct IncomingStream {
-    /// The Open frame (payload is `"{target_agent}:{target_addr}"`; target may be empty).
+    /// The relayed Open frame (the requester circuit is the frame's circuit
+    /// field; the payload is empty).
     pub open: TunnelData,
     /// The dedicated channel for this stream's subsequent Data/Close frames; closure is the poison signal.
     pub frames: mpsc::Receiver<TunnelData>,
@@ -163,49 +86,47 @@ pub trait TunnelTransport: Send + Sync + 'static {
     /// UDP datagram).
     async fn send_open(
         &self,
-        stream_id: &str,
+        stream_id: StreamId,
         target_agent: &str,
-        target_addr: Option<&str>,
         proto: StreamProto,
     ) -> Result<()> {
-        self.send_open_with(stream_id, target_agent, target_addr, proto, false)
+        self.send_open_with(stream_id, target_agent, proto, false)
             .await
     }
 
     /// [`TunnelTransport::send_open`] with the per-stream e2e (inner TLS)
     /// declaration: `true` sets [`crate::protocol::FLAG_E2E`] on the Open
     /// frame, asking the target agent for the agent↔agent TLS layer
-    /// (docs/design/agent-e2e-encryption.md §3.6).
+    ///.
     async fn send_open_with(
         &self,
-        stream_id: &str,
+        stream_id: StreamId,
         target_agent: &str,
-        target_addr: Option<&str>,
         proto: StreamProto,
         e2e: bool,
     ) -> Result<()>;
 
     /// Sends a data frame (request direction, ingress → hub).
-    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()>;
+    async fn send_data(&self, stream_id: StreamId, data: Bytes) -> Result<()>;
 
     /// Sends a data frame (response direction, egress → hub).
-    async fn send_data_response(&self, stream_id: &str, data: Bytes) -> Result<()>;
+    async fn send_data_response(&self, stream_id: StreamId, data: Bytes) -> Result<()>;
 
     /// Closes the stream (request direction).
-    async fn send_close(&self, stream_id: &str) -> Result<()>;
+    async fn send_close(&self, stream_id: StreamId) -> Result<()>;
 
-    /// Closes the stream (response direction). `reason` travels in the
-    /// Close frame payload as a short machine token (e.g. `connect_failed`;
-    /// empty = ordinary close) so the far end can distinguish backend
-    /// failures from normal teardown (2026-09-16 reason-propagation
-    /// hardening).
-    async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()>;
+    /// Closes the stream (response direction). `reason` travels as the u8
+    /// Close payload code (the shared
+    /// `interflow_contract::close_reason_code` table; [`CloseReason::CLOSE_FRAME`]
+    /// = ordinary close) so the far end can distinguish backend failures from
+    /// normal teardown (2026-09-16 reason-propagation hardening).
+    async fn send_close_response(&self, stream_id: StreamId, reason: CloseReason) -> Result<()>;
 
     /// Registers the dedicated inbound channel for a response-direction stream (ingress return path / expose edge). Re-registering overwrites the old channel.
-    async fn register_stream(&self, stream_id: String) -> mpsc::Receiver<TunnelData>;
+    async fn register_stream(&self, stream_id: StreamId) -> mpsc::Receiver<TunnelData>;
 
     /// Unregisters the dedicated channel for a response-direction stream.
-    async fn unregister_stream(&self, stream_id: &str);
+    async fn unregister_stream(&self, stream_id: StreamId);
 
     /// Takes the receiver end for new request-direction stream events (consumed by egress). May only be taken once per tunnel;
     /// while not yet taken, request-direction Opens that arrive park waiting
@@ -216,7 +137,7 @@ pub trait TunnelTransport: Send + Sync + 'static {
     async fn take_incoming_streams(&self) -> Option<mpsc::Receiver<IncomingStream>>;
 
     /// Unregisters the request-direction stream channel (called when a forwarder exits; idempotent).
-    async fn unregister_incoming_stream(&self, stream_id: &str);
+    async fn unregister_incoming_stream(&self, stream_id: StreamId);
 
     /// Session-termination contract: releases all stream resources of this tunnel. Idempotent (repeat calls have no side effects).
     ///
@@ -316,16 +237,15 @@ impl AttachGate {
 /// Inbound frame dispatcher: shared by h2 (decoded from /poll) and QUIC (stream read tasks).
 ///
 /// Direction classification replaces the old loopback/Open special-casing:
-/// source being the [`RESPONSE_SOURCE`] / [`CLOSE_SOURCE`] sentinel → response
-/// direction; everything else (including loopback, source == own) → request
-/// direction. The request/response channels for the same sid live in two
-/// separate tables, so one agent playing both roles (loopback) does not
-/// conflict.
+/// `FLAG_RESPONSE` → response direction; everything else (including loopback,
+/// circuit == own) → request direction. The request/response channels for the
+/// same sid live in two separate tables, so one agent playing both roles
+/// (loopback) does not conflict.
 pub(crate) struct TunnelDispatch {
     /// Response-direction stream channels (registered by ingress/edge via register_stream).
-    resp_streams: Arc<RwLock<HashMap<String, mpsc::Sender<TunnelData>>>>,
+    resp_streams: Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
     /// Request-direction stream channels (created by dispatch on Open).
-    req_streams: Arc<RwLock<HashMap<String, mpsc::Sender<TunnelData>>>>,
+    req_streams: Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
     /// New-stream event sender (delivery only begins after the receiver is taken by egress; see open_request_stream).
     incoming_tx: mpsc::Sender<IncomingStream>,
     /// New-stream event receiver (take-once; still `Some` means egress has not taken over).
@@ -365,7 +285,7 @@ impl TunnelDispatch {
     /// Registers a dedicated response-direction stream channel (capacity [`STREAM_CHANNEL_CAP`]: under congestion the sender
     /// applies a bounded wait + poisoning fallback, so a single stream's
     /// backlog cannot blow up memory).
-    pub(crate) async fn register_stream(&self, stream_id: String) -> mpsc::Receiver<TunnelData> {
+    pub(crate) async fn register_stream(&self, stream_id: StreamId) -> mpsc::Receiver<TunnelData> {
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAP);
         let mut map = self.resp_streams.write().await;
         map.insert(stream_id, tx);
@@ -373,9 +293,9 @@ impl TunnelDispatch {
     }
 
     /// Unregisters the dedicated response-direction stream channel.
-    pub(crate) async fn unregister_stream(&self, stream_id: &str) {
+    pub(crate) async fn unregister_stream(&self, stream_id: StreamId) {
         let mut map = self.resp_streams.write().await;
-        map.remove(stream_id);
+        map.remove(&stream_id);
     }
 
     /// Takes the request-direction new-stream event receiver (take-once) and wakes parked Open hand-offs.
@@ -392,9 +312,9 @@ impl TunnelDispatch {
     }
 
     /// Unregisters the request-direction stream channel (called when a forwarder exits; idempotent).
-    pub(crate) async fn unregister_incoming_stream(&self, stream_id: &str) {
+    pub(crate) async fn unregister_incoming_stream(&self, stream_id: StreamId) {
         let mut map = self.req_streams.write().await;
-        map.remove(stream_id);
+        map.remove(&stream_id);
     }
 
     /// Session termination: clears the request-direction stream table, returning the number of entries released (idempotent; a second call returns 0).
@@ -407,7 +327,7 @@ impl TunnelDispatch {
     /// poisoning path never triggers, so table entries must be released
     /// uniformly by the termination contract
     /// ([`TunnelTransport::shutdown`])
-    /// (docs/bug/2026-09-14-egress-fd-leak-session-rebuild.md).
+    ///.
     pub(crate) async fn close_all_request_streams(&self) -> usize {
         let mut map = self.req_streams.write().await;
         let n = map.len();
@@ -429,10 +349,11 @@ impl TunnelDispatch {
 
     /// Dispatches a `TunnelData` frame to the corresponding stream channel based on direction.
     ///
-    /// - Response direction (`_response_`): delivered on a resp-table hit,
+    /// - Response direction (`FLAG_RESPONSE`): delivered on a resp-table hit,
     ///   dropped on a miss (late frame);
-    /// - Close notification (`_close_`, sent by the hub when the peer tears
-    ///   down the stream): delivered to the req table first (the egress
+    /// - Close notification (a hub-authored Close, `FLAG_HUB_ORIGIN`, sent by
+    ///   the hub when the peer tears down the stream): delivered to the req
+    ///   table first (the egress
     ///   forwarder reclaims the slot/connection as soon as it receives it —
     ///   otherwise streams closed by the origin linger indefinitely on the
     ///   agent side); with no req-table entry it goes to the resp table
@@ -443,8 +364,9 @@ impl TunnelDispatch {
     ///   on a miss (late frame, or a QUIC DATAGRAM arriving before the Open —
     ///   legitimate loss under UDP semantics).
     pub(crate) async fn dispatch(&self, tunnel_data: TunnelData) {
-        let is_response = matches!(tunnel_data.source, FrameSource::Response);
-        let is_close_notification = matches!(tunnel_data.source, FrameSource::Close);
+        let is_response = matches!(tunnel_data.origin, FrameOrigin::Response);
+        let is_close_notification = matches!(tunnel_data.origin, FrameOrigin::Hub)
+            && tunnel_data.stream_type == FrameType::Close;
 
         if is_response {
             Self::deliver(tunnel_data, &self.resp_streams, "response").await;
@@ -479,10 +401,10 @@ impl TunnelDispatch {
     /// consumer has exited; drop this frame.
     async fn deliver(
         tunnel_data: TunnelData,
-        map: &Arc<RwLock<HashMap<String, mpsc::Sender<TunnelData>>>>,
+        map: &Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
         direction: &'static str,
     ) {
-        let stream_id = tunnel_data.stream_id.clone();
+        let stream_id = tunnel_data.stream_id;
         // Release the read lock right after cloning the sender, so send().await does not block register/unregister
         let tx = {
             let map = map.read().await;
@@ -519,11 +441,11 @@ impl TunnelDispatch {
     /// subsequent Data/Close frames always hit the channel) and hands
     /// `(Open frame, Receiver)` off to egress.
     async fn open_request_stream(&self, open: TunnelData) {
-        let stream_id = open.stream_id.clone();
+        let stream_id = open.stream_id;
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAP);
         {
             let mut map = self.req_streams.write().await;
-            if map.insert(stream_id.clone(), tx.clone()).is_some() {
+            if map.insert(stream_id, tx.clone()).is_some() {
                 warn!(
                     "duplicate Open for request-direction stream {stream_id}, overwriting old channel (old forwarder will exit)"
                 );
@@ -537,7 +459,7 @@ impl TunnelDispatch {
                 &self.req_streams,
                 open,
                 rx,
-                &stream_id,
+                stream_id,
                 &tx,
             )
             .await;
@@ -558,7 +480,7 @@ impl TunnelDispatch {
                 "pending-attach budget full ({}), dropping Open: {stream_id}",
                 self.pending_attach_cap
             );
-            Self::remove_req_stream(&self.req_streams, &stream_id, &tx).await;
+            Self::remove_req_stream(&self.req_streams, stream_id, &tx).await;
             return;
         }
         let gate = Arc::clone(&self.attach_gate);
@@ -591,10 +513,10 @@ impl TunnelDispatch {
                 warn!(
                     "egress did not attach within {ATTACH_GRACE:?} (misrouted or handler not started), dropping Open and rolling back table entry: {stream_id}"
                 );
-                Self::remove_req_stream(&req_streams, &stream_id, &tx).await;
+                Self::remove_req_stream(&req_streams, stream_id, &tx).await;
                 return;
             }
-            Self::hand_off_incoming(&incoming_tx, &req_streams, open, rx, &stream_id, &tx).await;
+            Self::hand_off_incoming(&incoming_tx, &req_streams, open, rx, stream_id, &tx).await;
         });
     }
 
@@ -607,10 +529,10 @@ impl TunnelDispatch {
     /// JoinError fallback.
     async fn hand_off_incoming(
         incoming_tx: &mpsc::Sender<IncomingStream>,
-        req_streams: &Arc<RwLock<HashMap<String, mpsc::Sender<TunnelData>>>>,
+        req_streams: &Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
         open: TunnelData,
         frames: mpsc::Receiver<TunnelData>,
-        stream_id: &str,
+        stream_id: StreamId,
         tx: &mpsc::Sender<TunnelData>,
     ) {
         match tokio::time::timeout(
@@ -645,13 +567,13 @@ impl TunnelDispatch {
     /// entry, the old Open's timeout rollback must not delete the new Open's
     /// channel (otherwise the new forwarder would be poisoned for no reason).
     async fn remove_req_stream(
-        map: &Arc<RwLock<HashMap<String, mpsc::Sender<TunnelData>>>>,
-        stream_id: &str,
+        map: &Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
+        stream_id: StreamId,
         tx: &mpsc::Sender<TunnelData>,
     ) {
         let mut map = map.write().await;
-        if map.get(stream_id).is_some_and(|cur| cur.same_channel(tx)) {
-            map.remove(stream_id);
+        if map.get(&stream_id).is_some_and(|cur| cur.same_channel(tx)) {
+            map.remove(&stream_id);
         }
     }
 
@@ -668,9 +590,10 @@ impl TunnelDispatch {
         let outcome = wire::decode_frame(buffer);
         match outcome {
             wire::DecodeOutcome::Ok(frame) => Some(TunnelData {
-                // one small allocation for stream_id; source goes through Arc<str> reference counting
+                // typed Copy ids — zero allocation on the dispatch path (the
+                // former String ×2 + Arc<str> are gone)
                 stream_id: frame.stream_id,
-                source: FrameSource::parse(&frame.source_agent),
+                origin: FrameOrigin::from_parts(frame.flags, frame.circuit),
                 // payload is a Bytes slice, zero-copy
                 data: frame.payload,
                 stream_type: frame.frame_type,
@@ -726,10 +649,24 @@ mod tests {
         })
     }
 
-    fn open_td(sid: &str) -> TunnelData {
+    /// A deterministic nonzero test circuit (hex `12...30`, same shape as the
+    /// negotiation tests).
+    fn test_circuit() -> crate::protocol::CircuitToken {
+        crate::protocol::CircuitToken::from_hex("12078a05e14f4e2c99b1679be1df7c30").unwrap()
+    }
+
+    /// A nonzero StreamId encoding a small integer label.
+    fn sid(label: u64) -> StreamId {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&label.to_be_bytes());
+        bytes[15] = 1;
+        StreamId::from_bytes(bytes)
+    }
+
+    fn open_td(label: u64) -> TunnelData {
         TunnelData {
-            stream_id: sid.to_string(),
-            source: FrameSource::Agent("src-agent".into()),
+            stream_id: sid(label),
+            origin: FrameOrigin::Agent(test_circuit()),
             data: Bytes::new(),
             stream_type: FrameType::Open,
             flags: 0,
@@ -751,7 +688,7 @@ mod tests {
         // Egress has taken over (receiver taken) but leaves the backlog unconsumed: fill the event channel
         let _rx = dispatch.take_incoming_streams().unwrap();
         for i in 0..crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR {
-            dispatch.dispatch(open_td(&format!("fill-{i}"))).await;
+            dispatch.dispatch(open_td(i as u64 + 1)).await;
         }
         assert_eq!(
             req_stream_count(&dispatch).await,
@@ -760,12 +697,12 @@ mod tests {
 
         // Over-budget Open: with a paused clock, deterministically reach the timeout branch
         let started = tokio::time::Instant::now();
-        dispatch.dispatch(open_td("overflow")).await;
+        dispatch.dispatch(open_td(9_001)).await;
         assert!(started.elapsed() >= INCOMING_SEND_TIMEOUT);
 
         // Table entry rolled back (dropped stream leaves no channel), counter +1
         assert!(
-            dispatch.req_streams.read().await.get("overflow").is_none(),
+            dispatch.req_streams.read().await.get(&sid(9_001)).is_none(),
             "the over-budget Open's table entry must be rolled back"
         );
         let dropped = metrics_handle()
@@ -788,13 +725,13 @@ mod tests {
     async fn open_delivers_to_egress_consumer() {
         let dispatch = TunnelDispatch::new();
         let mut rx = dispatch.take_incoming_streams().unwrap();
-        dispatch.dispatch(open_td("healthy")).await;
+        dispatch.dispatch(open_td(1)).await;
         let ev = rx
             .recv()
             .await
             .expect("Open event should be handed off immediately (channel far from full)");
-        assert_eq!(ev.open.stream_id, "healthy");
-        assert!(dispatch.req_streams.read().await.contains_key("healthy"));
+        assert_eq!(ev.open.stream_id, sid(1));
+        assert!(dispatch.req_streams.read().await.contains_key(&sid(1)));
     }
 
     /// Main regression (the timing race reproduced in the soak guardrail on 2026-09-13; fails before the fix):
@@ -805,13 +742,9 @@ mod tests {
     async fn open_before_egress_attach_is_delivered_after_attach() {
         let dispatch = TunnelDispatch::new();
         // Not yet taken over: the Open parks (table entry retained, not dropped)
-        dispatch.dispatch(open_td("race-window")).await;
+        dispatch.dispatch(open_td(2)).await;
         assert!(
-            dispatch
-                .req_streams
-                .read()
-                .await
-                .contains_key("race-window"),
+            dispatch.req_streams.read().await.contains_key(&sid(2)),
             "the table entry must be retained while parked (later Data frames must hit the channel)"
         );
 
@@ -821,13 +754,13 @@ mod tests {
             .await
             .expect("the parked Open must be handed off after takeover (this recv times out before the fix)")
             .expect("channel alive");
-        assert_eq!(ev.open.stream_id, "race-window");
+        assert_eq!(ev.open.stream_id, sid(2));
 
         // A Data frame arriving during the parking window hits the same channel (zero loss)
         dispatch
             .dispatch(TunnelData {
-                stream_id: "race-window".to_string(),
-                source: FrameSource::Agent("src-agent".into()),
+                stream_id: sid(2),
+                origin: FrameOrigin::Agent(test_circuit()),
                 data: Bytes::from_static(b"early-data"),
                 stream_type: FrameType::Data,
                 flags: 0,
@@ -848,7 +781,7 @@ mod tests {
     async fn open_without_egress_attachment_drops_after_grace() {
         let _ = metrics_handle();
         let dispatch = TunnelDispatch::new();
-        dispatch.dispatch(open_td("stray")).await;
+        dispatch.dispatch(open_td(3)).await;
         assert_eq!(
             req_stream_count(&dispatch).await,
             1,
@@ -881,14 +814,14 @@ mod tests {
         let _ = metrics_handle();
         let dispatch = TunnelDispatch::new();
         for i in 0..crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR {
-            dispatch.dispatch(open_td(&format!("park-{i}"))).await;
+            dispatch.dispatch(open_td(i as u64 + 1)).await;
         }
         assert_eq!(
             req_stream_count(&dispatch).await,
             crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR
         );
 
-        dispatch.dispatch(open_td("overflow")).await;
+        dispatch.dispatch(open_td(9_001)).await;
         assert_eq!(
             req_stream_count(&dispatch).await,
             crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR,
@@ -929,16 +862,16 @@ mod tests {
     async fn close_notification_routes_to_forwarder_first() {
         let dispatch = TunnelDispatch::new();
         let mut rx = dispatch.take_incoming_streams().unwrap();
-        dispatch.dispatch(open_td("peer-close")).await;
+        dispatch.dispatch(open_td(4)).await;
         let ev = rx.recv().await.expect("Open handed off");
         let mut frames = ev.frames;
 
         // _close_ notification → req channel (the forwarder side receives the Close frame)
         dispatch
             .dispatch(TunnelData {
-                stream_id: "peer-close".to_string(),
-                source: FrameSource::Close,
-                data: Bytes::from_static(b"CLOSE:peer-close:"),
+                stream_id: sid(4),
+                origin: FrameOrigin::Hub,
+                data: Bytes::from_static(&[3]),
                 stream_type: FrameType::Close,
                 flags: 0,
             })
@@ -950,12 +883,12 @@ mod tests {
         assert_eq!(td.stream_type, FrameType::Close);
 
         // _close_ with no req-table entry → resp table (received by the ingress registrant)
-        let mut resp = dispatch.register_stream("ingress-side".to_string()).await;
+        let mut resp = dispatch.register_stream(sid(5)).await;
         dispatch
             .dispatch(TunnelData {
-                stream_id: "ingress-side".to_string(),
-                source: FrameSource::Close,
-                data: Bytes::from_static(b"CLOSE:ingress-side:"),
+                stream_id: sid(5),
+                origin: FrameOrigin::Hub,
+                data: Bytes::from_static(&[0]),
                 stream_type: FrameType::Close,
                 flags: 0,
             })
@@ -974,7 +907,7 @@ mod tests {
         let rx = dispatch.take_incoming_streams().unwrap();
         drop(rx);
         let started = tokio::time::Instant::now();
-        dispatch.dispatch(open_td("orphan")).await;
+        dispatch.dispatch(open_td(6)).await;
         assert!(
             started.elapsed() < INCOMING_SEND_TIMEOUT,
             "a closed channel should fail immediately instead of waiting out the full timeout"
@@ -992,8 +925,8 @@ mod tests {
     async fn close_all_request_streams_releases_forwarder_channels() {
         let dispatch = TunnelDispatch::new();
         let mut rx = dispatch.take_incoming_streams().unwrap();
-        dispatch.dispatch(open_td("leak-1")).await;
-        dispatch.dispatch(open_td("leak-2")).await;
+        dispatch.dispatch(open_td(7)).await;
+        dispatch.dispatch(open_td(8)).await;
         let ev1 = rx.recv().await.expect("Open handed off");
         let ev2 = rx.recv().await.expect("Open handed off");
         assert_eq!(req_stream_count(&dispatch).await, 2);
@@ -1019,7 +952,7 @@ mod tests {
     #[tokio::test]
     async fn close_all_response_streams_releases_pump_channels() {
         let dispatch = TunnelDispatch::new();
-        let mut pump_rx = dispatch.register_stream("ingress-1".to_string()).await;
+        let mut pump_rx = dispatch.register_stream(sid(9)).await;
         assert_eq!(dispatch.close_all_response_streams().await, 1);
 
         let r = tokio::time::timeout(Duration::from_secs(1), pump_rx.recv()).await;
@@ -1030,8 +963,8 @@ mod tests {
         // Table now empty: subsequent frames are dropped as late frames, no hit
         dispatch
             .dispatch(TunnelData {
-                stream_id: "ingress-1".to_string(),
-                source: FrameSource::Response,
+                stream_id: sid(9),
+                origin: FrameOrigin::Response,
                 data: Bytes::new(),
                 stream_type: FrameType::Data,
                 flags: 0,
@@ -1048,28 +981,24 @@ mod tests {
         let dispatch = Arc::new(TunnelDispatch::new());
         let _rx = dispatch.take_incoming_streams().unwrap();
         for i in 0..crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR {
-            dispatch.dispatch(open_td(&format!("fill-{i}"))).await;
+            dispatch.dispatch(open_td(i as u64 + 1)).await;
         }
         // The first Open blocks on the timeout; while it is pending, Open the
         // same sid once more (simulating the insertion interleaving of
         // concurrent dispatch: the new channel goes straight into the table).
         let d = Arc::clone(&dispatch);
         let first = tokio::spawn(async move {
-            d.dispatch(open_td("dup")).await;
+            d.dispatch(open_td(10)).await;
         });
         tokio::task::yield_now().await;
         {
             let (tx2, _rx2) = mpsc::channel(STREAM_CHANNEL_CAP);
-            dispatch
-                .req_streams
-                .write()
-                .await
-                .insert("dup".to_string(), tx2);
+            dispatch.req_streams.write().await.insert(sid(10), tx2);
         }
         first.await.unwrap();
         // The old Open's timeout rollback is stopped by the same_channel guard: the new channel stays in the table
         assert!(
-            dispatch.req_streams.read().await.contains_key("dup"),
+            dispatch.req_streams.read().await.contains_key(&sid(10)),
             "the timeout rollback must not mis-delete the new channel installed by the duplicate Open"
         );
     }

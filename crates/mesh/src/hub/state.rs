@@ -8,8 +8,8 @@
 
 use bytes::{Bytes, BytesMut};
 use interflow_core::error::InterflowError;
-use interflow_core::protocol::StreamProto;
-use interflow_core::security::AuditSink;
+use interflow_core::protocol::{CircuitToken, RouteToken, StreamProto};
+use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker};
 pub use interflow_core::tunnel::TunnelData;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::config::HubConfig;
 use http_body_util::combinators::BoxBody;
@@ -76,7 +78,7 @@ impl PeerIdentity {
 
     /// Splits a qualified key `"{tenant}/{agent}"` back into its parts.
     /// `None` for malformed keys.
-    pub fn split_qualified(key: &str) -> Option<(&str, &str)> {
+    pub(crate) fn split_qualified(key: &str) -> Option<(&str, &str)> {
         let (tenant, agent) = key.split_once('/')?;
         (!tenant.is_empty() && !agent.is_empty()).then_some((tenant, agent))
     }
@@ -90,7 +92,13 @@ impl PeerIdentity {
 pub type SharedStreamCounts = Arc<std::sync::Mutex<HashMap<String, usize>>>;
 
 /// Active stream table type.
-pub type SharedActiveStreams = Arc<RwLock<HashMap<String, ActiveStream>>>;
+pub type SharedActiveStreams =
+    Arc<RwLock<HashMap<interflow_core::protocol::StreamId, ActiveStream>>>;
+
+/// Route token → `(source semantic agent, qualified semantic target)`.
+/// Tokens are removed when their source semantic agent registers a new
+/// circuit; target reconnection intentionally leaves them valid.
+pub type SharedRouteLeases = Arc<RwLock<HashMap<RouteToken, (CircuitToken, String, String)>>>;
 
 /// Hot-reloadable runtime limits (a lock-free hot-path atomic collection,
 /// one struct threaded through the whole hub).
@@ -172,51 +180,48 @@ pub(crate) fn release_stream_slot(counts: &SharedStreamCounts, agent: &str) {
     }
 }
 
-/// Core state for stream routing: the minimal set needed by the
-/// dispatch/cleanup primitives shared by the h2 plane and the QUIC plane.
+/// Long-lived shared hub state.
 ///
-/// Derived from [`crate::hub::service::HubService`] or
-/// [`crate::hub::accept::AcceptContext`], so that `/stream`, `/poll`, and
-/// the QUIC relay operate on the same tables and timeout discipline.
+/// One aggregate carried verbatim by the h2 plane, the QUIC plane, and the
+/// background supervision tasks (heartbeat / eviction / poll-grace).
+/// Previously split across four overlapping structs whose only differences
+/// were which subset of this table they happened to reference.
 #[derive(Clone)]
-pub struct HubCore {
+pub struct HubState {
     /// Table of registered agents.
     pub agents: SharedAgents,
-    /// Active stream table.
-    pub active_streams: SharedActiveStreams,
-    /// Per-agent stream counts.
-    pub stream_counts: SharedStreamCounts,
-    /// Data frame dispatch timeout in seconds (hot-path atomic).
-    pub channel_send_timeout_secs: Arc<AtomicU64>,
-}
-
-/// Shared handle set needed by agent eviction and heartbeat tasks.
-///
-/// Assembled by `HubService` and handed to the evict/heartbeat tasks in
-/// [`crate::hub::heartbeat`] and held by the poll-grace task of
-/// [`RxStream`]; this lets those tasks — which live outside request
-/// handling — access the registry and stream tables without depending on
-/// `HubService` itself.
-#[derive(Clone)]
-pub struct HubHandles {
-    /// Table of registered agents.
-    pub agents: SharedAgents,
-    /// Active stream table.
-    pub active_streams: SharedActiveStreams,
-    /// Per-agent stream counts.
-    pub stream_counts: SharedStreamCounts,
-    /// Audit sink.
-    pub audit: AuditSink,
-    /// Hub configuration (read by the heartbeat task every tick).
+    /// Control-plane route leases. Keys and values split semantic identity from
+    /// the opaque data plane, but this table is memory-only and never logged.
+    pub route_leases: SharedRouteLeases,
+    /// Hub configuration (hot-reloadable).
     pub config: SharedHubConfig,
-    /// Poll grace seconds (hot-path atomic, hot-reloadable).
-    pub poll_grace_secs: Arc<AtomicU64>,
+    /// Active stream table.
+    pub active_streams: SharedActiveStreams,
+    /// TLS plane (mTLS acceptor + tenant derivation).
+    pub tls_plane: SharedTlsPlane,
+    /// Hot-reloadable runtime limits.
+    pub limits: HubLimits,
+    /// Authentication rate limiter (None means disabled).
+    pub rate_limiter: Option<Arc<AuthRateLimiter>>,
+    /// Active stream count per source agent (for `max_streams_per_agent`).
+    pub stream_counts: SharedStreamCounts,
+    /// Audit log sink (no-op in disabled mode).
+    pub audit: AuditSink,
+    /// Connection tracker (per-IP + global caps).
+    pub conn_tracker: Arc<ConnTracker>,
+    /// Background task group: connection-level tasks attach here so the
+    /// shutdown drain waits for all of them to close out.
+    pub tasks: TaskTracker,
+    /// Shutdown signal: once triggered, connections enter graceful
+    /// GOAWAY/CONNECTION_CLOSE close-out.
+    pub shutdown: CancellationToken,
 }
 
 // The data frame type reuses `interflow_core::tunnel::TunnelData`
 // (isomorphic with the agent side, eliminating a twin definition); the
-// sentinel semantics of the `source_agent` field (`"_open_"`, `"_close_"`,
-// `"_response_"`) are documented on the core `TunnelData`.
+// direction/origin semantics live in the frame flags (`FLAG_RESPONSE`,
+// `FLAG_HUB_ORIGIN`) and are derived into `FrameOrigin` on the core
+// `TunnelData`.
 
 /// Shared state of a single agent.
 ///
@@ -226,6 +231,9 @@ pub struct HubHandles {
 /// the inner read lock and releases it immediately; the actual
 /// `tx.send().await` executes outside all locks.
 pub struct AgentSession {
+    /// Opaque data-plane identity for the current registration. Rotates when
+    /// another TLS connection replaces this semantic agent registration.
+    pub circuit: CircuitToken,
     /// Sender — hub → agent /poll write end (**data plane**: Data / Ping;
     /// when full the sender waits in a bounded fashion, propagating
     /// backpressure upstream).
@@ -293,10 +301,11 @@ pub struct AgentSession {
 impl AgentSession {
     /// Creates a fresh session with new channels (generation 0). `quic`
     /// carries the relay connection when registration arrives over QUIC.
-    pub fn new(quic: Option<Arc<QuicAgentConn>>) -> Self {
+    pub fn new(circuit: CircuitToken, quic: Option<Arc<QuicAgentConn>>) -> Self {
         let (tx, rx) = mpsc::channel(HUB_CHANNEL_CAP);
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         Self {
+            circuit,
             tx,
             ctrl_tx,
             ctrl_backlog: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -322,9 +331,10 @@ impl AgentSession {
     /// required: the old poll connection's RxStream holds the old Arc, and
     /// Drop identifies a stale rx via the generation comparison — replacing
     /// the whole Arc would make the comparison always hit the old Arc.
-    pub fn install_channels(&mut self, quic: Option<Arc<QuicAgentConn>>) {
+    pub fn install_channels(&mut self, circuit: CircuitToken, quic: Option<Arc<QuicAgentConn>>) {
         let (tx, rx) = mpsc::channel(HUB_CHANNEL_CAP);
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+        self.circuit = circuit;
         self.tx = tx;
         self.ctrl_tx = ctrl_tx;
         self.rx = Some(rx);
@@ -401,8 +411,10 @@ pub struct ActiveStream {
     pub source_agent: String,
     /// Target agent.
     pub target_agent: String,
-    /// Target address (optional; dynamic addressing).
-    pub target_addr: Option<String>,
+    /// Initiating agent's opaque data-plane identity.
+    pub source_circuit: CircuitToken,
+    /// Target agent's opaque data-plane identity.
+    pub target_circuit: CircuitToken,
     /// Stream-carried protocol (recorded at Open); Data frames pass the
     /// corresponding flags through so egress can identify it statelessly.
     pub proto: StreamProto,
@@ -432,10 +444,6 @@ pub struct QuicAgentConn {
     /// Whether this agent negotiated DATAGRAM capability (Hello/HelloAck
     /// caps).
     pub datagram_cap: std::sync::atomic::AtomicBool,
-    /// Whether this agent declared the e2e (inner TLS) capability in its
-    /// Hello caps — observation only (fleet visibility), never a routing
-    /// or downgrade input (RFC agent-e2e-encryption §3.6).
-    pub e2e_cap: std::sync::atomic::AtomicBool,
 }
 
 /// Adapts an `mpsc::Receiver<TunnelData>` into a `futures::Stream` for a
@@ -461,8 +469,8 @@ pub struct RxStream {
     /// Wake slot sharing the origin of `AgentSession::poll_waker` (cloned
     /// at construction; accessed synchronously in poll_next).
     poll_waker: Option<Arc<std::sync::Mutex<Option<Waker>>>>,
-    /// Handles needed by the poll-grace task.
-    handles: HubHandles,
+    /// Shared hub state needed by the poll-grace task.
+    hub: Arc<HubState>,
     /// Owning agent id (only for the grace task's logging and eviction).
     agent_id: String,
 }
@@ -479,7 +487,7 @@ impl RxStream {
         state: Arc<RwLock<AgentSession>>,
         generation: u64,
         poll_waker: Arc<std::sync::Mutex<Option<Waker>>>,
-        handles: HubHandles,
+        hub: Arc<HubState>,
         agent_id: String,
     ) -> Self {
         Self {
@@ -490,7 +498,7 @@ impl RxStream {
             state: Some(state),
             generation,
             poll_waker: Some(poll_waker),
-            handles,
+            hub,
             agent_id,
         }
     }
@@ -524,7 +532,7 @@ impl Drop for RxStream {
         let Some(state) = self.state.take() else {
             return;
         };
-        let handles = self.handles.clone();
+        let hub = self.hub.clone();
         let agent_id = self.agent_id.clone();
         let generation = self.generation;
         // Drop may happen during runtime shutdown (tests / process exit);
@@ -547,7 +555,7 @@ impl Drop for RxStream {
                     }
                 }
                 let grace = std::time::Duration::from_secs(
-                    handles.poll_grace_secs.load(AtomicOrdering::Relaxed),
+                    hub.limits.poll_grace_secs.load(AtomicOrdering::Relaxed),
                 );
                 tokio::time::sleep(grace).await;
                 // Re-check: same Arc + same generation + rx still never
@@ -560,7 +568,7 @@ impl Drop for RxStream {
                 };
                 if still_idle {
                     crate::hub::heartbeat::evict_agent(
-                        &handles,
+                        &hub,
                         &agent_id,
                         &state,
                         "poll_grace_expired",
@@ -659,20 +667,29 @@ impl RxStream {
         &mut self,
         df: TunnelData,
     ) -> Poll<Option<Result<Frame<Bytes>, InterflowError>>> {
-        let mut header =
-            BytesMut::with_capacity(64 + df.stream_id.len() + df.source.as_str().len());
+        use interflow_core::protocol::FrameOrigin;
+        // The circuit field is derived from the origin: agent frames carry
+        // the opaque circuit, response/hub frames the zero marker (the
+        // header has no string source field anymore).
+        let circuit = match df.origin {
+            FrameOrigin::Agent(c) => c,
+            FrameOrigin::Response | FrameOrigin::Hub => {
+                interflow_core::protocol::CircuitToken::ZERO
+            }
+        };
+        let mut header = BytesMut::with_capacity(wire::FRAME_HEADER_LEN);
         if wire::encode_frame_header(
             df.stream_type,
             df.flags,
-            &df.stream_id,
-            df.source.as_str(),
+            df.stream_id,
+            circuit,
             df.data.len(),
             &mut header,
         )
         .is_none()
         {
             tracing::error!(
-                "Frame encode failed (field too large): stream_id={}",
+                "Frame encode failed (contract violation): stream_id={}",
                 df.stream_id
             );
             return Poll::Ready(Some(Ok(Frame::data(Bytes::new()))));

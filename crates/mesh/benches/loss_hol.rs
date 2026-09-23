@@ -262,7 +262,8 @@ fn main() {
                     "reps": args.reps,
                     "seed_base": args.seed,
                 },
-                "ts": chrono_like_now(),
+                "ts": rfc3339_now(),
+                "ts_unix": unix_secs_now(),
             }),
             results: &results,
         };
@@ -300,45 +301,21 @@ fn transport_name(t: TransportKind) -> &'static str {
     }
 }
 
-/// RFC3339 local timestamp (for artifact metadata; no chrono dependency, a
-/// good-enough format).
-fn chrono_like_now() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{} (unix {})", local_date_string(), now.as_secs())
+/// RFC 3339 UTC timestamp for artifact metadata (whole `time` formatting; no
+/// chrono dependency in the bench).
+fn rfc3339_now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("RFC 3339 formatting of a UTC timestamp cannot fail")
 }
 
-fn local_date_string() -> String {
-    // Simplified: unix seconds → UTC date (the bench artifact only needs an
-    // identifiable time).
-    let days = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+/// Unix seconds companion field, kept separate so the artifact stays
+/// mechanically sortable without parsing the RFC 3339 string.
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-        / 86_400;
-    let (mut y, mut m, mut d) = (1970u32, 1u32, 1u32);
-    let mut remaining = days;
-    loop {
-        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
-        let len = match m {
-            2 if leap => 29,
-            2 => 28,
-            4 | 6 | 9 | 11 => 30,
-            _ => 31,
-        };
-        if remaining < len {
-            break;
-        }
-        remaining -= len;
-        m += 1;
-        if m > 12 {
-            m = 1;
-            y += 1;
-        }
-    }
-    d += remaining as u32;
-    format!("{y:04}-{m:02}-{d:02}")
 }
 
 // ---------------------------------------------------------------------------
@@ -497,7 +474,7 @@ async fn run_scenario(
     let teardown = async {
         let _ = egress.shutdown_graceful().await;
         let _ = ingress.shutdown_graceful().await;
-        hub.shutdown()
+        hub.shutdown_graceful()
             .await
             .map_err(|e| format!("hub shutdown: {e}"))?;
         if let Some(p) = tcp_proxy {

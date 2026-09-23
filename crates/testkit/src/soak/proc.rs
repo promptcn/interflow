@@ -1,18 +1,21 @@
-//! Subprocess orchestration: lifecycle management for the real `interflow-mesh` hub / agent binaries.
+//! Subprocess orchestration: lifecycle management for the soak nodes.
 //!
-//! The soak gate's system under test = three real processes (hub + egress agent + ingress
-//! agent), configured through real TOML files (the serde-serialized output of
-//! `HubConfig`/`AgentConfig`), each logging to its own file under the run directory, and
+//! The soak gate's system under test = three real processes (hub + egress agent +
+//! ingress agent) run by the `interflow-soak-node` dev binary, configured through
+//! the JSON engine-config handoff (the serde-serialized `HubConfig`/`AgentConfig`
+//! model — a machine format between the runner and its children, not a product
+//! configuration face), each logging to its own file under the run directory, and
 //! shut down through the real SIGTERM → graceful drain path.
 
+use super::error::{SoakError, SoakResult};
 use crate::certs::TestCerts;
 use crate::config::TEST_TENANT;
 use interflow_core::protocol::StreamProto;
 use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
     AclConfig, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, ControlConfig, EgressRule,
-    HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig, HubTlsConfig,
-    IngressRule, LoggingConfig, MetricsConfig, ServerConfig, TenantConfig, TransportKind,
+    HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig, HubTlsConfig, IngressRule,
+    LoggingConfig, MetricsConfig, ServerConfig, TenantConfig, TransportKind,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -25,9 +28,9 @@ use tokio::process::{Child, Command};
 #[allow(clippy::too_many_arguments)]
 pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) -> HubConfig {
     HubConfig {
-        config_version: HUB_CONFIG_VERSION,
         server: ServerConfig {
             listen_addr: listen,
+            node_name: None,
             proxy_protocol: Default::default(),
         },
         auth: AuthConfig {
@@ -35,6 +38,7 @@ pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) ->
             tenants: vec![TenantConfig {
                 name: TEST_TENANT.to_string(),
                 ca_path: certs.ca_path().display().to_string(),
+                crl_path: Some(certs.crl_path().display().to_string()),
                 trusted_gateway: false,
             }],
         },
@@ -150,10 +154,11 @@ fn base_agent_config(
     transport: TransportKind,
     certs: &TestCerts,
 ) -> AgentConfig {
+    let (client_cert, client_key) = certs.named_client_cert(id);
     AgentConfig {
         agent: AgentInfo {
             id: id.to_string(),
-            hub_url: format!("http://{hub_endpoint}"),
+            hub_url: format!("https://{hub_endpoint}"),
             transport,
             hub_quic_addr: (transport == TransportKind::Quic).then(|| hub_endpoint.to_string()),
             // handshake retransmit headroom under packet loss
@@ -167,8 +172,8 @@ fn base_agent_config(
         tls: Some(AgentTlsConfig {
             enabled: true,
             ca_path: Some(certs.ca_path().display().to_string()),
-            client_cert_path: None,
-            client_key_path: None,
+            client_cert_path: Some(client_cert.display().to_string()),
+            client_key_path: Some(client_key.display().to_string()),
             hub_cert_fingerprint: None,
         }),
         logging: LoggingConfig {
@@ -182,11 +187,12 @@ fn base_agent_config(
     }
 }
 
-/// Serialize a config to a TOML file.
-pub fn write_toml<T: serde::Serialize>(path: &Path, cfg: &T) -> Result<(), String> {
-    let text =
-        toml::to_string_pretty(cfg).map_err(|e| format!("serialize {}: {e}", path.display()))?;
-    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+/// Serialize a config to the JSON handoff file consumed by
+/// `interflow-soak-node`.
+pub fn write_json<T: serde::Serialize>(path: &Path, cfg: &T) -> SoakResult<()> {
+    let text = serde_json::to_string(cfg)
+        .map_err(|e| SoakError::msg(format!("serialize {}: {e}", path.display())))?;
+    std::fs::write(path, text).map_err(|e| SoakError::msg(format!("write {}: {e}", path.display())))
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +218,7 @@ pub fn spawn_mesh(
     log_path: &Path,
     name: &'static str,
     extra_env: &[(&str, &str)],
-) -> Result<MeshProcess, String> {
+) -> SoakResult<MeshProcess> {
     let open = || {
         std::fs::OpenOptions::new()
             .create(true)
@@ -220,20 +226,29 @@ pub fn spawn_mesh(
             .open(log_path)
     };
     let mut cmd = Command::new(bin);
-    cmd.arg(subcommand).arg("--config").arg(config_path);
+    cmd.arg(subcommand).arg("--json").arg(config_path);
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
     let child = cmd
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(
-            open().map_err(|e| format!("open log: {e}"))?,
-        ))
-        .stderr(std::process::Stdio::from(
-            open().map_err(|e| format!("open log: {e}"))?,
-        ))
+        .stdout(std::process::Stdio::from(open().map_err(|e| {
+            SoakError::Process {
+                process: name,
+                message: format!("open log: {e}"),
+            }
+        })?))
+        .stderr(std::process::Stdio::from(open().map_err(|e| {
+            SoakError::Process {
+                process: name,
+                message: format!("open log: {e}"),
+            }
+        })?))
         .spawn()
-        .map_err(|e| format!("spawn {name} ({}){}: {e}", bin.display(), subcommand))?;
+        .map_err(|e| SoakError::Process {
+            process: name,
+            message: format!("spawn ({}){}: {e}", bin.display(), subcommand),
+        })?;
     Ok(MeshProcess {
         name,
         child,
@@ -242,6 +257,13 @@ pub fn spawn_mesh(
 }
 
 impl MeshProcess {
+    fn err(&self, what: &str, source: impl std::fmt::Display) -> SoakError {
+        SoakError::Process {
+            process: self.name,
+            message: format!("{what}: {source}"),
+        }
+    }
+
     /// PID (while the process is still running).
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
@@ -284,27 +306,23 @@ impl MeshProcess {
     /// SIGKILL immediately and reap (eviction scenario: simulates an agent's abnormal
     /// death — no graceful Close, no connection-layer notification, only the hub-side
     /// death-signal path).
-    pub async fn kill_and_wait(&mut self) -> Result<(), String> {
+    pub async fn kill_and_wait(&mut self) -> SoakResult<()> {
         self.child
             .start_kill()
-            .map_err(|e| format!("{} SIGKILL: {e}", self.name))?;
+            .map_err(|e| self.err("SIGKILL", e))?;
         self.child
             .wait()
             .await
-            .map_err(|e| format!("{} wait-after-kill: {e}", self.name))?;
+            .map_err(|e| self.err("wait-after-kill", e))?;
         Ok(())
     }
 
     /// SIGTERM graceful shutdown: wait a bounded time for exit and return the exit code; on
     /// timeout, fall back to SIGKILL and report an error.
-    pub async fn terminate_graceful(&mut self, timeout: Duration) -> Result<Option<i32>, String> {
+    pub async fn terminate_graceful(&mut self, timeout: Duration) -> SoakResult<Option<i32>> {
         let Some(pid) = self.child.id() else {
             // Already exited: take the final status
-            let status = self
-                .child
-                .wait()
-                .await
-                .map_err(|e| format!("{} wait: {e}", self.name))?;
+            let status = self.child.wait().await.map_err(|e| self.err("wait", e))?;
             return Ok(status.code());
         };
         #[cfg(unix)]
@@ -317,34 +335,33 @@ impl MeshProcess {
                 .await;
             if let Ok(out) = &r {
                 if !out.status.success() {
-                    return Err(format!("{} kill -TERM failed: {}", self.name, out.status));
+                    return Err(self.err("kill -TERM failed", &out.status.to_string()));
                 }
             }
         }
         #[cfg(not(unix))]
         {
             let _ = pid;
-            self.child
-                .start_kill()
-                .map_err(|e| format!("{} kill: {e}", self.name))?;
+            self.child.start_kill().map_err(|e| self.err("kill", e))?;
         }
         match tokio::time::timeout(timeout, self.child.wait()).await {
-            Ok(status) => status
-                .map(|s| s.code())
-                .map_err(|e| format!("{} wait: {e}", self.name)),
+            Ok(status) => status.map(|s| s.code()).map_err(|e| self.err("wait", e)),
             Err(_) => {
                 self.child
                     .start_kill()
-                    .map_err(|e| format!("{} SIGKILL: {e}", self.name))?;
+                    .map_err(|e| self.err("SIGKILL", e))?;
                 let status = self
                     .child
                     .wait()
                     .await
-                    .map_err(|e| format!("{} wait-after-kill: {e}", self.name))?;
-                Err(format!(
-                    "{} graceful shutdown timed out ({timeout:?}), fell back to SIGKILL (final status {status})",
-                    self.name
-                ))
+                    .map_err(|e| self.err("wait-after-kill", e))?;
+                Err(SoakError::Process {
+                    process: self.name,
+                    message: format!(
+                        "graceful shutdown timed out ({timeout:?}), fell back to SIGKILL \
+                         (final status {status})"
+                    ),
+                })
             }
         }
     }
@@ -354,60 +371,45 @@ impl MeshProcess {
 mod tests {
     use super::*;
 
-    /// The config must really be loadable: serialize → `load_hub_config` round-trip.
-    /// If the TOML produced by soak is incompatible with the mesh parser, this fails
-    /// until fixed.
+    /// The JSON handoff must round-trip: serialize → deserialize yields the
+    /// same engine config (`interflow-soak-node` deserializes exactly what
+    /// these helpers serialize).
     #[test]
-    fn hub_config_toml_round_trips() {
+    fn hub_config_json_round_trips() {
         let certs = TestCerts::generate("soak-proc-test", "soak-egress");
         let listen: SocketAddr = "127.0.0.1:16666".parse().expect("listen");
         let metrics: SocketAddr = "127.0.0.1:16667".parse().expect("metrics");
         let cfg = hub_config(listen, metrics, &certs);
-        let toml_text = toml::to_string_pretty(&cfg).expect("hub toml");
-        let dir = std::env::temp_dir().join(format!("interflow-soak-cfg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let path = dir.join("hub.toml");
-        std::fs::write(&path, &toml_text).expect("write");
-        let loaded = interflow_mesh::config::load_hub_config(&path).expect("hub round-trip");
+        let text = serde_json::to_string(&cfg).expect("hub json");
+        let loaded: HubConfig = serde_json::from_str(&text).expect("hub round-trip");
         assert_eq!(loaded.server.listen_addr, listen);
         assert_eq!(loaded.metrics.listen_addr, metrics);
         assert!(loaded.metrics.enabled);
         assert!(loaded.tls.as_ref().is_some_and(|t| t.enabled));
         assert!(loaded.transport.quic.enabled);
         assert!(loaded.heartbeat.enabled);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn agent_configs_toml_round_trip() {
+    fn agent_configs_json_round_trip() {
         let certs = TestCerts::generate("soak-proc-test", "soak-egress");
         let endpoint: SocketAddr = "127.0.0.1:16666".parse().expect("endpoint");
         let listen: SocketAddr = "127.0.0.1:17777".parse().expect("listen");
         let backend: SocketAddr = "127.0.0.1:18888".parse().expect("backend");
 
         for transport in [TransportKind::H2, TransportKind::Quic] {
-            let dir = std::env::temp_dir().join(format!(
-                "interflow-soak-agent-{:?}-{}",
-                transport,
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).expect("dir");
-
             let egress = egress_agent_config(endpoint, transport, &certs, backend);
-            let p1 = dir.join("egress.toml");
-            write_toml(&p1, &egress).expect("write egress");
-            let l1 = interflow_mesh::config::load_agent_config(&p1).expect("egress round-trip");
+            let text = serde_json::to_string(&egress).expect("egress json");
+            let l1: AgentConfig = serde_json::from_str(&text).expect("egress round-trip");
             assert_eq!(l1.agent.id, "egress");
             assert_eq!(l1.agent.transport, transport);
             assert_eq!(l1.agent.connect_timeout_secs, 10);
 
             let ingress = ingress_agent_config(endpoint, transport, &certs, listen, backend, 300);
-            let p2 = dir.join("ingress.toml");
-            write_toml(&p2, &ingress).expect("write ingress");
-            let l2 = interflow_mesh::config::load_agent_config(&p2).expect("ingress round-trip");
+            let text = serde_json::to_string(&ingress).expect("ingress json");
+            let l2: AgentConfig = serde_json::from_str(&text).expect("ingress round-trip");
             assert_eq!(l2.ingress.len(), 1);
             assert_eq!(l2.ingress[0].idle_timeout_secs, Some(300));
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

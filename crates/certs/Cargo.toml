@@ -1,10 +1,10 @@
 [package]
 name = "interflow-certs"
-version = "0.3.0"
-edition = "2024"
-rust-version = "1.97"
-description = "Interflow certificate issuance: tenant CAs, hub server pairs, and agent client certificates — the single rcgen implementation behind `interflow-mesh certs`, the expose init wizard, and the test kit"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Interflow certificate issuance: tenant CAs, hub server pairs, and agent client certificates — the single rcgen implementation behind the identity issuer and the test kit"
+license.workspace = true
 
 [lib]
 name = "interflow_certs"

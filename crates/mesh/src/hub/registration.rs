@@ -4,9 +4,9 @@ use crate::hub::service::{HubService, json_response, text_response};
 use crate::hub::state::{AgentSession, HubResponseBody, SharedStreamCounts};
 use hyper::{Response, StatusCode};
 use interflow_core::error::Result;
+use interflow_core::protocol::CircuitToken;
 use interflow_core::security::AuditKind;
 use interflow_core::tunnel::negotiation::{HeartbeatAd, RegisterResponse};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -24,7 +24,6 @@ impl HubService {
     ///    hyper polling applies backpressure automatically, ultimately
     ///    triggering upstream TCP flow control).
     /// 3. Insert into the agent registry atomically under a single write lock.
-    #[tracing::instrument(skip(self), fields(agent_id = %agent_id, peer = %self.peer_addr))]
     pub(crate) async fn handle_register(
         &self,
         agent_id: String,
@@ -37,20 +36,14 @@ impl HubService {
             let identity = self.connection_identity.read().await;
             match &*identity {
                 Some(existing) if existing.agent == agent_id => existing.clone(),
-                Some(existing) => {
-                    warn!(
-                        "identity mismatch: connection is bound to {}/{}, but registration attempt is for {agent_id}",
-                        existing.tenant, existing.agent
-                    );
+                Some(_) => {
+                    warn!("registration identity mismatch on an authenticated connection");
                     metrics::counter!("interflow_hub_auth_failures", "reason" => "identity_mismatch").increment(1);
-                    self.audit.record(
+                    self.state.audit.record(
                         AuditKind::AgentRegisterDenied {
-                            reason: format!(
-                                "identity_mismatch: bound={}/{}, claimed={agent_id}",
-                                existing.tenant, existing.agent
-                            ),
+                            reason: "identity_mismatch".to_string(),
                         },
-                        Some(existing.qualified()),
+                        None,
                         Some(self.peer_str()),
                     );
                     return Ok(text_response(StatusCode::FORBIDDEN, "Identity mismatch"));
@@ -58,7 +51,7 @@ impl HubService {
                 None => {
                     metrics::counter!("interflow_hub_auth_failures", "reason" => "no_client_cert")
                         .increment(1);
-                    self.audit.record(
+                    self.state.audit.record(
                         AuditKind::AgentRegisterDenied {
                             reason: "no_client_cert".into(),
                         },
@@ -73,30 +66,45 @@ impl HubService {
             }
         };
         let agent_key = identity.qualified();
-        info!("Agent registered: {agent_key} from {}", self.peer_addr);
+        let circuit = CircuitToken::random()?;
+        *self.connection_circuit.write().await = Some(circuit);
+        info!(
+            "Agent registered: circuit={circuit} from {}",
+            self.peer_addr
+        );
+        self.state
+            .route_leases
+            .write()
+            .await
+            .retain(|_, (_, source, _)| source != &agent_key);
 
         // Single write lock: atomically insert or replace the channel in
         // place (see [`AgentSession::install_channels`] for why in place).
         // The registry key is tenant-qualified: the same bare id under
         // another tenant is a different, non-colliding entry.
         let registered_count = {
-            let mut agents = self.agents.write().await;
+            let mut agents = self.state.agents.write().await;
             match agents.get(&agent_key) {
                 Some(existing) => {
                     // h2 registration overwrites a QUIC session: the old
                     // relay connection closes itself out via its
                     // connection-lost watcher
-                    existing.write().await.install_channels(None);
+                    existing.write().await.install_channels(circuit, None);
                 }
                 None => {
                     agents.insert(
                         agent_key.clone(),
-                        Arc::new(RwLock::new(AgentSession::new(None))),
+                        Arc::new(RwLock::new(AgentSession::new(circuit, None))),
                     );
                 }
             }
             agents.len()
         };
+        self.state
+            .route_leases
+            .write()
+            .await
+            .retain(|_, (_, source, _)| source != &agent_key);
         // Absolute value rather than increment: re-registration no longer
         // accumulates drift
         metrics::gauge!("interflow_hub_agents_registered")
@@ -109,18 +117,18 @@ impl HubService {
         // the per-agent count stays occupied forever and new streams are
         // rejected.
         Self::sweep_agent_streams(
-            &self.agents,
-            &self.active_streams,
-            &self.stream_counts,
+            &self.state.agents,
+            &self.state.active_streams,
+            &self.state.stream_counts,
             &agent_key,
         )
         .await;
 
-        self.audit.record(
+        self.state.audit.record(
             AuditKind::AgentRegistered {
-                agent_id: agent_key.clone(),
+                circuit: circuit.to_hex(),
             },
-            Some(agent_key),
+            Some(circuit.to_hex()),
             Some(self.peer_str()),
         );
 
@@ -128,8 +136,9 @@ impl HubService {
         // heartbeat cadence; agents parse it and derive the poll watchdog /
         // task-stall timeouts (see `interflow_core::tunnel::negotiation`).
         let caps = {
-            let cfg = self.config.read().await;
+            let cfg = self.state.config.read().await;
             RegisterResponse {
+                circuit_token: circuit,
                 heartbeat: cfg
                     .heartbeat
                     .enabled
@@ -152,29 +161,31 @@ impl HubService {
     /// The identity binding check must be completed before calling; the
     /// authentication level is equivalent to `/register`.
     pub(crate) async fn implicit_re_register(&self, agent_id: &str) -> Arc<RwLock<AgentSession>> {
-        info!(
-            "Agent {} not registered, implicitly re-registering",
-            agent_id
-        );
-        let arc = Arc::new(RwLock::new(AgentSession::new(None)));
+        let Some(circuit) = self.circuit().await else {
+            // A data-plane request cannot implicitly register: it has no
+            // response in which to learn the freshly generated circuit.
+            unreachable!("implicit re-registration requires a connection circuit");
+        };
+        info!("Agent circuit={circuit} not registered, implicitly re-registering");
+        let arc = Arc::new(RwLock::new(AgentSession::new(circuit, None)));
         {
-            let mut agents = self.agents.write().await;
+            let mut agents = self.state.agents.write().await;
             agents.insert(agent_id.to_string(), arc.clone());
             metrics::gauge!("interflow_hub_agents_registered")
                 .set(crate::hub::state::count_as_f64(agents.len()));
         }
         Self::sweep_agent_streams(
-            &self.agents,
-            &self.active_streams,
-            &self.stream_counts,
+            &self.state.agents,
+            &self.state.active_streams,
+            &self.state.stream_counts,
             agent_id,
         )
         .await;
-        self.audit.record(
+        self.state.audit.record(
             AuditKind::AgentRegistered {
-                agent_id: agent_id.to_string(),
+                circuit: circuit.to_hex(),
             },
-            Some(agent_id.to_string()),
+            Some(circuit.to_hex()),
             Some(self.peer_str()),
         );
         // Heartbeats are served by the global supervision loop (see
@@ -206,7 +217,7 @@ impl HubService {
     ///   Close+FIN — no explicit notification needed.
     pub(crate) async fn sweep_agent_streams(
         agents: &crate::hub::state::SharedAgents,
-        active_streams: &Arc<RwLock<HashMap<String, crate::hub::ActiveStream>>>,
+        active_streams: &crate::hub::state::SharedActiveStreams,
         stream_counts: &SharedStreamCounts,
         agent_id: &str,
     ) {
@@ -214,7 +225,7 @@ impl HubService {
         let mut removed_total = 0usize;
         // Poll-plane peers needing explicit notification (the relay plane is
         // informed by the table-entry drop)
-        let mut poll_peers: Vec<(String, String)> = Vec::new();
+        let mut poll_peers: Vec<(String, interflow_core::protocol::StreamId)> = Vec::new();
         {
             let mut streams = active_streams.write().await;
             streams.retain(|sid, s| {
@@ -225,7 +236,7 @@ impl HubService {
                     // For a loopback stream (source == target) the peer is the
                     // evicted agent itself; no notification needed.
                     if !s.target.is_relay() && s.target_agent != agent_id {
-                        poll_peers.push((s.target_agent.clone(), sid.clone()));
+                        poll_peers.push((s.target_agent.clone(), *sid));
                     }
                     false
                 } else if s.target_agent == agent_id {
@@ -234,7 +245,7 @@ impl HubService {
                     // accordingly
                     removed_total += 1;
                     if !s.source.is_relay() && s.source_agent != agent_id {
-                        poll_peers.push((s.source_agent.clone(), sid.clone()));
+                        poll_peers.push((s.source_agent.clone(), *sid));
                     }
                     false
                 } else {
@@ -245,7 +256,7 @@ impl HubService {
                 metrics::gauge!("interflow_hub_streams_active")
                     .decrement(u32::try_from(removed_total).unwrap_or(u32::MAX));
                 warn!(
-                    "agent {agent_id} offline/reconnected: cleaned up {} orphan streams ({} of them needed poll-side peer notification)",
+                    "agent offline/reconnected: cleaned up {} orphan streams ({} of them needed poll-side peer notification)",
                     removed_total,
                     poll_peers.len()
                 );
@@ -263,8 +274,13 @@ impl HubService {
         // Guaranteed delivery outside the locks (eviction is a failure path;
         // termination takes priority over any tail data still queued)
         for (peer, sid) in poll_peers {
-            if crate::hub::control::deliver_close_via_control(agents, &peer, &sid, "agent-evicted")
-                .await
+            if crate::hub::control::deliver_close_via_control(
+                agents,
+                &peer,
+                sid,
+                interflow_core::protocol::CloseReason::SessionClosed,
+            )
+            .await
             {
                 metrics::counter!("interflow_hub_sweep_peer_notified_total").increment(1);
             }

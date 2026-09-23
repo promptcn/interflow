@@ -5,26 +5,39 @@
 //! growing) read the hub process's real metrics endpoint — the same data production
 //! operators see.
 
+use super::error::{SoakError, SoakResult};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Scrape the metrics endpoint once and return the response body (Prometheus text format).
-pub async fn scrape(addr: SocketAddr, path: &str) -> Result<String, String> {
+pub async fn scrape(addr: SocketAddr, path: &str) -> SoakResult<String> {
     let mut sock = tokio::net::TcpStream::connect(addr)
         .await
-        .map_err(|e| format!("connect {addr}: {e}"))?;
+        .map_err(|e| SoakError::Scrape {
+            addr,
+            message: format!("connect: {e}"),
+        })?;
     let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     sock.write_all(req.as_bytes())
         .await
-        .map_err(|e| format!("write: {e}"))?;
+        .map_err(|e| SoakError::Scrape {
+            addr,
+            message: format!("write: {e}"),
+        })?;
     let mut raw = Vec::new();
     sock.read_to_end(&mut raw)
         .await
-        .map_err(|e| format!("read: {e}"))?;
+        .map_err(|e| SoakError::Scrape {
+            addr,
+            message: format!("read: {e}"),
+        })?;
     let text = String::from_utf8_lossy(&raw);
     let (_, body) = text
         .split_once("\r\n\r\n")
-        .ok_or("metrics response missing HTTP header separator")?;
+        .ok_or_else(|| SoakError::Scrape {
+            addr,
+            message: "missing HTTP header separator".to_string(),
+        })?;
     Ok(body.to_string())
 }
 

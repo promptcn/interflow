@@ -7,19 +7,15 @@
 //!   `Vec<ConfigError>`
 //! - Called by [`crate::config::loader`] after `toml::from_str`
 
-use crate::config::{AGENT_CONFIG_VERSION, AgentConfig, HUB_CONFIG_VERSION, HubConfig};
+use crate::config::{AgentConfig, HubConfig};
 use std::path::Path;
 
 /// A single configuration error.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ConfigError {
-    /// `config_version` does not match the current schema.
-    #[error("config_version mismatch: expected {expected}, actual {actual}")]
-    UnsupportedVersion { expected: u32, actual: u32 },
-
     /// The tenant trust table is empty (mTLS-only: nobody could register).
     #[error(
-        "[auth.tenants] is empty: at least one tenant CA is required (mTLS is the only authentication mode; see docs/design/multi-tenant-mtls-only.md)"
+        "[auth.tenants] is empty: at least one tenant CA is required (mTLS is the only authentication mode; see (internal design notes))"
     )]
     TenantsEmpty,
 
@@ -106,6 +102,15 @@ impl ConfigErrorList {
     }
 }
 
+impl<'a> IntoIterator for &'a ConfigErrorList {
+    type Item = &'a ConfigError;
+    type IntoIter = std::slice::Iter<'a, ConfigError>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.errors.iter()
+    }
+}
+
 impl std::fmt::Display for ConfigErrorList {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let bullets: String = self
@@ -141,6 +146,16 @@ fn valid_agent_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
+/// Ingress `target_agent` accepts the bare agent id or the tenant-qualified
+/// wire form `workspace/agent` (cross-workspace targets from a signed
+/// policy are qualified by [`crate::hub::state::qualified_agent_id`]).
+fn valid_target_agent(s: &str) -> bool {
+    match s.split_once('/') {
+        Some((tenant, agent)) => valid_agent_id(tenant) && valid_agent_id(agent),
+        None => valid_agent_id(s),
+    }
+}
+
 const fn is_loopback(addr: std::net::SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
@@ -160,15 +175,7 @@ fn valid_tenant_name(s: &str) -> bool {
 pub fn validate_hub(cfg: &HubConfig) -> Result<(), ConfigErrorList> {
     let mut errs = Vec::new();
 
-    // 1. config_version
-    if cfg.config_version != HUB_CONFIG_VERSION {
-        errs.push(ConfigError::UnsupportedVersion {
-            expected: HUB_CONFIG_VERSION,
-            actual: cfg.config_version,
-        });
-    }
-
-    // 2. mTLS-only: the tenant trust table must be non-empty and well-formed
+    // 1. mTLS-only: the tenant trust table must be non-empty and well-formed
     if cfg.auth.tenants.is_empty() {
         errs.push(ConfigError::TenantsEmpty);
     }
@@ -190,6 +197,13 @@ pub fn validate_hub(cfg: &HubConfig) -> Result<(), ConfigErrorList> {
             errs.push(ConfigError::Invalid(format!(
                 "[auth.tenants] ca_path does not exist: {}",
                 tenant.ca_path
+            )));
+        }
+        if let Some(crl) = &tenant.crl_path
+            && !Path::new(crl).exists()
+        {
+            errs.push(ConfigError::Invalid(format!(
+                "[auth.tenants] crl_path does not exist: {crl}"
             )));
         }
     }
@@ -327,15 +341,8 @@ pub fn validate_hub(cfg: &HubConfig) -> Result<(), ConfigErrorList> {
 }
 
 /// Validates the agent configuration.
-pub fn validate_agent(cfg: &AgentConfig) -> Result<(), ConfigErrorList> {
+pub(crate) fn validate_agent(cfg: &AgentConfig) -> Result<(), ConfigErrorList> {
     let mut errs = Vec::new();
-
-    if cfg.config_version != AGENT_CONFIG_VERSION {
-        errs.push(ConfigError::UnsupportedVersion {
-            expected: AGENT_CONFIG_VERSION,
-            actual: cfg.config_version,
-        });
-    }
 
     if !valid_agent_id(&cfg.agent.id) {
         errs.push(ConfigError::Invalid(format!(
@@ -346,7 +353,13 @@ pub fn validate_agent(cfg: &AgentConfig) -> Result<(), ConfigErrorList> {
 
     // ingress target_agent validation
     for rule in &cfg.ingress {
-        if !valid_agent_id(&rule.target_agent) {
+        if !is_loopback(rule.listen_addr) {
+            errs.push(ConfigError::Invalid(format!(
+                "[[ingress]] {} listen_addr must be loopback; agent ingress is a local access point, not a public listener",
+                rule.name
+            )));
+        }
+        if !valid_target_agent(&rule.target_agent) {
             errs.push(ConfigError::Invalid(format!(
                 "[[ingress]] {} invalid target_agent: {}",
                 rule.name, rule.target_agent
@@ -517,52 +530,52 @@ pub fn validate_agent(cfg: &AgentConfig) -> Result<(), ConfigErrorList> {
         }
     }
 
-    // E2e (inner TLS) — RFC docs/design/agent-e2e-encryption.md §5.1.
-    if cfg.e2e.enabled() {
-        // The inner layer presents the regular [tls] client pair and anchors
-        // peers at [tls] ca_path (single-CA model) — both must be in place,
-        // or startup fails fast instead of failing per-stream at runtime.
-        let tls_ready = cfg.tls.as_ref().is_some_and(|tls| {
-            tls.enabled && tls.client_cert_path.is_some() && tls.client_key_path.is_some()
-        });
-        if !tls_ready {
-            errs.push(ConfigError::Invalid(
-                "[e2e] mode != off requires [tls] enabled with client_cert_path + client_key_path \
-                 (the inner layer reuses the same mTLS pair)"
-                    .to_string(),
-            ));
-        }
-        if cfg
-            .tls
-            .as_ref()
-            .and_then(|tls| tls.ca_path.as_ref())
-            .is_none()
-        {
-            errs.push(ConfigError::Invalid(
-                "[e2e] mode != off requires [tls] ca_path (the tenant anchor for verifying \
-                 peers; fingerprint pinning alone cannot anchor the inner layer)"
-                    .to_string(),
-            ));
-        }
-        if cfg.e2e.handshake_timeout_secs == 0 {
-            errs.push(ConfigError::Invalid(
-                "[e2e] handshake_timeout_secs must be > 0 (anti dribble)".to_string(),
-            ));
-        }
+    // Inner TLS is mandatory.
+    let tls_ready = cfg.tls.as_ref().is_some_and(|tls| {
+        tls.enabled && tls.client_cert_path.is_some() && tls.client_key_path.is_some()
+    });
+    if !tls_ready {
+        errs.push(ConfigError::Invalid(
+            "inner TLS requires [tls] enabled with client_cert_path + client_key_path (the inner layer \
+             reuses the same mTLS pair)"
+                .to_string(),
+        ));
     }
-    // Anchor files are checked whenever configured (off mode included) so a
-    // stale path surfaces at startup, not on the day e2e is switched on.
-    if let Some(gw) = &cfg.e2e.gateway_ca_path
+    if cfg
+        .tls
+        .as_ref()
+        .and_then(|tls| tls.ca_path.as_ref())
+        .is_none()
+    {
+        errs.push(ConfigError::Invalid(
+            "inner TLS requires [tls] ca_path (the tenant anchor for verifying peers; fingerprint \
+             pinning alone cannot anchor the inner layer)"
+                .to_string(),
+        ));
+    }
+    if cfg.inner_tls.handshake_timeout_secs == 0 {
+        errs.push(ConfigError::Invalid(
+            "[inner_tls] handshake_timeout_secs must be > 0 (anti dribble)".to_string(),
+        ));
+    }
+    if let Some(gw) = &cfg.inner_tls.ingress_ca_path
         && !Path::new(gw).exists()
     {
         errs.push(ConfigError::Invalid(format!(
-            "[e2e] gateway_ca_path does not exist: {gw}"
+            "[inner_tls] ingress_ca_path does not exist: {gw}"
         )));
     }
-    for ca in &cfg.e2e.extra_trusted_cas {
+    for ca in &cfg.inner_tls.extra_trusted_cas {
         if !Path::new(ca).exists() {
             errs.push(ConfigError::Invalid(format!(
-                "[e2e] extra_trusted_cas entry does not exist: {ca}"
+                "[inner_tls] extra_trusted_cas entry does not exist: {ca}"
+            )));
+        }
+    }
+    for crl in &cfg.inner_tls.crl_paths {
+        if !Path::new(crl).exists() {
+            errs.push(ConfigError::Invalid(format!(
+                "[inner_tls] crl_paths entry does not exist: {crl}"
             )));
         }
     }
@@ -598,9 +611,9 @@ mod tests {
         std::fs::write(dir.join("hub.key"), b"dummy").unwrap();
         std::fs::write(dir.join("tenant-ca.crt"), b"dummy").unwrap();
         HubConfig {
-            config_version: HUB_CONFIG_VERSION,
             server: ServerConfig {
                 listen_addr: "127.0.0.1:6666".parse().unwrap(),
+                node_name: None,
                 proxy_protocol: Default::default(),
             },
             auth: AuthConfig {
@@ -608,6 +621,7 @@ mod tests {
                 tenants: vec![TenantConfig {
                     name: "acme".to_string(),
                     ca_path: dir.join("tenant-ca.crt").display().to_string(),
+                    crl_path: None,
                     trusted_gateway: false,
                 }],
             },
@@ -661,13 +675,6 @@ mod tests {
             err.iter()
                 .any(|e| matches!(e, ConfigError::TenantNameInvalid { .. }))
         );
-    }
-
-    #[test]
-    fn version_mismatch_rejected() {
-        let mut cfg = base_hub_config();
-        cfg.config_version = 99;
-        validate_hub(&cfg).expect_err("should reject version");
     }
 
     #[test]
@@ -727,13 +734,55 @@ mod tests {
     }
 
     fn base_agent_config() -> AgentConfig {
-        AgentConfig {
+        let dir = std::env::temp_dir().join(format!(
+            "interflow-validate-base-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ca.crt"), b"dummy").unwrap();
+        std::fs::write(dir.join("agent.crt"), b"dummy").unwrap();
+        std::fs::write(dir.join("agent.key"), b"dummy").unwrap();
+        let mut cfg = AgentConfig {
             control: ControlConfig {
                 enabled: false,
                 ..ControlConfig::default()
             },
             ..AgentConfig::for_identity("test-agent", "https://hub.example.com:6666")
-        }
+        };
+        cfg.tls = Some(AgentTlsConfig {
+            enabled: true,
+            ca_path: Some(dir.join("ca.crt").display().to_string()),
+            client_cert_path: Some(dir.join("agent.crt").display().to_string()),
+            client_key_path: Some(dir.join("agent.key").display().to_string()),
+            hub_cert_fingerprint: None,
+        });
+        cfg
+    }
+
+    #[test]
+    fn agent_ingress_must_be_loopback() {
+        let mut cfg = base_agent_config();
+        cfg.ingress = vec![IngressRule {
+            name: "local".to_owned(),
+            listen_addr: "127.0.0.1:3000".parse().unwrap(),
+            listen_protocol: interflow_core::protocol::StreamProto::Tcp,
+            target_agent: "peer".to_owned(),
+            remote_addr: None,
+            idle_timeout_secs: None,
+            udp_per_ip_pps: 0,
+            udp_per_ip_bytes_per_sec: 0,
+            udp_egress_bytes_per_sec: 0,
+        }];
+        validate_agent(&cfg).expect("loopback agent ingress is valid");
+
+        cfg.ingress[0].listen_addr = "0.0.0.0:3000".parse().unwrap();
+        let err = validate_agent(&cfg).expect_err("non-loopback ingress must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("loopback"))),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -796,11 +845,11 @@ mod tests {
         // Happy shape.
         let mut cfg = base_agent_config();
         cfg.tls = Some(tls);
-        cfg.e2e = E2eConfig {
-            mode: E2eMode::Required,
+        cfg.inner_tls = InnerTlsConfig {
             handshake_timeout_secs: 10,
-            gateway_ca_path: Some(dir.join("gw-ca.crt").display().to_string()),
+            ingress_ca_path: Some(dir.join("gw-ca.crt").display().to_string()),
             extra_trusted_cas: vec![dir.join("extra-ca.crt").display().to_string()],
+            crl_paths: Vec::new(),
         };
         validate_agent(&cfg).expect("fully configured e2e passes");
 
@@ -832,17 +881,16 @@ mod tests {
 
         // Zero handshake deadline.
         let mut bad = cfg;
-        bad.e2e.handshake_timeout_secs = 0;
+        bad.inner_tls.handshake_timeout_secs = 0;
         let err = validate_agent(&bad).expect_err("zero deadline must reject");
         assert!(
             err.iter()
                 .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("handshake_timeout")))
         );
 
-        // Missing anchor files are named even in off mode.
-        bad.e2e.mode = E2eMode::Off;
-        bad.e2e.handshake_timeout_secs = 10;
-        bad.e2e.extra_trusted_cas = vec![dir.join("missing-ca.crt").display().to_string()];
+        // Missing anchor files are named even when inner TLS is otherwise default.
+        bad.inner_tls.handshake_timeout_secs = 10;
+        bad.inner_tls.extra_trusted_cas = vec![dir.join("missing-ca.crt").display().to_string()];
         let err = validate_agent(&bad).expect_err("missing anchor must reject");
         assert!(
             err.iter()

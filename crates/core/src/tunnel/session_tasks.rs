@@ -1,8 +1,7 @@
 //! Session task supervision: the death contract and the stall heartbeat.
 //!
 //! Two invariants every session-critical task must satisfy (the panic
-//! containment design, docs/development/2026-09-16-panic-containment-
-//! supervision.md):
+//! containment design):
 //!
 //! 1. **Death contract**: a critical task exiting — by returning, by
 //!    panicking (the JoinError surfaces here), or by abort — ends the
@@ -294,7 +293,7 @@ impl SessionTasks {
     /// Spawns an auxiliary session task: tracker membership only (bounded
     /// wind-down), no death cascade — for tasks whose exit degrades but
     /// does not invalidate the session (pong answers, stats samplers).
-    pub fn spawn_auxiliary<F>(&self, future: F)
+    pub(crate) fn spawn_auxiliary<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {

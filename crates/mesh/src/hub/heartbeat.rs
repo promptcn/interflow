@@ -6,7 +6,8 @@
 //! per agent (ownerless JoinHandle, zero logs on the happy path); once such a
 //! task vanished nobody knew — `last_pong` stayed frozen at registration time
 //! with nobody declaring death, and the hub fell silent for 7.5 hours
-//! (docs/bug/2026-09-13, mechanism B). Now replaced with a **single global
+//! (mechanism B).
+//! Now replaced with a **single global
 //! supervision loop** hosted by the task group of
 //! [`crate::hub::server::HubServer`], with an outer self-healing wrapper
 //! guaranteeing that its death is always logged, counted, and restarted.
@@ -33,11 +34,10 @@
 //! [`crate::hub::poll`]); the agent side self-heals with zero cooperation.
 
 use crate::hub::service::HubService;
-use crate::hub::state::{AgentSession, HubHandles, TunnelData};
+use crate::hub::state::{AgentSession, HubState, TunnelData};
 use bytes::Bytes;
-use interflow_core::protocol::FrameType;
+use interflow_core::protocol::{FLAG_HUB_ORIGIN, FrameOrigin, StreamId};
 use interflow_core::security::AuditKind;
-use interflow_core::tunnel::FrameSource;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,6 +53,34 @@ use interflow_core::config::params::liveness::{HEARTBEAT_DISABLED_POLL, Heartbea
 /// Restart delay after the supervision loop exits abnormally.
 const HEARTBEAT_SUPERVISOR_RESTART_DELAY: Duration = Duration::from_secs(1);
 
+/// One heartbeat cadence snapshot. The single-lock invariant: the interval
+/// decides the sleep and the cadence decides the dead line — a torn read
+/// between two lock acquisitions could pair values from different reloads.
+/// Shared verbatim by the h2 supervision loop and the per-connection QUIC
+/// heartbeat.
+pub(crate) fn cadence_snapshot(config: &crate::config::HubConfig) -> Option<HeartbeatCadence> {
+    config
+        .heartbeat
+        .enabled
+        .then(|| HeartbeatCadence::from(&config.heartbeat))
+}
+
+/// The effective sleep before the next heartbeat tick: the cadence interval
+/// when enabled, the disabled-poll period while waiting for a hot reload.
+pub(crate) const fn tick_sleep(cadence: Option<HeartbeatCadence>) -> Duration {
+    match cadence {
+        Some(c) => Duration::from_secs(c.interval_secs),
+        None => HEARTBEAT_DISABLED_POLL,
+    }
+}
+
+/// Death decision over a session's last Pong — the canonical dead-line
+/// derivation (single source with the agent-side watchdog/stall derivations
+/// in core params).
+pub(crate) fn pong_expired(session: &AgentSession, cadence: &HeartbeatCadence) -> bool {
+    session.last_pong.elapsed() > cadence.dead_line()
+}
+
 /// Evicts an agent: the unified cleanup entry point for all death signals
 /// (send timeout / poll grace timeout / heartbeat loss).
 ///
@@ -60,11 +88,12 @@ const HEARTBEAT_SUPERVISOR_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// observed; if the agent re-registered in the meantime (the entry replaced
 /// by a new Arc), this eviction is voided and the new session is untouched.
 pub(crate) async fn evict_agent(
-    h: &HubHandles,
+    h: &HubState,
     agent_id: &str,
     expected: &Arc<tokio::sync::RwLock<AgentSession>>,
     reason: &'static str,
 ) {
+    let circuit = expected.read().await.circuit;
     // 1. Sever the session entry (see [`AgentSession::terminate`]).
     expected.write().await.terminate();
 
@@ -84,7 +113,7 @@ pub(crate) async fn evict_agent(
     };
     if !removed {
         debug!(
-            "agent {agent_id} eviction voided (entry already taken over by re-registration): reason={reason}"
+            "agent eviction voided (entry already taken over by re-registration): reason={reason}"
         );
         return;
     }
@@ -96,13 +125,13 @@ pub(crate) async fn evict_agent(
     metrics::counter!("interflow_hub_agent_evicted", "reason" => reason).increment(1);
     h.audit.record(
         AuditKind::AgentEvicted {
-            agent_id: agent_id.to_string(),
+            circuit: circuit.to_hex(),
             reason: reason.to_string(),
         },
-        Some(agent_id.to_string()),
+        Some(circuit.to_hex()),
         None,
     );
-    warn!("agent {agent_id} evicted (reason={reason}), orphan streams cleaned");
+    warn!("agent circuit={circuit} evicted (reason={reason}), orphan streams cleaned");
 }
 
 /// Managed entry point of the heartbeat supervision loop: when the loop body
@@ -112,7 +141,11 @@ pub(crate) async fn evict_agent(
 /// defects of the "heartbeat task silently vanishes" kind (2026-09-13,
 /// mechanism B) would have no structural point of exposure. Normal exit
 /// happens only on shutdown.
-pub fn spawn_heartbeat_supervisor(h: HubHandles, tasks: &TaskTracker, shutdown: CancellationToken) {
+pub fn spawn_heartbeat_supervisor(
+    h: std::sync::Arc<HubState>,
+    tasks: &TaskTracker,
+    shutdown: CancellationToken,
+) {
     tasks.spawn(async move {
         loop {
             let inner = tokio::spawn(run_heartbeat_supervisor(h.clone(), shutdown.clone()));
@@ -147,34 +180,23 @@ pub fn spawn_heartbeat_supervisor(h: HubHandles, tasks: &TaskTracker, shutdown: 
 ///   channel stays full for `max_missed` consecutive ticks, warn once
 ///   (episode style); the Pong outage itself ages out via `last_pong` and
 ///   goes through the normal eviction path.
-async fn run_heartbeat_supervisor(h: HubHandles, shutdown: CancellationToken) {
+async fn run_heartbeat_supervisor(h: std::sync::Arc<HubState>, shutdown: CancellationToken) {
     let mut tick: u64 = 0;
     // Per-agent consecutive-full counts (episode-style alerting; forgotten
     // once the agent disappears)
     let mut full_streaks: HashMap<String, u32> = HashMap::new();
     loop {
-        // One config snapshot per tick: the interval decides the sleep and
-        // the cadence decides the dead line — a torn read between two lock
-        // acquisitions could pair values from different reloads.
+        // One config snapshot per tick (see [`cadence_snapshot`]).
         let cadence = {
             let cfg = h.config.read().await;
-            cfg.heartbeat
-                .enabled
-                .then(|| HeartbeatCadence::from(&cfg.heartbeat))
+            cadence_snapshot(&cfg)
         };
-        let interval_secs = cadence.map_or(0, |c| c.interval_secs);
-        let sleep_for = if interval_secs == 0 {
-            HEARTBEAT_DISABLED_POLL
-        } else {
-            Duration::from_secs(interval_secs)
-        };
+        let sleep_for = tick_sleep(cadence);
         tokio::select! {
             () = shutdown.cancelled() => break,
             () = tokio::time::sleep(sleep_for) => {}
         }
         let Some(cadence) = cadence else { continue };
-        // The eviction dead line — the canonical derivation (single source
-        // with the agent-side watchdog/stall derivations in core params).
         let deadline = cadence.dead_line();
         let summary_every = cadence.summary_ticks();
         tick += 1;
@@ -192,29 +214,32 @@ async fn run_heartbeat_supervisor(h: HubHandles, shutdown: CancellationToken) {
         let mut full = 0u64;
         let mut evicted = 0u64;
         for (agent_id, state) in &snapshot {
-            let (alive, tx, is_quic) = {
+            let (alive, tx, is_quic, circuit) = {
                 let st = state.read().await;
                 (
-                    st.last_pong.elapsed() <= deadline,
+                    !pong_expired(&st, &cadence),
                     st.tx.clone(),
                     st.quic.is_some(),
+                    st.circuit,
                 )
             };
             if is_quic {
                 continue;
             }
             if !alive {
-                warn!("agent {agent_id} heartbeat lost (no Pong for >{deadline:?}), evicting");
+                warn!(
+                    "agent circuit={circuit} heartbeat lost (no Pong for >{deadline:?}), evicting"
+                );
                 full_streaks.remove(agent_id);
                 evict_agent(&h, agent_id, state, "heartbeat_missed").await;
                 evicted += 1;
                 continue;
             }
             let ping = TunnelData {
-                stream_id: String::new(),
-                source: FrameSource::Ping,
-                stream_type: FrameType::Ping,
-                flags: 0,
+                stream_id: StreamId::ZERO,
+                origin: FrameOrigin::Hub,
+                stream_type: interflow_core::protocol::FrameType::Ping,
+                flags: FLAG_HUB_ORIGIN,
                 data: Bytes::new(),
             };
             match tx.try_send(ping) {
@@ -222,7 +247,7 @@ async fn run_heartbeat_supervisor(h: HubHandles, shutdown: CancellationToken) {
                     pings += 1;
                     metrics::counter!("interflow_hub_heartbeat_pings_sent").increment(1);
                     full_streaks.remove(agent_id);
-                    debug!("agent {agent_id} heartbeat Ping enqueued");
+                    debug!("agent circuit={circuit} heartbeat Ping enqueued");
                 }
                 Err(e) => {
                     full += 1;
@@ -233,11 +258,11 @@ async fn run_heartbeat_supervisor(h: HubHandles, shutdown: CancellationToken) {
                     // fullness is closed out by last_pong aging
                     if *streak == cadence.max_missed.max(1) {
                         warn!(
-                            "agent {agent_id} heartbeat Ping failed to enqueue {streak} times in a row\
+                            "agent circuit={circuit} heartbeat Ping failed to enqueue {streak} times in a row\
                              (poll channel full, consumer most likely stalled)"
                         );
                     }
-                    debug!("agent {agent_id} heartbeat Ping enqueue failed: {e}");
+                    debug!("agent circuit={circuit} heartbeat Ping enqueue failed: {e}");
                 }
             }
         }

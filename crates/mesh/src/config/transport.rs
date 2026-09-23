@@ -1,16 +1,13 @@
 //! Transport-layer tuning shared by the hub and agent schemas.
 //!
 //! One `[transport.h2]` / `[transport.quic]` shape on both endpoints
-//! (schema v3): before this, the h2 keepalive was hard-coded per endpoint
-//! (and asymmetric — agent 5s/10s, hub 10s/20s), and the QUIC
-//! idle/keepalive existed only on the hub side while the agent endpoint
-//! carried its own hard-coded constants — pointless to tune, since QUIC
-//! negotiates the idle timeout as the *minimum* of both endpoints. With the
-//! same knobs and the same defaults on both sides (sourced from the shared
-//! transport profile in core `config::params`), a link's transport behavior
-//! is a property of the pair, not an accident of which side you tuned.
+//! (QUIC negotiates the idle timeout as the *minimum* of both endpoints).
+//! With the same knobs and defaults on both sides, sourced from the shared
+//! transport profile in core `config::params`, a link's transport behavior is
+//! a property of the pair rather than an accident of which side was tuned.
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// h2 HTTP/2 keepalive tuning — one schema shared verbatim by the hub and
 /// agent TOMLs.
@@ -83,6 +80,24 @@ impl Default for AgentQuicConfig {
         Self {
             max_idle_timeout_ms: default_quic_idle_timeout_ms(),
             keepalive_interval_ms: default_quic_keepalive_interval_ms(),
+        }
+    }
+}
+
+impl From<&AgentQuicConfig> for interflow_core::tunnel::quic::QuicEndpointParams {
+    fn from(cfg: &AgentQuicConfig) -> Self {
+        Self {
+            max_idle_timeout_ms: cfg.max_idle_timeout_ms,
+            keepalive_interval: Duration::from_millis(u64::from(cfg.keepalive_interval_ms)),
+        }
+    }
+}
+
+impl From<&crate::config::HubQuicConfig> for interflow_core::tunnel::quic::QuicEndpointParams {
+    fn from(cfg: &crate::config::HubQuicConfig) -> Self {
+        Self {
+            max_idle_timeout_ms: cfg.max_idle_timeout_ms,
+            keepalive_interval: Duration::from_millis(u64::from(cfg.keepalive_interval_ms)),
         }
     }
 }

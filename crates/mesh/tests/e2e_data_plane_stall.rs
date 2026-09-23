@@ -43,7 +43,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use interflow_core::error::InterflowError;
 use interflow_core::protocol::frame::{DecodeOutcome, FrameType, encode_frame};
-use interflow_core::tunnel::PING_SOURCE;
+use interflow_core::tls::{TlsMinVersion, build_mtls_acceptor};
 use interflow_mesh::agent::{AgentClient, AgentState};
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
 use interflow_testkit::{
@@ -160,7 +160,7 @@ struct FakeHub {
     counts: Arc<FakeCounts>,
 }
 
-/// Start the fake hub: cleartext h2. `/poll` emits one Ping frame per request
+/// Start the fake hub: TLS + mTLS h2. `/poll` emits one Ping frame per request
 /// then stalls forever (never ends the response, never registers a waker —
 /// the connection and other streams are unaffected, precisely reproducing the
 /// incident shape of "control plane alive, data plane dead").
@@ -170,6 +170,13 @@ async fn spawn_fake_hub(mode: FakeMode) -> FakeHub {
         .expect("fake hub bind");
     let addr = listener.local_addr().expect("fake hub addr");
     let counts = Arc::new(FakeCounts::default());
+    let acceptor = build_mtls_acceptor(
+        &certs().server_cert_path().display().to_string(),
+        &certs().server_key_path().display().to_string(),
+        &certs().ca_path().display().to_string(),
+        TlsMinVersion::V1_3,
+    )
+    .expect("fake hub mTLS acceptor");
 
     let svc_counts = counts.clone();
     let svc = FakeHubSvc {
@@ -182,7 +189,15 @@ async fn spawn_fake_hub(mode: FakeMode) -> FakeHub {
                 break;
             };
             let svc = svc.clone();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
+                let stream = match acceptor.accept(stream).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        eprintln!("fake hub TLS handshake error: {e}");
+                        return;
+                    }
+                };
                 let conn = http2::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), svc);
                 if let Err(e) = conn.await {
@@ -234,7 +249,7 @@ impl Service<Request<Incoming>> for FakeHubSvc {
                             // response (heartbeat 1s/2missed, but the test
                             // overrides the derived value with a fixed 1s
                             // watchdog)
-                            let caps = r#"{"heartbeat":{"interval_secs":1,"max_missed":2}}"#;
+                            let caps = r#"{"circuit_token":"12078a05e14f4e2c99b1679be1df7c30","heartbeat":{"interval_secs":1,"max_missed":2}}"#;
                             Response::builder()
                                 .status(StatusCode::OK)
                                 .header(CONTENT_TYPE, "application/json")
@@ -256,8 +271,15 @@ impl Service<Request<Incoming>> for FakeHubSvc {
                         StreamBody::new(futures::stream::poll_fn(move |_cx: &mut Context<'_>| {
                             if !fired.swap(true, Ordering::SeqCst) {
                                 let mut buf = BytesMut::new();
-                                encode_frame(FrameType::Ping, 0, "", PING_SOURCE, &[], &mut buf)
-                                    .expect("ping encode");
+                                encode_frame(
+                                    FrameType::Ping,
+                                    interflow_core::protocol::FLAG_HUB_ORIGIN,
+                                    interflow_core::protocol::StreamId::ZERO,
+                                    interflow_core::protocol::CircuitToken::ZERO,
+                                    &[],
+                                    &mut buf,
+                                )
+                                .expect("ping encode");
                                 Poll::Ready(Some(Ok(HttpFrame::data(buf.freeze()))))
                             } else {
                                 Poll::Pending
@@ -323,10 +345,7 @@ async fn pinged_then_stalled_poll_stream_triggers_session_rebuild() {
     let port = fake.addr.port();
 
     let mut cfg = agent_config("stall-wedge", port, certs());
-    cfg.agent.hub_url = format!("http://{}", fake.addr);
-    // The fake hub speaks plain h2 (no TLS terminator); the mTLS fixture
-    // must be stripped for these protocol-level cases.
-    cfg.tls = None;
+    cfg.agent.hub_url = format!("https://{}", fake.addr);
     cfg.agent.poll_idle_timeout_secs = Some(1);
     let agent = spawn_agent_registered(cfg).await;
 
@@ -397,10 +416,7 @@ async fn unparseable_register_body_fails_registration() {
     let fake = spawn_fake_hub(FakeMode::PlainText).await;
 
     let mut cfg = agent_config("stall-plaintext", fake.addr.port(), certs());
-    cfg.agent.hub_url = format!("http://{}", fake.addr);
-    // The fake hub speaks plain h2 (no TLS terminator); the mTLS fixture
-    // must be stripped for these protocol-level cases.
-    cfg.tls = None;
+    cfg.agent.hub_url = format!("https://{}", fake.addr);
     let agent = AgentClient::new(cfg).expect("client build").start();
 
     tokio::time::sleep(Duration::from_secs(5)).await;

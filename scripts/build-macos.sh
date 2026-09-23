@@ -17,11 +17,11 @@ fi
 echo "Starting build for macos-$TARGET_NAME..."
 
 # Build for release
-cargo build --release --bin interflow-mesh --bin interflow-expose
+cargo build --release --bin interflow --bin interflow-mesh --bin interflow-registrar
 
 # Copy the artifacts
 mkdir -p artifacts
-for BIN in interflow-mesh interflow-expose; do
+for BIN in interflow interflow-mesh interflow-registrar; do
     OUTPUT_FILE="artifacts/${BIN}-macos-$TARGET_NAME"
     if [ -f "target/release/${BIN}" ]; then
         cp "target/release/${BIN}" "$OUTPUT_FILE"

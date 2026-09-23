@@ -35,11 +35,11 @@ fi
 echo "Starting build for $TARGET..."
 
 cargo zigbuild --release --target "$TARGET" \
-    --bin interflow-mesh --bin interflow-expose
+    --bin interflow --bin interflow-mesh --bin interflow-registrar
 
 # Copy the artifacts
 mkdir -p artifacts
-for BIN in interflow-mesh interflow-expose; do
+for BIN in interflow interflow-mesh interflow-registrar; do
     OUTPUT_FILE="artifacts/${BIN}-linux-${ARCH}"
     cp "target/${TARGET}/release/${BIN}" "$OUTPUT_FILE"
     echo "Built: $PWD/$OUTPUT_FILE"

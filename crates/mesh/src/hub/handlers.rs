@@ -21,7 +21,7 @@ impl HubService {
         };
         let tenant = identity.tenant.clone();
         let agent_list: Vec<String> = {
-            let agents = self.agents.read().await;
+            let agents = self.state.agents.read().await;
             agents
                 .keys()
                 .filter(|key| {

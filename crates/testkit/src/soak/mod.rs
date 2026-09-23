@@ -6,6 +6,7 @@
 //! - [`rss`]: per-PID memory sampling
 //! - [`scrape`]: scraping the hub's production `/metrics` endpoint
 //! - [`runner`]: scenario orchestration, assertions, artifact, and report (CLI in `bin/soak.rs`)
+pub mod error;
 pub mod phases;
 pub mod proc;
 pub mod rss;

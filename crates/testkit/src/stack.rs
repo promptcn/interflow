@@ -1,18 +1,16 @@
 //! Stack assembly: in-process hub / agent instances, graceful shutdown, readiness probes.
 //!
-//! The hub handle owns the shutdown token ([`HubServer::run_until`]); `shutdown()`
-//! returns after drain completes. The agent exposes [`AgentHandle`] directly (which
-//! supports `shutdown_graceful`).
+//! The hub handle is the engine-level [`interflow_mesh::hub::HubHandle`]
+//! (spawn + lifecycle watch + graceful shutdown); [`spawn_hub`] wraps it with
+//! the test contract "returned only once accepting". The agent exposes
+//! [`AgentHandle`] directly (which supports `shutdown_graceful`).
 
-use interflow_core::error::Result;
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_mesh::config::{AgentConfig, HubConfig};
-use interflow_mesh::hub::HubServer;
+pub use interflow_mesh::hub::{HubHandle, HubLifecycle};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
 /// Bind 127.0.0.1:0 to grab an ephemeral port (released immediately after binding; there is
 /// a tiny race between tests but it is usually good enough).
@@ -21,26 +19,8 @@ pub fn pick_ephemeral_port() -> u16 {
     listener.local_addr().expect("addr").port()
 }
 
-/// An in-process hub instance: driven by `run_until`; dropping it does not shut it down
-/// (reclaimed when the test runtime ends). Call [`HubHandle::shutdown`] for a clean stop.
-pub struct HubHandle {
-    task: JoinHandle<Result<()>>,
-    shutdown_token: CancellationToken,
-}
-
-impl HubHandle {
-    /// Graceful shutdown: trigger drain (stop accepting → GOAWAY/CONNECTION_CLOSE → wait
-    /// for close-out) and wait for `run_until` to return.
-    pub async fn shutdown(self) -> Result<()> {
-        self.shutdown_token.cancel();
-        self.task
-            .await
-            .unwrap_or_else(|e| panic!("hub task join: {e}"))
-    }
-}
-
-/// Start a hub (a background task drives `run_until`) and **wait until it is
-/// accepting connections** (TCP bound + QUIC listener up) before returning.
+/// Start a hub and **wait until it is accepting connections** (TCP bound +
+/// QUIC listener up) before returning.
 ///
 /// This is the readiness contract for every in-process hub in tests: by the
 /// time a `HubHandle` exists the hub can be connected to — no startup sleeps,
@@ -48,25 +28,27 @@ impl HubHandle {
 /// never reaches readiness.
 pub async fn spawn_hub(cfg: HubConfig) -> HubHandle {
     const READY_TIMEOUT: Duration = Duration::from_secs(10);
-    let shutdown_token = CancellationToken::new();
-    let token = shutdown_token.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let server = HubServer::new(cfg, "<testkit>".to_string()).expect("hub build");
-        server.run_until_signalled(token, ready_tx).await
-    });
-    match tokio::time::timeout(READY_TIMEOUT, ready_rx).await {
-        Ok(Ok(())) => {}
-        // Server task ended (or timed out) before signaling readiness:
-        // surface the real error instead of a confusing downstream failure.
-        _ => {
-            let outcome = task.await.unwrap_or_else(|e| panic!("hub task join: {e}"));
-            panic!("hub not ready within {READY_TIMEOUT:?}: {outcome:?}");
+    let hub = HubHandle::spawn(cfg).expect("hub build");
+    let mut state = hub.subscribe_state();
+    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    loop {
+        match state.borrow_and_update().clone() {
+            HubLifecycle::Running => return hub,
+            // Ended before readiness (e.g. listen bind failure): surface the
+            // real error instead of a confusing downstream failure.
+            HubLifecycle::Failed { error } => panic!("hub not ready: {error}"),
+            HubLifecycle::Starting => {}
+            terminal => panic!("hub left readiness wait in {terminal:?}"),
         }
-    }
-    HubHandle {
-        task,
-        shutdown_token,
+        if tokio::time::timeout_at(deadline, state.changed())
+            .await
+            .is_err()
+        {
+            panic!(
+                "hub not ready within {READY_TIMEOUT:?} (state: {:?})",
+                hub.state()
+            );
+        }
     }
 }
 

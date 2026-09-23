@@ -1,6 +1,6 @@
 //! `/poll` handling: long-lived connection that streams `TunnelData` from hub → agent.
 
-use crate::hub::service::{HubService, agent_id_of, bind_connection_identity, text_response};
+use crate::hub::service::{HubService, circuit_token_of, text_response};
 use crate::hub::state::{HubResponseBody, RxStream};
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Incoming;
@@ -23,19 +23,15 @@ impl HubService {
         &self,
         req: Request<Incoming>,
     ) -> Result<Response<HubResponseBody>> {
-        let agent_id = agent_id_of(&req)?;
-
-        // Identity binding check (bare id vs the mTLS identity's CN)
-        if let Err(resp) =
-            bind_connection_identity(&self.connection_identity, agent_id, "poll").await
-        {
-            return Ok(*resp);
-        }
+        let circuit = circuit_token_of(&req)?;
         let agent_key = self.qualified_id().await;
+        if self.circuit().await != Some(circuit) {
+            return Ok(text_response(StatusCode::UNAUTHORIZED, "Circuit mismatch"));
+        }
 
         // Take the AgentSession Arc (outer read lock is very short-lived)
         let state_arc = {
-            let agents = self.agents.read().await;
+            let agents = self.state.agents.read().await;
             agents.get(&agent_key).cloned()
         };
 
@@ -52,6 +48,9 @@ impl HubService {
             // authentication level is equivalent to /register.
             self.implicit_re_register(&agent_key).await
         };
+        if state_arc.read().await.circuit != circuit {
+            return Ok(text_response(StatusCode::UNAUTHORIZED, "Circuit mismatch"));
+        }
 
         // Decide under the inner write lock: take the existing rx /
         // rebuild the channel in place / return 409
@@ -76,7 +75,7 @@ impl HubService {
                 // survives (liveness and QUIC handle untouched, the active
                 // upload lease keeps running) and the fresh rx is consumed
                 // by this very poll instead of being parked.
-                info!("Agent {agent_key} channel closed or lost, recreating");
+                info!("Agent circuit={circuit} channel closed or lost, recreating");
                 let (tx, rx) = mpsc::channel(256);
                 let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
                 state.tx = tx;
@@ -94,10 +93,7 @@ impl HubService {
                 // a per-agent heartbeat task taking over
                 (rx, ctrl_rx, backlog, generation, waker_slot)
             } else {
-                warn!(
-                    "Agent {} attempted poll but no channel available (in use)",
-                    agent_id
-                );
+                warn!("Agent circuit={circuit} attempted poll but no channel available (in use)");
                 return Ok(text_response(StatusCode::CONFLICT, "Channel busy"));
             }
         };
@@ -109,7 +105,7 @@ impl HubService {
             state_arc,
             generation,
             waker_slot,
-            self.handles(),
+            self.state.clone(),
             agent_key.clone(),
         );
         // ChunkHygiene enforces the h2 body chunking invariants (no empty
@@ -124,7 +120,7 @@ impl HubService {
             .body(body)
             .expect("status+body response is infallible");
 
-        info!("Agent {agent_key} entering streaming receive mode");
+        info!("Agent circuit={circuit} entering streaming receive mode");
         Ok(response)
     }
 }

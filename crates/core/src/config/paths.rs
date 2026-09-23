@@ -1,22 +1,15 @@
-//! Config-relative path anchoring.
-//!
-//! Invariant: every relative filesystem path that appears inside a config
-//! file resolves against the directory containing that config file — never
-//! against the process working directory, which is meaningless under
-//! systemd, Docker, or GUI launches. CLI-flag paths keep the standard Unix
-//! CWD semantics and are out of scope.
+//! User-typed path handling (tilde expansion + base anchoring).
 //!
 //! A leading `~` (bare or `~/…`) expands to the user's home directory at
-//! every entry point. Hand-typed paths (config files, profiles, GUI forms)
-//! never pass through a shell, so the program itself carries this one shell
+//! every entry point. Hand-typed paths (GUI forms, profiles) never pass
+//! through a shell, so the program itself carries this one shell
 //! convention instead of each entry failing on the literal.
 //!
-//! Anchoring happens at load time, immediately after secret expansion and
-//! before validation, so every downstream consumer (validation, TLS
-//! acceptors, audit writers, hot-reload) sees absolute paths and needs no
-//! path handling of its own.
+//! [`anchor`] resolves a relative path against a base directory (the
+//! profile's directory on the GUI path) — never against the process
+//! working directory, which is meaningless under systemd, Docker, or GUI
+//! launches.
 
-use crate::error::{InterflowError, Result};
 use std::path::{Path, PathBuf};
 
 /// Expands a leading `~` to the user's home directory.
@@ -46,35 +39,15 @@ fn expand_tilde_opt(path: &str) -> Option<String> {
     })
 }
 
-/// Absolutizes `path` against the process working directory when relative.
-///
-/// `fs::canonicalize` is deliberately avoided: it requires the file to
-/// already exist and prefixes `\\?\` on Windows.
-pub fn absolutize(path: &Path) -> Result<PathBuf> {
-    if let Some(expanded) = path.to_str().and_then(expand_tilde_opt) {
-        return Ok(PathBuf::from(expanded));
-    }
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-    let cwd = std::env::current_dir().map_err(|e| {
-        InterflowError::config(format!(
-            "cannot resolve relative config path {}: {e}",
-            path.display()
-        ))
-    })?;
-    Ok(cwd.join(path))
-}
-
-/// Anchors a config-file path string against the config file's directory.
+/// Anchors a relative path string against `base_dir`.
 ///
 /// Absolute values and empty values pass through unchanged (empty is
-/// reported by load-time validation, not silently rewritten here). `.`
+/// reported by validation, not silently rewritten here). `.`
 /// components are lexically dropped; `..` is preserved (no symlink-aware
 /// canonicalization — the target may not exist yet).
 pub fn anchor(base_dir: &Path, value: &str) -> String {
     // Tilde expansion wins over anchoring: `~/x` is lexically relative but
-    // semantically absolute, so it must never join the config directory.
+    // semantically absolute, so it must never join the base directory.
     if let Some(expanded) = expand_tilde_opt(value) {
         return expanded;
     }
@@ -125,19 +98,6 @@ mod tests {
     }
 
     #[test]
-    fn absolutize_keeps_absolute() {
-        let abs = std::env::temp_dir();
-        assert_eq!(absolutize(&abs).unwrap(), abs);
-    }
-
-    #[test]
-    fn absolutize_joins_cwd_for_relative() {
-        let joined = absolutize(Path::new("hub.toml")).unwrap();
-        assert!(joined.is_absolute());
-        assert!(joined.ends_with("hub.toml"));
-    }
-
-    #[test]
     fn tilde_expands_to_home() {
         let home = dirs::home_dir().unwrap();
         assert_eq!(expand_tilde("~"), home.display().to_string());
@@ -168,15 +128,6 @@ mod tests {
         assert_eq!(
             anchor(Path::new("/etc/interflow"), "~/certs/agent.crt"),
             home.join("certs/agent.crt").display().to_string()
-        );
-    }
-
-    #[test]
-    fn absolutize_expands_tilde() {
-        let home = dirs::home_dir().unwrap();
-        assert_eq!(
-            absolutize(Path::new("~/hub.toml")).unwrap(),
-            home.join("hub.toml")
         );
     }
 }

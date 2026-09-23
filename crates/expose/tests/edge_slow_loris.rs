@@ -21,61 +21,16 @@
     dead_code,
     unused_mut
 )]
-use interflow_expose::client::ExposeArgs;
-use interflow_expose::edge::EdgeArgs;
-use interflow_expose::edge::EdgeHubTls;
+use interflow_expose::client::{ExposeArgs, LocalService};
+use interflow_expose::edge::{
+    ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, Route, WorkspaceTrust,
+};
 use interflow_mesh::agent::AgentState;
 use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-
-async fn spawn_echo() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
-    let addr = listener.local_addr().expect("echo addr");
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                loop {
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if sock.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
-fn pick_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("addr").port()
-}
-
-async fn wait_for_tcp(addr: SocketAddr, timeout: Duration) -> std::io::Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(e);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-}
 
 /// Starts edge + expose client + the given backend (all real components) and
 /// returns the edge listen address. `stream_idle_timeout_secs` injects the
@@ -86,58 +41,65 @@ async fn spawn_stack(
     stream_idle_timeout_secs: u64,
     backend_addr: SocketAddr,
 ) -> SocketAddr {
-    let edge_port = pick_port();
-    let hub_port = pick_port();
+    let edge_port = interflow_testkit::pick_ephemeral_port();
+    let hub_port = interflow_testkit::pick_ephemeral_port();
     let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
     let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
-    let routes_content = format!(
-        r#"
-[[routes]]
-host = "test.local"
-tenant = "test"
-agent_id = "expose-test"
-remote_addr = "{backend_addr}"
-"#
-    );
-    let routes_path = std::env::temp_dir().join(format!(
-        "interflow_test_routes_{}.toml",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::write(&routes_path, &routes_content).expect("write routes.toml");
-
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
-    let edge_args = EdgeArgs {
+    let (principal_cert, principal_key) = certs.named_client_cert("edge");
+    let edge_config = EdgeConfig {
         listen_addr: edge_listen,
-        hub_listen_addr: hub_listen,
-        routes_path: routes_path.to_string_lossy().into_owned(),
-        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
-        proxy_protocol: Default::default(),
-        hub_tls: Some(EdgeHubTls {
-            cert_path: certs.server_cert_path().display().to_string(),
-            key_path: certs.server_key_path().display().to_string(),
-        }),
-        audit_path,
-        stream_idle_timeout_secs,
-        agent_recovery_timeout_secs: 120,
-        ..Default::default()
+        control_listen_addr: hub_listen,
+        control_tls: ControlEndpointTls {
+            cert: certs.server_cert_path(),
+            key: certs.server_key_path(),
+        },
+        workspace_trust: vec![WorkspaceTrust {
+            workspace: "test".to_string(),
+            ca: certs.ca_path(),
+        }],
+        principals: vec![IngressPrincipal {
+            workspace: "test".to_string(),
+            cert: principal_cert,
+            key: principal_key,
+        }],
+        routes: vec![Route {
+            host: "test.local".to_string(),
+            workspace: "test".to_string(),
+            agent_id: "expose-test".to_string(),
+            service_id: "web".to_string(),
+        }],
+        audit_path: audit_path.map(std::path::PathBuf::from),
+        listener: EdgeListenerPolicy {
+            stream_idle_timeout: Duration::from_secs(stream_idle_timeout_secs),
+            ..EdgeListenerPolicy::default()
+        },
+        agent_recovery_timeout: Duration::from_secs(120),
+        ..EdgeConfig::default()
     };
-    tokio::task::spawn(interflow_expose::edge::run(edge_args));
+    tokio::task::spawn(interflow_expose::edge::run(edge_config));
 
-    wait_for_tcp(edge_listen, Duration::from_secs(5))
+    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
         .await
         .expect("edge listener should start within 5s");
-    wait_for_tcp(hub_listen, Duration::from_secs(5))
+    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
         .await
         .expect("edge hub should start within 5s");
 
     let (client_cert, client_key) = certs.client_paths();
     let client_args = ExposeArgs {
-        local_ports: vec![backend_addr.port()],
+        log_name: None,
+        services: vec![LocalService {
+            id: "web".into(),
+            target_addr: backend_addr,
+            overridden: false,
+        }],
         hub_url: format!("https://127.0.0.1:{hub_port}"),
         client_cert: Some(client_cert.display().to_string()),
         client_key: Some(client_key.display().to_string()),
         agent_id: "expose-test".into(),
+        ingress_ca_path: Some(certs.ca_path().display().to_string()),
         ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
@@ -211,7 +173,7 @@ async fn spawn_silent_backend(silence: Duration, burst: Option<Vec<u8>>) -> Sock
 /// closed within 10s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn edge_slow_loris_timeout() {
-    let edge_listen = spawn_stack(None, 300, spawn_echo().await).await;
+    let edge_listen = spawn_stack(None, 300, interflow_testkit::echo_server().await.0).await;
 
     let mut sock = TcpStream::connect(edge_listen).await.expect("connect edge");
     // Send 1 byte then hang (never send a complete Host header)
@@ -245,7 +207,12 @@ async fn edge_no_route_silent_close() {
         uuid::Uuid::new_v4()
     ));
     let audit_path_str = audit_path.to_string_lossy().to_string();
-    let edge_listen = spawn_stack(Some(audit_path_str.clone()), 300, spawn_echo().await).await;
+    let edge_listen = spawn_stack(
+        Some(audit_path_str.clone()),
+        300,
+        interflow_testkit::echo_server().await.0,
+    )
+    .await;
 
     let mut sock = TcpStream::connect(edge_listen).await.expect("connect edge");
     let request = b"GET / HTTP/1.1\r\nHost: no.such.route\r\nConnection: close\r\n\r\n";
@@ -281,7 +248,7 @@ async fn edge_no_route_silent_close() {
 /// yields no Host → no route match → silent close).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn edge_duplicate_host_rejected() {
-    let edge_listen = spawn_stack(None, 300, spawn_echo().await).await;
+    let edge_listen = spawn_stack(None, 300, interflow_testkit::echo_server().await.0).await;
 
     let mut sock = TcpStream::connect(edge_listen).await.expect("connect edge");
     let request = b"GET / HTTP/1.1\r\nHost: test.local\r\nHost: evil.com\r\n\r\n";

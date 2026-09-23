@@ -54,16 +54,16 @@ jobs:
           cargo install --locked cargo-zigbuild
       - name: Build (Linux musl via zigbuild)
         if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo zigbuild --release --target ${{ matrix.target }} --bin interflow-mesh --bin interflow-expose
+        run: cargo zigbuild --release --target ${{ matrix.target }} --bin interflow --bin interflow-mesh --bin interflow-registrar
       - name: Build (macOS / Windows)
         if: matrix.target != 'x86_64-unknown-linux-musl' && matrix.target != 'aarch64-unknown-linux-musl'
-        run: cargo build --release --target ${{ matrix.target }} --bin interflow-mesh --bin interflow-expose
+        run: cargo build --release --target ${{ matrix.target }} --bin interflow --bin interflow-mesh --bin interflow-registrar
       - name: Stage artifacts (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
           staging=interflow-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p $staging
-          cp target/${{ matrix.target }}/release/interflow-mesh target/${{ matrix.target }}/release/interflow-expose $staging/
+          cp target/${{ matrix.target }}/release/interflow target/${{ matrix.target }}/release/interflow-mesh target/${{ matrix.target }}/release/interflow-registrar $staging/
           cp README.md LICENSE* $staging/
           tar czf $staging.tar.gz $staging
           shasum -a 256 $staging.tar.gz > $staging.tar.gz.sha256
@@ -75,7 +75,7 @@ jobs:
         run: |
           $staging = "interflow-${{ github.ref_name }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Force $staging | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/interflow-mesh.exe, target/${{ matrix.target }}/release/interflow-expose.exe, README.md, LICENSE $staging
+          Copy-Item target/${{ matrix.target }}/release/interflow.exe, target/${{ matrix.target }}/release/interflow-mesh.exe, target/${{ matrix.target }}/release/interflow-registrar.exe, README.md, LICENSE $staging
           Compress-Archive $staging "$staging.zip"
           $hash = (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("$PWD/$staging.zip.sha256", "$hash  $staging.zip`n")

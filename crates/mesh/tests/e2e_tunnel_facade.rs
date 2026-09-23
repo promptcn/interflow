@@ -1,6 +1,5 @@
 //! E2E: the session-slot tunnel facade (regression tests for the 2026-09-16
-//! edge self-dial incident, docs/bug/2026-09-16-edge-self-dial-agent-no-
-//! reregister.md).
+//! edge self-dial incident).
 //!
 //! Architecture under test: `AgentHandle::tunnel()` hands embedders an
 //! [`AgentTunnel`] backed by a hot-swappable session slot — the supervisor
@@ -31,11 +30,12 @@
     dead_code,
     unused_mut
 )]
-use bytes::Bytes;
 use interflow_core::error::InterflowError;
 use interflow_core::protocol::StreamProto;
-use interflow_core::protocol::frame::FrameType;
+use interflow_core::tls::{InnerTlsMaterial, inner_client_config};
 use interflow_core::tunnel::AgentTunnel;
+use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
+use interflow_core::tunnel::{InnerStreamHello, TargetSelector};
 use interflow_mesh::config::EgressRule;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, pick_ephemeral_port, spawn_agent_registered, spawn_hub,
@@ -43,57 +43,87 @@ use interflow_testkit::{
 };
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
     static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
     C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
 }
 
-/// One request-direction stream through the facade, edge-listener style:
-/// register the return channel, Open toward the target agent, push a payload,
-/// collect the echoed bytes back.
+/// One request-direction stream through the facade, edge-listener shape:
+/// mandatory inner TLS + encrypted selector, payload, then echoed bytes.
 async fn facade_round_trip(
     tunnel: &AgentTunnel,
     target_agent: &str,
     target_addr: SocketAddr,
     payload: &[u8],
 ) -> interflow_core::error::Result<Vec<u8>> {
-    let sid = uuid::Uuid::new_v4().to_string();
-    let mut data_rx = tunnel.register_stream(sid.clone()).await;
+    let sid = interflow_core::protocol::StreamId::random().unwrap();
+    let data_rx = tunnel.register_stream(sid).await;
     tunnel
-        .send_open(
-            &sid,
-            target_agent,
-            Some(&target_addr.to_string()),
-            StreamProto::Tcp,
-        )
+        .send_open_with(sid, target_agent, StreamProto::Tcp, true)
         .await?;
-    tunnel
-        .send_data(&sid, Bytes::copy_from_slice(payload))
-        .await?;
+
+    let (cert, key) = certs().named_client_cert("front");
+    let ca = certs().ca_path().display().to_string();
+    let material = InnerTlsMaterial::from_paths(
+        &[ca.as_str()],
+        &cert.display().to_string(),
+        &key.display().to_string(),
+    )
+    .map_err(|e| InterflowError::connection(format!("inner material")).with_source(e))?;
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+        inner_client_config(&material, target_agent)
+            .map_err(|e| InterflowError::connection(format!("inner connector")).with_source(e))?,
+    ));
+    let adapter = E2eTunnelIo::ingress(data_rx, tunnel.clone(), sid);
+    let mut tls = match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
+        E2eHandshakeOutcome::Established(tls, _) => tls,
+        E2eHandshakeOutcome::Failed { error } => {
+            tunnel.unregister_stream(sid).await;
+            return Err(InterflowError::connection(format!(
+                "inner TLS handshake failed: {error}"
+            )));
+        }
+    };
+    InnerStreamHello {
+        source_principal: "front".to_owned(),
+        source_fingerprint: material.leaf_fingerprint(),
+        selector: TargetSelector::Address(target_addr.to_string()),
+        correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+    }
+    .write(&mut tls)
+    .await?;
+    tls.write_all(payload).await?;
+    tls.flush().await?;
 
     let mut got = Vec::with_capacity(payload.len());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while got.len() < payload.len() {
-        let frame = tokio::time::timeout_at(deadline, data_rx.recv())
-            .await
-            .expect("echo frame within deadline")
-            .expect("stream channel must stay open until the echo completes");
-        if frame.stream_type == FrameType::Close {
-            // A peer-side rejection (e.g. "Target agent not registered")
-            // surfaces as a Close frame on the return channel — surface it
-            // as an error with the reason instead of appending its payload
-            // bytes to the echo.
-            let reason = String::from_utf8_lossy(&frame.data);
-            tunnel.unregister_stream(&sid).await;
-            return Err(InterflowError::connection(format!(
-                "stream closed by the peer before the echo completed: {reason}"
-            )));
-        }
-        got.extend_from_slice(&frame.data);
+        let mut chunk = vec![0u8; payload.len() - got.len()];
+        let n = match tokio::time::timeout_at(deadline, tls.read(&mut chunk)).await {
+            Ok(Ok(0)) => {
+                tunnel.unregister_stream(sid).await;
+                return Err(InterflowError::connection(
+                    "stream closed by the peer before the echo completed",
+                ));
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                tunnel.unregister_stream(sid).await;
+                return Err(
+                    InterflowError::connection(format!("inner stream read failed")).with_source(e),
+                );
+            }
+            Err(_) => {
+                tunnel.unregister_stream(sid).await;
+                return Err(InterflowError::connection("echo timed out"));
+            }
+        };
+        got.extend_from_slice(&chunk[..n]);
     }
-    let _ = tunnel.send_close(&sid).await;
-    tunnel.unregister_stream(&sid).await;
+    let _ = tunnel.send_close(sid).await;
+    tunnel.unregister_stream(sid).await;
     Ok(got)
 }
 
@@ -132,7 +162,7 @@ async fn facade_rides_across_session_rebuild() {
 
     // 5. Kill the hub: connection-level death (drain: GOAWAY, then forced
     //    close) — the incident's failure form.
-    hub.shutdown().await.expect("hub shutdown");
+    hub.shutdown_graceful().await.expect("hub shutdown");
     // Give the session wind-down a moment to run (it is bounded by design:
     // withdraw → 1s tunnel contract → 5s drain grace); 2s covers the
     // withdraw with margin in the common case.
@@ -143,11 +173,11 @@ async fn facade_rides_across_session_rebuild() {
     let probe_start = Instant::now();
     let probe = tokio::time::timeout(
         Duration::from_secs(3),
-        tunnel.send_open(
-            "gap-probe",
+        tunnel.send_open_with(
+            interflow_testkit::opaque_stream_id("gap-probe"),
             "egress",
-            Some(&echo_addr.to_string()),
             StreamProto::Tcp,
+            true,
         ),
     )
     .await;
@@ -205,7 +235,9 @@ async fn empty_slot_register_returns_sealed_channel() {
 
     // Give the first (failing) connect attempt a moment; either way the slot
     // is empty until a session registers.
-    let mut data_rx = tunnel.register_stream("sealed-probe".to_string()).await;
+    let mut data_rx = tunnel
+        .register_stream(interflow_testkit::opaque_stream_id("sealed-probe"))
+        .await;
     let frame = tokio::time::timeout(Duration::from_secs(1), data_rx.recv()).await;
     match frame {
         // Sealed channel: immediate closure (None), or an error out of the

@@ -23,12 +23,14 @@
 //! - Probe accounting (2026-09-17): recovery evidence must not depend on the
 //!   peer Close reason's arrival timing — an HTTP/1.1 keepalive client hangs
 //!   up first and the `backend_closed` token structurally never lands
-//!   (docs/bug/2026-09-17-edge-route-breaker-stuck-open.md). A probe that
+//!  . A probe that
 //!   relayed response bytes to the client without a failure reason is
 //!   therefore itself recovery evidence, classified by [`route_evidence`]
 //!   from the pump's locally-observed [`StreamOutcome`].
 
+use super::HTTP_HEAD_MAX_BYTES;
 use crate::edge::host_router::HostRouter;
+use crate::edge::ingress_identity::IngressIdentity;
 use interflow_core::protocol::{CloseReason, StreamProto};
 use interflow_core::security::ProxyProtocolPolicy;
 use interflow_core::security::XffPolicy;
@@ -38,15 +40,16 @@ use interflow_core::security::{
     AuditKind, AuditSink, AuthRateLimiter, ConnGuard, ConnTracker, XffError,
 };
 use interflow_core::tunnel::AgentTunnel;
-use interflow_core::tunnel::pump::{PumpConfig, StreamOutcome, pump_tcp_stream};
+use interflow_core::tunnel::pump::{PumpConfig, StreamOutcome};
 use interflow_mesh::agent::target_breaker::{BreakerDecision, TargetBreakers};
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// What a finished public connection proves about its route's health — the
 /// single classification authority feeding the route breaker.
@@ -96,11 +99,6 @@ const fn route_evidence(outcome: &StreamOutcome, probe: bool) -> RouteEvidence {
     }
 }
 
-/// Maximum number of bytes read per connection while looking for the Host
-/// header (HTTP/1.x request headers are typically < 8KB).
-const HOST_PEEK_BYTES: usize = 8 * 1024;
-/// Maximum allowed length of the Host header value (RFC 3986 recommends ≤ 255).
-const HOST_MAX_LEN: usize = 255;
 /// Client response write-stall tolerance: a single-frame write timeout (client
 /// not reading → send buffer full) closes the connection. Pairs with poisoning
 /// of the dispatch response direction (channel closed when full) — without this
@@ -110,19 +108,58 @@ const HOST_MAX_LEN: usize = 255;
 const CLIENT_WRITE_STALL_TIMEOUT: Duration =
     interflow_core::config::params::DEFAULT_CLIENT_WRITE_STALL_TIMEOUT;
 
-/// Edge public (internet-facing) listener.
+/// The two rustls configs ACME mode needs on the public listener.
+///
+/// Ordinary handshakes get the live certificate; ACME-ALPN handshakes get
+/// the challenge certificate (`None` in fronted modes — plain TCP).
+#[derive(Clone)]
+pub struct PublicTlsPlanes {
+    /// TLS-ALPN-01 challenge config.
+    pub challenge: std::sync::Arc<tokio_rustls::rustls::ServerConfig>,
+    /// Live-certificate config (swapped by the renewal loop).
+    pub default: std::sync::Arc<tokio_rustls::rustls::ServerConfig>,
+    /// Normalized certificate/route host set (from `build_host_allowlist`):
+    /// a ClientHello whose SNI is outside this set is closed right after the
+    /// acceptor, before the handshake — the connection could never be
+    /// routed, so the check only saves handshake and peek cost.
+    pub host_allowlist: std::sync::Arc<std::collections::HashSet<String>>,
+    /// Single-public-port mode: connections whose SNI is `host` complete
+    /// their handshake with the control plane's own mTLS configuration and
+    /// are served by the embedded control endpoint (P2). `None` = the
+    /// control plane lives on its own port only.
+    pub control: Option<std::sync::Arc<ControlDispatch>>,
+}
+
+/// The public listener's door into the embedded control endpoint.
+pub struct ControlDispatch {
+    /// The control endpoint's server name (must differ from every route
+    /// host — the manifest validator enforces it).
+    pub host: String,
+    /// The control plane's mTLS server configuration.
+    pub config: std::sync::Arc<tokio_rustls::rustls::ServerConfig>,
+    /// Serve handle into the embedded hub.
+    pub hub: interflow_mesh::hub::HubDispatchHandle,
+}
+
 pub struct EdgeListener {
-    /// Listen address (e.g. `0.0.0.0:8443`).
+    /// Listen address (e.g. `0.0.0.0:443` in ACME mode).
     pub listen_addr: SocketAddr,
+    /// Log attribution for this edge's lines (display only): the value the
+    /// hosting node's "This node" log filter matches. Every listener-side
+    /// event carries it via the `node` field.
+    pub node: String,
+    /// Public-HTTPS termination (`None` = plain TCP behind a front proxy).
+    pub tls: Option<PublicTlsPlanes>,
     /// Host route table.
     pub router: Arc<HostRouter>,
-    /// Established tunnel (injected by AgentClient; agent_id is usually `edge`).
-    pub tunnel: AgentTunnel,
+    /// One tunnel session per workspace (injected by the per-workspace
+    /// internal agents; each route selects its own workspace's session).
+    pub tunnels: HashMap<String, WorkspaceSession>,
     /// Host peek timeout (slow-loris defense). Defaults to 10s.
     pub host_peek_timeout: Duration,
     /// Stream idle timeout (close when no data flows in either direction).
-    /// Configured via CLI `--stream-idle-timeout-secs`, defaults to 300s;
-    /// must be ≤ the fronting nginx `proxy_read_timeout`.
+    /// Fixed `EdgeListenerPolicy` default (300s); must be ≤ the fronting
+    /// nginx `proxy_read_timeout` in the fronted topology.
     pub stream_idle_timeout: Duration,
     /// Connection tracker (per-IP + global caps).
     pub conn_tracker: Arc<ConnTracker>,
@@ -145,27 +182,61 @@ pub struct EdgeListener {
     /// PROXY protocol there). Shares the proxy policy's trusted set; the
     /// derived IP keys governance/audit only — never identity.
     pub xff_policy: Arc<XffPolicy>,
-    /// Gateway inner-TLS material (present iff the stable identity was
-    /// loaded): gateway flows then declare `FLAG_E2E` and run the inner
-    /// handshake against the route tenant's anchor, falling back to
-    /// plaintext on failure — the edge host is the product's plaintext
-    /// terminus, so fallback costs availability, not confidentiality; the
-    /// security enforcement lives at the egress side (`required` mode).
-    pub e2e: Option<Arc<crate::edge::gateway::EdgeE2e>>,
+    /// Workspace-scoped ingress identity. Every flow declares `FLAG_E2E`
+    /// and completes the inner handshake with the route's workspace
+    /// principal against that workspace's anchor; failure closes the
+    /// stream. The edge host remains the public plaintext terminus, but the
+    /// control endpoint never carries payload plaintext.
+    pub identity: Arc<IngressIdentity>,
+}
+
+/// One workspace's tunnel session on the listener.
+#[derive(Clone)]
+pub struct WorkspaceSession {
+    /// The hub-plane agent id (the workspace principal's CN — the inner
+    /// layer's source-principal binding).
+    pub agent_id: String,
+    /// The session-slot tunnel facade (rides supervisor rebuilds).
+    pub tunnel: AgentTunnel,
 }
 
 impl EdgeListener {
     /// Binds the listen port and runs the accept loop. Blocks the caller.
     pub async fn run(self) -> std::io::Result<()> {
+        Self::run_inner(self, None).await
+    }
+
+    /// [`run`] with an external readiness signal: `ready` fires once the
+    /// listen port is bound, just before the accept loop starts. Callers
+    /// that need "accepting by the time this returns" (the edge's readiness
+    /// barrier, the GUI's ingress engine) get an exact signal instead of
+    /// probing the port.
+    pub async fn run_signalled(
+        self,
+        ready: tokio::sync::oneshot::Sender<()>,
+    ) -> std::io::Result<()> {
+        Self::run_inner(self, Some(ready)).await
+    }
+
+    async fn run_inner(
+        self,
+        ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> std::io::Result<()> {
         let listener = TcpListener::bind(self.listen_addr).await?;
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
         info!(
+            node = %self.node,
             "Edge public listener started: {} ({} routes)",
             self.listen_addr,
             self.router.len()
         );
 
+        let tls = self.tls;
+        let node = self.node;
         let router = self.router;
-        let tunnel = self.tunnel;
+        let tunnels = self.tunnels;
         let host_peek_timeout = self.host_peek_timeout;
         let stream_idle_timeout = self.stream_idle_timeout;
         let conn_tracker = self.conn_tracker;
@@ -175,31 +246,37 @@ impl EdgeListener {
 
         let proxy_policy = self.proxy_policy;
         let xff_policy = self.xff_policy;
-        let e2e = self.e2e;
+        let identity = self.identity;
 
         loop {
             let (stream, addr) = listener.accept().await?;
 
-            // Per-IP resource gating runs inside the connection task, after
-            // the PROXY negotiation keys it on the real client IP (behind
-            // nginx every TCP peer is 127.0.0.1 — gating there would throttle
-            // the proxy itself).
+            // Per-IP resource gating runs inside the connection task. In
+            // fronted mode it waits for the PROXY negotiation to key on the
+            // real client IP (behind nginx every TCP peer is 127.0.0.1 —
+            // gating there would throttle the proxy itself); in ACME mode
+            // (80/443 direct, no front) it runs before the TLS accept, on
+            // the TCP peer IP.
+            let tls = tls.clone();
+            let node = node.clone();
             let router = router.clone();
-            let tunnel = tunnel.clone();
+            let tunnels = tunnels.clone();
             let audit = audit.clone();
             let route_breaker = route_breaker.clone();
             let conn_tracker = conn_tracker.clone();
             let rate_limiter = rate_limiter.clone();
             let proxy_policy = proxy_policy.clone();
             let xff_policy = xff_policy.clone();
-            let e2e = e2e.clone();
+            let identity = identity.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(
+                if let Err(e) = handle_public_connection(
+                    &node,
                     stream,
                     addr,
+                    tls.as_ref(),
                     &router,
-                    &tunnel,
+                    &tunnels,
                     host_peek_timeout,
                     stream_idle_timeout,
                     &audit,
@@ -208,26 +285,30 @@ impl EdgeListener {
                     rate_limiter.as_ref(),
                     &proxy_policy,
                     &xff_policy,
-                    e2e.as_ref(),
+                    &identity,
                 )
                 .await
                 {
-                    debug!("edge connection finished ({addr}): {e}");
+                    debug!(node = %node, "edge connection finished ({addr}): {e}");
                 }
             });
         }
     }
 }
 
-/// Handles a single public connection: peek the first bytes for Host → look
-/// up the route → (route breaker gate) → open a stream → bidirectional
-/// pump → feed the close reason back into the route breaker.
+/// Handles a single public connection: (TLS mode: pre-handshake gate →
+/// ClientHello under the handshake deadline → SNI allowlist → handshake)
+/// then peek the first bytes for Host → look up the route → (route breaker
+/// gate) → open a stream → bidirectional pump → feed the close reason back
+/// into the route breaker.
 #[allow(clippy::too_many_arguments)]
-async fn handle_connection(
-    mut socket: TcpStream,
+async fn handle_public_connection(
+    node: &str,
+    tcp: TcpStream,
     peer: SocketAddr,
+    tls: Option<&PublicTlsPlanes>,
     router: &HostRouter,
-    tunnel: &AgentTunnel,
+    tunnels: &HashMap<String, WorkspaceSession>,
     host_peek_timeout: Duration,
     stream_idle_timeout: Duration,
     audit: &AuditSink,
@@ -236,16 +317,175 @@ async fn handle_connection(
     rate_limiter: Option<&Arc<AuthRateLimiter>>,
     proxy_policy: &Arc<ProxyProtocolPolicy>,
     xff_policy: &Arc<XffPolicy>,
-    e2e: Option<&Arc<crate::edge::gateway::EdgeE2e>>,
+    identity: &Arc<IngressIdentity>,
 ) -> interflow_core::error::Result<()> {
+    let _ = tcp.set_nodelay(true);
+    let Some(tls) = tls else {
+        return handle_connection(
+            node,
+            tcp,
+            peer,
+            None,
+            router,
+            tunnels,
+            host_peek_timeout,
+            stream_idle_timeout,
+            audit,
+            route_breaker,
+            conn_tracker,
+            rate_limiter,
+            proxy_policy,
+            xff_policy,
+            identity,
+        )
+        .await;
+    };
+    // Pre-handshake gate: ACME mode is 80/443 direct by product definition
+    // (no PROXY/XFF front), so the TCP peer IP is the client IP. Running the
+    // gate here — before any handshake byte is read — extends the per-IP
+    // rate limit and concurrency caps over the handshake itself; the guard
+    // is handed down to `handle_connection` and reused, never re-acquired.
+    // A denial stays a silent close on this path: no handshake has started,
+    // so there is no channel to answer on (and answering would spend the
+    // handshake work this gate exists to withhold).
+    let ConnAdmission::Admitted(guard) =
+        gate_connection(node, peer.ip(), peer, audit, rate_limiter, conn_tracker)
+    else {
+        return Ok(());
+    };
+    let Some(start) = tls_stage(
+        node,
+        tokio_rustls::LazyConfigAcceptor::new(
+            tokio_rustls::rustls::server::Acceptor::default(),
+            tcp,
+        ),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    if rustls_acme::is_tls_alpn_challenge(&start.client_hello()) {
+        debug!(node = %node, "acme TLS-ALPN-01 validation request: peer={peer}");
+        let Some(mut challenge) = tls_stage(node, start.into_stream(tls.challenge.clone())).await?
+        else {
+            return Ok(());
+        };
+        challenge.shutdown().await?;
+        return Ok(());
+    }
+    // Single-public-port mode: the control endpoint's own server name rides
+    // the same port. Complete the handshake with the control plane's mTLS
+    // configuration and hand the stream to the embedded hub — identity,
+    // tenant derivation and admission semantics are unchanged; this
+    // listener's pre-handshake gate already admitted the connection (the
+    // `guard` stays held for the connection's lifetime below).
+    if let Some(control) = &tls.control
+        && start
+            .client_hello()
+            .server_name()
+            .is_some_and(|sni| sni.eq_ignore_ascii_case(control.host.as_str()))
+    {
+        metrics::counter!("interflow_edge_control_dispatched").increment(1);
+        debug!(node = %node, "control-plane SNI dispatched to embedded hub: peer={peer}");
+        let Some(control_stream) =
+            tls_stage(node, start.into_stream(control.config.clone())).await?
+        else {
+            return Ok(());
+        };
+        return control.hub.serve_tls(control_stream, peer).await;
+    }
+    // SNI allowlist pre-check (defense in depth): the connection could never
+    // be routed under this name — close before the handshake saves the cert
+    // exchange and the peek cost. A TLS-ALPN-01 validation SNI is one of the
+    // certificate hosts, so the branch above is unaffected; an SNI-less
+    // client is closed here exactly as the cert resolver would reject it.
+    let sni_known = start
+        .client_hello()
+        .server_name()
+        .is_some_and(|sni| tls.host_allowlist.contains(&sni.to_ascii_lowercase()));
+    if !sni_known {
+        metrics::counter!("interflow_edge_sni_rejected").increment(1);
+        debug!(node = %node, "edge TLS SNI outside host allowlist, closing: peer={peer}");
+        return Ok(());
+    }
+    let Some(tls_stream) = tls_stage(node, start.into_stream(tls.default.clone())).await? else {
+        return Ok(());
+    };
+    handle_connection(
+        node,
+        tls_stream,
+        peer,
+        Some(guard),
+        router,
+        tunnels,
+        host_peek_timeout,
+        stream_idle_timeout,
+        audit,
+        route_breaker,
+        conn_tracker,
+        rate_limiter,
+        proxy_policy,
+        xff_policy,
+        identity,
+    )
+    .await
+}
+
+/// Runs one TLS-accept stage (the ClientHello read or handshake completion)
+/// under [`super::TLS_HANDSHAKE_TIMEOUT`]: a stalled handshake counts
+/// `interflow_edge_tls_handshake_timeout` and yields `Ok(None)` for a silent
+/// close, while transport errors propagate to the caller.
+async fn tls_stage<T>(
+    node: &str,
+    stage: impl std::future::Future<Output = std::io::Result<T>>,
+) -> interflow_core::error::Result<Option<T>> {
+    match tokio::time::timeout(super::TLS_HANDSHAKE_TIMEOUT, stage).await {
+        Ok(Ok(value)) => Ok(Some(value)),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            metrics::counter!("interflow_edge_tls_handshake_timeout").increment(1);
+            debug!(node = %node, "edge TLS handshake stalled past the deadline, closing");
+            Ok(None)
+        }
+    }
+}
+
+/// Handles a single public connection (plaintext at the byte level): peek
+/// the first bytes for Host → look up the route → (route breaker gate) →
+/// open a stream → bidirectional pump → feed the close reason back into the
+/// route breaker.
+///
+/// `pre_gate`: a guard already acquired by the pre-TLS gate (ACME mode). It
+/// is THE connection's admission — reused here, never re-acquired — so the
+/// deferred-XFF re-gate never runs on a pre-gated connection and the quota
+/// is counted exactly once.
+#[allow(clippy::too_many_arguments)]
+async fn handle_connection<S>(
+    node: &str,
+    mut socket: S,
+    peer: SocketAddr,
+    pre_gate: Option<ConnGuard>,
+    router: &HostRouter,
+    tunnels: &HashMap<String, WorkspaceSession>,
+    host_peek_timeout: Duration,
+    stream_idle_timeout: Duration,
+    audit: &AuditSink,
+    route_breaker: Option<&Arc<TargetBreakers>>,
+    conn_tracker: &Arc<ConnTracker>,
+    rate_limiter: Option<&Arc<AuthRateLimiter>>,
+    proxy_policy: &Arc<ProxyProtocolPolicy>,
+    xff_policy: &Arc<XffPolicy>,
+    identity: &Arc<IngressIdentity>,
+) -> interflow_core::error::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use interflow_core::error::InterflowError;
-    // TCP_NODELAY: disable Nagle to reduce small-packet latency (notable for echo / ping-pong workloads)
-    let _ = socket.set_nodelay(true);
 
     // 1. PROXY protocol negotiation (same budget as the Host peek): derives
     //    the effective client IP; over-read bytes of a direct connection are
     //    replayed as the start of the HTTP buffer.
-    let mut initial = bytes::BytesMut::with_capacity(HOST_PEEK_BYTES);
+    let mut initial = bytes::BytesMut::with_capacity(HTTP_HEAD_MAX_BYTES);
     let mut effective_ip =
         match tokio::time::timeout(host_peek_timeout, proxy_policy.read(&mut socket, peer.ip()))
             .await
@@ -265,11 +505,15 @@ async fn handle_connection(
                     ProxyError::Malformed(_) => "malformed_proxy_header",
                     ProxyError::Io(_) => "proxy_read_error",
                 };
-                warn!("PROXY negotiation rejected ({reason}): peer={peer}");
+                warn!(
+                    node = %node,
+                    "PROXY negotiation rejected ({reason}): peer={peer}"
+                );
                 audit.record(
                     AuditKind::StreamDenied {
                         stream_id: String::new(),
-                        source: peer.ip().to_string(),
+                        source_circuit: String::new(),
+                        source_ip: None,
                         reason: reason.to_string(),
                     },
                     None,
@@ -290,30 +534,46 @@ async fn handle_connection(
     //    the peek, preserving the connect→peek→disconnect flood defense.
     //    For a trusted proxy the gate is deferred until the request head is
     //    buffered: the effective IP lives in the XFF header, and nginx's own
-    //    limit_req/limit_conn cap that fronting leg meanwhile.
-    let xff_deferred = xff_policy.mode.enabled() && xff_policy.is_trusted(peer.ip());
+    //    limit_req/limit_conn cap that fronting leg meanwhile. A pre-gated
+    //    connection (ACME mode: gated pre-TLS on the TCP peer key) skips
+    //    both paths below — its admission is already held, and ACME's
+    //    80/443-direct product definition has no XFF face to defer to.
+    let xff_deferred =
+        pre_gate.is_none() && xff_policy.mode.enabled() && xff_policy.is_trusted(peer.ip());
     let mut guard = if xff_deferred {
         None
     } else {
-        match gate_connection(effective_ip, peer, audit, rate_limiter, conn_tracker) {
+        match pre_gate {
             Some(g) => Some(g),
-            None => return Ok(()),
+            None => {
+                match gate_connection(node, effective_ip, peer, audit, rate_limiter, conn_tracker) {
+                    ConnAdmission::Admitted(g) => Some(g),
+                    // `pre_gate=None` reaches here only on the plaintext
+                    // (fronted) face — answer the denial with a real status so
+                    // the front relays 429/503 instead of synthesizing 502.
+                    ConnAdmission::Denied(kind) => {
+                        write_deny_response(&mut socket, kind).await;
+                        return Ok(());
+                    }
+                }
+            }
         }
     };
 
-    // Read the first bytes into a buffer, accumulating until the Host header
-    // is found or the cap is reached. The whole peek phase is bounded by a
-    // timeout to defend against slow-loris. When XFF is deferred the loop
-    // continues past the Host until the full request head arrives (blank
-    // line) — the XFF header may follow Host in the buffer, and stopping at
-    // Host would silently drop it.
-
+    // Buffer the request head until it is complete (blank line) or the cap
+    // is reached. The whole peek phase is bounded by a timeout to defend
+    // against slow-loris. Waiting for the complete head lets core's shared
+    // `http_head` parser own all HTTP/1.x syntax: Host extraction, duplicate
+    // rejection and the XFF-deferred path all see the same parsed head, and
+    // a head that trickles in slowly is bounded by the timeout — the
+    // clients that sent Host early but stalled before the blank line are
+    // exactly the slow-loris profile this budget exists for.
     let host = tokio::time::timeout(host_peek_timeout, async {
         let mut tmp = vec![0u8; 4096];
         loop {
-            if initial.len() >= HOST_PEEK_BYTES {
+            if initial.len() >= HTTP_HEAD_MAX_BYTES {
                 return Err(InterflowError::protocol(format!(
-                    "Host header not found within the first {HOST_PEEK_BYTES} bytes"
+                    "request head exceeds the first {HTTP_HEAD_MAX_BYTES} bytes"
                 )));
             }
             let n = socket.read(&mut tmp).await?;
@@ -321,32 +581,26 @@ async fn handle_connection(
                 return Err(InterflowError::protocol("connection closed early"));
             }
             initial.extend_from_slice(&tmp[..n]);
-            if xff_deferred {
-                if find_headers_end(&initial).is_none() {
-                    continue;
-                }
-                match extract_host(&initial) {
-                    HostParseResult::Found(h) => return Ok(h),
-                    HostParseResult::Invalid(reason) => {
-                        metrics::counter!("interflow_edge_host_invalid").increment(1);
-                        return Err(InterflowError::protocol(reason));
-                    }
-                    // The head is complete: no Host will appear by reading
-                    // more header bytes — only body could follow.
-                    HostParseResult::NotFound => {
-                        metrics::counter!("interflow_edge_host_invalid").increment(1);
-                        return Err(InterflowError::protocol("missing_host"));
-                    }
-                }
+            if interflow_core::security::http_head::find_headers_end(&initial).is_none() {
+                continue;
             }
-            match extract_host(&initial) {
-                HostParseResult::Found(h) => return Ok(h),
-                HostParseResult::Invalid(reason) => {
-                    metrics::counter!("interflow_edge_host_invalid").increment(1);
-                    return Err(InterflowError::protocol(reason));
+            let outcome = match interflow_core::security::http_head::parse_request_head(&initial) {
+                // Complete head: find_headers_end saw the blank line, so a
+                // Partial here means an early stray terminator — keep reading.
+                interflow_core::security::http_head::HeadParse::Partial => continue,
+                interflow_core::security::http_head::HeadParse::Invalid(reason) => {
+                    Err(reason.as_str().to_owned())
                 }
-                HostParseResult::NotFound => {}
-            }
+                interflow_core::security::http_head::HeadParse::Complete(head) => {
+                    interflow_core::security::http_head::validated_host(&head.headers)
+                        .map(str::to_owned)
+                        .map_err(|e| e.as_str().to_owned())
+                }
+            };
+            return outcome.map_err(|reason| {
+                metrics::counter!("interflow_edge_host_invalid").increment(1);
+                InterflowError::protocol(reason)
+            });
         }
     })
     .await
@@ -365,21 +619,33 @@ async fn handle_connection(
             XffResolution::Effective(ip) => ip,
             XffResolution::Peer => peer.ip(),
             XffResolution::Denied(err) => {
-                let reason = match err {
+                let (reason, missing) = match err {
                     XffError::Missing => {
                         metrics::counter!("interflow_edge_xff_missing").increment(1);
-                        "x_forwarded_for_required"
+                        ("x_forwarded_for_required", true)
                     }
                     XffError::Invalid => {
                         metrics::counter!("interflow_edge_xff_invalid").increment(1);
-                        "x_forwarded_for_invalid"
+                        ("x_forwarded_for_invalid", false)
                     }
                 };
-                warn!("X-Forwarded-For rejected ({reason}): peer={peer}");
+                if missing {
+                    // The browser sees an unexplained 502 — name the fix here.
+                    warn!(
+                        node = %node,
+                        "X-Forwarded-For rejected ({reason}): peer={peer} — the fronting \
+                         proxy sent no X-Forwarded-For; fix the proxy with \
+                         `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` \
+                         (diagnose: interflow doctor ingress)"
+                    );
+                } else {
+                    warn!(node = %node, "X-Forwarded-For rejected ({reason}): peer={peer}");
+                }
                 audit.record(
                     AuditKind::StreamDenied {
                         stream_id: String::new(),
-                        source: peer.ip().to_string(),
+                        source_circuit: String::new(),
+                        source_ip: None,
                         reason: reason.to_string(),
                     },
                     None,
@@ -388,20 +654,30 @@ async fn handle_connection(
                 return Ok(());
             }
         };
-        match gate_connection(effective_ip, peer, audit, rate_limiter, conn_tracker) {
-            Some(g) => guard = Some(g),
-            None => return Ok(()),
+        match gate_connection(node, effective_ip, peer, audit, rate_limiter, conn_tracker) {
+            ConnAdmission::Admitted(g) => guard = Some(g),
+            // The request head is fully buffered and this path exists only
+            // behind a trusted front on the plaintext face — the 429/503 is
+            // a complete, valid HTTP answer, not a mid-handshake abort.
+            ConnAdmission::Denied(kind) => {
+                write_deny_response(&mut socket, kind).await;
+                return Ok(());
+            }
         }
     }
 
     let Some(route) = router.lookup(&host) else {
         // No route matched: close silently, send no 404, do not leak that the edge is alive
-        warn!("no route matched host={host} (peer={peer}, effective={effective_ip})");
+        warn!(
+            node = %node,
+            "no route matched host={host} (peer={peer}, effective={effective_ip})"
+        );
         metrics::counter!("interflow_edge_no_route").increment(1);
         audit.record(
             AuditKind::StreamDenied {
                 stream_id: String::new(),
-                source: effective_ip.to_string(),
+                source_circuit: String::new(),
+                source_ip: None,
                 reason: format!("no_route: {host}"),
             },
             None,
@@ -411,8 +687,9 @@ async fn handle_connection(
     };
 
     debug!(
-        "edge route hit: {host} → {}/{} remote={}",
-        route.tenant, route.agent_id, route.remote_addr
+        node = %node,
+        "edge route hit: {host} → {}/{} service={}",
+        route.workspace, route.agent_id, route.service_id
     );
 
     // Route-level breaker gate: a tripped route is closed right here — no
@@ -428,219 +705,183 @@ async fn handle_connection(
         audit.record(
             AuditKind::StreamDenied {
                 stream_id: String::new(),
-                source: effective_ip.to_string(),
+                source_circuit: String::new(),
+                source_ip: None,
                 reason: format!("route_circuit_open: {host}"),
             },
             None,
             Some(peer.to_string()),
         );
-        debug!("route circuit open, closing without tunnel open: host={host} peer={peer}");
+        debug!(
+            node = %node,
+            "route circuit open, closing without tunnel open: host={host} peer={peer}"
+        );
         return Ok(());
     }
     let route_probe = route_decision == Some(BreakerDecision::Probe);
 
-    let stream_id = uuid::Uuid::new_v4().to_string();
-    let data_rx = tunnel.register_stream(stream_id.clone()).await;
-
-    // Tenant-qualified target: the hub resolves (tenant, agent_id); a route
-    // whose agent is registered under another tenant finds no target and the
-    // Open fails closed.
-    let qualified_target = format!("{}/{}", route.tenant, route.agent_id);
-    let remote_addr_str = route.remote_addr.to_string();
-
-    // Inner TLS (e2e) participation: only with the stable gateway identity
-    // AND a per-tenant anchor for this route (a tenant without --client-ca
-    // cannot be inner-verified; those streams proceed plain, logged once
-    // per route lookup at debug).
-    let e2e_material = e2e.and_then(|e| e.material_for(&route.tenant));
-    let open_result = if e2e_material.is_some() {
-        tunnel
-            .send_open_with(
-                &stream_id,
-                &qualified_target,
-                Some(&remote_addr_str),
-                StreamProto::Tcp,
-                true,
-            )
-            .await
-    } else {
-        tunnel
-            .send_open(
-                &stream_id,
-                &qualified_target,
-                Some(&remote_addr_str),
-                StreamProto::Tcp,
-            )
-            .await
+    // Resolve the route's workspace session. Every workspace's presence
+    // was validated at startup, so a miss here is an internal invariant
+    // break — fail this connection closed rather than rerouting it through
+    // another workspace's principal.
+    let Some(session) = tunnels.get(&route.workspace) else {
+        error!(
+            node = %node,
+            "route workspace {} has no tunnel session (startup invariant broken): host={host}",
+            route.workspace
+        );
+        metrics::counter!("interflow_edge_no_route").increment(1);
+        audit.record(
+            AuditKind::StreamDenied {
+                stream_id: String::new(),
+                source_circuit: String::new(),
+                source_ip: None,
+                reason: format!("workspace_session_missing: {}", route.workspace),
+            },
+            None,
+            Some(peer.to_string()),
+        );
+        return Ok(());
     };
-    let _ = guard;
-    if let Err(e) = open_result {
-        tunnel.unregister_stream(&stream_id).await;
+    let tunnel = &session.tunnel;
+
+    let stream_id = interflow_core::protocol::StreamId::random()?;
+    let data_rx = tunnel.register_stream(stream_id).await;
+
+    // Every ingress stream uses inner TLS. A missing per-route workspace
+    // anchor or stale principal material is a configuration error: close this stream
+    // rather than downgrading the hub leg to plaintext.
+    let material = match identity.material_for(&route.workspace) {
+        Ok(material) => material,
+        Err(e) => {
+            warn!(
+                node = %node,
+                "ingress inner TLS material unavailable: host={host} workspace={} peer={peer}: {e}",
+                route.workspace
+            );
+            metrics::counter!("interflow_edge_e2e_handshake_failures_total",
+                "reason" => "protocol")
+            .increment(1);
+            if let Some(breaker) = route_breaker {
+                breaker.note_failure(&host);
+            }
+            let _ = tunnel.send_close(stream_id).await;
+            tunnel.unregister_stream(stream_id).await;
+            return Ok(());
+        }
+    };
+
+    let qualified_target = format!("{}/{}", route.workspace, route.agent_id);
+    if let Err(e) = tunnel
+        .send_open_with(stream_id, &qualified_target, StreamProto::Tcp, true)
+        .await
+    {
+        tunnel.unregister_stream(stream_id).await;
         return Err(e);
     }
+    let _ = guard;
 
-    // E2e path: the inner handshake rides Data frames through the hub; the
-    // already-read first bytes become TLS application data after the
-    // handshake. Fallback to plaintext mirrors the mesh ingress's
-    // `opportunistic` semantics (the edge host is the product's plaintext
-    // terminus; enforcement lives at the egress).
-    if let Some(material) = e2e_material {
-        let connector = match interflow_core::tls::inner_client_config(&material, &route.agent_id) {
-            Ok(config) => Some(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
-                config,
-            ))),
-            Err(e) => {
-                // Stale material (files changed underneath): proceed plain
-                // rather than failing the visitor.
-                debug!(
-                    "edge e2e connector build failed for {}: {e}",
-                    route.agent_id
-                );
-                metrics::counter!("interflow_edge_e2e_handshake_failures_total",
-                    "reason" => "protocol")
-                .increment(1);
-                None
-            }
-        };
-        if let Some(connector) = connector {
-            let adapter = interflow_core::tunnel::e2e::E2eTunnelIo::ingress(
-                data_rx,
-                tunnel.clone(),
-                stream_id.clone(),
+    let connector = match interflow_core::tls::inner_client_config(&material, &route.agent_id) {
+        Ok(config) => tokio_rustls::TlsConnector::from(std::sync::Arc::new(config)),
+        Err(e) => {
+            warn!(
+                node = %node,
+                "ingress inner TLS connector build failed: host={host} agent={} peer={peer}: {e}",
+                route.agent_id
             );
-            match interflow_core::tunnel::e2e::inner_tls_connect(
-                adapter,
-                connector,
-                EDGE_E2E_HANDSHAKE_TIMEOUT,
-            )
-            .await
-            {
-                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Established(mut tls, reason) => {
-                    metrics::counter!("interflow_edge_e2e_handshakes_total").increment(1);
-                    if !initial.is_empty() && tls.write_all(&initial).await.is_err() {
-                        tunnel.unregister_stream(&stream_id).await;
-                        return Ok(());
-                    }
-                    let sid = stream_id.clone();
-                    let t2 = tunnel.clone();
-                    let outcome = interflow_core::tunnel::pump::pump_duplex(
-                        socket,
-                        tls,
-                        &pump_cfg(stream_idle_timeout),
-                        &stream_id,
-                        async move {
-                            let _ = t2.send_close(&sid).await;
-                            t2.unregister_stream(&sid).await;
-                        },
-                    )
-                    .await;
-                    let outcome = interflow_core::tunnel::pump::StreamOutcome {
-                        close_reason: outcome.close_reason.or_else(|| reason.get()),
-                        response_relayed: outcome.response_relayed,
-                    };
-                    if let Some(breaker) = route_breaker {
-                        match route_evidence(&outcome, route_probe) {
-                            RouteEvidence::Failure => breaker.note_failure(&host),
-                            RouteEvidence::DerivativeFailure => breaker.note_soft_failure(&host),
-                            RouteEvidence::Recovery => breaker.note_success(&host),
-                            RouteEvidence::Neutral => {}
-                        }
-                    }
-                    return Ok(());
-                }
-                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { parts, error } => {
-                    let reason_label = interflow_core::tls::classify_handshake_error(&error);
-                    metrics::counter!("interflow_edge_e2e_handshake_failures_total",
-                        "reason" => reason_label)
-                    .increment(1);
-                    debug!(
-                        "edge e2e handshake failed ({reason_label}: {error}), falling back to                          plaintext: host={host}"
-                    );
-                    // Fallback: our initial bytes go out as plain Data;
-                    // the peer bytes buffered during the attempt replay to
-                    // the visitor socket; then the plain pump takes over.
-                    if !initial.is_empty() {
-                        let initial_bytes = initial.split().freeze();
-                        if tunnel.send_data(&stream_id, initial_bytes).await.is_err() {
-                            tunnel.unregister_stream(&stream_id).await;
-                            return Ok(());
-                        }
-                    }
-                    let (rd, mut wr) = socket.into_split();
-                    if !parts.buffered.is_empty() && wr.write_all(&parts.buffered).await.is_err() {
-                        tunnel.unregister_stream(&stream_id).await;
-                        return Ok(());
-                    }
-                    let outcome = pump_tcp_stream(
-                        rd,
-                        wr,
-                        parts.rx,
-                        tunnel,
-                        &stream_id,
-                        &pump_cfg(stream_idle_timeout),
-                    )
-                    .await;
-                    if let Some(breaker) = route_breaker {
-                        match route_evidence(&outcome, route_probe) {
-                            RouteEvidence::Failure => breaker.note_failure(&host),
-                            RouteEvidence::DerivativeFailure => breaker.note_soft_failure(&host),
-                            RouteEvidence::Recovery => breaker.note_success(&host),
-                            RouteEvidence::Neutral => {}
-                        }
-                    }
-                    return Ok(());
-                }
+            metrics::counter!("interflow_edge_e2e_handshake_failures_total",
+                "reason" => "protocol")
+            .increment(1);
+            if let Some(breaker) = route_breaker {
+                breaker.note_failure(&host);
             }
+            let _ = tunnel.send_close(stream_id).await;
+            tunnel.unregister_stream(stream_id).await;
+            return Ok(());
         }
-        // Connector build failed (stale material): fall through to the plain
-        // path below with the plain channel — but the adapter consumed
-        // data_rx above only in the handshake branch; here nothing was
-        // consumed, so the plain path's expectations still hold.
-    }
+    };
 
-    // Send the already-read first bytes into the tunnel first (the egress
-    // side will use them as the start of the HTTP request).
-    if !initial.is_empty() {
-        let initial_bytes = initial.split().freeze();
-        if let Err(e) = tunnel.send_data(&stream_id, initial_bytes).await {
-            tunnel.unregister_stream(&stream_id).await;
-            return Err(e);
+    let adapter =
+        interflow_core::tunnel::e2e::E2eTunnelIo::ingress(data_rx, tunnel.clone(), stream_id);
+    let (tls, peer_close_reason) = match interflow_core::tunnel::e2e::inner_tls_connect(
+        adapter,
+        connector,
+        EDGE_E2E_HANDSHAKE_TIMEOUT,
+    )
+    .await
+    {
+        interflow_core::tunnel::e2e::E2eHandshakeOutcome::Established(mut tls, reason) => {
+            metrics::counter!("interflow_edge_e2e_handshakes_total").increment(1);
+            let hello = interflow_core::tunnel::InnerStreamHello {
+                source_principal: session.agent_id.clone(),
+                source_fingerprint: material.leaf_fingerprint(),
+                // Select by service **id**: the target agent resolves the
+                // id to its own effective dial target (pack default or
+                // machine-local preference). The edge never names an
+                // address, so an ingress compromise can only select among
+                // the services the agent itself declares.
+                selector: interflow_core::tunnel::TargetSelector::Service(route.service_id.clone()),
+                correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+            };
+            if hello.write(&mut tls).await.is_err() {
+                if let Some(breaker) = route_breaker {
+                    breaker.note_failure(&host);
+                }
+                let _ = tunnel.send_close(stream_id).await;
+                tunnel.unregister_stream(stream_id).await;
+                return Ok(());
+            }
+            if !initial.is_empty() && tls.write_all(&initial).await.is_err() {
+                if let Some(breaker) = route_breaker {
+                    breaker.note_failure(&host);
+                }
+                let _ = tunnel.send_close(stream_id).await;
+                tunnel.unregister_stream(stream_id).await;
+                return Ok(());
+            }
+            (tls, reason)
         }
-    }
+        interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { error } => {
+            let reason_label = interflow_core::tls::classify_handshake_error(&error);
+            metrics::counter!("interflow_edge_e2e_handshake_failures_total",
+                "reason" => reason_label)
+            .increment(1);
+            warn!(
+                node = %node,
+                "gateway inner TLS handshake failed ({reason_label}: {error}), closing: host={host} peer={peer}"
+            );
+            if let Some(breaker) = route_breaker {
+                breaker.note_failure(&host);
+            }
+            let _ = tunnel.send_close(stream_id).await;
+            tunnel.unregister_stream(stream_id).await;
+            return Ok(());
+        }
+    };
 
-    // Bidirectional pump (shared implementation, inline future without
-    // spawn): when either half exits, the whole stream is closed out and
-    // unregistered — if the write half exits first, the read half is
-    // cancelled by drop (so a half-open socket cannot linger until the idle
-    // timeout); if the read half exits first, unregister first then flush the
-    // buffer. The JoinHandle double-poll panic class is structurally excluded
-    // (docs/bug/2026-09-13-select-branch-double-await-joinhandle-panic.md).
-    //
-    // The outcome carries the locally-observed facts (the peer Close reason
-    // when one arrived in time, and whether response bytes reached the
-    // client) — the route breaker's evidence base.
-    let (rd, wr) = socket.into_split();
-    let outcome = pump_tcp_stream(
-        rd,
-        wr,
-        data_rx,
-        tunnel,
-        &stream_id,
-        &PumpConfig {
-            idle_timeout: stream_idle_timeout,
-            write_stall_timeout: CLIENT_WRITE_STALL_TIMEOUT,
-            idle_timeout_counter: "interflow_edge_stream_idle_timeout",
-            write_stall_counter: "interflow_edge_client_write_stall",
-            log_label: "edge",
+    let sid = stream_id;
+    let t2 = tunnel.clone();
+    let outcome = interflow_core::tunnel::pump::pump_duplex(
+        socket,
+        tls,
+        &pump_cfg(stream_idle_timeout),
+        CloseReason::CloseFrame,
+        Duration::ZERO,
+        stream_id,
+        async move {
+            let _ = t2.send_close(sid).await;
+            t2.unregister_stream(sid).await;
         },
     )
     .await;
-
+    let outcome = StreamOutcome {
+        close_reason: outcome.close_reason.or_else(|| peer_close_reason.get()),
+        response_relayed: outcome.response_relayed,
+    };
     // Feed the route breaker from the classified evidence: a failing dial
     // counts (and re-arms), the agent's own breaker verdict counts without
     // re-arming (derivative), recovery evidence clears a tripped route, and
-    // everything else (client-side aborts, rate limits, ordinary closes) is
-    // neutral.
+    // everything else (client-side aborts, ordinary closes) is neutral.
     if let Some(breaker) = route_breaker {
         match route_evidence(&outcome, route_probe) {
             RouteEvidence::Failure => breaker.note_failure(&host),
@@ -649,21 +890,45 @@ async fn handle_connection(
             RouteEvidence::Neutral => {}
         }
     }
-
     Ok(())
+}
+
+/// Why [`gate_connection`] denied a connection.
+///
+/// The answer differs by surface: plaintext (fronted) faces answer the
+/// denial with a real HTTP status ([`write_deny_response`]); the pre-TLS
+/// gate cannot answer at all — no handshake bytes have been exchanged yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DenialKind {
+    /// Per-IP new-connection quota exceeded → HTTP 429 + `Retry-After`.
+    RateLimited {
+        /// The configured per-IP-per-minute quota (drives `Retry-After`).
+        quota_per_minute: u32,
+    },
+    /// Per-IP concurrent connection cap exceeded → HTTP 503.
+    ConnLimitExceeded,
+}
+
+/// The admission verdict of [`gate_connection`].
+pub(super) enum ConnAdmission {
+    Admitted(ConnGuard),
+    Denied(DenialKind),
 }
 
 /// Applies the per-IP new-connection rate limit and concurrency caps to one
 /// connection, keyed on the effective client IP (TCP peer, PROXY-asserted,
-/// or XFF-restored). A denial records metrics + audit and yields `None` —
-/// the caller drops the connection without a response.
-fn gate_connection(
+/// or XFF-restored). A denial records metrics + audit and logs at WARN — a
+/// security rejection that was invisible at the production INFO level
+/// already cost one full misdirected diagnostic round
+///.
+pub(super) fn gate_connection(
+    node: &str,
     effective_ip: IpAddr,
     peer: SocketAddr,
     audit: &AuditSink,
     rate_limiter: Option<&Arc<AuthRateLimiter>>,
     conn_tracker: &Arc<ConnTracker>,
-) -> Option<ConnGuard> {
+) -> ConnAdmission {
     if let Some(limiter) = rate_limiter
         && !limiter.check(effective_ip)
     {
@@ -671,62 +936,94 @@ fn gate_connection(
         audit.record(
             AuditKind::StreamDenied {
                 stream_id: String::new(),
-                source: effective_ip.to_string(),
+                source_circuit: String::new(),
+                source_ip: Some(effective_ip.to_string()),
                 reason: "rate_limited".into(),
             },
             None,
             Some(peer.to_string()),
         );
-        debug!("edge connection denied (rate limited): effective={effective_ip} peer={peer}");
-        return None;
+        warn!(
+            node = %node,
+            "edge connection denied (rate limited): effective={effective_ip} peer={peer} — \
+             per-IP new-connection quota ({} per minute) exceeded; legitimate traffic behind a \
+             front proxy should raise [edge] new_conn_rate_per_ip_per_minute",
+            limiter.quota()
+        );
+        return ConnAdmission::Denied(DenialKind::RateLimited {
+            quota_per_minute: limiter.quota(),
+        });
     }
     if let Some(guard) = conn_tracker.try_acquire(effective_ip) {
-        return Some(guard);
+        return ConnAdmission::Admitted(guard);
     }
     metrics::counter!("interflow_edge_conn_rejected").increment(1);
     audit.record(
         AuditKind::StreamDenied {
             stream_id: String::new(),
-            source: effective_ip.to_string(),
+            source_circuit: String::new(),
+            source_ip: None,
             reason: "conn_limit_exceeded".into(),
         },
         None,
         Some(peer.to_string()),
     );
-    debug!("edge connection denied (connection limit): effective={effective_ip} peer={peer}");
-    None
+    warn!(
+        node = %node,
+        "edge connection denied (connection limit): effective={effective_ip} peer={peer} — \
+         per-IP concurrent connection cap exceeded"
+    );
+    ConnAdmission::Denied(DenialKind::ConnLimitExceeded)
 }
 
-/// Host parse result: three states, distinguishing "not found yet" from
-/// "definitely invalid".
-enum HostParseResult {
-    /// A valid Host was found.
-    Found(String),
-    /// Definitely invalid (duplicate Host, illegal characters, too long) —
-    /// reject the whole connection immediately.
-    Invalid(&'static str),
-    /// Not found yet; keep reading.
-    NotFound,
+/// Answers a plaintext gate denial with a real HTTP status before the close.
+///
+/// A fronting proxy then relays the edge's semantics (429/503 +
+/// `Retry-After`) instead of synthesizing 502 "upstream prematurely closed"
+/// — the failure mode that misdirected the 2026-09-23 investigation toward
+/// the tunnel and backends. One bounded write; a client that never reads it
+/// loses nothing (the connection was doomed regardless).
+pub(super) async fn write_deny_response<S>(socket: &mut S, kind: DenialKind)
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    let (status, retry_after, body) = match kind {
+        // One token refills every 60/quota seconds — the next attempt
+        // realistically succeeds after one refill interval.
+        DenialKind::RateLimited { quota_per_minute } => (
+            "429 Too Many Requests",
+            60_u32.div_ceil(quota_per_minute.max(1)).clamp(1, 60),
+            "edge: per-IP new-connection rate limit exceeded\n",
+        ),
+        // A concurrency slot frees as soon as any one connection closes.
+        DenialKind::ConnLimitExceeded => (
+            "503 Service Unavailable",
+            1,
+            "edge: per-IP concurrent connection limit exceeded\n",
+        ),
+    };
+    let answer = format!(
+        "HTTP/1.1 {status}\r\nRetry-After: {retry_after}\r\n\
+         Content-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = socket.write_all(answer.as_bytes()).await;
+    let _ = socket.shutdown().await;
 }
 
-/// Extracts the Host header value from the bytes read so far (case-insensitive).
-///
-/// Binary safe: matching happens only on ASCII bytes and does not require the
-/// whole peek buffer to be valid UTF-8. Otherwise requests with binary bodies
-/// such as multipart/form-data would contain non-UTF-8 bytes within the first
-/// 8KB, making `from_utf8` fail wholesale so the Host is never found and the
-/// request eventually hits host_peek_timeout (user-visible symptom: 502).
-///
-/// Scan range: only the header region; stop immediately at the blank line
-/// (`\r\n\r\n` or `\n\n`). Otherwise a binary body might happen to contain a
-/// 5-byte sliding-window match like `\nHost: ...\n`, which would be
-/// misjudged as duplicate_host and reject a legitimate request.
-///
+// Host extraction from the buffered request head lives in core's shared
+// `http_head` module (httparse-backed): duplicate-Host rejection, Host
+// charset/length validation and the header-region-only scan are preserved
+// there under test. The hand-written scanner this replaces (plus its
+// private find_headers_end/trim helpers) had already diverged from the
+// X-Forwarded-For copy in core.
+
 /// Inner-TLS handshake deadline for gateway flows (mirrors the mesh
-/// agent-side `[e2e] handshake_timeout_secs` default).
+/// agent-side `[inner_tls] handshake_timeout_secs` default).
 const EDGE_E2E_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The listener's pump configuration (shared by the plain and e2e paths).
+/// The listener's inner-TLS pump configuration.
 const fn pump_cfg(stream_idle_timeout: std::time::Duration) -> PumpConfig {
     PumpConfig {
         idle_timeout: stream_idle_timeout,
@@ -737,122 +1034,10 @@ const fn pump_cfg(stream_idle_timeout: std::time::Duration) -> PumpConfig {
     }
 }
 
-/// Hardening (kept from the original implementation):
-/// - Return `Invalid` immediately upon detecting a second Host header (reject the whole connection; prevents header injection/smuggling)
-/// - Validate host characters: only `[A-Za-z0-9.\-:()\[\]]` allowed; values with control characters/spaces are rejected
-/// - Limit host length to ≤ 255
-fn extract_host(buf: &[u8]) -> HostParseResult {
-    // Find the end of the header region (first `\r\n\r\n` or `\n\n`); if not
-    // found, scan to the end of buf.
-    let headers_end = find_headers_end(buf).unwrap_or(buf.len());
-
-    let mut found: Option<String> = None;
-    // Search byte-wise for line-leading `Host:` / `host:` etc. (line start =
-    // buffer beginning or after \r\n / \n).
-    let mut i = 0;
-    while i < headers_end {
-        // The current line starts at i; find the next CRLF/LF.
-        let line_end = buf[i..headers_end]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(headers_end, |p| i + p);
-        let line = trim_cr(&buf[i..line_end]);
-
-        if line.len() >= 5 && eq_ignore_ascii_case_bytes(&line[..5], b"host:") {
-            // Take the value segment and trim ASCII whitespace from both
-            // ends. The value must be valid UTF-8 (hosts are ASCII).
-            let value = trim_ascii_whitespace(&line[5..]);
-            if value.is_empty() {
-                // Empty value: treat as absent and keep looking
-            } else if value.len() > HOST_MAX_LEN {
-                return HostParseResult::Invalid("host_too_long");
-            } else if let Ok(s) = std::str::from_utf8(value) {
-                if !is_valid_host(s) {
-                    return HostParseResult::Invalid("host_invalid_chars");
-                }
-                if found.is_some() {
-                    return HostParseResult::Invalid("duplicate_host");
-                }
-                found = Some(s.to_string());
-            } else {
-                return HostParseResult::Invalid("host_invalid_chars");
-            }
-        }
-
-        if line_end == headers_end {
-            break;
-        }
-        i = line_end + 1;
-    }
-    match found {
-        Some(h) if !h.is_empty() => HostParseResult::Found(h),
-        _ => HostParseResult::NotFound,
-    }
-}
-
-/// Locates the end of the HTTP/1.x header region (first byte after the blank line).
-///
-/// Matches the first `\r\n\r\n` or `\n\n`. The return value is the index of
-/// the first byte after the header terminator, i.e. the header region is
-/// `&buf[..pos]` (excluding the terminator itself). Both orders are scanned
-/// byte-wise in a single O(n) pass.
-const fn find_headers_end(buf: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    let n = buf.len();
-    while i + 1 < n {
-        if buf[i] == b'\n' {
-            if buf[i + 1] == b'\n' {
-                return Some(i + 2);
-            }
-            if i + 2 < n && buf[i + 1] == b'\r' && buf[i + 2] == b'\n' {
-                return Some(i + 3);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Strips a trailing `\r` from the line (CRLF → LF tolerance). No allocation.
-fn trim_cr(line: &[u8]) -> &[u8] {
-    if line.last() == Some(&b'\r') {
-        &line[..line.len() - 1]
-    } else {
-        line
-    }
-}
-
-/// Trims ASCII whitespace (space / tab). Other whitespace is not allowed in
-/// HTTP header values.
-fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
-    let mut start = 0;
-    let mut end = s.len();
-    while start < end && (s[start] == b' ' || s[start] == b'\t') {
-        start += 1;
-    }
-    while end > start && (s[end - 1] == b' ' || s[end - 1] == b'\t') {
-        end -= 1;
-    }
-    &s[start..end]
-}
-
-/// Byte-slice version of `eq_ignore_ascii_case` (avoids converting to str).
-fn eq_ignore_ascii_case_bytes(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(x, y)| x.eq_ignore_ascii_case(y))
-}
-
-/// Validates host characters: only letters, digits, dot, hyphen, colon
-/// (port), and square brackets (IPv6) are allowed. Hosts containing control
-/// characters, spaces, or other separators are rejected outright.
-fn is_valid_host(s: &str) -> bool {
-    s.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == ':' || c == '[' || c == ']'
-    })
-}
-
+/// Hardening (kept from the original implementation, now enforced by the
+/// shared parser): duplicate Host rejects the whole connection; host
+/// characters are limited to `[A-Za-z0-9.\-:\[\]]`; host length ≤ 255; only
+/// the header region is scanned, so binary bodies cannot smuggle headers.
 #[cfg(test)]
 #[allow(
     clippy::panic,
@@ -935,151 +1120,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_host_basic() {
-        let req = b"GET / HTTP/1.1\r\nHost: myapp.example.com\r\nUser-Agent: x\r\n\r\n";
-        assert!(matches!(extract_host(req), HostParseResult::Found(h) if h == "myapp.example.com"));
-    }
-
-    #[test]
-    fn extract_host_case_insensitive() {
-        let req = b"GET / HTTP/1.1\r\nhOsT: myapp.example.com\r\n\r\n";
-        assert!(matches!(extract_host(req), HostParseResult::Found(h) if h == "myapp.example.com"));
-    }
-
-    #[test]
-    fn extract_host_with_port() {
-        let req = b"GET / HTTP/1.1\r\nHost: myapp.example.com:8443\r\n\r\n";
-        assert!(
-            matches!(extract_host(req), HostParseResult::Found(h) if h == "myapp.example.com:8443")
-        );
-    }
-
-    #[test]
-    fn extract_host_missing_returns_notfound() {
-        let req = b"GET / HTTP/1.1\r\nUser-Agent: x\r\n\r\n";
-        assert!(matches!(extract_host(req), HostParseResult::NotFound));
-    }
-
-    #[test]
-    fn extract_host_rejects_duplicate() {
-        let req = b"GET / HTTP/1.1\r\nHost: a.com\r\nHost: b.com\r\n\r\n";
-        assert!(
-            matches!(extract_host(req), HostParseResult::Invalid(_)),
-            "duplicate Host must be rejected"
-        );
-    }
-
-    #[test]
-    fn extract_host_rejects_invalid_chars() {
-        let req = b"GET / HTTP/1.1\r\nHost: evil.com extra\r\n\r\n";
-        assert!(matches!(extract_host(req), HostParseResult::Invalid(_)));
-    }
-
-    #[test]
-    fn extract_host_rejects_too_long() {
-        let long = "a".repeat(HOST_MAX_LEN + 1);
-        let req = format!("GET / HTTP/1.1\r\nHost: {long}\r\n\r\n");
-        assert!(matches!(
-            extract_host(req.as_bytes()),
-            HostParseResult::Invalid(_)
-        ));
-    }
-
-    #[test]
-    fn extract_host_allows_ipv6() {
-        let req = b"GET / HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n";
-        assert!(matches!(extract_host(req), HostParseResult::Found(h) if h == "[::1]:8443"));
-    }
-
-    #[test]
-    fn is_valid_host_basic() {
-        assert!(is_valid_host("example.com"));
-        assert!(is_valid_host("example.com:8443"));
-        assert!(is_valid_host("[::1]:8443"));
-        assert!(!is_valid_host("evil.com extra"));
-        assert!(!is_valid_host("evil.com\r\nX: y"));
-        assert!(!is_valid_host("evil\x00.com"));
-    }
-
-    /// Regression: a multipart request whose body contains binary (gzip
-    /// bytes) is not valid UTF-8 as a whole. The old implementation
-    /// `from_utf8(buf).ok()` failed outright → always `NotFound` → 10s peek
-    /// timeout → upstream 502. The new implementation searches for the Host
-    /// header byte-wise and correctly recognizes the Host even in a buffer
-    /// containing a binary body.
-    #[test]
-    fn extract_host_with_binary_body() {
-        let mut req = b"POST /v1/workers/x/builds HTTP/1.1\r\n\
-Host: fetch.example.com\r\n\
-Content-Type: multipart/form-data; boundary=---x\r\n\
-Content-Length: 1102\r\n\
-\r\n\
------x\r\n\
-Content-Disposition: form-data; name=\"file\"; filename=\"a.tar.gz\"\r\n\
-\r\n"
-            .to_vec();
-        // Inject non-UTF-8 bytes (gzip magic followed by some continuation bytes).
-        req.extend_from_slice(&[0x1f, 0x8b, 0x80, 0xc0, 0xff, 0xfe, 0x00, 0x7f]);
-        req.extend_from_slice(b"\r\n-----x--\r\n");
-        assert!(matches!(
-            extract_host(&req),
-            HostParseResult::Found(h) if h == "fetch.example.com"
-        ));
-    }
-
-    /// Regression: non-UTF-8 bytes are also tolerated between HTTP headers
-    /// (theoretically they shouldn't occur, but once the peek buffer has read
-    /// into the body we must not give up on the Host just because the body
-    /// isn't UTF-8).
-    #[test]
-    fn extract_host_finds_first_host_then_keeps_scanning() {
-        let mut req = b"GET / HTTP/1.1\r\nHost: a.example.com\r\n\r\n".to_vec();
-        // Headers ended; the body is arbitrary binary.
-        req.extend_from_slice(&[0xff, 0xfe, 0xfd, 0x00, 0x01]);
-        assert!(matches!(
-            extract_host(&req),
-            HostParseResult::Found(h) if h == "a.example.com"
-        ));
-    }
-
-    #[test]
-    fn extract_host_rejects_invalid_utf8_value() {
-        // The Host header name is ASCII, but the value has non-ASCII bytes
-        // mixed in: must be judged Invalid.
-        let req = b"GET / HTTP/1.1\r\nHost: ev\xffel.com\r\n\r\n";
-        assert!(matches!(extract_host(req), HostParseResult::Invalid(_)));
-    }
-
-    /// Regression: if the body region after the header terminator in the
-    /// peek buffer happens to contain a 5-byte sliding-window match like
-    /// `\nHost: ...\n`, it must never be misjudged as duplicate_host. Scanning
-    /// must stop at the first blank line.
-    #[test]
-    fn extract_host_ignores_host_like_pattern_in_body() {
-        let mut req = b"POST /x HTTP/1.1\r\n\
-Host: real.example.com\r\n\
-Content-Type: application/octet-stream\r\n\
-Content-Length: 100\r\n\
-\r\n"
-            .to_vec();
-        // Stuff a byte sequence into the body that looks like a second Host
-        // header; it must be ignored.
-        req.extend_from_slice(b"\nHost: fake.example.com\r\n");
-        req.extend_from_slice(&[0xff; 80]);
-        assert!(matches!(
-            extract_host(&req),
-            HostParseResult::Found(h) if h == "real.example.com"
-        ));
-    }
-
-    /// Regression: an LF-only header terminator (`\n\n`) must also be recognized.
-    #[test]
-    fn extract_host_stops_at_lf_only_header_end() {
-        let req = b"GET / HTTP/1.1\nHost: real.example.com\n\nHost: fake.example.com\n";
-        assert!(matches!(
-            extract_host(req),
-            HostParseResult::Found(h) if h == "real.example.com"
-        ));
-    }
+    // The Host-extraction unit suite (basic/case/port/missing/duplicate/
+    // invalid-chars/too-long/ipv6/binary-body/first-host-scan/invalid-utf8/
+    // host-like-in-body/LF-only) moved with the parser into
+    // interflow-core's `security::http_head` tests; the listener keeps the
+    // behavioral integration tests (slow-loris, duplicate-Host close,
+    // binary-body routing, XFF) in crates/expose/tests.
 }

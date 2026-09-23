@@ -1,0 +1,19 @@
+[Unit]
+Description=Interflow agent node alpha
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+TimeoutStartSec=30s
+ExecStart=/usr/local/bin/interflow-mesh agent --pack /srv/interflow/packs/agent-alpha
+Restart=always
+RestartSec=5
+User=interflow
+Group=interflow
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/interflow/packs/agent-alpha
+
+[Install]
+WantedBy=multi-user.target

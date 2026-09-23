@@ -1,87 +1,147 @@
 # Interflow
 
-A multiplexed tunnel system with mTLS by default: it carries both TCP byte streams and UDP datagrams over a single custom frame protocol that runs on two transports — HTTP/2 and QUIC. Two usage scenarios, each with its own optimal architecture and a standalone binary:
 
-| Scenario | Binary | One-liner |
-|---|---|---|
-| **A. Public domain → LAN service** (ngrok-style) | `interflow-expose` | Expose a local port through a public domain |
-| **B. LAN A ↔ LAN B** (site-to-site) | `interflow-mesh` | Interconnect two private networks through a public hub relay |
+## Quick start
 
-Both binaries share the same tunnel primitives (`interflow-core`: frame protocol × h2 / QUIC dual transports); the scenario-specific orchestration lives in each binary.
+```bash
+interflow setup --realm example --control-endpoint relay.example.com:16666 \
+  --host app.example.com --agent desktop --service web --service-address 127.0.0.1:8080
+interflow plan apply --manifest interflow.toml --issuer issuer --out dist
+
+interflow ingress run --pack dist/packs/ingress-edge   # public entry node
+interflow agent run   --pack dist/packs/agent-desktop   # in-network connector
+```
+
+You declare **Ingress / Agent / Service / Route**; identities, trust, and
+signed routing policy ship inside self-describing Credential Packs — no
+certificate paths anywhere. Workspaces share one ingress with per-workspace
+issuers and cross-workspace deny by default. See the deployment guide for packs, rotation, revocation, `doctor`, and
+the registrar; see the versioning guide for the product-version /
+format-version / generation model.
+
+A multiplexed tunnel with mTLS by default: it carries both TCP byte streams
+and UDP datagrams over a single custom frame protocol (fixed 41-byte binary header, flags-carried direction/origin, opaque raw tokens, reason codes) that runs on two
+transports — HTTP/2 and QUIC.
+
+## Site-to-site (private network ↔ private network)
+
+The same manifest model drives the mesh engine: declare a `[mesh.hub.*]`
+node and per-agent mesh rules, `interflow plan apply` renders hub and agent
+Credential Packs, and the nodes run on the `interflow-mesh` binary (a node
+is an identity — a machine can run any number of them, each in its own
+mesh):
+
+```bash
+interflow plan apply --manifest interflow.toml --issuer issuer --out dist
+
+interflow-mesh hub   --pack dist/packs/hub-central   # public relay
+interflow-mesh agent --pack dist/packs/agent-lan-a    # LAN A side
+interflow-mesh agent --pack dist/packs/agent-lan-b    # LAN B side
+```
+
+Hub and agent credentials are issued offline (never enrolled), renew
+automatically against the registrar, and respond to the same `rotate` /
+`revoke` / `doctor` lifecycle as expose packs. The runnable scenario lives
+in `crates/mesh/dev-examples/site-to-site/`.
+
+## Engine components
+
+The `interflow-mesh` engine is driven exclusively from Credential Packs
+(the binary exposes only `hub/agent --pack`). Engine development and
+isolated test topologies go through the same pack machinery
+(`crates/mesh/dev-examples/site-to-site/` renders packs from a manifest);
+the dev soak harness uses a testkit-only node binary with a JSON config
+handoff.
 
 ## Repository layout
 
 ```
 interflow/
 ├── crates/
-│   ├── core/      ← HTTP/2 tunnel primitives (protocol / tunnel / registry / acl / tls / pump / telemetry)
-│   ├── expose/    ← Scenario A: consolidated edge component + local expose client + init wizard
-│   └── mesh/      ← Scenario B: pure hub + dual-mode agent (ingress + egress)
+│   ├── identity/   ← identity model: manifest, issuer, Credential Packs, trust bundles, policy
+│   ├── cli/        ← the unified `interflow` entry point (setup / plan / ingress / agent / lifecycle)
+│   ├── expose/     ← public-domain engine (lib-only, driven from packs by the CLI/GUI)
+│   ├── mesh/       ← site-to-site engine + the `interflow-mesh` binary (pack-only)
+│   ├── core/       ← tunnel primitives (protocol / tunnel / registry / acl / tls / pump / telemetry)
+│   ├── registrar/  ← the independent enrollment / renewal service (`interflow-registrar`)
+│   ├── renewal/    ← shared credential-renewal scheduler (pack lifecycle beside every engine)
+│   ├── certs/      ← shared rcgen issuance behind the issuer and the test kit
+│   ├── contract/   ← FORMAT_VERSION / Generation machine contracts
+│   ├── util/       ← shared micro-utilities (authority parsing, atomic writes)
+│   └── testkit/    ← dev-only test/bench harness
+├── src/, src-tauri/ ← Tauri 2 GUI (unified node manager: expose agents, mesh agents, hubs, and ingresses side by side, each from a Credential Pack — each node is an identity, not a machine, and the GUI manages any number of them on its host)
 ├── examples/      ← generic, runnable scenario examples
 └── Cargo.toml     ← workspace root
 ```
 
 ---
 
-## Scenario A: public domain → LAN service (`interflow-expose`)
+## Public domain → LAN service (`interflow`)
 
-Like ngrok, it exposes a local port under a public domain — but with a fixed domain (no random assignment), and the public entry point terminates TLS at Nginx before handing traffic to the edge.
+Like ngrok, it exposes a local port under a public domain — but with a fixed domain (no random assignment), and the public entry point terminates HTTPS itself: ACME by default (`[public_tls] mode = "acme"`, ports 80/443 direct), or a frontend proxy (nginx/LB) in the advanced topology.
 
 ### Topology
 
+Default — the ingress terminates public HTTPS itself via ACME:
+
 ```
 [public server]
-  Nginx (443, TLS, by Host/SNI)
-     │ proxy_pass http://127.0.0.1:8443
-     ▼
-  interflow-expose edge              ← single process: HubServer + EdgeListener (consolidated)
-     │ HTTP/2 tunnel (or QUIC — see "QUIC transport" below)
+  interflow ingress run --pack …     ← single process: control endpoint + ingress listener
+     │ public HTTPS terminated here (ACME: HTTP-01 + TLS-ALPN-01, auto-renewal)
+     │ HTTP/2 tunnel (mTLS from the Credential Pack)
      ▼
 [local machine]
-  interflow-expose expose 3000       ← single command: egress agent + auto configuration
+  interflow agent run --pack …       ← in-network connector; services come from the pack
      │
      ▼
   127.0.0.1:3000
 ```
 
+Advanced — frontend proxy (`[public_tls] mode = "frontend-proxy"`): nginx/LB
+terminates TLS on 443 and `proxy_pass`es plaintext HTTP/1 to the ingress
+listener (e.g. `127.0.0.1:8443`); the tunnel leg below is unchanged.
+
 ### First run
 
 ```bash
-# Public server: interactive wizard generates certificates + configuration
-interflow-expose init
-# → generates the tenant CA + hub certificate + one agent client cert
-#   into ./certs/ (tenants/<tenant>-ca.*, hub.*, agents/<agent-id>.*)
-# → emits a routes.toml template and an nginx.conf snippet
-# → prints the commands for both sides
+# 1. Operator machine: declare the deployment (the single source of truth)
+interflow setup \
+  --realm example --control-endpoint relay.example.com:16666 \
+  --registrar-endpoint https://registrar.example.com \
+  --host app.example.com --agent myagent \
+  --service web --service-address 127.0.0.1:3000
 
-# Public server: start the edge (trusting client certs from the tenant CA)
-interflow-expose edge \
-  --listen 0.0.0.0:8443 \
-  --hub-listen 0.0.0.0:16666 \
-  --routes routes.toml \
-  --client-ca main=./certs/tenants/main-ca.crt \
-  --hub-cert ./certs/hub.crt --hub-key ./certs/hub.key \
-  --x-forwarded-for required   # behind nginx; see examples/public-domain-to-lan
+# 2. Run the independent short-lived credential registrar (keep `issuer/` offline)
+interflow-registrar certificate --issuer issuer --realm example \
+  --endpoint https://registrar.example.com
+interflow-registrar serve --issuer issuer --listen 0.0.0.0:18666 \
+  --tls-cert registrar.crt \
+  --endpoint https://registrar.example.com \
+  --tls-key registrar.key --leaf-ttl 24h \
+  --control-endpoint relay.example.com:16666
 
-# Local machine: fill in the profile on first use (with the command printed by init)
-interflow-expose expose 3000 \
-  --hub https://hub.example.com:16666 \
-  --client-cert ./certs/agents/expose-myapp.crt \
-  --client-key ./certs/agents/expose-myapp.key \
-  --agent-id expose-myapp \
-  --ca-path ./certs/tenants/main-ca.crt \
-  --save
+# 3. Issue every identity + Credential Pack
+interflow plan apply --manifest interflow.toml --issuer issuer --out dist
 
-# Local machine: afterwards a single command is enough
-interflow-expose expose 3000
+# 4. Public server: start the ingress from its pack
+interflow ingress run --pack dist/packs/ingress-edge
+
+# 5. Local machine: start the agent from its pack
+interflow agent run --pack dist/packs/agent-myagent
 ```
+
+No certificate paths anywhere: the packs carry identity, trust, the signed
+route policy, and the node configuration. Leaf credentials default to a 24h
+TTL and renew automatically at 50% remaining lifetime. `interflow rotate`
+remains for policy/trust generation changes, revoke with `interflow revoke`,
+and diagnose with `interflow doctor`.
 
 ### Key design
 
-- **The edge is a consolidated component**, not a "hub + ingress bundle": the HTTP/1 listener and the tunnel server cooperate directly on the same event loop — public request → peek the first 8 KB for the `Host` header → route-table lookup → open a tunnel stream to the target egress agent → pass the byte stream through
-- **Nginx terminates TLS**; the edge sees the plaintext HTTP/1 arriving from nginx `proxy_pass`
+- **The ingress is a consolidated component**, not a "hub + ingress bundle": the public listener and the tunnel server cooperate directly on the same event loop — public request → peek the first 8 KB for the `Host` header → route-table lookup (from the signed policy, in memory) → open a tunnel stream to the target egress agent → pass the byte stream through
+- **Public HTTPS**: ACME terminates TLS on the ingress by default (HTTP-01 + TLS-ALPN-01, auto-renewal); the fronted topology keeps nginx terminating TLS with the ingress receiving plaintext HTTP/1 from `proxy_pass`
 - **L4 passthrough**: the edge does not parse the full HTTP protocol — it only peeks the Host header for routing; the remaining byte stream crosses the tunnel untouched, and the backend service (a local HTTP server / SSH / any TCP service) parses it itself
-- **h2 tunnel by default, QUIC opt-in**: the expose client↔edge leg can switch to QUIC (`--transport quic` on the client, `--quic-listen` on the edge — see [QUIC transport](#quic-transport-optional-coexists-with-h2-as-a-dual-stack)); nginx stays on the public path either way, since the QUIC UDP port is dialed directly
+- **h2 tunnel by default, QUIC opt-in**: the agent↔ingress leg can switch to QUIC via the pack / GUI transport preference (verified e2e in `crates/expose/tests/e2e_expose_quic.rs`); the control leg stays on h2, and a QUIC listener on the ingress side is on the manifest roadmap
 
 ### Deployment notes: long silent windows and SSE
 
@@ -89,139 +149,29 @@ When the backend is an LLM / SSE-style service that stays silent for a long time
 
 ```
 nginx proxy_read_timeout (default 60s — must be raised)
-  ≥ edge stream idle timeout (--stream-idle-timeout-secs, default 300s)
+  ≥ edge stream idle timeout (fixed 300s policy default)
   ≥ the longest silent interval of the service (e.g. the wait for the first LLM token)
 ```
 
-nginx's default `proxy_read_timeout 60s` cuts the connection after 60 s of backend silence — before interflow's 300 s budget ever gets a chance to act; the default response buffering also breaks SSE token-by-token streaming. The nginx snippet generated by `interflow-expose init` already contains the correct settings; when configuring by hand, all three pieces are mandatory:
+nginx's default `proxy_read_timeout 60s` cuts the connection after 60 s of backend silence — before interflow's 300 s budget ever gets a chance to act; the default response buffering also breaks SSE token-by-token streaming. The example [`examples/public-domain-to-lan/nginx.conf`](examples/public-domain-to-lan/nginx.conf) already contains the correct settings; when configuring by hand, all three pieces are mandatory:
 
 ```nginx
 location / {
     proxy_pass http://127.0.0.1:8443;
     proxy_set_header Host $host;
     proxy_http_version 1.1;    # required for keep-alive
-    proxy_read_timeout 6m;     # ≥ edge --stream-idle-timeout-secs (default 300s)
+    proxy_read_timeout 6m;     # ≥ edge stream idle timeout (300s)
     proxy_buffering off;       # don't buffer SSE token-by-token streaming
 }
 ```
 
 ---
 
-## Scenario B: LAN A ↔ LAN B (`interflow-mesh`)
+## Transports and UDP
 
-A classic site-to-site tunnel: two private networks interconnected through a public hub relay. The hub is a pure tunnel router that never touches public traffic; both ends are agents.
+**h2 is the default transport** — it connects wherever TCP egress is allowed. **QUIC is an opt-in upgrade** for the agent↔ingress leg (a transport preference in the pack / GUI): tunnel streams then run on QUIC native streams (custom frames written raw), eliminating single-TCP-connection head-of-line blocking. The choice is static per agent with no automatic fallback between the two — which is exactly why h2 stays the default. ACL / stream limits / mTLS / cert-pin keep identical semantics on both transports.
 
-### Topology
-
-```
-[LAN A]                              [public]                  [LAN B]
- interflow-mesh agent                 interflow-mesh hub      interflow-mesh agent
- (ingress: local listener :3001)  ─tunnel─►  (pure routing bridge)  ◄─tunnel─  (egress: dials :3000)
-   ▲
-   │ LAN A client accesses :3001
-```
-
-### Usage
-
-```bash
-# Public relay node
-interflow-mesh hub --config examples/site-to-site/hub.toml
-
-# LAN A (ingress: local listener, tunnels traffic to the far end)
-interflow-mesh agent --config examples/site-to-site/agent-lan-a.toml
-
-# LAN B (egress: receives traffic from the tunnel, dials the local service)
-interflow-mesh agent --config examples/site-to-site/agent-lan-b.toml
-```
-
-The runnable quickstart lives in `examples/site-to-site/` (`hub.toml`, `agent-lan-a.toml`, `agent-lan-b.toml`). Start with [`examples/README.md`](examples/README.md) for the scenario index.
-
-Relative paths inside a config file (e.g. `certs/hub.crt`) resolve against the config file's own directory — never against the working directory — so the examples load identically no matter where you launch the binary from. Example certificates are never committed (git-ignored by policy): each scenario provides `generate-certs.sh`. CLI-flag paths (`--config`, `--ca-path`) keep the usual shell semantics.
-
-### Key design
-
-- **The hub stays pure**: stream routing + ACL + authentication only — it never terminates public TLS and never parses HTTP
-- **Ingress / egress agents are symmetric**: same binary, the config decides the role; one agent can carry both directions at once
-- **Any TCP / UDP traffic**: TCP byte streams and UDP datagrams (DNS / game-style traffic) all traverse
-
-### UDP forwarding
-
-Declare `listen_protocol = "udp"` on an ingress rule to forward UDP; each client source address gets one tunnel stream, and datagram boundaries are preserved by the frame protocol (one frame per packet — no merging, no fragmentation):
-
-```toml
-# ingress agent
-[[ingress]]
-name = "dns"
-listen_addr = "0.0.0.0:5353"
-listen_protocol = "udp"
-target_agent = "egress"
-remote_addr = "10.0.0.1:53"
-# optional tuning (defaults shown; 0 = disable the given item)
-idle_timeout_secs = 60             # idle-session reclamation (closed when idle in both directions)
-udp_per_ip_pps = 50                # inbound per-IP packet rate (anti-amplification)
-udp_per_ip_bytes_per_sec = 10240   # inbound per-IP byte rate
-udp_egress_bytes_per_sec = 262144  # return-path per-session byte rate (anti-amplification relay)
-
-# egress agent
-[[egress]]
-name = "dns-out"
-target_addr = "10.0.0.1:53"
-target_protocol = "udp"
-```
-
-Safe defaults (a differentiator neither frp nor rathole ships): a 65507-byte read buffer that refuses silent truncation, and bidirectional inbound / return-path rate limits that suppress UDP amplification reflection. **Audit and tighten `udp_per_ip_*` as needed before exposing DNS.**
-
-### QUIC transport (optional, coexists with h2 as a dual stack)
-
-With `[transport.quic]` enabled on the hub and `transport = "quic"` selected on the agent, tunnel streams run directly on QUIC native streams (custom frames written raw — eliminating single-TCP-connection head-of-line blocking and the "one HTTP exchange per frame on the upstream"); UDP sessions additionally take the QUIC DATAGRAM (RFC 9221) fast path — small packets travel unreliably and unordered straight to the peer, so packet loss no longer HOLs the whole connection (neither frp nor rathole does this). ACL / stream limits / heartbeat eviction / mTLS / cert-pin keep identical semantics across both transports, and cross-transport interop is supported (h2 agent ↔ quic agent).
-
-Positioning of the pair: **h2 is the default and fallback-safe transport** — it connects wherever TCP egress is allowed; **QUIC is an opt-in upgrade** — pick it when the agent's network allows UDP egress (many corporate egress policies block UDP). The choice is static per-agent config with no automatic fallback between the two, which is exactly why h2 stays the default.
-
-Both scenarios support it. In the mesh scenario:
-
-```toml
-# hub
-[transport.quic]
-enabled = true            # requires certificates from [tls] (QUIC mandates TLS)
-listen_addr = "0.0.0.0:6667"
-datagram_enabled = true   # DATAGRAM fast path for UDP sessions (on by default)
-
-# agent
-[agent]
-transport = "quic"        # default "h2"
-hub_quic_addr = "hub.example.com:6667"
-
-# Optional transport tuning (same schema on BOTH ends — see below)
-[transport.h2]
-keepalive_interval_secs = 5
-keepalive_timeout_secs = 10
-```
-
-`[transport]` is endpoint-symmetric by design: the hub and the agent expose
-the same `[transport.h2]` / `[transport.quic]` knobs with the same defaults,
-because QUIC negotiates the idle timeout as the endpoints' *minimum* —
-raising only one side silently does nothing. Tuning one link means changing
-both sides together.
-
-In the expose scenario there is no toml — the same plane is wired through CLI flags:
-
-```bash
-# Public server: edge opens an extra QUIC listener for expose clients.
-# The UDP port bypasses nginx (open it on the firewall) and requires the
-# hub certificate (--hub-cert/--hub-key): QUIC mandates TLS, and the cert's
-# SAN must cover the hostname clients dial.
-interflow-expose edge \
-  --quic-listen 0.0.0.0:16666 \
-  --hub-cert ./certs/hub.crt --hub-key ./certs/hub.key \
-  ... # --listen/--hub-listen/--routes/--client-ca as usual
-
-# Local machine: the client dials QUIC instead of h2. The QUIC address can
-# stay implicit — with --hub-quic-addr omitted it derives from the hub URL's
-# host:port, which matches the edge's same-port dual-stack default above.
-interflow-expose expose 3000 --transport quic
-```
-
-The edge's own dial to its embedded hub stays on h2 — the hub relays across transports (h2 edge tunnel ↔ quic expose client), verified e2e in `crates/expose/tests/e2e_expose_quic.rs`. `interflow-expose init` offers the QUIC options in its wizard, and the GUI exposes a transport toggle.
+**UDP** is carried as datagrams over an encrypted agent-to-agent QUIC association: datagram boundaries are preserved (RFC 9221 DATAGRAM frames), large packets are explicitly fragmented and reassembled (never silently truncated), and bidirectional per-IP / return-path anti-amplification rate limits are on by default. The engine carries UDP today in the site-to-site engine mode; exposing UDP services in the manifest is on the roadmap.
 
 ---
 
@@ -234,14 +184,14 @@ One-line positioning: **frp is the most feature-complete bundle with the largest
 | Dimension | frp | rathole | interflow |
 |---|---|---|---|
 | Transport stack | TCP / KCP / QUIC / WS (quic-go, QUIC streams instead of yamux) | TCP / TLS / Noise / WS (one connection per stream) | **One frame protocol over both long-lived h2 streams and QUIC (quinn)**, cross-transport interop (h2 agent ↔ quic agent via the same hub relay, e2e-verified) |
-| UDP carriage | reliable stream (loss HOLs the whole service) | reliable stream | reliable stream + **QUIC DATAGRAM (RFC 9221) fast path** (≤1023 B unreliable direct delivery — DNS-style traffic gets zero retransmission, zero HOL) |
+| UDP carriage | reliable stream (loss HOLs the whole service) | reliable stream | **inner QUIC DATAGRAM over an encrypted agent-to-agent association** (datagram semantics + explicit large-packet fragmentation) |
 | Large UDP packets | 1500-byte read buffer by default, overlong packets silently truncated | hardcoded 2048, silently truncated | 65535-byte read buffer; truncation is an explicit drop with a counter |
 | UDP amplification defense | none | none | per-IP pps + byte dual-bucket inbound rate limit and a return-path rate limit, on by default |
-| Security defaults | random self-signed cert + client skips verification + token (CA / mTLS / OIDC configurable) | per-service token + optional Noise/TLS | **mTLS + client-cert CN binding + SHA256 cert-pin + constant-time comparison**, same standard defaults on h2 / QUIC |
-| Topology | expose family (stcp / xtcp visitor) | expose only | expose (L4 passthrough + Host routing) + **symmetric site-to-site mesh** |
+| Security defaults | random self-signed cert + client skips verification + token (CA / mTLS / OIDC configurable) | per-service token + optional Noise/TLS | **mTLS + SHA256 cert-pin + constant-time comparison + inner TLS/QUIC for TCP/UDP payloads**, same standard defaults on h2 / QUIC; identity is a signed pack, never a shared secret |
+| Topology | expose family (stcp / xtcp visitor) | expose only | public-domain tunnels (L4 passthrough + Host routing) + **site-to-site engine mode** |
 | TCP data plane | reliable stream | reliable stream | **structured and lossless**: per-stream channels, no frame-loss path in the data plane; end-to-end stall bounds (dispatch 5s / backend write 10s / hub dispatch 30s), failures visible in metrics by reason |
 | Resource defense | server-side limits (maxPoolCount / maxPorts, …) | none | hub concurrency limits + ACL + audit; **independent agent-side defenses** (local stream caps / stream-open rate limiting / dial double timeouts, independent of hub configuration) |
-| Hot reload | frpc admin API (re-reads the file) | file watch (notify) | hub / edge SIGHUP with an **explicit reload contract** (immediate / new-connections-only / restart-required — the third tier is warned per field, never silently ignored); agent control API **writes back to disk** (every command acknowledged, origin-tagged, reconnect resync converges drift) |
+| Change contract | frpc admin API (re-reads the file) | file watch (notify) | **explicit by construction**: a pack generation is immutable — route/trust changes go through `rotate` / re-`plan apply` and are verifiable (`doctor`, Trust Bundles with generation + digest); the engine-level hub additionally supports SIGHUP hot reload with a documented immediate / new-connections-only / restart-required contract |
 | Binary size | ~10 MiB | minimal build 574 KiB (feature trimming + upx) | several MiB (minimization is not a goal — see the product decisions below) |
 | Feature surface | plugin family / P2P hole punching / load balancing / health checks / dashboard | minimal | no plugins, no P2P (explicit trade-offs) |
 | Ecosystem | the largest community and distribution ecosystem | OpenWrt / embedded niche | new project |
@@ -250,7 +200,7 @@ One-line positioning: **frp is the most feature-complete bundle with the largest
 
 - **frp**: P2P hole punching (xtcp, relay-free direct connection), aggressive KCP transport, client plugins (protocol conversion / static files / socks5 egress), L7 vhost routing, proxy load balancing and health checks, OIDC, a web dashboard, and the largest community and third-party ecosystem.
 - **rathole**: a ~574 KiB embedded minimal build (a dropbear-class presence on routers / OpenWrt), the minimal-configuration mindset of certificate-free Noise; its "one connection per stream" model naturally has no cross-stream head-of-line blocking on TCP.
-- **interflow's known boundaries**: h2 mode has cross-stream TCP head-of-line blocking (solved by the QUIC transport; h2 remains the default — deployable wherever TCP egress works — while QUIC is an opt-in upgrade that requires UDP egress); the expose scenario does not support UDP yet (fully supported in the mesh scenario); community size and third-party ecosystem start from zero.
+- **interflow's known boundaries**: h2 mode has cross-stream TCP head-of-line blocking (solved by the QUIC transport; h2 remains the default — deployable wherever TCP egress works — while QUIC is an opt-in upgrade that requires UDP egress); the public-domain product path does not expose UDP yet (the engine carries it today in the site-to-site mode; manifest-level exposure is on the roadmap); community size and third-party ecosystem start from zero.
 
 ### Explicitly out of scope (product decisions, not missing capability)
 
@@ -267,11 +217,10 @@ One-line positioning: **frp is the most feature-complete bundle with the largest
 # Build the whole workspace
 cargo build --workspace
 
-# Tests (core 101 + mesh 181 + expose 62 = 344 cases: unit + e2e,
-# including adversarial and resilience scenarios such as silent-link
-# recovery / slow backends / Open floods / disconnect self-healing,
-# plus config-invariant locks: liveness-chain derivations, negotiation
-# compatibility matrix, schema validation rules)
+# Tests (workspace-wide unit + e2e: adversarial and resilience scenarios such
+# as silent-link recovery / slow backends / Open floods / disconnect
+# self-healing, plus config-invariant locks: liveness-chain derivations,
+# negotiation compatibility matrix, schema validation rules)
 cargo test --workspace
 
 # Cross-platform release builds (zig for cross-compilation; artifacts land in artifacts/)
@@ -279,10 +228,10 @@ cargo test --workspace
 ./scripts/build-macos.sh
 ./scripts/build-windows.sh
 
-# GUI (Tauri 2, experimental): macOS DMG
+# GUI (Tauri 2, unified node manager): macOS DMG
 ./scripts/build-dmg.sh
 
-# Docker (mesh by default; --build-arg BINARY=interflow-expose also works)
+# Docker (mesh hub/agent image by default; --build-arg BINARY=interflow also works)
 docker build -t interflow:latest .
 ```
 
@@ -291,84 +240,24 @@ docker build -t interflow:latest .
 ```
 just test          # all tests
 just lint          # strict clippy (forbid unsafe / deny panic)
-just example-public-domain-certs
-just example-public-domain-edge
-just example-public-domain-agent 3000
-just example-site-to-site-certs
-just example-site-to-site-hub
-just example-site-to-site-agent-a
-just example-site-to-site-agent-b
-just init          # run the expose init wizard
+just example-public-domain-plan
+just example-public-domain-ingress
+just example-public-domain-agent
 ```
+
+(Engine-level recipes such as the site-to-site example exist too — `just --list`.)
 
 ---
 
 ## Tech stack
 
 - **Rust 2024** + Tokio
-- **Dual transport stack**: long-lived HTTP/2 streams (hyper 1.x: `/stream/up` upstream + `/poll` downstream mirrored streaming) and QUIC (quinn 0.11: one QUIC stream per tunnel stream + RFC 9221 DATAGRAM), both sharing the same custom frame protocol
+- **Dual transport stack**: long-lived HTTP/2 streams (hyper 1.x: `/stream/up` upstream + `/poll` downstream mirrored streaming) and QUIC (quinn 0.11: one QUIC stream per tunnel stream + RFC 9221 DATAGRAM), both sharing the same custom frame protocol (codec property-tested + cargo-fuzzed)
 - **rustls** (no openssl; mTLS / cert pinning / SHA256 fingerprint verification)
-- **TOML** configuration (schema v3, `deny_unknown_fields` guards against typos; defaults single-sourced in code)
+- **TOML** configuration (`deny_unknown_fields` guards against typos; defaults single-sourced in code)
 - **Tracing** + Prometheus metrics
 - **Strict lints**: `deny(unsafe_code)`, `deny(panic)`, `warn(pedantic + nursery)`
 
 ## License
 
-Apache-2.0
-
-## Multi-enterprise hub (multi-tenant, since v4)
-
-One hub may carry multiple enterprises, each with its **own CA**. Design and
-rationale: `docs/design/multi-tenant-mtls-only.md` (mTLS is the only
-authentication; tokens no longer exist).
-
-```text
-enterprise A CA (offline key) ──┐
-enterprise B CA (offline key) ──┼──► hub: [[auth.tenants]]  identity = (tenant, CN)
-edge gateway (ephemeral CA)  ──┘    cross-tenant deny by default
-```
-
-One identity per command — the `interflow-mesh certs` subcommand (run it on
-an **operator machine**, never on the hub host; idempotent: existing material
-is validated, never blindly skipped or overwritten):
-
-1. `interflow-mesh certs init --hub-dns <hub-hostname> [--tenant NAME] [--out DIR]`
-   generates the hub certificate + the first tenant CA (`--hub-dns` is the
-   hostname agents dial — omit it only for local development, where the SAN
-   defaults to `localhost, 127.0.0.1`);
-   `interflow-mesh certs tenant new <NAME>` adds a tenant;
-   `interflow-mesh certs agent issue <TENANT> <AGENT_ID>` issues agent
-   certificates (CN == agent_id == file name). CA private keys stay offline;
-   the hub only reads public CA certs.
-2. hub.toml:
-
-   ```toml
-   [auth]
-   rate_limit_per_minute = 30
-
-   [[auth.tenants]]
-   name = "acme"
-   ca_path = "certs/acme-ca.crt"
-
-   [tls]
-   enabled = true
-   cert_path = "certs/hub.crt"
-   key_path = "certs/hub.key"
-   ```
-
-3. agent.toml (`client_cert_path`/`client_key_path` are mandatory; the CN
-   must equal `agent.id`).
-4. expose edge: `--client-ca acme=certs/acme-ca.crt` (repeatable; the edge
-   mints its own per-restart gateway principal in memory).
-5. routes.toml routes carry `tenant`; real client IPs for rate limiting and
-   audit are restored per topology: the standard nginx HTTP `proxy_pass` leg
-   uses `--x-forwarded-for required` (nginx sets `X-Forwarded-For`; stock
-   nginx cannot emit the PROXY protocol on that leg), while a PROXY-v2-
-   capable front (LB / nginx stream) uses `--proxy-protocol required`. Both
-   share `--trusted-proxy` and key governance/audit only — never identity.
-
-**Migration (one-time, no coexistence):** v3 configs fail fast with
-`deny_unknown_fields` errors; reissue certificates, switch configs, then
-enable the real-IP mechanism for your topology. Rotation unit is the tenant —
-one leaked tenant CA never affects the others.
-affects the others.
+Apache-2.0 — see [LICENSE](LICENSE).

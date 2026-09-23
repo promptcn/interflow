@@ -1,150 +1,101 @@
-//! Host routing table: `Host` header → `(agent_id, remote_addr)`.
+//! Host routing table: `Host` header → `(workspace, agent_id, service_id)`.
 //!
-//! The configuration source is `routes.toml`:
-//! ```toml
-//! [[routes]]
-//! host = "myapp.example.com"
-//! tenant = "acme"
-//! agent_id = "expose-myapp"
-//! remote_addr = "127.0.0.1:3000"
-//!
-//! # Optional: same `[logging]` schema as hub.toml/agent.toml. When present,
-//! # SIGHUP hot-reloads `level`; a `format` change needs a restart. Absent
-//! # means logging is not managed by this file (a `--log-level` flag survives
-//! # SIGHUP).
-//! [logging]
-//! level = "info,interflow_mesh=debug"
-//! ```
+//! Production source: the Credential Pack's **signed runtime policy**,
+//! resolved in memory at startup (`HostRouter::from_routes`). A pack
+//! generation is immutable — route changes go through `rotate`, never a file
+//! edit, so there is no file schema and no hot-reload path.
 
-use arc_swap::ArcSwap;
-use interflow_core::config::LoggingConfig;
 use interflow_core::error::{InterflowError, Result};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// A single routing rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Route {
     /// Host header of public requests (lowercase, no port).
     pub host: String,
-    /// Owning tenant: the Open target resolves to `(tenant, agent_id)` — a
-    /// route pointing at an agent registered under another tenant simply
-    /// finds no target and is rejected (tenant mismatch fails closed).
-    pub tenant: String,
+    /// Owning workspace: the Open target resolves to `(workspace,
+    /// agent_id)` — a route pointing at an agent registered under another
+    /// workspace simply finds no target and is rejected (fail closed).
+    pub workspace: String,
     /// The corresponding local expose agent_id (must be registered under
-    /// `tenant`; its certificate CN must equal it).
+    /// `workspace`; its certificate CN must equal it).
     pub agent_id: String,
-    /// Target address the egress agent dials (where the local service
-    /// actually listens).
-    pub remote_addr: SocketAddr,
+    /// The service the edge asks the agent for, **by id**: the agent
+    /// resolves the id to its own effective dial target (pack default or
+    /// machine-local preference). The edge never carries an address, so a
+    /// compromised ingress can only select among the services the target
+    /// agent itself declares.
+    pub service_id: String,
 }
 
-/// Root of the routing-table config file.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RoutesConfig {
-    /// List of routing rules.
-    #[serde(default)]
-    pub routes: Vec<Route>,
-    /// Optional logging overrides (same schema as the hub/agent `[logging]`
-    /// section). `None` (section absent) = logging is not managed by this
-    /// file: startup falls back to `--log-level`/`info`, and SIGHUP leaves
-    /// the level untouched.
-    #[serde(default)]
-    pub logging: Option<LoggingConfig>,
-}
-
-/// In-process host routing table. Internally holds a wholesale-replaceable
-/// snapshot in an `ArcSwap`, supporting runtime SIGHUP hot reload; the read
-/// side is lock-free.
+/// In-process host routing table. Built once from the signed policy and
+/// immutable afterwards; the read side is lock-free.
 #[derive(Debug, Clone)]
 pub struct HostRouter {
-    inner: Arc<ArcSwap<HashMap<String, Route>>>,
-}
-
-impl RoutesConfig {
-    /// Reads + parses `routes.toml` → [`RoutesConfig`]. Shared by the initial
-    /// load, the SIGHUP reload task, and the CLI's best-effort logging
-    /// pre-read, so every path sees the same schema and validation.
-    pub fn load(path: &str) -> Result<Self> {
-        let s = std::fs::read_to_string(path).map_err(|e| {
-            InterflowError::config(format!("failed to read routing table {path}")).with_source(e)
-        })?;
-        toml::from_str(&s).map_err(|e| {
-            InterflowError::config(format!("failed to parse routing table {path}")).with_source(e)
-        })
-    }
+    inner: Arc<HashMap<String, Route>>,
 }
 
 impl HostRouter {
-    /// Constructs from a `RoutesConfig`. A duplicate (normalized) host is a
-    /// configuration error — the pre-v4 silent last-wins hid route hijacks
-    /// and typos; now the load fails loudly instead.
-    pub fn from_config(cfg: &RoutesConfig) -> Result<Self> {
+    /// Constructs from already-resolved in-memory routes (host →
+    /// workspace/agent/address bindings from the signed policy). A duplicate
+    /// (normalized) host is a configuration error — the legacy silent
+    /// last-wins hid route hijacks and typos; now construction fails loudly
+    /// instead.
+    pub fn from_routes(routes: &[Route]) -> Result<Self> {
         Ok(Self {
-            inner: Arc::new(ArcSwap::from_pointee(cfg_to_map(cfg)?)),
+            inner: Arc::new(routes_to_map(routes)?),
         })
     }
 
-    /// Loads from a TOML file and constructs.
-    pub fn load(path: &str) -> Result<Self> {
-        Self::from_config(&RoutesConfig::load(path)?)
-    }
-
     /// Looks up a host. The `host` argument is normalized (lowercased, port
-    /// stripped).
+    /// and IPv6 brackets stripped). A value that does not parse as an
+    /// authority cannot match: every registered key is parser-derived, so an
+    /// unparseable Host header simply never routes (fail closed).
     pub fn lookup(&self, host: &str) -> Option<Route> {
-        self.inner.load().get(&normalize_host(host)).cloned()
-    }
-
-    /// Swaps in the routing table from an already-parsed config. Public so
-    /// the SIGHUP reload task can apply routes and logging from a single
-    /// parse (one file read can never update routes but not logging).
-    pub fn apply(&self, cfg: &RoutesConfig) -> Result<()> {
-        self.inner.store(Arc::new(cfg_to_map(cfg)?));
-        Ok(())
-    }
-
-    /// Re-reads `routes.toml` and swaps the routing table wholesale. On parse
-    /// failure **or a duplicate-host rejection** the old table is kept.
-    pub fn reload(&self, path: &str) -> Result<()> {
-        self.apply(&RoutesConfig::load(path)?)
+        let key = normalize_host(host)?;
+        self.inner.get(&key).cloned()
     }
 
     /// Number of registered hosts.
     pub fn len(&self) -> usize {
-        self.inner.load().len()
+        self.inner.len()
     }
 
     /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.inner.load().len() == 0
+        self.inner.is_empty()
     }
 }
 
-/// Normalizes a Host header: strip the port suffix, lowercase, trim whitespace.
-fn normalize_host(s: &str) -> String {
-    let trimmed = s.trim().to_ascii_lowercase();
-    // Strip the `:port` suffix (e.g. `myapp.example.com:8080` → `myapp.example.com`)
-    match trimmed.rsplit_once(':') {
-        Some((host, _port)) if !host.is_empty() => host.to_string(),
-        _ => trimmed,
-    }
+/// Normalizes a Host header via the shared authority parser: lowercase,
+/// port-stripped, IPv6 brackets removed (`[::1]:8443` → `::1`). `None` when
+/// the value is not a valid authority — the old `rsplit_once(':')` mangling
+/// turned `[::1]` into `"[:",` which could never match a configured host.
+fn normalize_host(s: &str) -> Option<String> {
+    let lowered = s.trim().to_ascii_lowercase();
+    interflow_util::parse_authority(&lowered)
+        .ok()
+        .map(|parsed| parsed.host)
 }
 
-/// Normalizes a `RoutesConfig` into a host→Route map (hosts already
-/// normalized). Duplicate hosts (after normalization) are rejected — silent
-/// last-wins would let a typo or a tampered file hijack a route.
-fn cfg_to_map(cfg: &RoutesConfig) -> Result<HashMap<String, Route>> {
-    let mut map = HashMap::with_capacity(cfg.routes.len());
-    for r in &cfg.routes {
-        let key = normalize_host(&r.host);
+/// Normalizes a route list into a host→Route map (hosts already normalized).
+/// Route keys must parse as authorities — an unparseable key is a
+/// configuration error rather than a silently unroutable route. Duplicate
+/// hosts (after normalization) are rejected — silent last-wins would let a
+/// typo or a tampered policy hijack a route.
+fn routes_to_map(routes: &[Route]) -> Result<HashMap<String, Route>> {
+    let mut map = HashMap::with_capacity(routes.len());
+    for r in routes {
+        let key = normalize_host(&r.host).ok_or_else(|| {
+            InterflowError::config(format!(
+                "invalid host in routing table: {:?} (expected host[:port], IPv6 in brackets)",
+                r.host
+            ))
+        })?;
         if map.contains_key(&key) {
             return Err(InterflowError::config(format!(
-                "duplicate host in routing table: {key} (routes.toml must map each host exactly once)"
+                "duplicate host in routing table: {key} (each host must be mapped exactly once)"
             )));
         }
         map.insert(key, r.clone());
@@ -162,25 +113,51 @@ fn cfg_to_map(cfg: &RoutesConfig) -> Result<HashMap<String, Route>> {
 mod tests {
     use super::*;
 
+    fn route(host: &str, agent_id: &str) -> Route {
+        Route {
+            host: host.into(),
+            workspace: "acme".into(),
+            agent_id: agent_id.into(),
+            service_id: "web".into(),
+        }
+    }
+
     #[test]
     fn normalize_handles_port_and_case() {
-        assert_eq!(normalize_host("MyApp.Example.COM:443"), "myapp.example.com");
-        assert_eq!(normalize_host("  myapp.example.com  "), "myapp.example.com");
-        assert_eq!(normalize_host("myapp.example.com"), "myapp.example.com");
+        let norm = |s: &str| normalize_host(s).unwrap();
+        assert_eq!(norm("MyApp.Example.COM:443"), "myapp.example.com");
+        assert_eq!(norm("  myapp.example.com  "), "myapp.example.com");
+        assert_eq!(norm("myapp.example.com"), "myapp.example.com");
+        // The IPv6 fix: brackets and port are stripped to the bare address
+        // (the old rsplit_once logic produced "[::1]" / "[:")
+        assert_eq!(norm("[::1]:8443"), "::1");
+        assert_eq!(norm("[2001:DB8::1]"), "2001:db8::1");
+    }
+
+    #[test]
+    fn unparseable_hosts_never_match_or_load() {
+        // Lookup side: fail closed — no route can be matched by garbage
+        assert_eq!(normalize_host("::1"), None);
+        assert_eq!(normalize_host(""), None);
+        assert_eq!(normalize_host("host/path"), None);
+
+        // Construction side: an unparseable route key is a loud config error
+        assert!(HostRouter::from_routes(&[route("::1", "agent-a")]).is_err());
+    }
+
+    #[test]
+    fn ipv6_routes_route_via_bracketed_host_headers() {
+        let router = HostRouter::from_routes(&[route("[2001:db8::10]:443", "agent-a")]).unwrap();
+        let found = router
+            .lookup("[2001:db8::10]:8443")
+            .expect("bracketed IPv6 Host must route");
+        assert_eq!(found.agent_id, "agent-a");
     }
 
     #[test]
     fn lookup_finds_registered_host() {
-        let cfg = RoutesConfig {
-            routes: vec![Route {
-                host: "MyApp.Example.com".into(),
-                tenant: "acme".into(),
-                agent_id: "expose-myapp".into(),
-                remote_addr: "127.0.0.1:3000".parse().unwrap(),
-            }],
-            logging: None,
-        };
-        let router = HostRouter::from_config(&cfg).unwrap();
+        let router =
+            HostRouter::from_routes(&[route("MyApp.Example.com", "expose-myapp")]).unwrap();
         assert!(router.lookup("myapp.example.com").is_some());
         assert!(router.lookup("myapp.example.com:8443").is_some());
         assert!(router.lookup("MYAPP.EXAMPLE.COM").is_some());
@@ -188,127 +165,22 @@ mod tests {
     }
 
     #[test]
-    fn logging_section_parses_and_stays_optional() {
-        // Absent section → None (logging not managed by the file).
-        let cfg: RoutesConfig = toml::from_str(
-            r#"
-[[routes]]
-host = "a.example.com"
-tenant = "acme"
-agent_id = "agent-a"
-remote_addr = "127.0.0.1:3000"
-"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.logging, None);
-
-        // Present section → level + format round-trip.
-        let cfg: RoutesConfig = toml::from_str(
-            r#"
-[[routes]]
-host = "a.example.com"
-tenant = "acme"
-agent_id = "agent-a"
-remote_addr = "127.0.0.1:3000"
-
-[logging]
-level = "info,interflow_mesh=debug"
-format = "json"
-"#,
-        )
-        .unwrap();
-        let logging = cfg.logging.expect("logging section");
-        assert_eq!(logging.level, "info,interflow_mesh=debug");
-        assert_eq!(logging.format, interflow_core::telemetry::LogFormat::Json);
-
-        // Level-only section keeps the shared LoggingConfig defaults.
-        let cfg: RoutesConfig = toml::from_str(
-            r#"
-[logging]
-level = "debug"
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            cfg.logging.as_ref().map(|l| l.level.as_str()),
-            Some("debug")
-        );
-
-        // deny_unknown_fields extends into the [logging] section.
-        assert!(
-            toml::from_str::<RoutesConfig>(
-                r#"
-[logging]
-level = "debug"
-unknown_key = 1
-"#,
-            )
-            .is_err()
-        );
+    fn from_routes_installs_in_memory_table() {
+        let router = HostRouter::from_routes(&[route("a.example.com", "agent-a")]).unwrap();
+        let found = router.lookup("a.example.com").expect("route installed");
+        assert_eq!(found.workspace, "acme");
+        assert_eq!(found.agent_id, "agent-a");
     }
 
-    /// After a successful reload, lookup immediately sees the new routing
-    /// table (covers backlog §7 matrix items 1-3), and the same single parse
-    /// surfaces the `[logging]` section for the reload task to apply.
     #[test]
-    fn reload_swaps_routing_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("routes.toml");
-
-        std::fs::write(
-            &path,
-            r#"
-[[routes]]
-host = "a.example.com"
-tenant = "acme"
-agent_id = "agent-a"
-remote_addr = "127.0.0.1:3000"
-"#,
-        )
-        .unwrap();
-        let router = HostRouter::load(path.to_str().unwrap()).unwrap();
-        assert!(router.lookup("a.example.com").is_some());
-        assert!(router.lookup("b.example.com").is_none());
-
-        // Rewrite the file (drop a, add b, start managing logging); after
-        // reload the old host is gone, the new host takes effect, and the
-        // logging section is visible from the same parse
-        std::fs::write(
-            &path,
-            r#"
-[[routes]]
-host = "b.example.com"
-tenant = "acme"
-agent_id = "agent-b"
-remote_addr = "127.0.0.1:4000"
-
-[logging]
-level = "debug"
-"#,
-        )
-        .unwrap();
-        let cfg = RoutesConfig::load(path.to_str().unwrap()).unwrap();
-        router.apply(&cfg).unwrap();
-        assert!(
-            router.lookup("a.example.com").is_none(),
-            "old route should be gone"
-        );
-        let b = router
-            .lookup("b.example.com")
-            .expect("new route should take effect");
-        assert_eq!(b.agent_id, "agent-b");
-        assert_eq!(
-            cfg.logging.as_ref().map(|l| l.level.as_str()),
-            Some("debug"),
-            "reload parse must expose the logging section too"
-        );
-
-        // Feed it broken TOML: the previous snapshot is kept (b still hits)
-        std::fs::write(&path, b"not valid toml {{{").unwrap();
-        assert!(RoutesConfig::load(path.to_str().unwrap()).is_err());
-        assert!(
-            router.lookup("b.example.com").is_some(),
-            "old routes should be kept on parse failure"
-        );
+    fn duplicate_normalized_host_fails_loudly() {
+        // "dup.example.com" and "dup.example.com:443" normalize to one key:
+        // the second would silently shadow the first under last-wins.
+        let err = HostRouter::from_routes(&[
+            route("dup.example.com", "x"),
+            route("dup.example.com:443", "y"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("duplicate host"));
     }
 }

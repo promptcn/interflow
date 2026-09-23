@@ -1,0 +1,34 @@
+# One-time bootstrap (operator, on the registrar server):
+#   0. install -m 0644 interflow-registrar.service /etc/systemd/system/ \
+#      && systemctl daemon-reload
+#   1. copy the issuer store to /srv/interflow/registrar/issuer (keep it 0600)
+#   2. interflow-registrar certificate \
+#        --issuer /srv/interflow/registrar/issuer \
+#        --realm promptcn --node registrar --endpoint https://registrar.example.com \
+#        --out-cert /srv/interflow/registrar/tls/registrar.crt \
+#        --out-key /srv/interflow/registrar/tls/registrar.key
+#   3. systemctl enable --now interflow-registrar
+[Unit]
+Description=Interflow registrar (independent identity issuer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/interflow-registrar serve \
+  --issuer /srv/interflow/registrar/issuer \
+  --listen 127.0.0.1:18666 \
+  --endpoint https://registrar.example.com \
+  --tls-cert /srv/interflow/registrar/tls/registrar.crt \
+  --tls-key /srv/interflow/registrar/tls/registrar.key \
+  --leaf-ttl 24h \
+  --control-endpoint example.com:16666
+Restart=always
+RestartSec=5
+User=interflow
+Group=interflow
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/interflow/registrar
+
+[Install]
+WantedBy=multi-user.target

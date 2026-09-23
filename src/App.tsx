@@ -1,47 +1,84 @@
-import { useEffect, useState } from "react";
-import { api, onLogLine, onTunnelState, TunnelState, LogLine, Transport, stateText, stateColor, isRunning } from "./api";
-import ConfigForm from "./components/ConfigForm";
-import StatusPanel from "./components/StatusPanel";
-import LogView from "./components/LogView";
+import { useEffect, useMemo, useState } from "react";
+import {
+  api,
+  onLogLine,
+  onNodeState,
+  type LogLine,
+  type NodeInfo,
+  type NodeStateDto,
+} from "./api";
+import DeployFace, { type DeployView } from "./components/DeployFace";
+import NodeDetail from "./components/NodeDetail";
+import NodeOverview from "./components/NodeOverview";
 
+const MAX_LOG_LINES = 2000;
+
+/// Two-layer information architecture: each face lands on an overview (the
+/// cards — "what exists and how is it"), and one level down a full-width
+/// detail page carries editing, pack-signed truth, and logs. `null` means
+/// overview; Esc climbs one level back up (never while typing).
 export default function App() {
-  const [state, setState] = useState<TunnelState | null>(null);
+  const [nodes, setNodes] = useState<NodeInfo[]>([]);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [logs, setLogs] = useState<LogLine[]>([]);
-  const [ports, setPorts] = useState<number[]>([]);
-  const [hubUrl, setHubUrl] = useState("");
-  const [clientCert, setClientCert] = useState("");
-  const [clientKey, setClientKey] = useState("");
-  const [agentId, setAgentId] = useState("");
-  const [caPath, setCaPath] = useState("");
-  const [transport, setTransport] = useState<Transport>("h2");
-  const [hubQuicAddr, setHubQuicAddr] = useState("");
-  const [profileLoaded, setProfileLoaded] = useState(false);
+  // In the node detail page: show its logs only, or everything on this
+  // machine (the GUI itself included).
+  const [allLogs, setAllLogs] = useState(false);
+  const [nodesLoaded, setNodesLoaded] = useState(false);
+  const [hostName, setHostName] = useState<string | null>(null);
+  // Operator face: deploy (issue packs) vs nodes (run them). Both faces
+  // stay mounted and merely hide — switching faces preserves editor and
+  // navigation state.
+  const [face, setFace] = useState<"nodes" | "deploy">("nodes");
+  const [deployView, setDeployView] = useState<DeployView>("packs");
+  const [selectedPackDir, setSelectedPackDir] = useState<string | null>(null);
+  // The one interruption channel: GUI errors surface here (dismissable)
+  // instead of as permanent furniture. The log buffer keeps the history.
+  const [guiError, setGuiError] = useState<string | null>(null);
+
+  const reportError = (message: string) => {
+    setGuiError(message);
+    setLogs((prev) => [
+      ...prev,
+      { ts: new Date().toISOString(), level: "ERROR", target: "gui", message, node: null },
+    ]);
+  };
+
+  const refreshNodes = async () => {
+    try {
+      setNodes(await api.listNodes());
+    } catch (e) {
+      console.error("Failed to list nodes:", e);
+    }
+  };
 
   useEffect(() => {
     (async () => {
       try {
-        const profile = await api.loadProfile();
-        if (profile.hub_url) setHubUrl(profile.hub_url);
-        if (profile.client_cert) setClientCert(profile.client_cert);
-        if (profile.client_key) setClientKey(profile.client_key);
-        if (profile.agent_id) setAgentId(profile.agent_id);
-        if (profile.ca_path) setCaPath(profile.ca_path);
-        if (profile.local_ports?.length) setPorts(profile.local_ports);
-        if (profile.transport) setTransport(profile.transport);
-        if (profile.hub_quic_addr) setHubQuicAddr(profile.hub_quic_addr);
+        setNodes(await api.listNodes());
       } finally {
-        setProfileLoaded(true);
+        setNodesLoaded(true);
       }
-      setState(await api.getState());
       setLogs(await api.getRecentLogs());
+      try {
+        setHostName(await api.getHostName());
+      } catch (e) {
+        console.error("Failed to get hostname:", e);
+      }
     })();
 
     const unsubs = [
-      onTunnelState(setState),
+      // State events patch the matching card; anything else (e.g. an add in
+      // another window) is covered by the refresh calls after mutations.
+      onNodeState((id, state) => {
+        setNodes((prev) =>
+          prev.map((n) => (n.id === id ? { ...n, state: state as NodeStateDto } : n))
+        );
+      }),
       onLogLine((line) =>
         setLogs((prev) => {
           const next = [...prev, line];
-          return next.length > 2000 ? next.slice(next.length - 2000) : next;
+          return next.length > MAX_LOG_LINES ? next.slice(next.length - MAX_LOG_LINES) : next;
         })
       ),
     ];
@@ -50,113 +87,113 @@ export default function App() {
     };
   }, []);
 
-  const running = isRunning(state);
-  const canStart =
-    !running &&
-    ports.length > 0 &&
-    hubUrl.trim() !== "" &&
-    clientCert.trim() !== "" &&
-    clientKey.trim() !== "" &&
-    agentId.trim() !== "";
-
-  const start = async () => {
-    try {
-      await api.startTunnel({
-        local_ports: ports,
-        hub_url: hubUrl.trim(),
-        client_cert: clientCert.trim(),
-        client_key: clientKey.trim(),
-        agent_id: agentId.trim(),
-        ca_path: caPath.trim() === "" ? null : caPath.trim(),
-        transport,
-        hub_quic_addr: hubQuicAddr.trim() === "" ? null : hubQuicAddr.trim(),
-      });
-      // After a successful start, persist the ports to the profile so the GUI auto-fills them on next launch
-      try {
-        await api.saveProfile({
-          hub_url: hubUrl.trim() || null,
-          client_cert: clientCert.trim() || null,
-          client_key: clientKey.trim() || null,
-          agent_id: agentId.trim() || null,
-          ca_path: caPath.trim() || null,
-          local_ports: ports,
-          transport,
-          hub_quic_addr: hubQuicAddr.trim() || null,
-        });
-      } catch (e) {
-        console.error("Failed to auto-save profile:", e);
+  // Esc climbs one level (detail → overview, pack detail → grid, manifest →
+  // packs) — but never steals the key from a text field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+      ) {
+        return;
       }
-    } catch (e) {
-      setLogs((prev) => [...prev, { ts: new Date().toISOString(), level: "ERROR", target: "gui", message: String(e) }]);
-    }
-  };
+      if (face === "nodes" && selectedNodeId !== null) setSelectedNodeId(null);
+      else if (face === "deploy") {
+        if (selectedPackDir !== null) setSelectedPackDir(null);
+        else if (deployView === "manifest") setDeployView("packs");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [face, selectedNodeId, selectedPackDir, deployView]);
 
-  const stop = async () => {
-    try {
-      await api.stopTunnel();
-    } catch (e) {
-      console.error(e);
-    }
-  };
+  const selected = nodes.find((n) => n.id === selectedNodeId) ?? null;
+
+  // Per-node log attribution: lines carry the engine's `node` field, which
+  // the backend sets to the node's unique attribution value (name + id
+  // prefix) — same-name nodes in different realms stay separable. "This
+  // machine" shows everything.
+  const visibleLogs = useMemo(() => {
+    if (!selected || allLogs) return logs;
+    return logs.filter((l) => l.node === selected.attribution);
+  }, [logs, selected, allLogs]);
 
   return (
-    <div className="app">
-      <StatusPanel state={state} text={stateText(state)} color={stateColor(state)} />
-      <ConfigForm
-        disabled={running}
-        ports={ports}
-        setPorts={setPorts}
-        hubUrl={hubUrl}
-        setHubUrl={setHubUrl}
-        clientCert={clientCert}
-        setClientCert={setClientCert}
-        clientKey={clientKey}
-        setClientKey={setClientKey}
-        agentId={agentId}
-        setAgentId={setAgentId}
-        caPath={caPath}
-        setCaPath={setCaPath}
-        transport={transport}
-        setTransport={setTransport}
-        hubQuicAddr={hubQuicAddr}
-        setHubQuicAddr={setHubQuicAddr}
-        profileLoaded={profileLoaded}
-        onGenerateAgentId={async () => setAgentId(await api.generateAgentId())}
-        onSaveProfile={async () => {
-          await api.saveProfile({
-            hub_url: hubUrl.trim() || null,
-            client_cert: clientCert.trim() || null,
-            client_key: clientKey.trim() || null,
-            agent_id: agentId.trim() || null,
-            ca_path: caPath.trim() || null,
-            local_ports: ports.length > 0 ? ports : null,
-            transport,
-            hub_quic_addr: hubQuicAddr.trim() || null,
-          });
-        }}
-      />
-      <div className="actions">
-        <button className="primary" disabled={!canStart} onClick={start}>
-          Start
-        </button>
-        <button disabled={!running} onClick={stop}>
-          Stop
-        </button>
+    <div className="app-frame">
+      <header className="machine-header">
+        <span className="machine-title">Interflow</span>
+        {hostName && <span className="machine-host">— {hostName}</span>}
+        <span className="face-toggle">
+          <button
+            className={face === "nodes" ? "selected" : ""}
+            onClick={() => setFace("nodes")}
+          >
+            Nodes
+          </button>
+          <button
+            className={face === "deploy" ? "selected" : ""}
+            onClick={() => setFace("deploy")}
+          >
+            Deploy
+          </button>
+        </span>
+      </header>
+
+      {guiError && (
+        <div className="error-banner" role="alert">
+          <span>{guiError}</span>
+          <button className="link" onClick={() => setGuiError(null)}>
+            dismiss
+          </button>
+        </div>
+      )}
+
+      <div className="app">
+        <div className={`face${face === "nodes" ? "" : " hidden"}`}>
+          {selected ? (
+            <NodeDetail
+              node={selected}
+              onBack={() => setSelectedNodeId(null)}
+              onChanged={refreshNodes}
+              onError={reportError}
+              logs={visibleLogs}
+              logScope={allLogs ? "machine" : "node"}
+              onLogScopeChange={(scope) => setAllLogs(scope === "machine")}
+              onClearLogs={async () => {
+                // View first (instant feedback), then the backend buffer it
+                // replays from on reload — the other order would let cleared
+                // lines reappear after a webview reload.
+                setLogs([]);
+                try {
+                  await api.clearLogs();
+                } catch (e) {
+                  console.error("Failed to clear logs:", e);
+                }
+              }}
+            />
+          ) : (
+            <NodeOverview
+              nodes={nodes}
+              loaded={nodesLoaded}
+              onChanged={refreshNodes}
+              onError={reportError}
+              onOpen={setSelectedNodeId}
+            />
+          )}
+        </div>
+        <div className={`face${face === "deploy" ? "" : " hidden"}`}>
+          <DeployFace
+            view={deployView}
+            selectedPack={selectedPackDir}
+            onViewChange={setDeployView}
+            onSelectPack={setSelectedPackDir}
+            onError={reportError}
+            onNodesChanged={refreshNodes}
+          />
+        </div>
       </div>
-      <LogView
-        logs={logs}
-        onClear={async () => {
-          // View first (instant feedback), then the backend buffer it
-          // replays from on reload — the other order would let cleared
-          // lines reappear after a webview reload.
-          setLogs([]);
-          try {
-            await api.clearLogs();
-          } catch (e) {
-            console.error("Failed to clear logs:", e);
-          }
-        }}
-      />
     </div>
   );
 }

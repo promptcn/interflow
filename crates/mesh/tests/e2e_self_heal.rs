@@ -29,12 +29,13 @@
     dead_code,
     unused_mut
 )]
-use bytes::Bytes;
 use interflow_core::error::InterflowError;
 use interflow_core::fault::FaultPoint;
 use interflow_core::protocol::StreamProto;
-use interflow_core::protocol::frame::FrameType;
+use interflow_core::tls::{InnerTlsMaterial, inner_client_config};
 use interflow_core::tunnel::AgentTunnel;
+use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
+use interflow_core::tunnel::{InnerStreamHello, TargetSelector};
 use interflow_mesh::agent::{AgentHandle, AgentState};
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
 use interflow_testkit::fault::{self, FaultPlan};
@@ -45,6 +46,7 @@ use interflow_testkit::{
 };
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
     static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
@@ -67,47 +69,80 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// One request-direction stream through the facade, edge-listener style
-/// (same shape as e2e_tunnel_facade): register the return channel, Open
-/// toward the target agent, push a payload, collect the echoed bytes back.
+/// One request-direction stream through the facade, edge-listener shape:
+/// mandatory inner TLS + encrypted selector, payload, then echoed bytes.
 async fn facade_round_trip(
     tunnel: &AgentTunnel,
     target_agent: &str,
     target_addr: SocketAddr,
     payload: &[u8],
 ) -> interflow_core::error::Result<Vec<u8>> {
-    let sid = uuid::Uuid::new_v4().to_string();
-    let mut data_rx = tunnel.register_stream(sid.clone()).await;
+    let sid = interflow_core::protocol::StreamId::random().unwrap();
+    let data_rx = tunnel.register_stream(sid).await;
     tunnel
-        .send_open(
-            &sid,
-            target_agent,
-            Some(&target_addr.to_string()),
-            StreamProto::Tcp,
-        )
+        .send_open_with(sid, target_agent, StreamProto::Tcp, true)
         .await?;
-    tunnel
-        .send_data(&sid, Bytes::copy_from_slice(payload))
-        .await?;
+
+    let (cert, key) = certs().named_client_cert("front");
+    let ca = certs().ca_path().display().to_string();
+    let material = InnerTlsMaterial::from_paths(
+        &[ca.as_str()],
+        &cert.display().to_string(),
+        &key.display().to_string(),
+    )
+    .map_err(|e| InterflowError::connection(format!("inner material")).with_source(e))?;
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+        inner_client_config(&material, target_agent)
+            .map_err(|e| InterflowError::connection(format!("inner connector")).with_source(e))?,
+    ));
+    let adapter = E2eTunnelIo::ingress(data_rx, tunnel.clone(), sid);
+    let mut tls = match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
+        E2eHandshakeOutcome::Established(tls, _) => tls,
+        E2eHandshakeOutcome::Failed { error } => {
+            tunnel.unregister_stream(sid).await;
+            return Err(InterflowError::connection(format!(
+                "inner TLS handshake failed: {error}"
+            )));
+        }
+    };
+    InnerStreamHello {
+        source_principal: "front".to_owned(),
+        source_fingerprint: material.leaf_fingerprint(),
+        selector: TargetSelector::Address(target_addr.to_string()),
+        correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+    }
+    .write(&mut tls)
+    .await?;
+    tls.write_all(payload).await?;
+    tls.flush().await?;
 
     let mut got = Vec::with_capacity(payload.len());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while got.len() < payload.len() {
-        let frame = tokio::time::timeout_at(deadline, data_rx.recv())
-            .await
-            .expect("echo frame within deadline")
-            .expect("stream channel must stay open until the echo completes");
-        if frame.stream_type == FrameType::Close {
-            let reason = String::from_utf8_lossy(&frame.data);
-            tunnel.unregister_stream(&sid).await;
-            return Err(InterflowError::connection(format!(
-                "stream closed by the peer before the echo completed: {reason}"
-            )));
-        }
-        got.extend_from_slice(&frame.data);
+        let mut chunk = vec![0u8; payload.len() - got.len()];
+        let n = match tokio::time::timeout_at(deadline, tls.read(&mut chunk)).await {
+            Ok(Ok(0)) => {
+                tunnel.unregister_stream(sid).await;
+                return Err(InterflowError::connection(
+                    "stream closed by the peer before the echo completed",
+                ));
+            }
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                tunnel.unregister_stream(sid).await;
+                return Err(
+                    InterflowError::connection(format!("inner stream read failed")).with_source(e),
+                );
+            }
+            Err(_) => {
+                tunnel.unregister_stream(sid).await;
+                return Err(InterflowError::connection("echo timed out"));
+            }
+        };
+        got.extend_from_slice(&chunk[..n]);
     }
-    let _ = tunnel.send_close(&sid).await;
-    tunnel.unregister_stream(&sid).await;
+    let _ = tunnel.send_close(sid).await;
+    tunnel.unregister_stream(sid).await;
     Ok(got)
 }
 
@@ -137,53 +172,20 @@ async fn round_trip_eventually(
     }
 }
 
-/// Waits until the agent's state is anything other than Connected (the
-/// session ended — the visible half of "the death was noticed"). Returns
-/// false on timeout.
-async fn wait_state_left_connected(handle: &AgentHandle, timeout: Duration) -> bool {
+/// Waits until one more session is established after `baseline` — the
+/// monotonic proof that the supervisor observed the death and rebuilt
+/// (`AgentHandle::sessions_established` cannot miss a rebuild, unlike a
+/// state watcher: a watch channel keeps only the latest value, so a fast
+/// Connected → Reconnecting → Connected cycle can be invisible to it).
+async fn wait_session_rebuilt(handle: &AgentHandle, baseline: u64, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if !matches!(handle.state(), AgentState::Connected { .. }) {
-            return true;
-        }
+    while handle.sessions_established() <= baseline {
         if tokio::time::Instant::now() >= deadline {
             return false;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-}
-
-/// Race-free form of "the session observably ended": subscribes at spawn
-/// time (before any state can pass) and resolves true once the agent has
-/// been Connected and then left it. Injected faults fire within
-/// milliseconds of the first establish — the whole Connected →
-/// Reconnecting → Connected cycle can complete before a polling observer
-/// starts, so the transition must be captured from the stream, not polled.
-fn watch_state_left_connected(
-    handle: &AgentHandle,
-    budget: Duration,
-) -> tokio::task::JoinHandle<bool> {
-    let mut rx = handle.subscribe_state();
-    tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + budget;
-        let mut seen_connected = matches!(&*rx.borrow_and_update(), AgentState::Connected { .. });
-        loop {
-            if seen_connected && !matches!(&*rx.borrow(), AgentState::Connected { .. }) {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            match tokio::time::timeout_at(deadline, rx.changed()).await {
-                Ok(Ok(())) => {
-                    if matches!(&*rx.borrow_and_update(), AgentState::Connected { .. }) {
-                        seen_connected = true;
-                    }
-                }
-                _ => return false,
-            }
-        }
-    })
+    true
 }
 
 /// Waits until the (TCP+QUIC dual-stack) port is bindable again — the
@@ -274,7 +276,12 @@ async fn session_panic_survives_and_reconnects() {
         front.state()
     );
     assert!(
-        faults.fired(FaultPoint::AgentSessionAfterRegister),
+        faults
+            .wait_fired(
+                FaultPoint::AgentSessionAfterRegister,
+                Duration::from_secs(5)
+            )
+            .await,
         "the fault must actually have fired (guards against a vacuous green)"
     );
 
@@ -319,15 +326,18 @@ async fn upload_task_panic_rebuilds_session() {
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::H2UploadLoopAfterEstablish));
     let front = spawn_agent(agent_config("front", hub_port, certs()));
-    // Subscribe BEFORE the fault can fire (see the helper's doc comment).
-    let left_connected = watch_state_left_connected(&front, REBUILD_BUDGET);
     assert!(
         wait_agent_connected(&front, Duration::from_secs(10)).await,
         "agent should connect initially (state: {:?})",
         front.state()
     );
     assert!(
-        faults.fired(FaultPoint::H2UploadLoopAfterEstablish),
+        faults
+            .wait_fired(
+                FaultPoint::H2UploadLoopAfterEstablish,
+                Duration::from_secs(5)
+            )
+            .await,
         "the upload-loop fault must have fired"
     );
 
@@ -337,9 +347,9 @@ async fn upload_task_panic_rebuilds_session() {
     // watches or rebuilds the upload anymore. The invariant under test is
     // therefore "the session ends and rebuilds", not "traffic breaks".
     assert!(
-        left_connected.await.unwrap_or(false),
-        "the upload task's death must end the session (state stayed {:?} — death unobserved)",
-        front.state()
+        wait_session_rebuilt(&front, 1, REBUILD_BUDGET).await,
+        "the upload task's death must end the session (sessions established: {} — death unobserved)",
+        front.sessions_established()
     );
 
     let tunnel = front.tunnel();
@@ -373,21 +383,22 @@ async fn poll_task_panic_rebuilds_session() {
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::H2PollLoopAfterConnect));
     let front = spawn_agent(agent_config("front", hub_port, certs()));
-    let left_connected = watch_state_left_connected(&front, REBUILD_BUDGET);
     assert!(
         wait_agent_connected(&front, Duration::from_secs(10)).await,
         "agent should connect initially (state: {:?})",
         front.state()
     );
     assert!(
-        faults.fired(FaultPoint::H2PollLoopAfterConnect),
+        faults
+            .wait_fired(FaultPoint::H2PollLoopAfterConnect, Duration::from_secs(5))
+            .await,
         "the poll-loop fault must have fired"
     );
 
     assert!(
-        left_connected.await.unwrap_or(false),
-        "the poll task's death must end the session (state stayed {:?} — death unobserved)",
-        front.state()
+        wait_session_rebuilt(&front, 1, REBUILD_BUDGET).await,
+        "the poll task's death must end the session (sessions established: {} — death unobserved)",
+        front.sessions_established()
     );
 
     let tunnel = front.tunnel();
@@ -432,16 +443,18 @@ async fn wedged_upload_rebuilds_via_stall_watchdog() {
         front.state()
     );
     assert!(
-        faults.fired(FaultPoint::H2UploadLoopStall),
+        faults
+            .wait_fired(FaultPoint::H2UploadLoopStall, Duration::from_secs(5))
+            .await,
         "the upload-loop stall must have fired"
     );
 
     // The wedged uplink must be noticed: the session ends (state leaves
     // Connected) within a heartbeat-derived window, then recovers.
     assert!(
-        wait_state_left_connected(&front, Duration::from_secs(15)).await,
-        "a wedged upload task must end the session (state stayed {:?} — stall not detected)",
-        front.state()
+        wait_session_rebuilt(&front, 1, Duration::from_secs(15)).await,
+        "a wedged upload task must end the session (sessions established: {} — stall not detected)",
+        front.sessions_established()
     );
 
     let tunnel = front.tunnel();
@@ -490,7 +503,9 @@ async fn supervisor_panic_is_observable_to_embedders() {
         }
     }
     assert!(
-        faults.fired(FaultPoint::AgentSuperviseLoopTick),
+        faults
+            .wait_fired(FaultPoint::AgentSuperviseLoopTick, Duration::from_secs(5))
+            .await,
         "the supervisor fault must have fired"
     );
     assert!(
@@ -543,21 +558,22 @@ async fn quic_control_read_panic_rebuilds_session() {
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::QuicControlReadLoop));
     let front = spawn_agent(agent_quic_config("front", hub_port, certs()));
-    let left_connected = watch_state_left_connected(&front, REBUILD_BUDGET);
     assert!(
         wait_agent_connected(&front, Duration::from_secs(10)).await,
         "agent should connect initially (state: {:?})",
         front.state()
     );
     assert!(
-        faults.fired(FaultPoint::QuicControlReadLoop),
+        faults
+            .wait_fired(FaultPoint::QuicControlReadLoop, Duration::from_secs(5))
+            .await,
         "the QUIC control-read fault must have fired"
     );
 
     assert!(
-        left_connected.await.unwrap_or(false),
-        "the control-read task's death must end the session (state stayed {:?} — death unobserved)",
-        front.state()
+        wait_session_rebuilt(&front, 1, REBUILD_BUDGET).await,
+        "the control-read task's death must end the session (sessions established: {} — death unobserved)",
+        front.sessions_established()
     );
 
     let tunnel = front.tunnel();
@@ -661,7 +677,7 @@ async fn quic_closed_watcher_panic_survives_hub_restart() {
     // watcher fault was consumed at session-1 start; the post-restart
     // reconnect rides on the (healthy) session-2 watcher AND the data
     // loops' death contract — belt and braces, exactly the point.
-    _hub1.shutdown().await.expect("first hub shutdown");
+    _hub1.shutdown_graceful().await.expect("first hub shutdown");
     assert!(
         wait_port_rebindable(hub_port, Duration::from_secs(10)).await,
         "hub port must become rebindable after graceful shutdown"
@@ -745,9 +761,9 @@ async fn quic_control_write_stall_rebuilds_session() {
     assert!(fault_fired, "the control-write stall must have fired");
 
     assert!(
-        wait_state_left_connected(&front, Duration::from_secs(15)).await,
-        "a wedged control-write task must end the session (state stayed {:?} — stall not detected)",
-        front.state()
+        wait_session_rebuilt(&front, 1, Duration::from_secs(15)).await,
+        "a wedged control-write task must end the session (sessions established: {} — stall not detected)",
+        front.sessions_established()
     );
 
     let tunnel = front.tunnel();

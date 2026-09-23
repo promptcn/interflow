@@ -8,9 +8,8 @@ use interflow_core::protocol::StreamProto;
 use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
     AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, ControlConfig,
-    EgressRule, HUB_CONFIG_VERSION, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig,
-    HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig, ServerConfig, TenantConfig,
-    TransportKind,
+    EgressRule, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig, HubTlsConfig,
+    IngressRule, LoggingConfig, MetricsConfig, ServerConfig, TenantConfig, TransportKind,
 };
 use std::net::SocketAddr;
 
@@ -49,11 +48,11 @@ pub fn hub_config_tuned(
     heartbeat: HeartbeatConfig,
 ) -> HubConfig {
     HubConfig {
-        config_version: HUB_CONFIG_VERSION,
         server: ServerConfig {
             listen_addr: format!("127.0.0.1:{listen_port}")
                 .parse()
                 .expect("listen addr"),
+            node_name: None,
             proxy_protocol: Default::default(),
         },
         auth: AuthConfig {
@@ -61,6 +60,7 @@ pub fn hub_config_tuned(
             tenants: vec![TenantConfig {
                 name: TEST_TENANT.to_string(),
                 ca_path: certs.ca_path().display().to_string(),
+                crl_path: Some(certs.crl_path().display().to_string()),
                 trusted_gateway: false,
             }],
         },
@@ -123,6 +123,10 @@ pub fn agent_config(id: &str, hub_port: u16, certs: &TestCerts) -> AgentConfig {
             client_key_path: Some(key.display().to_string()),
             hub_cert_fingerprint: None,
         }),
+        inner_tls: interflow_mesh::config::InnerTlsConfig {
+            crl_paths: vec![certs.crl_path().display().to_string()],
+            ..interflow_mesh::config::InnerTlsConfig::default()
+        },
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()

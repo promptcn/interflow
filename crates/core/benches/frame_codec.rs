@@ -21,6 +21,7 @@
 use bytes::BytesMut;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use interflow_core::protocol::frame::{FrameType, decode_frame, encode_frame};
+use interflow_core::protocol::{CircuitToken, StreamId};
 
 const PAYLOAD_SIZES: &[(usize, &str)] = &[
     (64, "64 B"),
@@ -30,19 +31,29 @@ const PAYLOAD_SIZES: &[(usize, &str)] = &[
     (1024 * 1024, "1 MiB"),
 ];
 
+/// One fixed nonzero stream id / circuit, matching the production shapes
+/// (128-bit random tokens; the frame header carries them as raw bytes).
+fn bench_ids() -> (StreamId, CircuitToken) {
+    (
+        StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+        CircuitToken::from_hex("12078a05e14f4e2c99b1679be1df7c30").unwrap(),
+    )
+}
+
 fn bench_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_frame");
     for (size, label) in PAYLOAD_SIZES {
         group.throughput(Throughput::Bytes(*size as u64));
         let payload = vec![0xABu8; *size];
+        let (sid, circuit) = bench_ids();
         group.bench_with_input(BenchmarkId::from_parameter(label), size, |b, _| {
             b.iter(|| {
                 let mut dst = BytesMut::with_capacity(*size + 64);
                 let _ = encode_frame(
                     std::hint::black_box(FrameType::Data),
                     std::hint::black_box(0),
-                    std::hint::black_box("sid-abc"),
-                    std::hint::black_box("agent-1"),
+                    std::hint::black_box(sid),
+                    std::hint::black_box(circuit),
                     std::hint::black_box(&payload),
                     &mut dst,
                 );
@@ -59,15 +70,9 @@ fn bench_decode(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*size as u64));
         let payload = vec![0xABu8; *size];
         // Pre-encode one frame into an owned buf; clone inside the bench
+        let (sid, circuit) = bench_ids();
         let mut encoded = BytesMut::with_capacity(*size + 64);
-        encode_frame(
-            FrameType::Data,
-            0,
-            "sid-abc",
-            "agent-1",
-            &payload,
-            &mut encoded,
-        );
+        encode_frame(FrameType::Data, 0, sid, circuit, &payload, &mut encoded).unwrap();
         let encoded_bytes = encoded.freeze();
 
         group.bench_with_input(BenchmarkId::from_parameter(label), size, |b, _| {
@@ -88,13 +93,14 @@ fn bench_round_trip(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*size as u64));
         let payload = vec![0xABu8; *size];
         group.bench_with_input(BenchmarkId::from_parameter(label), size, |b, _| {
+            let (sid, circuit) = bench_ids();
             b.iter(|| {
                 let mut buf = BytesMut::with_capacity(*size + 64);
                 let _ = encode_frame(
                     std::hint::black_box(FrameType::Data),
                     std::hint::black_box(0),
-                    std::hint::black_box("sid-abc"),
-                    std::hint::black_box("agent-1"),
+                    std::hint::black_box(sid),
+                    std::hint::black_box(circuit),
                     std::hint::black_box(&payload),
                     &mut buf,
                 );

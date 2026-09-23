@@ -25,44 +25,34 @@ pub enum ControlOpError {
     #[error("{0}")]
     Apply(String),
     /// Rule not found -> 404.
-    #[error("{0}")]
+    #[error("rule not found: {0}")]
     NotFound(String),
-    /// Persistence failed (memory and runtime side effects rolled back)
-    /// -> 500.
-    #[error("{0}")]
-    Persist(String),
 }
 
 impl From<RuleChangeError> for ControlOpError {
     fn from(e: RuleChangeError) -> Self {
         match e {
-            RuleChangeError::NotFound(name) => Self::NotFound(format!("rule not found: {name}")),
-            RuleChangeError::Persist(e) => Self::Persist(e.to_string()),
+            RuleChangeError::NotFound(name) => Self::NotFound(name),
         }
     }
 }
 
 #[derive(Debug)]
-pub enum IngressCommand {
-    /// Add (or replace by same name) a rule; replies Ok only after
-    /// persistence succeeds.
-    Add(IngressRule, oneshot::Sender<Result<(), ControlOpError>>),
+pub enum RuleCommand<R, V> {
+    /// Add (or replace by same name) a rule; replies Ok once it is in
+    /// effect.
+    Add(R, oneshot::Sender<Result<(), ControlOpError>>),
     /// Remove a rule; replies `NotFound` when absent.
     Remove(String, oneshot::Sender<Result<(), ControlOpError>>),
     /// List rules (with origin annotations).
-    List(oneshot::Sender<Vec<IngressRuleView>>),
+    List(oneshot::Sender<Vec<V>>),
 }
 
-#[derive(Debug)]
-pub enum EgressCommand {
-    /// Add (or replace by same name) a rule; replies Ok only after
-    /// persistence succeeds.
-    Add(EgressRule, oneshot::Sender<Result<(), ControlOpError>>),
-    /// Remove a rule; replies `NotFound` when absent.
-    Remove(String, oneshot::Sender<Result<(), ControlOpError>>),
-    /// List rules (with origin annotations).
-    List(oneshot::Sender<Vec<EgressRuleView>>),
-}
+/// The ingress plane's command shape (typed alias — consumers match on it
+/// exactly as before).
+pub type IngressCommand = RuleCommand<IngressRule, IngressRuleView>;
+/// The egress plane's command shape (typed alias).
+pub type EgressCommand = RuleCommand<EgressRule, EgressRuleView>;
 
 pub struct ControlServer {
     listen_addr: SocketAddr,
@@ -298,7 +288,7 @@ async fn handle_request(
                                 "Internal Error",
                             ));
                         }
-                        Ok(await_op(resp_rx.await, "Ingress rule added (persisted)"))
+                        Ok(await_op(resp_rx.await, "Ingress rule added"))
                     }
                     Err(e) => Ok(response(StatusCode::BAD_REQUEST, &e.to_string())),
                 }
@@ -319,7 +309,7 @@ async fn handle_request(
                                 "Internal Error",
                             ));
                         }
-                        Ok(await_op(resp_rx.await, "Egress rule added (persisted)"))
+                        Ok(await_op(resp_rx.await, "Egress rule added"))
                     }
                     Err(e) => Ok(response(StatusCode::BAD_REQUEST, &e.to_string())),
                 }
@@ -339,7 +329,7 @@ async fn handle_request(
                         "Internal Error",
                     ));
                 }
-                Ok(await_op(resp_rx.await, "Ingress rule removed (persisted)"))
+                Ok(await_op(resp_rx.await, "Ingress rule removed"))
             } else {
                 Ok(response(StatusCode::NOT_IMPLEMENTED, "Ingress not enabled"))
             }
@@ -356,7 +346,7 @@ async fn handle_request(
                         "Internal Error",
                     ));
                 }
-                Ok(await_op(resp_rx.await, "Egress rule removed (persisted)"))
+                Ok(await_op(resp_rx.await, "Egress rule removed"))
             } else {
                 Ok(response(StatusCode::NOT_IMPLEMENTED, "Egress not enabled"))
             }
@@ -366,7 +356,7 @@ async fn handle_request(
 }
 
 /// Await a change acknowledgment and map it to an HTTP response: Ok -> 200;
-/// Apply -> 400; NotFound -> 404; Persist -> 500; channel closed -> 500.
+/// Apply -> 400; NotFound -> 404; channel closed -> 500.
 fn await_op(
     receipt: std::result::Result<
         std::result::Result<(), ControlOpError>,
@@ -380,9 +370,8 @@ fn await_op(
             let status = match &e {
                 ControlOpError::Apply(_) => StatusCode::BAD_REQUEST,
                 ControlOpError::NotFound(_) => StatusCode::NOT_FOUND,
-                ControlOpError::Persist(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
-            response(status, &e.to_string())
+            response(status, &interflow_util::format_chain(&e))
         }
         Err(e) => {
             error!("Failed to receive rule change result: {}", e);

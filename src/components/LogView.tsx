@@ -4,9 +4,11 @@ import { LogLine } from "../api";
 
 export default function LogView({
   logs,
+  showNodeColumn,
   onClear,
 }: {
   logs: LogLine[];
+  showNodeColumn: boolean;
   onClear: () => void;
 }) {
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -44,6 +46,9 @@ export default function LogView({
           <div key={i} className={`log-line ${line.level.toLowerCase()}`}>
             <span className="log-ts">{line.ts}</span>
             <span className="log-level">{line.level}</span>
+            {showNodeColumn && (
+              <span className="log-node">{line.node ?? "—"}</span>
+            )}
             <span className="log-target">{line.target}</span>
             <span className="log-msg">{line.message}</span>
           </div>

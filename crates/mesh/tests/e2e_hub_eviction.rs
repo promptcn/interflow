@@ -56,10 +56,13 @@ use hyper::client::conn::http2::SendRequest;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use interflow_core::error::InterflowError;
+use interflow_core::protocol::CircuitToken;
+use interflow_core::protocol::RouteToken;
 use interflow_core::protocol::frame::{
     DecodeOutcome, DecodedFrame, FrameType, decode_frame, encode_frame,
 };
 use interflow_core::tunnel::H2RequestBody;
+use interflow_core::tunnel::negotiation::{RegisterResponse, RouteResponse};
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
 use interflow_mesh::hub::qualified_agent_id;
 use interflow_testkit::{hub_config_tuned, pick_ephemeral_port, spawn_hub};
@@ -69,6 +72,10 @@ use tokio::sync::mpsc;
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
     static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
     C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
+fn sid(label: &str) -> interflow_core::protocol::StreamId {
+    interflow_testkit::opaque_stream_id(label)
 }
 
 /// Establish a bare HTTP/2 connection to the hub.
@@ -95,7 +102,7 @@ fn empty_body() -> H2RequestBody {
     interflow_core::tunnel::empty_request_body()
 }
 
-async fn register(snd: &mut SendRequest<H2RequestBody>, id: &str) -> StatusCode {
+async fn register(snd: &mut SendRequest<H2RequestBody>, id: &str) -> CircuitToken {
     snd.ready().await.expect("ready");
     let req = Request::builder()
         .method("POST")
@@ -103,7 +110,36 @@ async fn register(snd: &mut SendRequest<H2RequestBody>, id: &str) -> StatusCode 
         .header("x-agent-id", id)
         .body(empty_body())
         .unwrap();
-    snd.send_request(req).await.expect("register").status()
+    let resp = snd.send_request(req).await.expect("register");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.expect("register body");
+    RegisterResponse::parse(&body.to_bytes())
+        .expect("register capability")
+        .circuit_token
+}
+
+async fn route(
+    snd: &mut SendRequest<H2RequestBody>,
+    circuit: CircuitToken,
+    target: &str,
+) -> RouteToken {
+    snd.ready().await.expect("ready");
+    let req = Request::builder()
+        .method("POST")
+        .uri("/route")
+        .header("x-circuit-token", circuit.to_hex())
+        .body(
+            http_body_util::Full::new(Bytes::copy_from_slice(target.as_bytes()))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap();
+    let resp = snd.send_request(req).await.expect("route");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.expect("route body");
+    serde_json::from_slice::<RouteResponse>(&body.to_bytes())
+        .expect("route capability")
+        .route_token
 }
 
 /// Open a streaming upload `POST /stream/up`; returns (frame-write channel,
@@ -113,7 +149,7 @@ async fn register(snd: &mut SendRequest<H2RequestBody>, id: &str) -> StatusCode 
 /// same death-signal semantics as on the agent side).
 async fn open_upload(
     snd: &mut SendRequest<H2RequestBody>,
-    id: &str,
+    circuit: CircuitToken,
 ) -> (mpsc::Sender<Bytes>, Response<hyper::body::Incoming>) {
     snd.ready().await.expect("ready");
     let (tx, mut rx) = mpsc::channel::<Bytes>(256);
@@ -128,7 +164,7 @@ async fn open_upload(
     let req = Request::builder()
         .method("POST")
         .uri("/stream/up")
-        .header("x-agent-id", id)
+        .header("x-circuit-token", circuit.to_hex())
         .body(body)
         .unwrap();
     let resp = snd.send_request(req).await.expect("upload request");
@@ -140,7 +176,13 @@ async fn open_upload(
     (tx, resp)
 }
 
-fn encode_up_frame(ft: FrameType, flags: u8, sid: &str, src: &str, payload: &[u8]) -> Bytes {
+fn encode_up_frame(
+    ft: FrameType,
+    flags: u8,
+    sid: interflow_core::protocol::StreamId,
+    src: CircuitToken,
+    payload: &[u8],
+) -> Bytes {
     let mut buf = BytesMut::new();
     encode_frame(ft, flags, sid, src, payload, &mut buf).expect("frame encode");
     buf.freeze()
@@ -148,32 +190,44 @@ fn encode_up_frame(ft: FrameType, flags: u8, sid: &str, src: &str, payload: &[u8
 
 /// Send an Open frame over the upload channel (payload = "{target}:{addr}",
 /// same encoding as QUIC).
-async fn up_open(tx: &mpsc::Sender<Bytes>, sid: &str, src: &str, tgt: &str) {
-    let payload = format!("{tgt}:");
+async fn up_open(
+    tx: &mpsc::Sender<Bytes>,
+    sid: interflow_core::protocol::StreamId,
+    src: CircuitToken,
+    route: RouteToken,
+) {
     tx.send(encode_up_frame(
         FrameType::Open,
         0,
         sid,
         src,
-        payload.as_bytes(),
+        &route.to_bytes(),
     ))
     .await
     .expect("send open frame");
 }
 
 /// Send a Data frame over the upload channel.
-async fn up_data(tx: &mpsc::Sender<Bytes>, sid: &str, src: &str, data: &[u8]) {
+async fn up_data(
+    tx: &mpsc::Sender<Bytes>,
+    sid: interflow_core::protocol::StreamId,
+    src: CircuitToken,
+    data: &[u8],
+) {
     tx.send(encode_up_frame(FrameType::Data, 0, sid, src, data))
         .await
         .expect("send data frame");
 }
 
-async fn poll(snd: &mut SendRequest<H2RequestBody>, id: &str) -> Response<hyper::body::Incoming> {
+async fn poll(
+    snd: &mut SendRequest<H2RequestBody>,
+    circuit: CircuitToken,
+) -> Response<hyper::body::Incoming> {
     snd.ready().await.expect("ready");
     let req = Request::builder()
         .method("GET")
         .uri("/poll")
-        .header("x-agent-id", id)
+        .header("x-circuit-token", circuit.to_hex())
         .body(empty_body())
         .unwrap();
     snd.send_request(req).await.expect("poll")
@@ -181,9 +235,17 @@ async fn poll(snd: &mut SendRequest<H2RequestBody>, id: &str) -> Response<hyper:
 
 /// Sends one data-plane Pong frame over the upload stream (the heartbeat
 /// reply contract — same as the real AgentTunnel).
-async fn send_uplink_pong(up_tx: &mpsc::Sender<Bytes>, id: &str) {
+async fn send_uplink_pong(up_tx: &mpsc::Sender<Bytes>, circuit: CircuitToken) {
     let mut buf = BytesMut::new();
-    encode_frame(FrameType::Pong, 0, "", id, &[], &mut buf);
+    encode_frame(
+        FrameType::Pong,
+        0,
+        interflow_core::protocol::StreamId::ZERO,
+        circuit,
+        &[],
+        &mut buf,
+    )
+    .expect("encode pong");
     up_tx.send(buf.freeze()).await.expect("send pong");
 }
 
@@ -251,22 +313,21 @@ where
     }
 }
 
-/// Wait for a `_close_` frame with the `CLOSE:{sid}:` prefix (the frame-level
-/// rejection signal) to appear on the poll body; **returns as soon as one is
-/// seen** (the full payload). Panics if none arrives within the deadline.
+/// Wait for the hub-origin Close frame (the frame-level rejection signal)
+/// for `sid` to appear on the poll body; **returns as soon as one is seen**
+/// (the reason token). Panics if none arrives within the deadline.
 async fn wait_close_notification(
     body: &mut hyper::body::Incoming,
-    sid: &str,
+    sid: interflow_core::protocol::StreamId,
     deadline: tokio::time::Instant,
 ) -> String {
-    let prefix = format!("CLOSE:{sid}:");
     let mut buf = BytesMut::new();
     loop {
         let frame_res = tokio::time::timeout_at(deadline, body.frame()).await;
         match frame_res {
-            Err(_) => panic!("timed out waiting for {prefix}"),
+            Err(_) => panic!("timed out waiting for close note on {sid}"),
             Ok(None) | Ok(Some(Err(_))) => {
-                panic!("poll ended early, {prefix} never received")
+                panic!("poll ended early, close note for {sid} never received")
             }
             Ok(Some(Ok(frame))) => {
                 let Ok(data) = frame.into_data() else {
@@ -275,10 +336,12 @@ async fn wait_close_notification(
                 buf.extend_from_slice(&data);
                 while let DecodeOutcome::Ok(f) = decode_frame(&mut buf) {
                     if matches!(f.frame_type, FrameType::Close)
-                        && f.source_agent == "_close_"
-                        && String::from_utf8_lossy(&f.payload).starts_with(&prefix)
+                        && f.flags & interflow_core::protocol::FLAG_HUB_ORIGIN != 0
+                        && f.stream_id == sid
                     {
-                        return String::from_utf8_lossy(&f.payload).to_string();
+                        return interflow_core::protocol::CloseReason::from_payload(&f.payload)
+                            .as_str()
+                            .to_owned();
                     }
                 }
             }
@@ -316,24 +379,27 @@ async fn open_to_unregistered_target_replies_close_frame() {
     .await;
 
     let mut src = connect(port, "src").await;
-    assert_eq!(register(&mut src, "src").await, 200);
+    let src_circuit = register(&mut src, "src").await;
+    let ghost_route = route(&mut src, src_circuit, "ghost").await;
 
-    let (up_tx, _up_resp) = open_upload(&mut src, "src").await;
-    let poll_resp = poll(&mut src, "src").await;
+    let (up_tx, _up_resp) = open_upload(&mut src, src_circuit).await;
+    let poll_resp = poll(&mut src, src_circuit).await;
     assert_eq!(poll_resp.status(), 200);
     let mut poll_body = poll_resp.into_body();
 
-    up_open(&up_tx, "s1", "src", "ghost").await;
+    let s1 = sid("s1");
+    up_open(&up_tx, s1, src_circuit, ghost_route).await;
 
     let note = wait_close_notification(
         &mut poll_body,
-        "s1",
+        s1,
         tokio::time::Instant::now() + Duration::from_secs(5),
     )
     .await;
-    assert!(
-        note.contains("not registered"),
-        "the rejection reason should state the target is not registered: {note}"
+    assert_eq!(
+        note,
+        interflow_core::protocol::CloseReason::NoTarget.as_str(),
+        "an unregistered target must map to the no-target code: {note}"
     );
 }
 
@@ -361,18 +427,19 @@ async fn open_flood_to_idle_target_delivers_all_via_control_channel() {
     .await;
 
     let mut src = connect(port, "src").await;
-    assert_eq!(register(&mut src, "src").await, 200);
+    let src_circuit = register(&mut src, "src").await;
     let mut tgt = connect(port, "tgt").await;
-    assert_eq!(register(&mut tgt, "tgt").await, 200);
+    let tgt_circuit = register(&mut tgt, "tgt").await;
+    let tgt_route = route(&mut src, src_circuit, "tgt").await;
 
-    let (up_tx, _up_resp) = open_upload(&mut src, "src").await;
-    let poll_resp = poll(&mut src, "src").await;
+    let (up_tx, _up_resp) = open_upload(&mut src, src_circuit).await;
+    let poll_resp = poll(&mut src, src_circuit).await;
     let mut poll_body = poll_resp.into_body();
 
     // All 257 Opens land on a target nobody is draining (under the old
     // semantics the 257th would be rejected and rolled back)
     for i in 0..257 {
-        up_open(&up_tx, &format!("s{i}"), "src", "tgt").await;
+        up_open(&up_tx, sid(&format!("s{i}")), src_circuit, tgt_route).await;
     }
 
     // The sender should not receive any `_close_` rejection (Opens are
@@ -397,7 +464,7 @@ async fn open_flood_to_idle_target_delivers_all_via_control_channel() {
     );
 
     // tgt starts polling: it should receive all 257 Opens
-    let tgt_resp = poll(&mut tgt, "tgt").await;
+    let tgt_resp = poll(&mut tgt, tgt_circuit).await;
     assert_eq!(tgt_resp.status(), 200);
     let mut tgt_body = tgt_resp.into_body();
     let opens = std::sync::Mutex::new(std::collections::HashSet::new());
@@ -420,19 +487,19 @@ async fn open_flood_to_idle_target_delivers_all_via_control_channel() {
         "all 257 Opens should be received: {opens:?}"
     );
     assert!(
-        opens.contains("s256"),
+        opens.contains(&sid("s256")),
         "the 257th Open (s256) must be delivered"
     );
     let _ = ended;
 
     // Subsequent Opens are dispatched as usual
-    up_open(&up_tx, "s257", "src", "tgt").await;
+    up_open(&up_tx, sid("s257"), src_circuit, tgt_route).await;
     let mut got_257 = false;
     let ended = drain_frames(
         &mut tgt_body,
         tokio::time::Instant::now() + Duration::from_secs(3),
         |f| {
-            if matches!(f.frame_type, FrameType::Open) && f.stream_id == "s257" {
+            if matches!(f.frame_type, FrameType::Open) && f.stream_id == sid("s257") {
                 got_257 = true;
             }
         },
@@ -459,32 +526,34 @@ async fn data_send_timeout_evicts_and_poll_recreates() {
     .await;
 
     let mut src = connect(port, "src").await;
-    assert_eq!(register(&mut src, "src").await, 200);
+    let src_circuit = register(&mut src, "src").await;
     let mut tgt = connect(port, "tgt").await;
-    assert_eq!(register(&mut tgt, "tgt").await, 200);
+    let tgt_circuit = register(&mut tgt, "tgt").await;
+    let tgt_route = route(&mut src, src_circuit, "tgt").await;
 
-    let (up_tx, _up_resp) = open_upload(&mut src, "src").await;
-    let poll_resp = poll(&mut src, "src").await;
+    let (up_tx, _up_resp) = open_upload(&mut src, src_circuit).await;
+    let poll_resp = poll(&mut src, src_circuit).await;
     let mut poll_body = poll_resp.into_body();
 
-    up_open(&up_tx, "s0", "src", "tgt").await;
+    let s0 = sid("s0");
+    up_open(&up_tx, s0, src_circuit, tgt_route).await;
 
     // Fill the **data channel** (after the 2026-09-14 channel separation, Open
     // goes through the control channel and is enqueued immediately; the data
     // channel's capacity is still consumed by the non-polling tgt): flood 256
     // Data frames on one stream
     for i in 0..256 {
-        up_data(&up_tx, "s0", "src", format!("fill-{i}").as_bytes()).await;
+        up_data(&up_tx, s0, src_circuit, format!("fill-{i}").as_bytes()).await;
     }
 
     // The 257th Data frame: full channel + no consumer → 1s backpressure
     // timeout → eviction + sender notified.
     // (Before the fix it hung forever — the root cause of the upstream 502)
     let started = std::time::Instant::now();
-    up_data(&up_tx, "s0", "src", b"hello").await;
+    up_data(&up_tx, s0, src_circuit, b"hello").await;
     let note = wait_close_notification(
         &mut poll_body,
-        "s0",
+        s0,
         tokio::time::Instant::now() + Duration::from_secs(5),
     )
     .await;
@@ -492,7 +561,7 @@ async fn data_send_timeout_evicts_and_poll_recreates() {
     // the eviction sweep's peer notice (agent-evicted — the sweep now also
     // notifies the peer) — both are legitimate termination signals
     assert!(
-        note.contains("stalled") || note.contains("agent-evicted"),
+        matches!(note.as_str(), "dispatch_poison" | "session_closed"),
         "expected a backpressure-timeout or eviction notice: {note}"
     );
     assert!(
@@ -511,7 +580,7 @@ async fn data_send_timeout_evicts_and_poll_recreates() {
     );
 
     // tgt polls again → implicit re-registration (before the fix, a 404 loop)
-    let resp = poll(&mut tgt, "tgt").await;
+    let resp = poll(&mut tgt, tgt_circuit).await;
     assert_eq!(
         resp.status(),
         200,
@@ -525,14 +594,14 @@ async fn data_send_timeout_evicts_and_poll_recreates() {
 
     // After re-registration the data plane recovers: a new Open should be
     // dispatched to tgt
-    up_open(&up_tx, "fresh", "src", "tgt").await;
+    up_open(&up_tx, sid("fresh"), src_circuit, tgt_route).await;
     let mut tgt_body = resp.into_body();
     let mut got_fresh = false;
     let ended = drain_frames(
         &mut tgt_body,
         tokio::time::Instant::now() + Duration::from_secs(3),
         |f| {
-            if matches!(f.frame_type, FrameType::Open) && f.stream_id == "fresh" {
+            if matches!(f.frame_type, FrameType::Open) && f.stream_id == sid("fresh") {
                 got_fresh = true;
             }
         },
@@ -560,8 +629,8 @@ async fn poll_disconnect_grace_evicts() {
     .await;
 
     let mut tgt = connect(port, "tgt").await;
-    assert_eq!(register(&mut tgt, "tgt").await, 200);
-    let resp = poll(&mut tgt, "tgt").await;
+    let tgt_circuit = register(&mut tgt, "tgt").await;
+    let resp = poll(&mut tgt, tgt_circuit).await;
     assert_eq!(resp.status(), 200);
     drop(resp); // simulate agent death: the poll connection breaks
 
@@ -576,7 +645,7 @@ async fn poll_disconnect_grace_evicts() {
     );
 
     // Poll again → implicit re-registration
-    let resp = poll(&mut tgt, "tgt").await;
+    let resp = poll(&mut tgt, tgt_circuit).await;
     assert_eq!(resp.status(), 200);
     let agents = list_agents(&mut tgt).await;
     assert!(agents.contains(&qualified_agent_id(interflow_testkit::TEST_TENANT, "tgt")));
@@ -604,8 +673,8 @@ async fn heartbeat_evicts_pong_aware_wedge_and_ends_poll() {
     .await;
 
     let mut tgt = connect(port, "wedge").await;
-    assert_eq!(register(&mut tgt, "wedge").await, 200);
-    let resp = poll(&mut tgt, "wedge").await;
+    let wedge_circuit = register(&mut tgt, "wedge").await;
+    let resp = poll(&mut tgt, wedge_circuit).await;
     assert_eq!(resp.status(), 200);
     let mut body = resp.into_body();
 
@@ -657,9 +726,9 @@ async fn pong_replying_agent_survives_heartbeat() {
     .await;
 
     let mut tgt = connect(port, "good").await;
-    assert_eq!(register(&mut tgt, "good").await, 200);
-    let (up_tx, _up_resp) = open_upload(&mut tgt, "good").await;
-    let resp = poll(&mut tgt, "good").await;
+    let good_circuit = register(&mut tgt, "good").await;
+    let (up_tx, _up_resp) = open_upload(&mut tgt, good_circuit).await;
+    let resp = poll(&mut tgt, good_circuit).await;
     assert_eq!(resp.status(), 200);
     let mut body = resp.into_body();
 
@@ -684,7 +753,7 @@ async fn pong_replying_agent_survives_heartbeat() {
                 while let DecodeOutcome::Ok(f) = decode_frame(&mut buf) {
                     if matches!(f.frame_type, FrameType::Ping) {
                         pings += 1;
-                        send_uplink_pong(&up_tx, "good").await;
+                        send_uplink_pong(&up_tx, good_circuit).await;
                     }
                 }
             }
@@ -765,7 +834,7 @@ async fn real_agent_survives_aggressive_heartbeat() {
 /// frames with a hard cap of 100 and no release path, so the 101st Ping
 /// GOAWAY'd the whole connection (`too_many_data_frames`) — in production at
 /// 15s cadence this was the deterministic 25:14.1 session churn
-/// (docs/bug/2026-09-17-h2-data-frame-budget-goaway-churn.md).
+///.
 ///
 /// With a 1s heartbeat the same counter trips at ~101s; a Pong-answering
 /// poll surviving ~110 cycles proves the bomb is defused (the hub's
@@ -789,9 +858,9 @@ async fn poll_survives_empty_data_frame_budget_past_100_heartbeats() {
     .await;
 
     let mut agent = connect(port, "bomb-probe").await;
-    assert_eq!(register(&mut agent, "bomb-probe").await, 200);
-    let (up_tx, _up_resp) = open_upload(&mut agent, "bomb-probe").await;
-    let resp = poll(&mut agent, "bomb-probe").await;
+    let agent_circuit = register(&mut agent, "bomb-probe").await;
+    let (up_tx, _up_resp) = open_upload(&mut agent, agent_circuit).await;
+    let resp = poll(&mut agent, agent_circuit).await;
     assert_eq!(resp.status(), 200);
     let mut body = resp.into_body();
 
@@ -816,7 +885,7 @@ async fn poll_survives_empty_data_frame_budget_past_100_heartbeats() {
                 while let DecodeOutcome::Ok(f) = decode_frame(&mut buf) {
                     if matches!(f.frame_type, FrameType::Ping) {
                         pings += 1;
-                        send_uplink_pong(&up_tx, "bomb-probe").await;
+                        send_uplink_pong(&up_tx, agent_circuit).await;
                     }
                 }
             }

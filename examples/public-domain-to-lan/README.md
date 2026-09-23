@@ -1,47 +1,58 @@
 # Public domain to LAN service
 
-This `interflow-expose` example routes requests for `app.example.com` through
-nginx and a public edge to a service listening on port `3000` in a private LAN.
+This example routes requests for `app.example.com` through a public ingress
+to a service listening on port `3000` in a private network, using the
+identity-first model: you declare Ingress / Agent / Service / Route, and
+`interflow plan apply` issues every Credential Pack.
 
 ```text
-public user ─HTTPS─► nginx :443 ─► edge :8443 ─► hub :16666 ◄─mTLS─ lan-agent ─► 127.0.0.1:3000
+public user ─HTTPS─► nginx :443 ─► ingress edge :8443 ─► control :16666 ◄─mTLS─ lan-agent ─► 127.0.0.1:3000
 ```
 
 ## Files
 
-- `generate-certs.sh` — create the local, git-ignored mTLS material
-- `start-edge.sh` — run the public edge behind nginx
-- `start-expose.sh` — run the LAN expose agent
-- `nginx.conf` — public TLS and X-Forwarded-For topology
-- `routes.toml` — Host-header route table
-- `profile.toml` — optional persistent expose-agent profile
+- `interflow.toml` — deployment manifest (Realm / Ingress / Agent / Service / Route)
+- `start-ingress.sh` — start the public ingress from its Credential Pack (local testing)
+- `start-agent.sh` — start the in-network agent from its Credential Pack (local testing)
+- `nginx.conf` — the reference public-TLS/XFF topology (the renderer encodes the same invariants)
 
-The example uses tenant `demo` and agent ID `lan-agent`. Override binaries with
-`INTERFLOW_EXPOSE_BIN` or `INTERFLOW_MESH_BIN`; by default the scripts use
-commands from `PATH`.
+`plan apply` writes `issuer/` (the secret issuer store — keep it offline) and
+`dist/` — Credential Packs plus the rendered server-side material (systemd
+units, nginx fragments, `install.sh`). **Production deployment** follows
+the deployment guide: `install.sh` once per server (machine bootstrap —
+user, dirs, binaries; it installs no units), then
+`interflow node install --pack packs/<kind>-<node>` per node (pack + unit +
+enable); the scripts and `nginx.conf` here are the local-testing /
+pre-rendering reference.
 
 ## Local smoke test
 
-Run the commands from this directory. `start-edge.sh` is designed for the
-nginx topology and therefore requires X-Forwarded-For, so the local smoke test
-starts a loopback edge directly instead.
-
-Generate a certificate whose SAN matches the local hub address:
+Run from this directory. First build the CLI (`cargo build --release --bin
+interflow` in the repository root), then generate a local manifest and issue
+the packs:
 
 ```bash
-INTERFLOW_MESH_BIN=../../target/release/interflow-mesh \
-  ./generate-certs.sh --hub-dns 127.0.0.1
+../../target/release/interflow setup \
+  --realm example \
+  --control-endpoint 127.0.0.1:16666 \
+  --host app.example.com \
+  --agent lan-agent \
+  --service web \
+  --service-address 127.0.0.1:3000 \
+  --out interflow.local.toml
+
+../../target/release/interflow plan apply \
+  --manifest interflow.local.toml \
+  --issuer issuer \
+  --out dist
 ```
 
-Terminal 1 — edge:
+Terminal 1 — ingress:
 
 ```bash
-../../target/release/interflow-expose edge \
-  --listen 127.0.0.1:8443 --hub-listen 127.0.0.1:16666 \
-  --routes "$PWD/routes.toml" \
-  --client-ca "demo=$PWD/certs/tenants/demo-ca.crt" \
-  --hub-cert "$PWD/certs/hub.crt" \
-  --hub-key "$PWD/certs/hub.key"
+INTERFLOW_BIN=../../target/release/interflow \
+INTERFLOW_INGRESS_PACK="$PWD/dist/packs/ingress-edge" \
+  ./start-ingress.sh
 ```
 
 Terminal 2 — local service:
@@ -50,12 +61,12 @@ Terminal 2 — local service:
 python3 -m http.server 3000
 ```
 
-Terminal 3 — expose agent:
+Terminal 3 — agent:
 
 ```bash
-INTERFLOW_EXPOSE_BIN=../../target/release/interflow-expose \
-  INTERFLOW_HUB_URL=https://127.0.0.1:16666 \
-  ./start-expose.sh 3000
+INTERFLOW_BIN=../../target/release/interflow \
+INTERFLOW_AGENT_PACK="$PWD/dist/packs/agent-lan-agent" \
+  ./start-agent.sh
 ```
 
 Terminal 4 — verify Host routing:
@@ -66,33 +77,36 @@ curl --fail -H 'Host: app.example.com' http://127.0.0.1:8443/
 
 ## Production deployment
 
-1. On an operator machine, issue certificates whose hub SAN matches the address
-   dialed by agents:
+1. Edit `interflow.toml`: set `realm.control_endpoint` to your public relay
+   address and keep `public_tls.mode = "frontend-proxy"` for the nginx
+   topology.
+
+2. On an operator machine, issue the deployment:
 
    ```bash
-   ./generate-certs.sh --hub-dns hub.example.com
+   interflow plan apply --manifest interflow.toml --issuer issuer --out dist
    ```
 
-2. Copy only these files:
+3. Distribute only the packs (or seal them first with `interflow pack seal`):
 
-   | Host | Files |
+   | Host | Material |
    |---|---|
-   | Public server | `hub.crt`, `hub.key`, `tenants/demo-ca.crt`, `routes.toml`, `nginx.conf`, `start-edge.sh` |
-   | LAN machine | `agents/lan-agent.crt`, `agents/lan-agent.key`, `tenants/demo-ca.crt`, `profile.toml`, `start-expose.sh` |
-   | Operator machine | keep `tenants/demo-ca.key` offline |
+   | Public server | `dist/packs/ingress-edge` + `nginx.conf` + your public TLS certificate |
+   | LAN machine | `dist/packs/agent-lan-agent` |
+   | Operator machine | keep `issuer/` offline — it can re-issue and revoke every identity |
 
-3. Obtain a public TLS certificate, replace the reserved `example.com`
-   placeholders, install `nginx.conf`, and start `start-edge.sh`.
+4. Replace the reserved `example.com` placeholders in `nginx.conf`, install
+   it, then start `start-ingress.sh` on the public server and
+   `start-agent.sh` plus your service on the LAN machine.
 
-4. Start the LAN service and `start-expose.sh 3000` on the LAN machine.
-
-nginx must set `X-Forwarded-For`; edge requires it so rate limits, connection
-caps, metrics, and audit use the visitor IP rather than nginx's loopback address.
-Authentication and tunnel authorization always use mTLS identity only.
+nginx must set `X-Forwarded-For`; the ingress requires it so rate limits,
+connection caps, metrics, and audit use the visitor IP rather than nginx's
+loopback address. Authentication and tunnel authorization always use the
+pack-issued mTLS identity only.
 
 ## Security notes
 
-- Never expose edge's HTTP listener `:8443` directly to the internet.
-- Keep `tenants/demo-ca.key` offline; the public server needs only the CA cert.
-- There is no certificate revocation yet. If a private key leaks, rotate the
-  tenant CA and reissue every certificate it signed.
+- Never expose the ingress HTTP listener `:8443` directly to the internet.
+- Keep the `issuer/` store offline; servers only need their own pack.
+- Rotate with `interflow rotate` and revoke with `interflow revoke` — a
+  revoked credential lands in the issuer deny list and CRL.

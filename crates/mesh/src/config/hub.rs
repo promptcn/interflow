@@ -1,9 +1,12 @@
-//! Hub configuration schema.
+//! Hub engine configuration model.
 //!
-//! All structs use `deny_unknown_fields` to guard against typos. The `[auth]`
-//! section is required and must carry a non-empty tenant trust table —
-//! authentication is mTLS-only, there are no credential toggles (see
-//! [`validate`] for details).
+//! Constructed programmatically: the pack bootstrap (`crate::pack`) derives
+//! it from a Credential Pack, the embedded expose edge assembles it
+//! in-memory, and the dev soak harness hands it across the process boundary
+//! as JSON. Structs keep `deny_unknown_fields` so handoffs reject unknown
+//! fields. The `[auth]` section is required and must carry a non-empty
+//! tenant trust table — authentication is mTLS-only, there are no credential
+//! toggles (see [`validate`] for details).
 
 use interflow_core::config::params::liveness::HeartbeatCadence;
 use interflow_core::config::params::transport::{
@@ -15,29 +18,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 
-/// Current configuration schema version.
-///
-/// v3 (2026-09-16, config-governance step 4): removed the dead `routes`
-/// static-routing table (zero runtime references since dynamic
-/// registration); moved `[quic]` into `[transport.quic]` and added
-/// `[transport.h2]` (endpoint-symmetric keepalive, previously hard-coded);
-/// `tls.min_version` now actually enforced (previously silently ignored).
-///
-/// v4 (2026-09-18, multi-tenant mTLS-only): `[auth]` reduced to
-/// `rate_limit_per_minute` + the `[[auth.tenants]]` trust table (mTLS client
-/// certificates are the only authentication; `mode`, `allow_anonymous`,
-/// `[auth.static_token]` and `[auth.mtls]` are gone — see
-/// docs/design/multi-tenant-mtls-only.md). `[[acl.rules]]` entries gained
-/// tenant fields and rules now only grant cross-tenant exceptions (same
-/// tenant is allowed by default). `[server]` gained `proxy_protocol`.
-pub const HUB_CONFIG_VERSION: u32 = 4;
-
 /// Hub configuration root structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HubConfig {
-    /// Schema version; must equal [`HUB_CONFIG_VERSION`].
-    pub config_version: u32,
     /// Server listen configuration.
     pub server: ServerConfig,
     /// Authentication and authorization.
@@ -90,7 +74,7 @@ pub struct HubTransportConfig {
 
 // h2 keepalive tuning lives in [`crate::config::transport`] (one schema,
 // one default source, shared with the agent).
-pub use crate::config::transport::H2TransportConfig;
+use crate::config::transport::H2TransportConfig;
 
 /// QUIC transport configuration (backlog §6.4; starting points follow the frp
 /// defaults).
@@ -251,6 +235,12 @@ impl From<&HeartbeatConfig> for HeartbeatAd {
 pub struct ServerConfig {
     /// Listen address.
     pub listen_addr: SocketAddr,
+    /// Display name for log attribution (the pack's node name on the product
+    /// path). Embedders hosting several nodes in one process key captured
+    /// log events on the `node` field this feeds. Purely informational — no
+    /// protocol or validation meaning.
+    #[serde(default)]
+    pub node_name: Option<String>,
     /// PROXY protocol negotiation (restores the real client IP behind an
     /// nginx `stream`/`proxy_pass` front). See
     /// `interflow_core::security::proxy_protocol` for the trust matrix.
@@ -263,7 +253,7 @@ pub struct ServerConfig {
 /// There is exactly one authentication mode (client certificates) and no
 /// credential toggles: the `[auth]` section carries the tenant trust table
 /// and the registration rate limit, nothing else (RFC
-/// docs/design/multi-tenant-mtls-only.md §3.1).
+/// (internal design notes) §3.1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
@@ -299,6 +289,9 @@ pub struct TenantConfig {
     /// Path to the tenant's client CA certificate PEM (public certificates
     /// only — the CA private key must never live on the hub host).
     pub ca_path: String,
+    /// Path to a PEM CRL issued by this tenant's CA.
+    #[serde(default)]
+    pub crl_path: Option<String>,
     /// Gateway tenants may open streams across tenant boundaries. Legitimately
     /// used only by the expose edge's in-process principal; operator
     /// configuration should never set this.
@@ -317,9 +310,7 @@ pub struct TlsConfig {
     /// Server private key PEM path (must be 0600).
     pub key_path: String,
     /// Minimum TLS version. Defaults to "1.2". Enforced via rustls
-    /// protocol-version selection (wired through every server-config
-    /// builder since schema v3 — before that the value parsed but never
-    /// reached rustls).
+    /// protocol selection in every server-config builder.
     #[serde(default = "default_tls_min_version")]
     pub min_version: interflow_core::tls::TlsMinVersion,
 }
@@ -355,7 +346,7 @@ impl AclConfig {
 ///
 /// Same-tenant streams are allowed by default and need no rule; an empty
 /// rule set therefore means full inter-tenant isolation (the inverse of the
-/// pre-v4 "empty = allow-all" semantics).
+/// legacy "empty = allow-all" semantics).
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AclRule {
@@ -421,7 +412,6 @@ mod tests {
     #[test]
     fn acl_rules_round_trip() {
         let toml_str = r#"
-config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -450,7 +440,6 @@ target_tenant = "globex"
 target = "egress-02"
 "#;
         let config: HubConfig = toml::from_str(toml_str).expect("parse");
-        assert_eq!(config.config_version, HUB_CONFIG_VERSION);
         assert_eq!(config.acl.rules.len(), 2);
         assert!(config.acl.rules.contains(&AclRule {
             source_tenant: "acme".to_string(),
@@ -463,7 +452,6 @@ target = "egress-02"
     #[test]
     fn empty_acl_when_no_rules() {
         let toml_str = r#"
-config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -482,7 +470,6 @@ ca_path = "certs/acme-ca.crt"
     #[test]
     fn deny_unknown_fields_rejects_typo() {
         let toml_str = r#"
-config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -509,7 +496,6 @@ litsten_addr = "oops"
         assert_eq!(d.max_missed, 4);
 
         let toml_str = r#"
-config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -539,7 +525,6 @@ max_missed = 1
     #[test]
     fn heartbeat_section_absent_uses_defaults() {
         let toml_str = r#"
-config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -558,7 +543,6 @@ ca_path = "certs/acme-ca.crt"
     #[test]
     fn security_stream_caps_parse_from_toml() {
         let toml_str = r#"
-config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"
@@ -580,7 +564,6 @@ max_streams_total = 128
     #[test]
     fn security_stream_caps_default_when_absent() {
         let toml_str = r#"
-config_version = 4
 
 [server]
 listen_addr = "127.0.0.1:8080"

@@ -14,6 +14,7 @@ use interflow_core::fault::FaultPoint;
 use interflow_core::tls::client::build_client_config;
 use interflow_core::tls::extract_cn_from_pem_file;
 use interflow_core::tunnel::negotiation::RegisterResponse;
+use interflow_core::tunnel::quic::QuicEndpointParams;
 use interflow_core::tunnel::session_tasks::{
     SessionExitGuard, SessionTasks, TaskExit, TaskExitReason,
 };
@@ -23,6 +24,7 @@ use interflow_core::tunnel::{
 };
 use rustls::pki_types::ServerName;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
@@ -55,25 +57,29 @@ const SESSION_DRAIN_GRACE: Duration = ShutdownBudget::DEFAULT.session_drain_grac
 /// ignoring the cancellation token — abort instead of waiting forever, so
 /// `run_session` always returns and the supervisor always reaches its next
 /// reconnect iteration (mechanism A of
-/// docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md).
+/// (internal design notes)).
 const HANDLER_JOIN_GRACE: Duration = ShutdownBudget::DEFAULT.handler_join;
 
 /// The agent client.
 #[derive(Clone)]
 pub struct AgentClient {
     config: AgentConfig,
-    /// Cross-session rule truth: control-API adds/removes are persisted
-    /// through this (file-backed); after a tunnel reconnect the handlers take
-    /// rules from here rather than the startup snapshot.
+    /// Cross-session rule truth: control-API adds/removes flow through this;
+    /// after a tunnel reconnect the handlers take rules from here rather
+    /// than the startup snapshot.
     rule_store: Arc<RuleStore>,
     /// Egress flood-line runtime (agent-scoped): concurrency counters and
     /// rate buckets are shared across sessions and not reset on session
     /// rebuild — residual flows from the previous session keep consuming
     /// quota, so the limit never goes blind.
     egress_runtime: Arc<crate::agent::egress::EgressRuntime>,
-    /// E2e (inner TLS) runtime (agent-scoped, startup-only assembly);
-    /// `None` when the mode is off.
-    e2e_runtime: Option<Arc<crate::agent::e2e::E2eRuntime>>,
+    /// Mandatory inner-TLS runtime (agent-scoped, startup-only assembly).
+    e2e_runtime: Arc<crate::agent::e2e::E2eRuntime>,
+    /// Turns on once a session has bound every configured ingress listener
+    /// (the agent's local-serving face — the readiness `node install` and
+    /// `Type=notify` units gate on). Carried on the client so every session
+    /// rebuild can fire it idempotently.
+    ingress_ready: tokio::sync::watch::Sender<bool>,
 }
 
 /// How one session ended (the supervisor decides reconnect or exit from this).
@@ -120,31 +126,16 @@ impl HubConnection {
 }
 
 impl AgentClient {
-    /// Build purely in-memory (rules are not persisted; in-memory additions
-    /// and changes survive reconnects).
+    /// Build from the engine configuration (rules held in memory across
+    /// reconnects; control-API additions live exactly as long as the
+    /// process — the durable source is the signed pack policy).
     ///
-    /// Suited to embedded agents (expose edge) and tests — there is no
-    /// config file to write back to.
+    /// Every production entry (mesh pack bootstrap, expose CLI, GUI, expose
+    /// edge) passes through here, so the identity pre-validation below
+    /// cannot be bypassed.
     pub fn new(config: AgentConfig) -> Result<Self> {
-        Self::build(config, None)
-    }
-
-    /// File-backed construction: control-API rule adds/removes are atomically
-    /// written back to this config file (the file is the source of truth).
-    pub fn with_config_file(
-        config: AgentConfig,
-        path: impl Into<std::path::PathBuf>,
-    ) -> Result<Self> {
-        Self::build(config, Some(path.into()))
-    }
-
-    /// The single construction funnel: every production entry (mesh CLI,
-    /// expose CLI, GUI, expose edge) passes through here, so the identity
-    /// pre-validation below cannot be bypassed by picking a different
-    /// constructor.
-    fn build(config: AgentConfig, rule_path: Option<std::path::PathBuf>) -> Result<Self> {
         Self::validate_identity_binding(&config)?;
-        let rule_store = RuleStore::from_config(&config, rule_path);
+        let rule_store = RuleStore::from_config(&config);
         let egress_runtime = Arc::new(crate::agent::egress::EgressRuntime::from_config(&config));
         // E2e (inner TLS) material: startup-only assembly — a bad anchor
         // set fails the agent here instead of per-stream at runtime.
@@ -154,6 +145,7 @@ impl AgentClient {
             rule_store,
             egress_runtime,
             e2e_runtime,
+            ingress_ready: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -194,14 +186,27 @@ impl AgentClient {
     /// State is broadcast via `watch`, process events stream out via mpsc;
     /// stop with [`AgentHandle::shutdown_graceful`] (cooperative, waits for
     /// all child tasks to exit).
+    ///
+    /// # Panics
+    ///
+    /// Must be called from within a Tokio runtime context (it spawns the
+    /// supervisor); like `tokio::spawn`, it panics otherwise. Callers on
+    /// threads without an ambient runtime must enter one first (e.g.
+    /// `Handle::enter`).
     pub fn start(self) -> AgentHandle {
         let shutdown = CancellationToken::new();
         let tracker = TaskTracker::new();
         let slot = SessionSlot::new();
         let (state_tx, state_rx) = tokio::sync::watch::channel(AgentState::Connecting);
         let (event_tx, event_rx) = mpsc::channel(64);
-        let sink = EventSink { state_tx, event_tx };
+        let established = Arc::new(AtomicU64::new(0));
+        let sink = EventSink {
+            state_tx,
+            event_tx,
+            established: Arc::clone(&established),
+        };
 
+        let ingress_ready_rx = self.ingress_ready.subscribe();
         let join = {
             let shutdown = shutdown.clone();
             let tracker = tracker.clone();
@@ -212,7 +217,16 @@ impl AgentClient {
             })
         };
 
-        AgentHandle::new(state_rx, event_rx, shutdown, tracker, slot, join)
+        AgentHandle::new(
+            state_rx,
+            event_rx,
+            shutdown,
+            tracker,
+            slot,
+            join,
+            established,
+            ingress_ready_rx,
+        )
     }
 
     /// Supervisor: state machine + reconnect loop (exponential backoff +
@@ -226,7 +240,12 @@ impl AgentClient {
         tracker: TaskTracker,
         slot: SessionSlot,
     ) -> Result<()> {
-        info!("Agent starting (auto-reconnect mode)");
+        // Node name for log attribution: embedders hosting several agents in
+        // one process (the GUI) key captured events on this field. Defaults
+        // to the agent id (the pack's node name); embedders may override
+        // with a per-slot unique `log_name`.
+        let node = self.config.agent.effective_log_name().to_string();
+        info!(node = %node, "Agent starting (auto-reconnect mode)");
         let mut attempt: u32 = 0;
         let mut failed = false;
 
@@ -236,7 +255,7 @@ impl AgentClient {
             // "Connecting to hub" log, a supervisor wedged between
             // iterations would leave zero log traces (the exact silence of
             // the 2026-09-16 edge incident).
-            info!("Agent connecting (attempt {})", attempt.saturating_add(1));
+            info!(node = %node, "Agent connecting (attempt {})", attempt.saturating_add(1));
             // Fault injection: panic in the supervisor's own frame — the
             // outermost in-process layer; recovery is the embedder's job.
             interflow_core::fault::trigger(FaultPoint::AgentSuperviseLoopTick);
@@ -265,7 +284,7 @@ impl AgentClient {
             let (reason, established) = match outcome {
                 Ok(SessionOutcome::Shutdown) => break,
                 Ok(SessionOutcome::Ended(reason)) => {
-                    warn!("Agent session ended ({reason}), reconnecting...");
+                    warn!(node = %node, "Agent session ended ({reason}), reconnecting...");
                     (reason, true)
                 }
                 Err(e) => {
@@ -273,15 +292,19 @@ impl AgentClient {
                     // (unopenable CA / invalid URL, etc.); fail and exit
                     // directly.
                     if e.is_fatal() {
-                        error!("Agent configuration error, will not retry: {e}");
+                        error!(
+                            node = %node,
+                            "Agent configuration error, will not retry: {}",
+                            interflow_util::format_chain(&e)
+                        );
                         sink.set_state(AgentState::Failed {
-                            error: e.to_string(),
+                            error: interflow_util::format_chain(&e),
                         });
                         failed = true;
                         break;
                     }
-                    let reason = e.to_string();
-                    error!("Agent error: {reason}, retrying after backoff...");
+                    let reason = interflow_util::format_chain(&e);
+                    error!(node = %node, "Agent error: {reason}, retrying after backoff...");
                     (reason, false)
                 }
             };
@@ -325,6 +348,9 @@ impl AgentClient {
         shutdown: &CancellationToken,
         slot: &SessionSlot,
     ) -> Result<SessionOutcome> {
+        // Log attribution (see supervise): defaults to the agent id (the
+        // pack's node name); overridable per-slot via `log_name`.
+        let node = self.config.agent.effective_log_name().to_string();
         // Session-level token: when the session ends (disconnect or user
         // shutdown alike), cancels all child tasks of this session.
         let session_token = shutdown.child_token();
@@ -423,21 +449,18 @@ impl AgentClient {
         };
 
         // Start ingress + egress mode
-        // Resync the rule tables from disk at session establishment
-        // (file-backed): externally hand-edited configs converge this way,
-        // and rules the control API wrote in the previous session survive
-        // reconnection.
-        self.rule_store.resync_from_disk().await;
         let rule_store = self.rule_store.clone();
         let security_config = self.config.security.clone();
         let egress_policy = crate::agent::egress::EgressPolicy::from(&self.config);
         let egress_runtime = Arc::clone(&self.egress_runtime);
-        let e2e_runtime = self.e2e_runtime.clone();
+        let e2e_runtime = Arc::clone(&self.e2e_runtime);
         let handler_token = session_token.clone();
         let handler_tracker = session_tracker.clone();
         let teardown_tunnel = tunnel.clone();
+        let handler_node = node.clone();
+        let handler_ingress_ready = self.ingress_ready.clone();
         let mut handler_task = session_tracker.spawn(async move {
-            info!("Starting agent services (ingress & egress)");
+            info!(node = %handler_node, "Starting agent services (ingress & egress)");
 
             // Prepare for Egress: take the incoming-stream event channel for
             // the request direction (once per tunnel)
@@ -455,23 +478,26 @@ impl AgentClient {
                 handler_token.clone(),
                 handler_tracker.clone(),
                 ingress_rx,
-                e2e_runtime.clone(),
+                Arc::clone(&e2e_runtime),
+                handler_ingress_ready,
             );
 
             // Create Egress Handler (sends response-direction frames via the
             // tunnel; never touches the h2 sender again)
             let egress = EgressHandler::new(
                 agent_id,
-                tunnel,
                 rule_store,
-                security_config,
-                egress_policy,
-                egress_runtime,
-                handler_token.clone(),
-                handler_tracker,
                 egress_rx,
                 incoming,
-                e2e_runtime,
+                crate::agent::egress::EgressSession {
+                    tunnel,
+                    security: security_config,
+                    policy: egress_policy,
+                    runtime: egress_runtime,
+                    session: handler_token.clone(),
+                    tracker: handler_tracker,
+                    e2e: e2e_runtime,
+                },
             );
 
             // Run both concurrently; session cancellation counts as a normal
@@ -490,7 +516,7 @@ impl AgentClient {
         // handle has already been polled to completion; awaiting the same
         // handle again outside the branch is a second poll, which tokio
         // panics on ("JoinHandle polled after completion",
-        // docs/bug/2026-09-13-select-branch-double-await-joinhandle-panic.md).
+        // (internal design notes)).
         let ended_by = tokio::select! {
             biased;
             // Critical-task exit reports come first so the ending gets its
@@ -542,6 +568,7 @@ impl AgentClient {
             .is_err()
         {
             warn!(
+                node = %node,
                 "tunnel termination contract timed out ({:?}), continuing teardown",
                 SESSION_SHUTDOWN_TIMEOUT
             );
@@ -571,12 +598,13 @@ impl AgentClient {
             }
             SessionEnd::Disconnected => {
                 join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
-                error!("Hub connection lost");
+                error!(node = %node, "Hub connection lost");
                 Ok(SessionOutcome::Ended("Hub connection lost".into()))
             }
             SessionEnd::Watchdog => {
                 join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
                 warn!(
+                    node = %node,
                     "internal death signal (watchdog / exit guard) cancelled the session, rebuilding"
                 );
                 Ok(SessionOutcome::Ended(
@@ -586,6 +614,7 @@ impl AgentClient {
             SessionEnd::CriticalTask(exit) => {
                 join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
                 warn!(
+                    node = %node,
                     "session-critical task '{}' exited ({:?}), rebuilding session",
                     exit.task, exit.reason
                 );
@@ -646,7 +675,7 @@ impl AgentClient {
                     None => {}
                 }
                 let tunnel = AgentTunnel::from_sender(
-                    conn.agent_id.clone(),
+                    conn.negotiated.circuit_token,
                     &conn.hub_url,
                     conn.send_request.clone(),
                     tasks,
@@ -697,29 +726,27 @@ impl AgentClient {
                 "[agent] transport = \"quic\" requires hub_quic_addr (host:port)".to_string(),
             )
         })?;
-        let (server_addr, server_name) = if let Ok(sa) = quic_addr.parse::<std::net::SocketAddr>() {
-            (sa, sa.ip().to_string())
+        let server_name = quic_server_name(quic_addr)?;
+        let server_addr = if let Ok(sa) = quic_addr.parse::<std::net::SocketAddr>() {
+            sa
         } else {
             // host:port form: resolve the hostname (take the first address)
-            let name = quic_addr.rsplit_once(':').map_or(quic_addr, |(h, _)| {
-                h.trim_start_matches('[').trim_end_matches(']')
-            });
-            let resolved = tokio::net::lookup_host(quic_addr)
+            tokio::net::lookup_host(quic_addr)
                 .await
                 .map_err(|e| {
                     InterflowError::connection(format!(
-                        "failed to resolve hub_quic_addr {quic_addr}: {e}"
+                        "failed to resolve hub_quic_addr {quic_addr}"
                     ))
+                    .with_source(e)
                 })?
                 .next()
                 .ok_or_else(|| {
                     InterflowError::connection(format!(
                         "hub_quic_addr has no resolvable address: {quic_addr}"
                     ))
-                })?;
-            (resolved, name.to_string())
+                })?
         };
-        info!("Connecting to hub (QUIC): {server_addr} (SNI: {server_name})");
+        info!(node = %self.config.agent.effective_log_name(), "Connecting to hub (QUIC): {server_addr} (SNI: {server_name})");
 
         // TLS client config (isomorphic with the h2 path: CA / cert-pin /
         // mTLS client certificate)
@@ -745,15 +772,8 @@ impl AgentClient {
         let session_params = interflow_core::tunnel::quic::QuicSessionParams {
             stall_override,
             establish_timeout,
-            transport: interflow_core::tunnel::quic::QuicEndpointParams {
-                max_idle_timeout_ms: self.config.transport.quic.max_idle_timeout_ms,
-                keepalive_interval: Duration::from_millis(u64::from(
-                    self.config.transport.quic.keepalive_interval_ms,
-                )),
-            },
+            transport: QuicEndpointParams::from(&self.config.transport.quic),
             incoming_streams_budget: self.config.max_incoming_streams,
-            // Observation-only capability declaration (RFC §3.6).
-            e2e_capable: self.config.e2e.enabled(),
         };
         let tunnel = std::sync::Arc::new(
             interflow_core::tunnel::quic::QuicTunnel::connect(
@@ -819,7 +839,7 @@ impl AgentClient {
     ///
     /// After taking `send_request`, the caller can:
     /// - construct its own [`AgentTunnel`] to run custom ingress/egress (e.g.
-    ///   the `interflow-expose` edge)
+    ///   the ingress engine)
     /// - or continue down the standard ingress+egress path of
     ///   [`AgentClient::start`]
     ///
@@ -843,7 +863,7 @@ impl AgentClient {
         let hub_url = &self.config.agent.hub_url;
         let uri: Uri = hub_url
             .parse()
-            .map_err(|e| InterflowError::config(format!("invalid hub URL: {e}")))?;
+            .map_err(|e| InterflowError::config("invalid hub URL".to_string()).with_source(e))?;
 
         let host = uri
             .host()
@@ -858,7 +878,7 @@ impl AgentClient {
         });
 
         let addr = format!("{host}:{port}");
-        info!("Connecting to hub: {}", addr);
+        info!(node = %self.config.agent.effective_log_name(), "Connecting to hub: {}", addr);
 
         // Prepare the connection builder
         let mut http_builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
@@ -880,11 +900,12 @@ impl AgentClient {
         // Establish the connection per config (TLS or TCP). The loading
         // layer has already normalized: Some means enabled.
         let (mut send_request, connection_handle) = if let Some(tls_config) = &self.config.tls {
-            info!("Connecting with TLS");
+            info!(node = %self.config.agent.effective_log_name(), "Connecting with TLS");
             // cert pinning: when hub_cert_fingerprint is configured, use the
             // pinned verifier in place of CA validation
             if let Some(pin_hex) = &tls_config.hub_cert_fingerprint {
                 info!(
+                    node = %self.config.agent.effective_log_name(),
                     "cert pinning enabled (bypasses system CAs, trusts only hub certificates with matching fingerprint)"
                 );
                 Self::connect_tls_pinned(
@@ -910,11 +931,13 @@ impl AgentClient {
                 let stream = TcpStream::connect(&addr).await?;
 
                 let domain = ServerName::try_from(host)
-                    .map_err(|e| InterflowError::config(format!("invalid domain {host}: {e}")))?
+                    .map_err(|e| {
+                        InterflowError::config(format!("invalid domain {host}")).with_source(e)
+                    })?
                     .to_owned();
 
                 let tls_stream = connector.connect(domain, stream).await.map_err(|e| {
-                    InterflowError::connection(format!("TLS handshake failed: {e}"))
+                    InterflowError::connection("TLS handshake failed".to_string()).with_source(e)
                 })?;
 
                 let (send_request, connection) =
@@ -985,10 +1008,11 @@ impl AgentClient {
         let connector = TlsConnector::from(Arc::new(config));
         let stream = TcpStream::connect(addr).await?;
         let domain = ServerName::try_from(host)
-            .map_err(|e| InterflowError::config(format!("invalid domain {host}: {e}")))?
+            .map_err(|e| InterflowError::config(format!("invalid domain {host}")).with_source(e))?
             .to_owned();
         let tls_stream = connector.connect(domain, stream).await.map_err(|e| {
-            InterflowError::connection(format!("TLS handshake failed (pin verification): {e}"))
+            InterflowError::connection("TLS handshake failed (pin verification)".to_string())
+                .with_source(e)
         })?;
         let (send_request, connection) = builder.handshake(TokioIo::new(tls_stream)).await?;
         let handle = tokio::spawn(async move {
@@ -1053,7 +1077,7 @@ impl EstablishedSession {
 /// handle has already been polled to completion, so the result can only be
 /// taken inside the branch body — awaiting that handle again outside the
 /// branch is a second poll, which tokio panics on
-/// (docs/bug/2026-09-13-select-branch-double-await-joinhandle-panic.md).
+///.
 enum SessionEnd {
     Shutdown,
     Disconnected,
@@ -1076,7 +1100,7 @@ enum SessionEnd {
 /// of waiting forever: `run_session` must always return so the supervisor
 /// reaches its next reconnect iteration; an unbounded join here is exactly
 /// how a wedged wind-down turns into a never-reconnecting agent
-/// (docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md §机制A).
+///.
 async fn join_or_abort<T>(
     handle: &mut tokio::task::JoinHandle<T>,
     grace: Duration,
@@ -1148,12 +1172,25 @@ fn quic_establish_error(e: InterflowError) -> InterflowError {
     InterflowError::connection(format!("{e}; {HINT}")).with_source(e)
 }
 
+/// Derives the QUIC SNI from a hub address: a bare IP for SocketAddr
+/// inputs, otherwise the authority host via the shared parser (bracket- and
+/// port-stripped — the old manual trim could strip repeated brackets and
+/// mangle portless inputs). Unparseable addresses are config errors.
+fn quic_server_name(quic_addr: &str) -> Result<String> {
+    if let Ok(sa) = quic_addr.parse::<std::net::SocketAddr>() {
+        return Ok(sa.ip().to_string());
+    }
+    interflow_util::parse_authority(quic_addr)
+        .map(|parsed| parsed.host)
+        .map_err(|e| InterflowError::config(format!("hub_quic_addr {quic_addr:?}")).with_source(e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// The bounded-join contract (mechanism A hardening,
-    /// docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md): a task
+    /// (internal design notes)): a task
     /// that never exits is aborted within the grace — never awaited forever.
     #[tokio::test]
     async fn join_or_abort_aborts_a_task_that_never_exits() {
@@ -1210,6 +1247,36 @@ mod tests {
         assert!(e.is_fatal(), "wrapping must not downgrade a config error");
     }
 
+    /// SNI derivation (the host:port split the QUIC dial path feeds into
+    /// rustls server_name): bare IPs for SocketAddr inputs, bracket- and
+    /// port-stripped hosts otherwise — the shared authority parser replaces
+    /// the old manual trim here.
+    #[test]
+    fn quic_server_name_handles_authority_forms() {
+        assert_eq!(
+            quic_server_name("hub.example.com:16666").unwrap(),
+            "hub.example.com"
+        );
+        // Exactly one bracket pair stripped (the old trim_start_matches
+        // would strip repeated brackets)
+        assert_eq!(
+            quic_server_name("[2001:db8::1]:16666").unwrap(),
+            "2001:db8::1"
+        );
+        assert_eq!(quic_server_name("[::1]").unwrap(), "::1");
+        // SocketAddr fast path: SNI is the bare IP string
+        assert_eq!(quic_server_name("127.0.0.1:16666").unwrap(), "127.0.0.1");
+        assert_eq!(
+            quic_server_name("[2001:db8::2]:16666").unwrap(),
+            "2001:db8::2"
+        );
+
+        // Unparseable addresses fail closed as config errors
+        assert!(quic_server_name("::1").is_err());
+        assert!(quic_server_name("").is_err());
+        assert!(quic_server_name("host").is_ok()); // portless host is legal for SNI
+    }
+
     /// The identity binding pre-validation (design §3.2): an agent id that
     /// differs from the certificate CN — the macOS-autocapitalized
     /// `Expose-lan-agent` shape from the 2026-09-18 GUI papercuts — must fail
@@ -1247,9 +1314,9 @@ mod tests {
     }
 
     /// The matching pair (id == CN) and the certificate-less constructions
-    /// (plain-http test setups) must keep constructing.
+    /// Certificate-less construction is rejected at the local assembly gate.
     #[test]
-    fn construction_accepts_matching_cn_and_certificate_less_configs() {
+    fn construction_accepts_matching_cn_and_rejects_certificate_less_configs() {
         let certs = interflow_testkit::certs::TestCerts::generate("cn-bind-ok", "agent-a");
         let (cert, key) = certs.named_client_cert("agent-a");
         let tls = |cert: std::path::PathBuf, key: std::path::PathBuf| {
@@ -1283,6 +1350,6 @@ mod tests {
                 ..AgentConfig::default()
             }
         };
-        assert!(AgentClient::new(plain).is_ok());
+        assert!(AgentClient::new(plain).is_err());
     }
 }

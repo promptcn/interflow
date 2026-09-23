@@ -71,8 +71,10 @@ fn bench_expose_rps(c: &mut Criterion) {
 
 mod setup {
     use super::*;
-    use interflow_expose::client::ExposeArgs;
-    use interflow_expose::edge::{EdgeArgs, EdgeHubTls, Route, RoutesConfig};
+    use interflow_expose::client::{ExposeArgs, LocalService};
+    use interflow_expose::edge::{
+        ControlEndpointTls, EdgeConfig, IngressPrincipal, Route, WorkspaceTrust,
+    };
     use interflow_mesh::config::TransportKind;
 
     pub async fn spawn_stack() -> (
@@ -110,47 +112,35 @@ mod setup {
         let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
         let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
-        // Construct RoutesConfig directly; no file read
-        let routes = RoutesConfig {
+        let certs = interflow_testkit::certs::TestCerts::generate("bench", "expose-test");
+        let (principal_cert, principal_key) = certs.named_client_cert("edge");
+        let edge_config = EdgeConfig {
+            listen_addr: edge_listen,
+            control_listen_addr: hub_listen,
+            control_tls: ControlEndpointTls {
+                cert: certs.server_cert_path(),
+                key: certs.server_key_path(),
+            },
+            workspace_trust: vec![WorkspaceTrust {
+                workspace: "test".to_string(),
+                ca: certs.ca_path(),
+            }],
+            principals: vec![IngressPrincipal {
+                workspace: "test".to_string(),
+                cert: principal_cert,
+                key: principal_key,
+            }],
             routes: vec![Route {
                 host: "test.local".into(),
-                tenant: "test".into(),
+                workspace: "test".into(),
                 agent_id: "expose-test".into(),
-                remote_addr: echo_addr,
+                service_id: "web".to_string(),
             }],
-            logging: None,
-        };
-        let routes_path = std::env::temp_dir().join(format!(
-            "interflow_bench_routes_{}.toml",
-            uuid::Uuid::new_v4()
-        ));
-        let routes_str = toml::to_string(&routes).expect("serialize routes");
-        std::fs::write(&routes_path, &routes_str).expect("write routes.toml");
-
-        let certs = interflow_testkit::certs::TestCerts::generate("bench", "expose-test");
-        let edge_args = EdgeArgs {
-            listen_addr: edge_listen,
-            hub_listen_addr: hub_listen,
-            routes_path: routes_path.to_string_lossy().into_owned(),
-            tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
-            proxy_protocol: Default::default(),
-            x_forwarded_for: Default::default(),
-            hub_tls: Some(EdgeHubTls {
-                cert_path: certs.server_cert_path().display().to_string(),
-                key_path: certs.server_key_path().display().to_string(),
-            }),
-            gateway_identity: None,
-            quic_listen: None,
             audit_path: None,
-            new_conn_rate_per_ip_per_minute: 0,
-            stream_idle_timeout_secs: 300,
-            route_breaker_enabled: true,
-            route_breaker_failure_threshold: 10,
-            route_breaker_window_secs: 60,
-            route_breaker_cooldown_secs: 30,
-            agent_recovery_timeout_secs: 120,
+            agent_recovery_timeout: Duration::from_secs(120),
+            ..EdgeConfig::default()
         };
-        let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_args));
+        let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_config));
 
         // Wait for the edge listener to be ready
         wait_for_tcp(edge_listen, Duration::from_secs(5))
@@ -162,11 +152,17 @@ mod setup {
 
         let (client_cert, client_key) = certs.client_paths();
         let client_args = ExposeArgs {
-            local_ports: vec![echo_addr.port()],
+            log_name: None,
+            services: vec![LocalService {
+                id: "web".into(),
+                target_addr: echo_addr,
+                overridden: false,
+            }],
             hub_url: format!("https://127.0.0.1:{hub_port}"),
             agent_id: "expose-test".into(),
             client_cert: Some(client_cert.display().to_string()),
             client_key: Some(client_key.display().to_string()),
+            ingress_ca_path: Some(certs.ca_path().display().to_string()),
             ca_path: Some(certs.ca_path().display().to_string()),
             transport: TransportKind::H2,
             hub_quic_addr: None,
@@ -180,7 +176,6 @@ mod setup {
 
         // The routes file can be deleted after reading (edge already loaded
         // it into memory at startup)
-        let _ = std::fs::remove_file(&routes_path);
 
         (edge_listen, edge_handle, client_handle, echo_handle)
     }

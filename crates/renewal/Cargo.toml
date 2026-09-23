@@ -1,0 +1,29 @@
+[package]
+name = "interflow-renewal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Unattended credential renewal: 50%-TTL rotation against the registrar, CRL freshness, and the node-local renewal scheduler"
+license.workspace = true
+
+[lib]
+name = "interflow_renewal"
+path = "src/lib.rs"
+
+[dependencies]
+interflow-identity = { path = "../identity", version = "0.4" }
+interflow-core = { path = "../core", version = "0.4" }
+# Shared atomic writes (CRL refresh)
+interflow-util = { path = "../util", version = "0.4" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+# Scheduler banners are tracing events (not eprintln): embedders that host
+# several nodes in one process (the GUI) capture and attribute them by the
+# `node` field.
+tracing = "0.1.44"
+
+[lints]
+workspace = true

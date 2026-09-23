@@ -40,10 +40,20 @@ fn random_payload(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 31 % 251) as u8).collect()
 }
 
+static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+async fn serial_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 /// T1: basic UDP echo send/receive — random payloads x 3 rounds compared byte
 /// for byte (small packets all pass under default rate limits).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_echo_round_trip_basic() {
+    let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
@@ -80,6 +90,7 @@ async fn udp_echo_round_trip_basic() {
 /// port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_multiple_concurrent_clients() {
+    let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
@@ -132,6 +143,7 @@ async fn udp_multiple_concurrent_clients() {
 /// restarts (the session is rebuilt automatically).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_agent_restart_recovers() {
+    let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
@@ -184,6 +196,7 @@ async fn udp_agent_restart_recovers() {
 /// deterministically rejected by the per-IP byte rate.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_large_datagrams_no_truncation() {
+    let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
@@ -219,13 +232,14 @@ async fn udp_large_datagrams_no_truncation() {
 }
 
 /// T7: idle-session recycling — the stream table does not leak, and the
-/// `max_streams_per_agent` slot is released.
+/// local inner-session slot is released.
 ///
-/// cap=3: the readiness-probe session takes 1 + two client sessions take 2 →
-/// full; while full, a 3rd client must fail, and after idle recycling it must
-/// succeed (proving the slot was released, not leaked).
+/// local cap=4: the outer association takes 1, the readiness probe takes 1,
+/// and two clients take 2; while full, a third client must fail, and after
+/// idle recycling it must succeed (proving the slot was released, not leaked).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_idle_session_recycled_and_slot_released() {
+    let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
     let security = HubSecurityConfig {
@@ -242,6 +256,9 @@ async fn udp_idle_session_recycled_and_slot_released() {
     .await;
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
+    // The hub sees one long-lived association; the local budget is the
+    // authoritative inner-session cap: association + readiness + two clients.
+    egress_cfg.max_incoming_streams = 4;
     egress_cfg.egress = vec![EgressRule {
         udp_idle_timeout_secs: Some(6),
         ..udp_egress_rule("echo", echo_addr)
@@ -263,15 +280,34 @@ async fn udp_idle_session_recycled_and_slot_released() {
 
     let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
 
-    // Stack-readiness probe (retries absorb agent registration latency)
+    // Stack-readiness probe (retries absorb agent registration latency). Keep
+    // its socket alive so the OS cannot reuse this source port for c3 before
+    // the idle timer expires.
     let ready = random_payload(16);
-    let resp = udp_echo_round_trip(ingress_addr, &ready, Duration::from_secs(15))
+    let ready_sock = udp_client().await;
+    let ready_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let resp = loop {
+        let remaining = ready_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "stack ready probe");
+        match udp_round_trip_once(
+            &ready_sock,
+            ingress_addr,
+            &ready,
+            remaining.min(Duration::from_secs(2)),
+        )
         .await
-        .expect("stack ready probe");
+        {
+            Ok(resp) => break resp,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => panic!("stack ready probe: {e}"),
+        }
+    };
     assert_eq!(resp, ready);
 
-    // Fill the per-agent stream quota (cap=2): two clients each establish one
-    // session
+    // Fill the remaining local inner-session quota: two clients each establish
+    // one session.
     let c1 = udp_client().await;
     let c2 = udp_client().await;
     for (i, sock) in [&c1, &c2].iter().enumerate() {
@@ -282,14 +318,14 @@ async fn udp_idle_session_recycled_and_slot_released() {
         assert_eq!(resp, payload);
     }
 
-    // Third client: over the cap, stream establishment rejected → no reply
-    // (while the sessions are occupied)
+    // Third client: over the cap, session establishment is rejected → no reply
+    // while the existing sessions are occupied.
     let c3 = udp_client().await;
     let probe = random_payload(16);
     let denied = udp_round_trip_once(&c3, ingress_addr, &probe, Duration::from_millis(1500)).await;
     assert!(
         denied.is_err(),
-        "the 3rd session must fail while cap=2 is exhausted"
+        "the 3rd session must fail while the local cap is exhausted"
     );
 
     // Wait for idle recycling (ingress 6s / egress 6s, independent fallbacks
@@ -308,6 +344,7 @@ async fn udp_idle_session_recycled_and_slot_released() {
 /// path without panicking or wedging; the stack stays usable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_late_reply_after_recycle_does_not_wedge() {
+    let _serial = serial_lock().await;
     // The echo backend delays its first reply by 3s; both sides idle 1s → the
     // session is recycled before the reply arrives
     let (echo_addr, _echo) = spawn_udp_echo_first_delayed(Duration::from_secs(3)).await;
@@ -366,6 +403,7 @@ async fn udp_late_reply_after_recycle_does_not_wedge() {
 /// within-limit traffic passes fully.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_rate_limit_drops_burst() {
+    let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
@@ -427,6 +465,7 @@ async fn udp_rate_limit_drops_burst() {
 /// drops come from the rate limiter, not a data-plane defect).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_rate_limit_high_pps_all_pass() {
+    let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
     let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
@@ -480,6 +519,7 @@ async fn udp_rate_limit_high_pps_all_pass() {
 /// contact), UDP fails fast; once the egress re-registers, it self-heals.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_hub_eviction_then_recovery() {
+    let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
     let hub_port = pick_ephemeral_port();
     let security = HubSecurityConfig {

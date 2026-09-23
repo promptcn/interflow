@@ -34,12 +34,13 @@
 )]
 use crate::error::{InterflowError, Result};
 use crate::protocol::frame as wire;
-use crate::protocol::{FrameType, StreamProto};
+use crate::protocol::{
+    CircuitToken, CloseReason, FrameOrigin, FrameType, RouteToken, StreamId, StreamProto,
+};
 use crate::tunnel::negotiation::RegisterResponse;
-use crate::tunnel::transport::FrameSource;
 use crate::tunnel::transport::{TunnelData, TunnelDispatch, TunnelTransport};
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -70,13 +71,6 @@ pub struct QuicSessionParams {
     /// Local concurrent-stream limit the dispatch event channel is sized
     /// from (agent `max_incoming_streams`; 0 = the shared floor).
     pub incoming_streams_budget: usize,
-    /// Declares the e2e (inner TLS) capability in the Hello caps byte —
-    /// **observation only**: the hub uses it for fleet visibility
-    /// (`interflow_quic_agents_e2e_capable`), never as an input to any
-    /// downgrade/fallback decision (caps assertions come from the hub,
-    /// which is inside the threat model; RFC
-    /// docs/design/agent-e2e-encryption.md §3.6).
-    pub e2e_capable: bool,
 }
 
 impl QuicSessionParams {
@@ -87,7 +81,6 @@ impl QuicSessionParams {
         establish_timeout: crate::tunnel::agent::DEFAULT_REQUEST_ESTABLISH_TIMEOUT,
         transport: QuicEndpointParams::DEFAULT,
         incoming_streams_budget: 0,
-        e2e_capable: false,
     };
 }
 
@@ -134,70 +127,78 @@ const STATS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 /// Per-stream write-command channel capacity (backpressure threshold).
 const WRITE_CHANNEL_CAP: usize = 64;
 
-/// Capability bit in the first byte of the Hello/HelloAck payload: the QUIC DATAGRAM (RFC 9221) fast path.
-pub const CAP_DATAGRAM: u8 = 0x01;
-/// Capability bit in the first byte of the Hello payload: the agent runs
-/// with the e2e (inner TLS) layer configured (observation only — see
-/// [`QuicSessionParams::e2e_capable`]).
-pub const CAP_E2E: u8 = 0x02;
+/// Capability bit in the Hello/HelloAck caps word: the QUIC DATAGRAM
+/// (RFC 9221) fast path (shared table: `interflow_contract::caps`).
+pub const CAP_DATAGRAM: u32 = interflow_contract::caps::DATAGRAM;
 
 /// Budget for a whole frame carried in a DATAGRAM.
 ///
-/// QUIC initial MTU 1200 − worst-case frame header (13 fixed + 36 uuid +
-/// 128 agent id = 177). Datagrams over budget fall back to stream carriage
-/// (reliable and ordered; under mixed carriage, UDP semantics allow
-/// out-of-order arrival).
+/// QUIC initial MTU 1200 − the fixed 41-byte frame header leaves ample
+/// margin under the 1200-byte datagram ceiling. Datagrams over budget fall
+/// back to stream carriage (reliable and ordered; under mixed carriage, UDP
+/// semantics allow out-of-order arrival).
 pub const DATAGRAM_FRAME_BUDGET: usize = 1023;
 
-/// Hello payload encoding: `[caps u8]`. Authentication is exclusively the
-/// QUIC TLS handshake (client certificates); the frame carries no
-/// credential material.
-pub fn encode_hello_payload(caps: u8) -> Bytes {
-    let mut buf = BytesMut::with_capacity(1);
-    buf.extend_from_slice(&[caps]);
-    buf.freeze()
-}
-
-/// Hello payload decoding: returns caps.
-pub fn decode_hello_payload(payload: &[u8]) -> u8 {
-    payload.first().copied().unwrap_or(0)
-}
-
-/// HelloAck payload encoding: `[caps u8][capability JSON]`.
+/// Hello payload encoding: `[caps u32 BE][name_len u16][utf-8 name]`.
 ///
-/// The leading caps byte declares transport-level capabilities (e.g.
-/// DATAGRAM support); the JSON suffix is the hub's capability declaration —
-/// the same [`RegisterResponse`] schema the h2 register response body
-/// carries, so both transports advertise identical capabilities. The hub
-/// always emits the suffix (heartbeat-disabled hubs advertise `{}`).
-pub fn encode_helloack_payload(caps: u8, capability: &RegisterResponse) -> Result<Bytes> {
-    let json = serde_json::to_vec(capability).map_err(|e| {
-        InterflowError::protocol("failed to encode capability declaration").with_source(e)
-    })?;
-    let mut buf = BytesMut::with_capacity(1 + json.len());
-    buf.extend_from_slice(&[caps]);
-    buf.extend_from_slice(&json);
+/// `name` is the agent's intended semantic id (validated by the hub against
+/// the mTLS client-certificate CN — the intent declaration, not a
+/// credential); the frame carries no credential material.
+fn encode_hello_payload(caps: u32, agent_id: &str) -> Result<Bytes> {
+    if agent_id.len() > 128 {
+        return Err(InterflowError::protocol("agent id too long for Hello"));
+    }
+    let mut buf = BytesMut::with_capacity(4 + 2 + agent_id.len());
+    buf.put_u32(caps);
+    buf.put_u16(u16::try_from(agent_id.len()).unwrap_or(u16::MAX));
+    buf.put_slice(agent_id.as_bytes());
     Ok(buf.freeze())
 }
 
-/// HelloAck payload decoding: returns `(caps, declaration)`.
-///
-/// Hub and agent deploy as a versioned pair, so a payload without the JSON
-/// suffix (or an unparseable one) is a protocol violation, not a fallback
-/// trigger.
-pub fn decode_helloack_capability(payload: &[u8]) -> Result<(u8, RegisterResponse)> {
-    let Some((caps, suffix)) = payload.split_first() else {
-        return Err(InterflowError::protocol(
-            "hub HelloAck payload is empty (no caps byte)",
-        ));
-    };
-    if suffix.is_empty() {
-        return Err(InterflowError::protocol(
-            "hub HelloAck carries no capability declaration",
-        ));
+/// Hello payload decoding: returns `(caps, name)`. A malformed payload is a
+/// protocol violation (paired deployment — the hub fails the registration).
+pub fn decode_hello_payload(payload: &[u8]) -> Result<(u32, String)> {
+    let invalid = || InterflowError::protocol("Hello payload is malformed");
+    if payload.len() < 6 {
+        return Err(invalid());
     }
-    let declaration = RegisterResponse::parse(suffix)?;
-    Ok((*caps, declaration))
+    let caps = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let name_len = u16::from_be_bytes([payload[4], payload[5]]) as usize;
+    if payload.len() != 6 + name_len || name_len > 128 || name_len == 0 {
+        return Err(invalid());
+    }
+    let name = std::str::from_utf8(&payload[6..])
+        .map_err(|_| invalid())?
+        .to_owned();
+    Ok((caps, name))
+}
+
+/// RouteRequest payload encoding: `[name_len u16][utf-8 name]`.
+fn encode_route_request_payload(target: &str) -> Result<Bytes> {
+    if target.len() > 256 {
+        return Err(InterflowError::protocol("route target is too long"));
+    }
+    let mut buf = BytesMut::with_capacity(2 + target.len());
+    buf.put_u16(u16::try_from(target.len()).unwrap_or(u16::MAX));
+    buf.put_slice(target.as_bytes());
+    Ok(buf.freeze())
+}
+
+/// RouteAck payload decoding: `[granted u8][route token 16 B]`. `granted == 0`
+/// (zero token) means the lease was denied.
+fn decode_route_ack_payload(payload: &[u8]) -> Result<Option<RouteToken>> {
+    let invalid = || InterflowError::protocol("RouteAck payload is malformed");
+    if payload.len() != 1 + 16 {
+        return Err(invalid());
+    }
+    let granted = payload[0];
+    let mut token = [0u8; 16];
+    token.copy_from_slice(&payload[1..]);
+    let token = RouteToken::from_bytes(token);
+    if granted == 0 || token.is_zero() {
+        return Ok(None);
+    }
+    Ok(Some(token))
 }
 
 /// Write command: an ordinary frame, or a Close frame (FIN closes out after the write).
@@ -214,7 +215,7 @@ struct StreamHandle {
 
 /// The QUIC tunnel backend.
 pub struct QuicTunnel {
-    agent_id: String,
+    circuit: CircuitToken,
     /// The local endpoint (held to keep the connection alive; the QUIC connection's UDP socket hangs off the endpoint).
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
@@ -223,43 +224,35 @@ pub struct QuicTunnel {
     token: CancellationToken,
     dispatch: Arc<TunnelDispatch>,
     /// stream_id → write handle (one shared table for locally initiated and hub-initiated streams).
-    streams: Arc<StdMutex<HashMap<String, StreamHandle>>>,
+    streams: Arc<StdMutex<HashMap<StreamId, StreamHandle>>>,
     /// The negotiated DATAGRAM capability (true only if both this end and the hub support it).
     datagram_ok: bool,
     /// Streams whose OpenAck has been received (small Data packets on these streams take the DATAGRAM fast path).
-    datagram_streams: Arc<StdMutex<std::collections::HashSet<String>>>,
+    datagram_streams: Arc<StdMutex<std::collections::HashSet<StreamId>>>,
     /// The effective critical-task stall timeout (negotiated or pinned at
     /// connect) — session-level consumers (e.g. the agent's closed watcher)
     /// read it so every critical task in the session shares one budget.
     stall_timeout: Duration,
+    /// Semantic target → opaque route token, valid for this QUIC session only.
+    routes: StdMutex<HashMap<String, RouteToken>>,
 }
 
 /// Encodes a frame as `Bytes`.
 fn encode_frame_bytes(
     frame_type: FrameType,
     flags: u8,
-    stream_id: &str,
-    source_agent: &str,
+    stream_id: StreamId,
+    circuit: CircuitToken,
     payload: &[u8],
 ) -> Result<Bytes> {
-    let mut buf = BytesMut::with_capacity(wire::decoded_frame_len(
-        stream_id,
-        source_agent,
-        payload.len(),
-    ));
-    wire::encode_frame(
-        frame_type,
-        flags,
-        stream_id,
-        source_agent,
-        payload,
-        &mut buf,
-    )
-    .ok_or_else(|| {
-        InterflowError::protocol(format!(
-            "QUIC frame encoding failed (field too long): {stream_id}"
-        ))
-    })?;
+    let mut buf = BytesMut::with_capacity(wire::decoded_frame_len(payload.len()));
+    wire::encode_frame(frame_type, flags, stream_id, circuit, payload, &mut buf).ok_or_else(
+        || {
+            InterflowError::protocol(format!(
+                "QUIC frame encoding failed (contract violation): {stream_id}"
+            ))
+        },
+    )?;
     Ok(buf.freeze())
 }
 
@@ -292,6 +285,7 @@ async fn stream_write_loop(mut send: quinn::SendStream, mut rx: mpsc::Receiver<W
 async fn control_read_loop(
     mut rx: quinn::RecvStream,
     tx: mpsc::Sender<WriteCmd>,
+    circuit: CircuitToken,
     beat: Beat,
     beat_every: Duration,
 ) {
@@ -306,10 +300,13 @@ async fn control_read_loop(
         buf.extend_from_slice(&chunk[..n]);
         while let Some(frame) = TunnelDispatch::decode_tunnel_data(&mut buf) {
             if matches!(frame.stream_type, FrameType::Ping) {
-                let pong = encode_frame_bytes(FrameType::Pong, 0, "", frame.source.as_str(), b"");
-                if let Ok(pong) = pong
-                    && tx.send(WriteCmd::Frame(pong)).await.is_err()
-                {
+                // The Pong carries this agent's own circuit (Ping is
+                // hub-origin with the zero circuit; the reply re-identifies).
+                let Ok(pong) = encode_frame_bytes(FrameType::Pong, 0, StreamId::ZERO, circuit, b"")
+                else {
+                    return;
+                };
+                if tx.send(WriteCmd::Frame(pong)).await.is_err() {
                     return;
                 }
             }
@@ -326,8 +323,8 @@ async fn control_read_loop(
 async fn accept_loop(
     conn: quinn::Connection,
     dispatch: Arc<TunnelDispatch>,
-    streams: Arc<StdMutex<HashMap<String, StreamHandle>>>,
-    datagram_streams: Arc<StdMutex<std::collections::HashSet<String>>>,
+    streams: Arc<StdMutex<HashMap<StreamId, StreamHandle>>>,
+    datagram_streams: Arc<StdMutex<std::collections::HashSet<StreamId>>>,
     shutdown: CancellationToken,
     beat: Beat,
     beat_every: Duration,
@@ -374,8 +371,8 @@ async fn accept_loop(
             tokio::spawn(stream_write_loop(tx, wrx));
             let handle = StreamHandle { tx: wtx };
             let td = TunnelData {
-                stream_id: opened.stream_id.clone(),
-                source: FrameSource::parse(&opened.source_agent),
+                stream_id: opened.stream_id,
+                origin: FrameOrigin::from_parts(opened.flags, opened.circuit),
                 data: opened.payload,
                 stream_type: opened.frame_type,
                 flags: opened.flags,
@@ -406,7 +403,7 @@ async fn stream_read_loop(
     mut rx: quinn::RecvStream,
     mut buf: BytesMut,
     dispatch: Arc<TunnelDispatch>,
-    datagram_streams: Option<Arc<StdMutex<std::collections::HashSet<String>>>>,
+    datagram_streams: Option<Arc<StdMutex<std::collections::HashSet<StreamId>>>>,
 ) {
     let mut chunk = vec![0u8; 16 * 1024];
     // Intercept OpenAck (the hub confirming this stream may take the DATAGRAM fast path); other frames dispatch as usual
@@ -418,7 +415,7 @@ async fn stream_read_loop(
             {
                 set.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(td.stream_id.clone());
+                    .insert(td.stream_id);
                 continue;
             }
             deferred.push(td);
@@ -464,6 +461,81 @@ async fn datagram_read_loop(
 }
 
 impl QuicTunnel {
+    /// Resolves (and caches) one semantic target into a session-scoped route
+    /// token using a short-lived QUIC control stream.
+    async fn resolve_route(&self, target_agent: &str) -> Result<RouteToken> {
+        let cached = self
+            .routes
+            .lock()
+            .map_err(|_| InterflowError::protocol("route cache poisoned"))?
+            .get(target_agent)
+            .copied();
+        if let Some(route) = cached {
+            return Ok(route);
+        }
+        if target_agent.len() > 256 {
+            return Err(InterflowError::protocol("route target is too long"));
+        }
+        let request_id = crate::protocol::StreamId::random()?;
+        let (mut tx, mut rx) = self.conn.open_bi().await.map_err(|e| {
+            InterflowError::connection("QUIC route stream open failed".to_string()).with_source(e)
+        })?;
+        let request = encode_frame_bytes(
+            FrameType::RouteRequest,
+            0,
+            request_id,
+            CircuitToken::ZERO,
+            &encode_route_request_payload(target_agent)?,
+        )?;
+        tx.write_all(&request).await.map_err(|e| {
+            InterflowError::connection("QUIC route request write failed".to_string()).with_source(e)
+        })?;
+        let _ = tx.finish();
+
+        let response = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut buf = BytesMut::with_capacity(256);
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = rx
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|e| {
+                        InterflowError::connection("QUIC route response read failed".to_string())
+                            .with_source(e)
+                    })?
+                    .unwrap_or(0);
+                if n == 0 {
+                    return Err(InterflowError::connection(
+                        "QUIC route stream closed before RouteAck",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                match wire::decode_frame(&mut buf) {
+                    wire::DecodeOutcome::Ok(frame) => return Ok(frame),
+                    wire::DecodeOutcome::Error => {
+                        return Err(InterflowError::protocol(
+                            "invalid QUIC route response frame",
+                        ));
+                    }
+                    wire::DecodeOutcome::Pending | wire::DecodeOutcome::UnknownType { .. } => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| InterflowError::connection("QUIC route lease timed out"))??;
+        if response.frame_type != FrameType::RouteAck || response.stream_id != request_id {
+            return Err(InterflowError::protocol("unexpected QUIC route response"));
+        }
+        let Some(route) = decode_route_ack_payload(&response.payload)? else {
+            return Err(InterflowError::connection("route lease rejected"));
+        };
+        self.routes
+            .lock()
+            .map_err(|_| InterflowError::protocol("route cache poisoned"))?
+            .insert(target_agent.to_owned(), route);
+        Ok(route)
+    }
+
     /// Connects to the hub and completes Hello/HelloAck registration.
     ///
     /// `tls` is built by the caller (CA / mTLS client certificate / cert pin
@@ -501,26 +573,31 @@ impl QuicTunnel {
 
         let quic_tls =
             quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).map_err(|e| {
-                InterflowError::config(format!("invalid QUIC client TLS configuration: {e}"))
+                InterflowError::config("invalid QUIC client TLS configuration".to_string())
+                    .with_source(e)
             })?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
         client_config.transport_config(Arc::new(transport));
 
         let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().map_err(|e| {
-            InterflowError::connection(format!("QUIC local endpoint bind failed: {e}"))
+            InterflowError::connection("QUIC local endpoint bind failed".to_string()).with_source(e)
         })?)
         .map_err(|e| {
-            InterflowError::connection(format!("QUIC local endpoint creation failed: {e}"))
+            InterflowError::connection("QUIC local endpoint creation failed".to_string())
+                .with_source(e)
         })?;
         endpoint.set_default_client_config(client_config);
 
         let conn = endpoint
             .connect(server_addr, server_name)
             .map_err(|e| {
-                InterflowError::connection(format!("QUIC connection initiation failed: {e}"))
+                InterflowError::connection("QUIC connection initiation failed".to_string())
+                    .with_source(e)
             })?
             .await
-            .map_err(|e| InterflowError::connection(format!("QUIC handshake failed: {e}")))?;
+            .map_err(|e| {
+                InterflowError::connection("QUIC handshake failed".to_string()).with_source(e)
+            })?;
 
         // Control stream: open_bi → write Hello directly → await HelloAck.
         //
@@ -529,21 +606,20 @@ impl QuicTunnel {
         // (plus the caller's overall connect timeout) — the establishment
         // phase needs no stall heartbeat of its own.
         let (mut control_tx, mut control_rx) = conn.open_bi().await.map_err(|e| {
-            InterflowError::connection(format!("QUIC control stream open failed: {e}"))
+            InterflowError::connection("QUIC control stream open failed".to_string()).with_source(e)
         })?;
 
-        let hello_caps = CAP_DATAGRAM | (u8::from(params.e2e_capable) * CAP_E2E);
+        let hello_caps = CAP_DATAGRAM;
         let hello = encode_frame_bytes(
             FrameType::Hello,
             0,
-            "",
-            &agent_id,
-            &encode_hello_payload(hello_caps),
+            StreamId::ZERO,
+            CircuitToken::ZERO,
+            &encode_hello_payload(hello_caps, &agent_id)?,
         )?;
-        control_tx
-            .write_all(&hello)
-            .await
-            .map_err(|e| InterflowError::connection(format!("QUIC Hello write failed: {e}")))?;
+        control_tx.write_all(&hello).await.map_err(|e| {
+            InterflowError::connection("QUIC Hello write failed".to_string()).with_source(e)
+        })?;
 
         // Await HelloAck (the hub sends an Error frame and closes the
         // connection on validation failure)
@@ -554,7 +630,10 @@ impl QuicTunnel {
                 let n = control_rx
                     .read(&mut chunk)
                     .await
-                    .map_err(|e| InterflowError::connection(format!("HelloAck read failed: {e}")))?
+                    .map_err(|e| {
+                        InterflowError::connection("HelloAck read failed".to_string())
+                            .with_source(e)
+                    })?
                     .unwrap_or(0);
                 if n == 0 {
                     return Err(InterflowError::connection(
@@ -581,13 +660,15 @@ impl QuicTunnel {
             ))
         })??;
 
-        // Capability negotiation: `[caps][JSON]`.
+        // Capability negotiation: the binary HelloAck payload (caps word +
+        // registration; see RegisterResponse::parse_wire).
         let (hub_caps, declaration) = match ack_frame.frame_type {
-            FrameType::HelloAck => decode_helloack_capability(&ack_frame.payload)?,
+            FrameType::HelloAck => RegisterResponse::parse_wire(&ack_frame.payload)?,
             FrameType::Error => {
                 return Err(InterflowError::connection(format!(
-                    "hub rejected registration: {}",
-                    String::from_utf8_lossy(&ack_frame.payload)
+                    "hub rejected registration: {:#06x} {}",
+                    error_code_of(&ack_frame.payload),
+                    error_text_of(&ack_frame.payload)
                 )));
             }
             other => {
@@ -624,9 +705,9 @@ impl QuicTunnel {
         let dispatch = Arc::new(TunnelDispatch::with_stream_limit(
             params.incoming_streams_budget,
         ));
-        let streams: Arc<StdMutex<HashMap<String, StreamHandle>>> =
+        let streams: Arc<StdMutex<HashMap<StreamId, StreamHandle>>> =
             Arc::new(StdMutex::new(HashMap::new()));
-        let datagram_streams: Arc<StdMutex<std::collections::HashSet<String>>> =
+        let datagram_streams: Arc<StdMutex<std::collections::HashSet<StreamId>>> =
             Arc::new(StdMutex::new(std::collections::HashSet::new()));
 
         // Control-stream read loop: Ping → Pong (the Pong goes through the
@@ -644,7 +725,7 @@ impl QuicTunnel {
                     crate::fault::trigger(crate::fault::FaultPoint::QuicControlReadLoop);
                     tokio::select! {
                         () = shutdown_control.cancelled() => {}
-                        () = control_read_loop(control_rx, pong_tx, beat, beat_every) => {}
+                        () = control_read_loop(control_rx, pong_tx, declaration.circuit_token, beat, beat_every) => {}
                     }
                 },
             );
@@ -719,7 +800,7 @@ impl QuicTunnel {
         }
 
         Ok(Self {
-            agent_id,
+            circuit: declaration.circuit_token,
             endpoint,
             conn,
             token: shutdown,
@@ -728,6 +809,7 @@ impl QuicTunnel {
             datagram_ok,
             datagram_streams,
             stall_timeout: task_stall_timeout,
+            routes: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -738,11 +820,11 @@ impl QuicTunnel {
         self.stall_timeout
     }
 
-    fn lookup_handle(&self, stream_id: &str) -> Option<StreamHandle> {
+    fn lookup_handle(&self, stream_id: StreamId) -> Option<StreamHandle> {
         self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(stream_id)
+            .get(&stream_id)
             .cloned()
     }
 
@@ -756,10 +838,12 @@ impl QuicTunnel {
         self.conn.closed().await;
     }
 
-    /// Writes one frame on the stream (request/response directions are equivalent under QUIC: the same bidirectional stream).
+    /// Writes one frame on the stream (agent-origin; the hub derives response
+    /// direction from the relay-stream side under QUIC — both directions ride
+    /// the same bidirectional stream).
     async fn send_frame_on(
         &self,
-        stream_id: &str,
+        stream_id: StreamId,
         frame_type: FrameType,
         flags: u8,
         payload: &[u8],
@@ -767,12 +851,24 @@ impl QuicTunnel {
         let handle = self
             .lookup_handle(stream_id)
             .ok_or_else(|| InterflowError::stream(format!("QUIC stream not found: {stream_id}")))?;
-        let buf = encode_frame_bytes(frame_type, flags, stream_id, &self.agent_id, payload)?;
+        let buf = encode_frame_bytes(frame_type, flags, stream_id, self.circuit, payload)?;
         handle.tx.send(WriteCmd::Frame(buf)).await.map_err(|_| {
             InterflowError::stream(format!("QUIC stream write task exited: {stream_id}"))
         })?;
         Ok(())
     }
+}
+
+/// Error frame payload helpers: `[code u16][utf-8 text]`.
+const fn error_code_of(payload: &[u8]) -> u16 {
+    if payload.len() < 2 {
+        return 0;
+    }
+    u16::from_be_bytes([payload[0], payload[1]])
+}
+
+fn error_text_of(payload: &[u8]) -> String {
+    String::from_utf8_lossy(&payload[2.min(payload.len())..]).to_string()
 }
 
 /// Control-stream forwarding write task (lands mpsc commands on the control-stream SendStream).
@@ -815,24 +911,21 @@ async fn control_write_forward(
 impl TunnelTransport for QuicTunnel {
     async fn send_open_with(
         &self,
-        stream_id: &str,
+        stream_id: StreamId,
         target_agent: &str,
-        target_addr: Option<&str>,
         proto: StreamProto,
         e2e: bool,
     ) -> Result<()> {
-        let (tx, rx) = self
-            .conn
-            .open_bi()
-            .await
-            .map_err(|e| InterflowError::connection(format!("QUIC stream open failed: {e}")))?;
+        let (tx, rx) = self.conn.open_bi().await.map_err(|e| {
+            InterflowError::connection("QUIC stream open failed".to_string()).with_source(e)
+        })?;
 
         let (wtx, wrx) = mpsc::channel(WRITE_CHANNEL_CAP);
         tokio::spawn(stream_write_loop(tx, wrx));
         self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(stream_id.to_string(), StreamHandle { tx: wtx });
+            .insert(stream_id, StreamHandle { tx: wtx });
 
         // Read loop (return-path frames on this stream → dispatch; the
         // ingress role hits via the response-direction dedicated channel)
@@ -850,38 +943,37 @@ impl TunnelTransport for QuicTunnel {
             }
         });
 
-        // Open frame: payload = "{target_agent}:{target_addr}" (the hub
-        // parses the target and dynamic address; the initiator's identity is
-        // bound by connection registration, and the in-frame source_agent is
-        // only a redundant check)
-        let payload = format!("{target_agent}:{}", target_addr.unwrap_or(""));
-        let flags = proto.as_flag() | if e2e { crate::protocol::FLAG_E2E } else { 0 };
-        self.send_frame_on(stream_id, FrameType::Open, flags, payload.as_bytes())
+        // The payload is the raw 16-byte route token (the data plane stays
+        // opaque; the transport resolves the local semantic target through
+        // the control-plane route lease first).
+        let route = self.resolve_route(target_agent).await?;
+        let flags = proto.as_flag() | (u8::from(e2e) * crate::protocol::FLAG_E2E);
+        self.send_frame_on(stream_id, FrameType::Open, flags, &route.to_bytes())
             .await
     }
 
-    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    async fn send_data(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         self.send_data_smart(stream_id, data).await
     }
 
-    async fn send_data_response(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    async fn send_data_response(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         // QUIC bidirectional streams have no direction concept: responses are written on the same stream
         self.send_data_smart(stream_id, data).await
     }
 
-    async fn send_close(&self, stream_id: &str) -> Result<()> {
-        self.close_stream(stream_id, "").await
+    async fn send_close(&self, stream_id: StreamId) -> Result<()> {
+        self.close_stream(stream_id, CloseReason::CloseFrame).await
     }
 
-    async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()> {
+    async fn send_close_response(&self, stream_id: StreamId, reason: CloseReason) -> Result<()> {
         self.close_stream(stream_id, reason).await
     }
 
-    async fn register_stream(&self, stream_id: String) -> mpsc::Receiver<TunnelData> {
+    async fn register_stream(&self, stream_id: StreamId) -> mpsc::Receiver<TunnelData> {
         self.dispatch.register_stream(stream_id).await
     }
 
-    async fn unregister_stream(&self, stream_id: &str) {
+    async fn unregister_stream(&self, stream_id: StreamId) {
         self.dispatch.unregister_stream(stream_id).await;
     }
 
@@ -891,7 +983,7 @@ impl TunnelTransport for QuicTunnel {
         self.dispatch.take_incoming_streams()
     }
 
-    async fn unregister_incoming_stream(&self, stream_id: &str) {
+    async fn unregister_incoming_stream(&self, stream_id: StreamId) {
         self.dispatch.unregister_incoming_stream(stream_id).await;
         // Request-direction forwarder exiting: synchronously release the
         // stream's QUIC write resources — remove the streams table entry
@@ -903,11 +995,11 @@ impl TunnelTransport for QuicTunnel {
         self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(stream_id);
+            .remove(&stream_id);
         self.datagram_streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(stream_id);
+            .remove(&stream_id);
     }
 
     /// Termination contract: cancel the token (stop the read loops) → CONNECTION_CLOSE (all quinn streams
@@ -953,46 +1045,45 @@ impl QuicTunnel {
     /// otherwise fall back to stream carriage. Control frames such as
     /// Open/Close always ride a stream (reliable ordering is a hard
     /// prerequisite for session establishment).
-    async fn send_data_smart(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    async fn send_data_smart(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         if self.datagram_ok
             && data.len() <= DATAGRAM_FRAME_BUDGET
             && self
                 .datagram_streams
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(stream_id)
+                .contains(&stream_id)
         {
-            let frame = encode_frame_bytes(FrameType::Data, 0, stream_id, &self.agent_id, &data)?;
+            let frame = encode_frame_bytes(FrameType::Data, 0, stream_id, self.circuit, &data)?;
             return self.conn.send_datagram(frame).map_err(|e| {
-                InterflowError::connection(format!("QUIC DATAGRAM send failed: {e}"))
+                InterflowError::connection("QUIC DATAGRAM send failed".to_string()).with_source(e)
             });
         }
         self.send_frame_on(stream_id, FrameType::Data, 0, &data)
             .await
     }
 
-    /// Closes the stream: writes the Close frame (payload = `reason`, a
-    /// short machine token; empty = ordinary close) + FIN and removes the
-    /// handle (idempotent).
-    async fn close_stream(&self, stream_id: &str, reason: &str) -> Result<()> {
+    /// Closes the stream: writes the Close frame (payload = the u8 reason
+    /// code) + FIN and removes the handle (idempotent).
+    async fn close_stream(&self, stream_id: StreamId, reason: CloseReason) -> Result<()> {
         let Some(handle) = self
             .streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(stream_id)
+            .remove(&stream_id)
         else {
             return Ok(());
         };
         self.datagram_streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(stream_id);
+            .remove(&stream_id);
         let buf = encode_frame_bytes(
             FrameType::Close,
             0,
             stream_id,
-            &self.agent_id,
-            reason.as_bytes(),
+            self.circuit,
+            &[reason.as_code()],
         )?;
         // The write task FINs automatically after receiving the CloseFrame
         let _ = handle.tx.send(WriteCmd::CloseFrame(buf)).await;
@@ -1004,46 +1095,86 @@ impl QuicTunnel {
 #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::protocol::CircuitToken;
     use crate::tunnel::negotiation::HeartbeatAd;
 
-    /// The HelloAck payload round-trip: caps byte preserved verbatim at
-    /// byte 0, the JSON suffix parses, and the stall derivation rides the
-    /// advertised cadence (75s dead line, not the 30s fallback).
+    /// The Hello payload is the caps word + the length-prefixed intended
+    /// id; malformed shapes are protocol violations.
     #[test]
-    fn helloack_capability_payload_round_trip() {
-        let capability = RegisterResponse {
-            heartbeat: Some(HeartbeatAd {
-                interval_secs: 15,
-                max_missed: 4,
-            }),
-        };
-
-        let payload = encode_helloack_payload(CAP_DATAGRAM, &capability).unwrap();
-        assert_eq!(payload[0], CAP_DATAGRAM, "caps byte must stay byte 0");
-        let (caps, declaration) = decode_helloack_capability(&payload).unwrap();
+    fn hello_payload_is_caps_plus_name() {
+        let payload = encode_hello_payload(CAP_DATAGRAM, "edge-1").unwrap();
+        assert_eq!(payload.len(), 4 + 2 + 6);
+        assert_eq!(&payload[..2], &[0, 0][..]);
+        let (caps, name) = decode_hello_payload(&payload).unwrap();
         assert_eq!(caps, CAP_DATAGRAM);
-        assert_eq!(declaration.heartbeat, capability.heartbeat);
-        assert_eq!(declaration.task_stall_timeout(), Duration::from_secs(75));
+        assert_eq!(name, "edge-1");
+        assert!(decode_hello_payload(&[]).is_err());
+        assert!(decode_hello_payload(&[0, 0, 1]).is_err());
+        // Length prefix must cover exactly the rest.
+        let mut b = payload.to_vec();
+        b[5] = 7;
+        assert!(decode_hello_payload(&b).is_err());
+        assert!(encode_hello_payload(0, &"x".repeat(129)).is_err());
     }
 
-    /// Paired deployment: a payload without a parseable declaration is a
-    /// protocol violation (bare caps byte / empty / garbage suffix).
+    /// RouteRequest/RouteAck payload round trip: name with length prefix,
+    /// granted/denied shapes, malformed rejections.
     #[test]
-    fn helloack_without_declaration_is_a_protocol_error() {
-        assert!(decode_helloack_capability(&[CAP_DATAGRAM]).is_err());
-        assert!(decode_helloack_capability(&[]).is_err());
-        assert!(decode_helloack_capability(&[0x01, b'{', b'!']).is_err());
+    fn route_payloads_round_trip() {
+        let payload = encode_route_request_payload("lan-b/egress-1").unwrap();
+        assert_eq!(payload[..2], [0, 14][..]); // "lan-b/egress-1".len()
+        let name = String::from_utf8(payload[2..].to_vec()).unwrap();
+        assert_eq!(name, "lan-b/egress-1");
+        assert!(encode_route_request_payload(&"x".repeat(257)).is_err());
+
+        let route = RouteToken::random().unwrap();
+        let mut ack = BytesMut::new();
+        ack.put_u8(1);
+        ack.put_slice(&route.to_bytes());
+        let ack: Bytes = ack.freeze();
+        assert_eq!(decode_route_ack_payload(&ack).unwrap(), Some(route));
+        // Denied: granted=0 with a zero token.
+        let denied = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(decode_route_ack_payload(&denied).unwrap(), None);
+        // Malformed shapes.
+        assert!(decode_route_ack_payload(&[]).is_err());
+        assert!(decode_route_ack_payload(&[1, 0]).is_err());
+        assert!(decode_route_ack_payload(&ack[..16]).is_err()); // one byte short
     }
 
-    /// A heartbeat-disabled hub advertises `{}` — the suffix is always
-    /// present, the derivations fall back.
+    /// The Hello frame satisfies the type × field contract (zero ids, no
+    /// origin flags) and the Pong frame carries the sender circuit.
     #[test]
-    fn helloack_heartbeat_disabled_advertises_empty_object() {
-        let capability = RegisterResponse::default();
-        let payload = encode_helloack_payload(0, &capability).unwrap();
-        let (caps, declaration) = decode_helloack_capability(&payload).unwrap();
-        assert_eq!(caps, 0);
-        assert_eq!(declaration.heartbeat, None);
-        assert_eq!(declaration.task_stall_timeout(), Duration::from_secs(30));
+    fn hello_and_pong_frames_satisfy_the_contract() {
+        let hello = encode_frame_bytes(
+            FrameType::Hello,
+            0,
+            StreamId::ZERO,
+            CircuitToken::ZERO,
+            &encode_hello_payload(CAP_DATAGRAM, "edge-1").unwrap(),
+        )
+        .unwrap();
+        let mut rx = BytesMut::from(&hello[..]);
+        let wire::DecodeOutcome::Ok(f) = wire::decode_frame(&mut rx) else {
+            panic!("hello must decode");
+        };
+        assert_eq!(f.frame_type, FrameType::Hello);
+        assert!(f.stream_id.is_zero() && f.circuit.is_zero());
+
+        let circuit = CircuitToken::from_hex("12078a05e14f4e2c99b1679be1df7c30").unwrap();
+        let pong = encode_frame_bytes(FrameType::Pong, 0, StreamId::ZERO, circuit, b"").unwrap();
+        let mut rx = BytesMut::from(&pong[..]);
+        let wire::DecodeOutcome::Ok(f) = wire::decode_frame(&mut rx) else {
+            panic!("pong must decode");
+        };
+        assert_eq!(f.frame_type, FrameType::Pong);
+        assert_eq!(f.circuit, circuit);
+        assert!(f.stream_id.is_zero());
+
+        // HeartbeatAd is still referenced by the negotiation derivations.
+        let _ = HeartbeatAd {
+            interval_secs: 1,
+            max_missed: 0,
+        };
     }
 }

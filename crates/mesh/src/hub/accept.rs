@@ -1,7 +1,7 @@
 //! Accept loop: PROXY negotiation → mTLS handshake → tenant identity
 //! derivation → dispatch to hyper HTTP/2 services.
 //!
-//! Per-connection pipeline (RFC docs/design/multi-tenant-mtls-only.md §5):
+//! Per-connection pipeline (RFC (internal design notes) §5):
 //! 1. PROXY protocol v2 negotiation under the fail-closed trust matrix —
 //!    the effective client IP restored here keys rate limiting, connection
 //!    caps and audit (never identity or ACL decisions)
@@ -14,78 +14,26 @@
 //!    [`PeerIdentity`]
 
 use crate::hub::service::HubService;
-use crate::hub::state::{
-    ActiveStream, PeerIdentity, SharedAgents, SharedHubConfig, SharedStreamCounts, SharedTlsPlane,
-};
+use crate::hub::state::{HubState, PeerIdentity};
 use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use interflow_core::error::Result;
+use interflow_core::security::AuditKind;
 use interflow_core::security::proxy_protocol::{
     PrefixedStream, ProxyError, ProxyOutcome, ProxyProtocolPolicy,
 };
-use interflow_core::security::{AuditKind, AuditSink, AuthRateLimiter, ConnTracker};
 use interflow_core::tls::extract_cn_from_chain;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 /// PROXY-preamble read budget: the same slow-loris discipline as the edge's
 /// host-peek phase.
 const PROXY_BUDGET: Duration = Duration::from_secs(10);
-
-/// Shared state for a single inbound TCP connection.
-///
-/// Each `accept` assembles a fresh [`HubService`] from these fields; identity
-/// binding is per-connection.
-#[derive(Clone)]
-pub(crate) struct AcceptContext {
-    pub(crate) agents: SharedAgents,
-
-    pub(crate) config: SharedHubConfig,
-    pub(crate) active_streams: Arc<RwLock<HashMap<String, ActiveStream>>>,
-    pub(crate) tls_plane: SharedTlsPlane,
-    pub(crate) limits: crate::hub::state::HubLimits,
-    pub(crate) rate_limiter: Option<Arc<AuthRateLimiter>>,
-    pub(crate) stream_counts: SharedStreamCounts,
-    pub(crate) audit: AuditSink,
-    pub(crate) conn_tracker: Arc<ConnTracker>,
-    /// Hub background task group: connection-level tasks are attached here so
-    /// shutdown drain waits for all of them to close out.
-    pub(crate) tasks: TaskTracker,
-    /// Hub shutdown signal: once triggered, connections enter graceful
-    /// GOAWAY close-out.
-    pub(crate) shutdown: CancellationToken,
-}
-
-impl AcceptContext {
-    /// Derives the core state for stream routing (shared by QUIC relay / h2 routing).
-    pub(crate) fn core(&self) -> crate::hub::state::HubCore {
-        crate::hub::state::HubCore {
-            agents: self.agents.clone(),
-            active_streams: self.active_streams.clone(),
-            stream_counts: self.stream_counts.clone(),
-            channel_send_timeout_secs: self.limits.channel_send_timeout_secs.clone(),
-        }
-    }
-
-    /// Handles needed by the eviction primitive (same shape as `HubService::handles`).
-    pub(crate) fn handles(&self) -> crate::hub::state::HubHandles {
-        crate::hub::state::HubHandles {
-            agents: self.agents.clone(),
-            active_streams: self.active_streams.clone(),
-            stream_counts: self.stream_counts.clone(),
-            audit: self.audit.clone(),
-            config: self.config.clone(),
-            poll_grace_secs: self.limits.poll_grace_secs.clone(),
-        }
-    }
-}
 
 /// Handles a new TCP connection: PROXY negotiation → resource gating on the
 /// effective IP → mTLS handshake → tenant identity derivation → h2 service.
@@ -96,13 +44,13 @@ impl AcceptContext {
 /// `Identity mismatch` path rejects it. A chain no tenant claims (only
 /// reachable in a hot-reload window) is rejected fail-closed.
 pub(crate) async fn handle_connection(
-    ctx: AcceptContext,
+    state: std::sync::Arc<HubState>,
     stream: TcpStream,
     addr: SocketAddr,
 ) -> Result<()> {
     // 1. PROXY protocol negotiation (budgeted).
     let policy = {
-        let cfg = ctx.config.read().await;
+        let cfg = state.config.read().await;
         Arc::new(ProxyProtocolPolicy::from_config(
             &cfg.server.proxy_protocol,
         )?)
@@ -121,10 +69,11 @@ pub(crate) async fn handle_connection(
                     ProxyError::Io(_) => "proxy_read_error",
                 };
                 warn!("PROXY protocol negotiation rejected ({reason}): peer={addr}");
-                ctx.audit.record(
+                state.audit.record(
                     AuditKind::StreamDenied {
                         stream_id: String::new(),
-                        source: addr.ip().to_string(),
+                        source_circuit: String::new(),
+                        source_ip: None,
                         reason: reason.to_string(),
                     },
                     None,
@@ -141,14 +90,15 @@ pub(crate) async fn handle_connection(
 
     // 2. Resource gating on the effective IP (per-IP new-conn rate +
     // concurrency caps; behind nginx these key on the real client, not 127.0.0.1).
-    if let Some(limiter) = &ctx.rate_limiter
+    if let Some(limiter) = &state.rate_limiter
         && !limiter.check(effective_ip)
     {
         metrics::counter!("interflow_hub_conn_rate_limited").increment(1);
-        ctx.audit.record(
+        state.audit.record(
             AuditKind::StreamDenied {
                 stream_id: String::new(),
-                source: effective_ip.to_string(),
+                source_circuit: String::new(),
+                source_ip: None,
                 reason: "rate_limited".into(),
             },
             None,
@@ -157,9 +107,9 @@ pub(crate) async fn handle_connection(
         debug!("connection denied (rate limited): effective={effective_ip} peer={addr}");
         return Ok(());
     }
-    let Some(guard) = ctx.conn_tracker.try_acquire(effective_ip) else {
+    let Some(guard) = state.conn_tracker.try_acquire(effective_ip) else {
         metrics::counter!("interflow_hub_conn_rejected").increment(1);
-        ctx.audit.record(
+        state.audit.record(
             AuditKind::ConnLimitExceeded {
                 peer_ip: effective_ip.to_string(),
                 scope: "conn_limit".into(),
@@ -173,7 +123,7 @@ pub(crate) async fn handle_connection(
 
     // 3. mTLS handshake via the plane snapshot (acceptor + verifier from the
     // same configuration generation).
-    let plane = ctx
+    let plane = state
         .tls_plane
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -188,8 +138,32 @@ pub(crate) async fn handle_connection(
         }
     };
 
+    serve_established(state, tls_stream, addr, effective_ip).await?;
+    drop(guard);
+    Ok(())
+}
+
+/// Steps 4-5 of the accept pipeline on a connection whose mTLS handshake
+/// already completed: tenant identity derivation, then the h2 service.
+///
+/// Shared by the TCP accept loop (which owns PROXY negotiation, gating and
+/// the handshake) and dispatched connections whose handshake a fronting
+/// listener completed with this plane's configuration — same identity and
+/// admission semantics either way.
+pub(crate) async fn serve_established<S>(
+    state: std::sync::Arc<HubState>,
+    tls_stream: tokio_rustls::server::TlsStream<S>,
+    addr: SocketAddr,
+    effective_ip: std::net::IpAddr,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let _ = &state;
     // 4. Tenant identity derivation: which tenant's root anchors the chain.
     let connection_identity: Arc<RwLock<Option<PeerIdentity>>> = Arc::new(RwLock::new(None));
+    let connection_circuit: Arc<RwLock<Option<interflow_core::protocol::CircuitToken>>> =
+        Arc::new(RwLock::new(None));
     {
         let (_, server_conn) = tls_stream.get_ref();
         let Some(certs) = server_conn.peer_certificates() else {
@@ -200,14 +174,21 @@ pub(crate) async fn handle_connection(
                 .increment(1);
             return Ok(());
         };
-        let derived = plane.verifier.derive(certs);
+        // Per-connection plane snapshot (same generation discipline as the
+        // accept loop; dispatched connections read the live plane too).
+        let verifier = state
+            .tls_plane
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let derived = verifier.verifier.derive(certs);
         let Some(tenant_ident) = derived else {
             warn!(
                 "client chain claimed by no tenant (hot-reload window?) — rejecting (peer={addr})"
             );
             metrics::counter!("interflow_hub_auth_failures", "reason" => "tenant_unclaimed")
                 .increment(1);
-            ctx.audit.record(
+            state.audit.record(
                 AuditKind::AgentRegisterDenied {
                     reason: "tenant_unclaimed".into(),
                 },
@@ -218,8 +199,8 @@ pub(crate) async fn handle_connection(
         };
         if let Some(cn) = extract_cn_from_chain(certs) {
             debug!(
-                "mTLS identity derived: tenant={} agent={cn} gateway={}",
-                tenant_ident.tenant, tenant_ident.trusted_gateway
+                "mTLS identity derived and bound to this connection (gateway={})",
+                tenant_ident.trusted_gateway
             );
             *connection_identity.write().await = Some(PeerIdentity {
                 tenant: tenant_ident.tenant,
@@ -235,22 +216,36 @@ pub(crate) async fn handle_connection(
 
     // Per-connection snapshot of the transport tuning (hot-reload friendly:
     // a SIGHUP applies to connections accepted afterwards).
-    let h2_transport = ctx.config.read().await.transport.h2.clone();
-    let shutdown = ctx.shutdown.clone();
+    let h2_transport = state.config.read().await.transport.h2.clone();
+    let shutdown = state.shutdown.clone();
+    let cleanup_state = state.clone();
+    let cleanup_circuit = connection_circuit.clone();
 
     let conn = h2_builder(&h2_transport).serve_connection(
         TokioIo::new(tls_stream),
-        HubService::new(ctx, addr, effective_ip, connection_identity),
+        HubService::new(
+            state,
+            addr,
+            effective_ip,
+            connection_identity,
+            connection_circuit,
+        ),
     );
     serve_h2(conn, shutdown, addr, true).await;
-    drop(guard);
+    let finished_circuit = *cleanup_circuit.read().await;
+    if let Some(circuit) = finished_circuit {
+        cleanup_state
+            .route_leases
+            .write()
+            .await
+            .retain(|_, (lease_circuit, _, _)| *lease_circuit != circuit);
+    }
     Ok(())
 }
 
 /// Common parameters for serving an h2 connection (shared by the TLS/plain
 /// branches). The keepalive pair comes from `[transport.h2]` — the same
-/// schema and defaults the agent side uses (endpoint-symmetric since schema
-/// v3; previously hard-coded and asymmetric, 10s/20s here vs 5s/10s there).
+/// shape and defaults the agent side uses.
 fn h2_builder(transport: &crate::config::H2TransportConfig) -> http2::Builder<TokioExecutor> {
     let mut builder = http2::Builder::new(TokioExecutor::new());
     builder

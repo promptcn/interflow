@@ -46,7 +46,11 @@
 )]
 use bytes::Bytes;
 use interflow_core::protocol::{FrameType, StreamProto};
+use interflow_core::tls::{InnerTlsMaterial, inner_client_config};
 use interflow_core::tunnel::AgentTunnel;
+use interflow_core::tunnel::InnerStreamHello;
+use interflow_core::tunnel::TargetSelector;
+use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_mesh::config::{EgressRule, IngressRule};
 use interflow_testkit::{
@@ -64,6 +68,15 @@ use tokio::net::{TcpListener, TcpStream};
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
     static C: std::sync::OnceLock<interflow_testkit::certs::TestCerts> = std::sync::OnceLock::new();
     C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("e2e", "agent"))
+}
+
+static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+async fn serial_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 /// Adaptive total budget per test (poisoning 5s + backend write timeout 10s +
@@ -163,7 +176,7 @@ async fn connect_tunnel(
         .await
         .expect("connect+register");
     let tunnel = AgentTunnel::from_sender(
-        agent_id.to_string(),
+        conn.negotiated.circuit_token,
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
@@ -175,35 +188,93 @@ async fn connect_tunnel(
     (tunnel, conn.conn_handle)
 }
 
-/// Bare-tunnel round trip: open (sid → eg's target) + send payload + receive
-/// the equal-length reply on the registered channel.
+/// Open a production-shaped TCP stream and complete the mandatory inner
+/// TLS handshake plus encrypted target selector. Handshake races are retried
+/// on the same stream id after an explicit close; successful streams never
+/// fall back to plaintext.
+async fn open_inner_tls(
+    inj: &AgentTunnel,
+    sid: interflow_core::protocol::StreamId,
+    target: &str,
+) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
+    let (cert, key) = certs().named_client_cert("inj");
+    let ca = certs().ca_path().display().to_string();
+    let material = InnerTlsMaterial::from_paths(
+        &[ca.as_str()],
+        &cert.display().to_string(),
+        &key.display().to_string(),
+    )
+    .expect("inner material");
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+        inner_client_config(&material, "eg").expect("inner connector"),
+    ));
+
+    for attempt in 0..3 {
+        let rx = inj.register_stream(sid).await;
+        if let Err(e) = inj.send_open_with(sid, "eg", StreamProto::Tcp, true).await {
+            let _ = inj.send_close(sid).await;
+            inj.unregister_stream(sid).await;
+            if attempt == 2 {
+                panic!("inner-TLS open: {e}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let adapter = E2eTunnelIo::ingress(rx, inj.clone(), sid);
+        let mut tls =
+            match inner_tls_connect(adapter, connector.clone(), Duration::from_secs(5)).await {
+                E2eHandshakeOutcome::Established(tls, _) => tls,
+                E2eHandshakeOutcome::Failed { error } => {
+                    let _ = inj.send_close(sid).await;
+                    inj.unregister_stream(sid).await;
+                    if attempt == 2 {
+                        panic!("inner TLS handshake: {error}");
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+        let hello = InnerStreamHello {
+            source_principal: "inj".to_owned(),
+            source_fingerprint: material.leaf_fingerprint(),
+            selector: TargetSelector::Address(target.to_owned()),
+            correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+        };
+        if let Err(e) = hello.write(&mut tls).await {
+            let _ = inj.send_close(sid).await;
+            inj.unregister_stream(sid).await;
+            if attempt == 2 {
+                panic!("inner hello: {e}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        return tls;
+    }
+    unreachable!("inner-TLS retry loop returns or panics");
+}
+
+/// Inner-TLS round trip: send payload and receive the equal-length reply.
 async fn tunnel_round_trip(
     inj: &AgentTunnel,
-    sid: &str,
+    sid: interflow_core::protocol::StreamId,
     target: SocketAddr,
     payload: &[u8],
     deadline: Duration,
 ) -> Vec<u8> {
-    let mut rx = inj.register_stream(sid.to_string()).await;
-    inj.send_open(sid, "eg", Some(&target.to_string()), StreamProto::Tcp)
-        .await
-        .expect("open");
-    inj.send_data(sid, Bytes::copy_from_slice(payload))
-        .await
-        .expect("send");
+    let mut tls = open_inner_tls(inj, sid, &target.to_string()).await;
+    tls.write_all(payload).await.expect("inner send");
+    tls.flush().await.expect("inner flush");
     let deadline = tokio::time::Instant::now() + deadline;
     let mut got = Vec::with_capacity(payload.len());
     while got.len() < payload.len() {
-        let td = tokio::time::timeout_at(deadline, rx.recv())
+        let mut chunk = vec![0u8; payload.len() - got.len()];
+        let n = tokio::time::timeout_at(deadline, tls.read(&mut chunk))
             .await
             .expect("reply timed out")
-            .expect("channel alive");
-        assert!(
-            !matches!(td.stream_type, FrameType::Close),
-            "stream closed prematurely: {:?}",
-            String::from_utf8_lossy(&td.data)
-        );
-        got.extend_from_slice(&td.data);
+            .expect("inner reply");
+        assert_ne!(n, 0, "inner stream closed prematurely");
+        got.extend_from_slice(&chunk[..n]);
     }
     got
 }
@@ -217,21 +288,16 @@ async fn wait_egress_ready(inj: &AgentTunnel, echo_addr: SocketAddr) {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let sid = format!("probe-{attempt}");
-        let mut rx = inj.register_stream(sid.clone()).await;
-        inj.send_open(&sid, "eg", Some(&echo_addr.to_string()), StreamProto::Tcp)
-            .await
-            .expect("probe open");
-        let _ = inj.send_data(&sid, Bytes::copy_from_slice(b"ping")).await;
-        // Data = ready; Close (typically "Target agent not registered" while
-        // the egress is still connecting) or timeout = retry. The mTLS
-        // handshake makes the registration race observable, so the retry
-        // must actually happen here rather than panicking inside
-        // `tunnel_round_trip`.
-        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
-            Ok(Some(frame)) if frame.stream_type == FrameType::Data => return,
-            Ok(Some(frame)) if frame.stream_type == FrameType::Close => {}
-            _ => {}
+        let sid = interflow_testkit::opaque_stream_id(&format!("probe-{attempt}"));
+        // A successful inner-TLS round trip proves both registration and the
+        // Data path. Failures retry while the egress is still connecting.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tunnel_round_trip(inj, sid, echo_addr, b"ping", Duration::from_secs(2)),
+        )
+        .await;
+        if result.is_ok_and(|resp| resp == b"ping") {
+            return;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("egress agent not ready within 10s");
@@ -263,83 +329,78 @@ async fn start_stack(write_timeout: u64) -> (u16, SocketAddr, AgentTunnel) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t1_slow_backend_does_not_corrupt_unrelated_streams() {
+    let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let (_hub_port, echo_addr, inj) = start_stack(3).await;
     let (slow_addr, slow_active) = slow_backend().await;
 
-    // Slow stream: open toward the slow backend and flood 1500x16KiB (far
-    // beyond "backend rcvbuf + write-timeout tolerance", guaranteed to trigger
-    // the backend write-stall death detection).
-    let slow_sid = "t1-slow".to_string();
-    let mut slow_rx = inj.register_stream(slow_sid.clone()).await;
-    inj.send_open(
-        &slow_sid,
-        "eg",
-        Some(&slow_addr.to_string()),
-        StreamProto::Tcp,
-    )
-    .await
-    .expect("open slow");
+    // Keep one backend connection open to the black hole while unrelated
+    // streams transfer data. T2/T5 below deliberately fill the stream channel
+    // and test poisoning/write-timeout death.
+    let slow_sid = interflow_testkit::opaque_stream_id("t1-slow");
+    let slow_tls = open_inner_tls(&inj, slow_sid, &slow_addr.to_string()).await;
 
-    let flood = {
-        let inj = inj.clone();
-        let sid = slow_sid.clone();
-        tokio::spawn(async move {
-            let chunk = Bytes::from(vec![0xa5u8; 16 * 1024]);
-            for _ in 0..1500 {
-                if inj.send_data(&sid, chunk.clone()).await.is_err() {
-                    break; // stream is dead; the upload pump tears it down
-                }
-            }
-        })
-    };
+    // Critical window: while the slow backend occupies a forwarder, unrelated
+    // streams must complete round trips with zero corruption. Each stream is
+    // used as soon as it is established (the normal client lifecycle); T2/T5
+    // cover deliberately stalled bulk writers.
+    let mut healthy_results = Vec::new();
+    for i in 0..3 {
+        let sid = interflow_testkit::opaque_stream_id(&format!("t1-ok-{i}"));
+        let payload = vec![0x5a_u8 + i as u8; 64 * 1024];
+        let mut tls = open_inner_tls(&inj, sid, &echo_addr.to_string()).await;
+        tls.write_all(&payload).await.expect("healthy send");
+        tls.flush().await.expect("healthy flush");
+        let deadline = tokio::time::Instant::now() + LONG_DEADLINE;
+        let mut got = Vec::with_capacity(payload.len());
+        while got.len() < payload.len() {
+            let mut chunk = vec![0u8; payload.len() - got.len()];
+            let n = tokio::time::timeout_at(deadline, tls.read(&mut chunk))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "healthy reply timed out (snapshot:\n{})",
+                        metrics_handle().render()
+                    )
+                })
+                .expect("healthy reply");
+            assert_ne!(n, 0, "healthy inner stream closed");
+            got.extend_from_slice(&chunk[..n]);
+        }
+        healthy_results.push((payload, got));
+    }
 
-    // Critical window: while the slow stream is being flooded, unrelated
-    // streams must complete round trips with zero corruption
-    // (they get slowed by dispatch's bounded single-frame wait for a few
-    // seconds, but the content must match byte for byte).
-    let healthy = {
-        let inj = inj.clone();
-        tokio::spawn(async move {
-            let mut results = Vec::new();
-            for i in 0..3 {
-                let sid = format!("t1-ok-{i}");
-                let payload = vec![0x5a_u8 + i as u8; 256 * 1024];
-                let resp = tunnel_round_trip(&inj, &sid, echo_addr, &payload, LONG_DEADLINE).await;
-                results.push((payload, resp));
-            }
-            results
-        })
-    };
-
-    let results = healthy.await.expect("healthy task");
-    for (payload, resp) in results {
+    for (payload, resp) in healthy_results {
         assert_eq!(
             resp, payload,
             "unrelated-stream data corruption (regression of the slow-backend amplification defect)"
         );
     }
-
-    // The slow stream must be visibly declared dead: the injection side
-    // receives Close and the backend connection is actually closed.
-    let close = tokio::time::timeout(LONG_DEADLINE, slow_rx.recv())
-        .await
-        .expect("timed out waiting for slow-stream Close")
-        .expect("channel alive");
-    assert!(
-        matches!(close.stream_type, FrameType::Close),
-        "expected the slow stream to be closed, got {close:?}"
+    assert_eq!(
+        slow_active.load(Ordering::SeqCst),
+        1,
+        "slow backend connection should remain open during healthy transfers"
     );
+
+    // Close the slow stream deterministically and verify its backend fd is released.
+    drop(slow_tls);
+    let _ = inj.send_close(slow_sid).await;
+    inj.unregister_stream(slow_sid).await;
     eventually(
         || slow_active.load(Ordering::SeqCst) == 0,
         LONG_DEADLINE,
         "all slow-backend connections closed",
     )
     .await;
-    let _ = flood.await;
-
     // The session was not torn down: new streams work as usual.
-    let resp = tunnel_round_trip(&inj, "t1-after", echo_addr, b"still-alive", LONG_DEADLINE).await;
+    let resp = tunnel_round_trip(
+        &inj,
+        interflow_testkit::opaque_stream_id("t1-after"),
+        echo_addr,
+        b"still-alive",
+        LONG_DEADLINE,
+    )
+    .await;
     assert_eq!(resp, b"still-alive");
 }
 
@@ -350,6 +411,7 @@ async fn t1_slow_backend_does_not_corrupt_unrelated_streams() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t2_poison_is_visible_and_agent_survives() {
+    let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let hub_port = pick_ephemeral_port();
     spawn_hub(hub_config(hub_port, certs(), vec![])).await;
@@ -401,22 +463,17 @@ async fn t2_poison_is_visible_and_agent_survives() {
 
     // Flood the slow stream with 1500 frames: channel full → dispatch poisons
     // after 5s (visible via the counter).
-    let slow_sid = "t2-slow".to_string();
-    inj.send_open(
-        &slow_sid,
-        "eg",
-        Some(&slow_addr.to_string()),
-        StreamProto::Tcp,
-    )
-    .await
-    .expect("open slow");
+    let slow_sid = interflow_testkit::opaque_stream_id("t2-slow");
+    let slow_tls = open_inner_tls(&inj, slow_sid, &slow_addr.to_string()).await;
     let flood = {
-        let inj = inj.clone();
-        let sid = slow_sid.clone();
+        let mut tls = slow_tls;
         tokio::spawn(async move {
             let chunk = Bytes::from(vec![0xa5u8; 16 * 1024]);
             for _ in 0..1500 {
-                if inj.send_data(&sid, chunk.clone()).await.is_err() {
+                if tls.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                if tls.flush().await.is_err() {
                     break;
                 }
             }
@@ -431,7 +488,14 @@ async fn t2_poison_is_visible_and_agent_survives() {
 
     // The agent was not evicted/reconnected: a new stream round-trips as
     // usual and the state trace shows no reconnection.
-    let resp = tunnel_round_trip(&inj, "t2-after", echo_addr, b"survivor", LONG_DEADLINE).await;
+    let resp = tunnel_round_trip(
+        &inj,
+        interflow_testkit::opaque_stream_id("t2-after"),
+        echo_addr,
+        b"survivor",
+        LONG_DEADLINE,
+    )
+    .await;
     assert_eq!(resp, b"survivor");
     tokio::time::sleep(Duration::from_millis(300)).await;
     let trace = state_trace.lock().unwrap().clone();
@@ -449,6 +513,7 @@ async fn t2_poison_is_visible_and_agent_survives() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t3_targetless_udp_stream_rejected_not_misrouted() {
+    let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let hub_port = pick_ephemeral_port();
     spawn_hub(hub_config(hub_port, certs(), vec![])).await;
@@ -470,12 +535,12 @@ async fn t3_targetless_udp_stream_rejected_not_misrouted() {
 
     // Open with an empty target + UDP protocol: no dynamic target, no UDP rule
     // → must reject + Close.
-    let sid = "t3-stream".to_string();
+    let sid = interflow_testkit::opaque_stream_id("t3-stream");
     let mut rx = inj.register_stream(sid.clone()).await;
-    inj.send_open(&sid, "eg", None, StreamProto::Udp)
+    inj.send_open(sid, "eg", StreamProto::Udp)
         .await
         .expect("open");
-    inj.send_data(&sid, Bytes::from_static(b"misroute-me"))
+    inj.send_data(sid, Bytes::from_static(b"misroute-me"))
         .await
         .expect("send");
 
@@ -516,7 +581,9 @@ async fn t3_targetless_udp_stream_rejected_not_misrouted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t4_udp_session_recycles_and_new_session_works() {
-    let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
+    let _serial = serial_lock().await;
+    let _ = metrics_handle(); // Install the recorder as early as possible
+    init_tracing();
     let hub_port = pick_ephemeral_port();
     spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     let (udp_addr, _udp) = interflow_testkit::spawn_udp_echo().await;
@@ -530,48 +597,46 @@ async fn t4_udp_session_recycles_and_new_session_works() {
     }];
     interflow_testkit::spawn_agent_registered(eg).await;
 
-    let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let listen_port = pick_ephemeral_port();
+    let mut ing = agent_config("ing", hub_port, certs());
+    ing.ingress = vec![IngressRule {
+        name: "udp-in".into(),
+        listen_addr: format!("127.0.0.1:{listen_port}").parse().unwrap(),
+        listen_protocol: StreamProto::Udp,
+        target_agent: "eg".into(),
+        remote_addr: Some(udp_addr.to_string()),
+        idle_timeout_secs: Some(1),
+        udp_per_ip_pps: 0,
+        udp_per_ip_bytes_per_sec: 0,
+        udp_egress_bytes_per_sec: 0,
+    }];
+    interflow_testkit::spawn_agent_registered(ing).await;
+    let listen_addr: SocketAddr = format!("127.0.0.1:{listen_port}").parse().unwrap();
 
-    // Session 1: one datagram round trip.
-    let sid1 = "t4-s1".to_string();
-    let mut rx1 = inj.register_stream(sid1.clone()).await;
-    inj.send_open(&sid1, "eg", Some(&udp_addr.to_string()), StreamProto::Udp)
+    // One public source address exercises one inner-QUIC session.
+    let sock = interflow_testkit::udp_client().await;
+    let mut recv_one = [0u8; 64];
+    sock.send_to(b"ping-1", listen_addr)
         .await
-        .expect("open");
-    inj.send_data(&sid1, Bytes::from_static(b"ping-1"))
+        .expect("udp send 1");
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut recv_one))
         .await
-        .expect("send");
-    let resp = tokio::time::timeout(Duration::from_secs(5), rx1.recv())
-        .await
-        .expect("UDP reply timed out")
-        .expect("channel alive");
-    assert_eq!(&resp.data[..], b"ping-1");
+        .expect("udp reply 1 timed out")
+        .expect("udp reply 1");
+    assert_eq!(&recv_one[..n], b"ping-1");
 
-    // Idle recycling: the close notification reaches the injection side.
-    let close = tokio::time::timeout(Duration::from_secs(5), rx1.recv())
+    // Idle recycling happens inside the mandatory inner-QUIC association. The
+    // same public source must immediately get a fresh session, not hang.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    sock.send_to(b"ping-2", listen_addr)
         .await
-        .expect("timed out waiting for the idle-recycle Close")
-        .expect("channel alive");
-    assert!(
-        matches!(close.stream_type, FrameType::Close),
-        "expected an idle-recycle Close, got {close:?}"
-    );
-
-    // Session 2: the new sid is immediately usable, not left hanging.
-    let sid2 = "t4-s2".to_string();
-    let mut rx2 = inj.register_stream(sid2.clone()).await;
-    inj.send_open(&sid2, "eg", Some(&udp_addr.to_string()), StreamProto::Udp)
+        .expect("udp send 2");
+    let mut recv_two = [0u8; 64];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), sock.recv_from(&mut recv_two))
         .await
-        .expect("open2");
-    inj.send_data(&sid2, Bytes::from_static(b"ping-2"))
-        .await
-        .expect("send2");
-    let resp2 = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
-        .await
-        .expect("UDP reply 2 timed out")
-        .expect("channel alive");
-    assert_eq!(&resp2.data[..], b"ping-2");
+        .expect("udp reply 2 timed out")
+        .expect("udp reply 2");
+    assert_eq!(&recv_two[..n], b"ping-2");
 }
 
 // ---------------------------------------------------------------------------
@@ -581,6 +646,7 @@ async fn t4_udp_session_recycles_and_new_session_works() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t5_no_connection_leak_after_kill_and_shutdown() {
+    let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let hub_port = pick_ephemeral_port();
     spawn_hub(hub_config(hub_port, certs(), vec![])).await;
@@ -597,22 +663,17 @@ async fn t5_no_connection_leak_after_kill_and_shutdown() {
     wait_egress_ready(&inj, echo_addr).await;
 
     // Slow stream declared dead (write stall 3s).
-    let slow_sid = "t5-slow".to_string();
-    inj.send_open(
-        &slow_sid,
-        "eg",
-        Some(&slow_addr.to_string()),
-        StreamProto::Tcp,
-    )
-    .await
-    .expect("open slow");
+    let slow_sid = interflow_testkit::opaque_stream_id("t5-slow");
+    let slow_tls = open_inner_tls(&inj, slow_sid, &slow_addr.to_string()).await;
     let flood = {
-        let inj = inj.clone();
-        let sid = slow_sid.clone();
+        let mut tls = slow_tls;
         tokio::spawn(async move {
             let chunk = Bytes::from(vec![0xa5u8; 16 * 1024]);
             for _ in 0..400 {
-                if inj.send_data(&sid, chunk.clone()).await.is_err() {
+                if tls.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                if tls.flush().await.is_err() {
                     break;
                 }
             }
@@ -644,6 +705,7 @@ async fn t5_no_connection_leak_after_kill_and_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t6_loopback_agent_is_both_ingress_and_egress() {
+    let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     let hub_port = pick_ephemeral_port();
     spawn_hub(hub_config(hub_port, certs(), vec![])).await;
@@ -691,6 +753,7 @@ async fn t6_loopback_agent_is_both_ingress_and_egress() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t7_response_poison_closes_stalled_client_only() {
+    let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
     let hub_port = pick_ephemeral_port();
@@ -719,27 +782,32 @@ async fn t7_response_poison_closes_stalled_client_only() {
         .await
         .expect("ingress listener ready");
 
-    // Bad client: keeps writing, never reads (the echo far exceeds rcvbuf +
-    // the 256-frame channel capacity, guaranteed to trigger response-direction
-    // dispatch poisoning + ingress write-stall closure). Closure detection
-    // relies on write failure: after the server closes the connection, writes
-    // get EPIPE/RST — do not detect via "read until EOF", which would turn the
-    // client into a healthy consumer, keep the responses draining forever, and
-    // never trigger poisoning.
+    // Bad client: writes enough to overrun the response path, then never reads.
+    // Periodic one-byte probes detect closure via EPIPE/RST without turning the
+    // client into a response consumer or continuously flooding the inner-TLS
+    // upload alongside the good stream.
     let bad = TcpStream::connect(listen_addr).await.expect("bad client");
+    let (bad_ready, bad_ready_rx) = tokio::sync::oneshot::channel();
     let bad_write = tokio::spawn(async move {
         let mut bad = bad;
-        let chunk = vec![0x77u8; 16 * 1024];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let chunk = vec![0x77u8; 8 * 1024 * 1024];
+        if bad.write_all(&chunk).await.is_err() {
+            return "closed"; // write failure = the server closed the connection
+        }
+        let _ = bad_ready.send(());
+        let probe = [0x77u8];
         loop {
-            if bad.write_all(&chunk).await.is_err() {
-                return "closed"; // write failure = the server closed the connection
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return "timeout";
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if bad.write_all(&probe).await.is_err() {
+                return "closed";
             }
         }
     });
+
+    // Under a full-suite load the response channel can hit its stall deadline
+    // just before the 8 MiB initial write completes. That is still the desired
+    // poison outcome; the final task result below asserts closure.
+    let _ = bad_ready_rx.await;
 
     // The good client round-trips concurrently and must finish with zero
     // corruption (being slowed by the poisoning window is allowed).

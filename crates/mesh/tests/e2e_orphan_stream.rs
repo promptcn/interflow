@@ -1,7 +1,7 @@
 //! E2E: eradicating intra-session orphan streams (regression suite for the
 //! 2026-09-14 second EMFILE recurrence).
 //!
-//! Background (docs/bug/2026-09-14-intrasession-orphan-stream-fd-leak.md):
+//! Background:
 //! 37808dc fixed the **cross-session** leak; three orphan paths remained
 //! within the same session — the hub's `_close_` notification silently
 //! dropped by try_send, `sweep_agent_streams` clearing the table without
@@ -37,8 +37,11 @@
     dead_code,
     unused_mut
 )]
-use interflow_core::protocol::{FrameType, StreamProto};
+use interflow_core::protocol::StreamProto;
+use interflow_core::tls::{InnerTlsMaterial, inner_client_config};
 use interflow_core::tunnel::AgentTunnel;
+use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
+use interflow_core::tunnel::{InnerStreamHello, TargetSelector};
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, hub_config, metrics_harness::counter_value, metrics_harness::metrics_handle,
@@ -91,7 +94,7 @@ async fn connect_tunnel(hub_port: u16, agent_id: &str) -> AgentTunnel {
         .await
         .expect("connect+register");
     AgentTunnel::from_sender(
-        agent_id.to_string(),
+        conn.negotiated.circuit_token,
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
@@ -100,6 +103,45 @@ async fn connect_tunnel(hub_port: u16, agent_id: &str) -> AgentTunnel {
         interflow_core::tunnel::H2Liveness::HEARTBEAT_DISABLED,
     )
     .expect("tunnel")
+}
+
+/// Establish an inner-TLS stream and send its encrypted target selector.
+async fn open_inner_tls(
+    inj: &AgentTunnel,
+    agent_id: &str,
+    sid: interflow_core::protocol::StreamId,
+    target: &str,
+) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
+    let rx = inj.register_stream(sid).await;
+    inj.send_open_with(sid, "eg", StreamProto::Tcp, true)
+        .await
+        .expect("inner-TLS open");
+    let (cert, key) = certs().named_client_cert(agent_id);
+    let ca = certs().ca_path().display().to_string();
+    let material = InnerTlsMaterial::from_paths(
+        &[ca.as_str()],
+        &cert.display().to_string(),
+        &key.display().to_string(),
+    )
+    .expect("inner material");
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+        inner_client_config(&material, "eg").expect("inner connector"),
+    ));
+    let adapter = E2eTunnelIo::ingress(rx, inj.clone(), sid);
+    let mut tls = match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
+        E2eHandshakeOutcome::Established(tls, _) => tls,
+        E2eHandshakeOutcome::Failed { error } => panic!("inner TLS handshake: {error}"),
+    };
+    InnerStreamHello {
+        source_principal: agent_id.to_owned(),
+        source_fingerprint: material.leaf_fingerprint(),
+        selector: TargetSelector::Address(target.to_owned()),
+        correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+    }
+    .write(&mut tls)
+    .await
+    .expect("inner hello");
+    tls
 }
 
 // ---------------------------------------------------------------------------
@@ -231,23 +273,17 @@ async fn silent_backend() -> (SocketAddr, Arc<AtomicUsize>) {
 
 /// Read from the tunnel until `n` bytes are received (skipping non-Data
 /// frames; fails on Close).
-async fn recv_response_data(
-    rx: &mut tokio::sync::mpsc::Receiver<interflow_core::tunnel::TunnelData>,
-    n: usize,
-    what: &str,
-) {
+async fn recv_response_data<R: tokio::io::AsyncRead + Unpin>(rx: &mut R, n: usize, what: &str) {
     let mut got = 0usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while got < n {
-        let td = tokio::time::timeout_at(deadline, rx.recv())
+        let mut chunk = vec![0u8; n - got];
+        let read = tokio::time::timeout_at(deadline, rx.read(&mut chunk))
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
             .expect("channel alive");
-        assert!(
-            !matches!(td.stream_type, FrameType::Close),
-            "{what} closed prematurely"
-        );
-        got += td.data.len();
+        assert!(read != 0, "{what} closed prematurely");
+        got += read;
     }
 }
 
@@ -273,19 +309,19 @@ async fn backend_eof_without_peer_close_releases_fd() {
         counter_value("interflow_egress_stream_closed_total{reason=\"backend_closed\"}");
 
     {
-        let mut resp = inj.register_stream("t1".to_string()).await;
-        inj.send_open(
-            "t1",
-            "eg",
-            Some(&backend_addr.to_string()),
-            StreamProto::Tcp,
+        let mut tls = open_inner_tls(
+            &inj,
+            "inj-t1",
+            interflow_testkit::opaque_stream_id("t1"),
+            &backend_addr.to_string(),
         )
-        .await
-        .expect("open");
-        inj.send_data("t1", bytes::Bytes::from_static(b"ping"))
-            .await
-            .expect("send");
-        recv_response_data(&mut resp, 4, "T1 echo").await;
+        .await;
+        tls.write_all(b"ping").await.expect("send");
+        tls.flush().await.expect("flush");
+        tls.flush().await.expect("flush");
+        recv_response_data(&mut tls, 4, "T1 echo").await;
+        // Keep the source side open: no Close, no connection drop.
+        tokio::time::sleep(Duration::from_secs(6)).await;
     }
     // * The peer (injection side) stays silent: no Close, no connection drop —
     // the stream remains "active" on the hub side.
@@ -303,10 +339,11 @@ async fn backend_eof_without_peer_close_releases_fd() {
     assert!(
         counter_value("interflow_egress_stream_closed_total{reason=\"backend_closed\"}")
             >= closed_before + 1,
-        "backend_closed attribution missing"
+        "backend_closed attribution missing (snapshot:\n{})",
+        metrics_handle().render()
     );
 
-    hub.shutdown().await.expect("hub shutdown");
+    hub.shutdown_graceful().await.expect("hub shutdown");
 }
 
 // ---------------------------------------------------------------------------
@@ -327,31 +364,27 @@ async fn backend_eof_drain_window_delivers_late_request_tail() {
     let _agent = spawn_agent_registered(agent_config("eg", hub_port, certs())).await;
     let inj = connect_tunnel(hub_port, "inj-t2").await;
 
-    {
-        let mut resp = inj.register_stream("t2".to_string()).await;
-        inj.send_open(
-            "t2",
-            "eg",
-            Some(&backend_addr.to_string()),
-            StreamProto::Tcp,
-        )
-        .await
-        .expect("open");
-        inj.send_data("t2", bytes::Bytes::from_static(b"ping"))
-            .await
-            .expect("send");
-        recv_response_data(&mut resp, 4, "T2 echo").await;
-    }
+    let mut tls = open_inner_tls(
+        &inj,
+        "inj-t2",
+        interflow_testkit::opaque_stream_id("t2"),
+        &backend_addr.to_string(),
+    )
+    .await;
+    tls.write_all(b"ping").await.expect("send");
+    tls.flush().await.expect("flush");
+    recv_response_data(&mut tls, 4, "T2 echo").await;
     // The backend has half-closed (the egress read task saw EOF). Old code:
     // EOF immediately sent Close back → the hub tore the stream down → the
     // tail data below was rejected with "Stream not found", and no drain
     // semantics existed.
     tokio::time::sleep(Duration::from_secs(1)).await; // within the drain window (5s)
-    inj.send_data("t2", bytes::Bytes::from_static(b"late-tail"))
-        .await
-        .expect(
-            "sending tail data within the window (the stream must still be alive on the hub side)",
-        );
+    // The same TLS object owns the half-closed stream; write the late tail
+    // through it after the backend FIN.
+    tls.write_all(b"late-tail").await.expect(
+        "sending tail data within the window (the stream must still be alive on the hub side)",
+    );
+    tls.flush().await.expect("flush tail data");
 
     // The tail data reaches the backend through the drain window
     eventually(
@@ -369,7 +402,7 @@ async fn backend_eof_drain_window_delivers_late_request_tail() {
     )
     .await;
 
-    hub.shutdown().await.expect("hub shutdown");
+    hub.shutdown_graceful().await.expect("hub shutdown");
 }
 
 // ---------------------------------------------------------------------------
@@ -391,18 +424,10 @@ async fn source_re_register_sweep_notifies_egress_streams() {
     let _agent = spawn_agent_registered(agent_config("eg", hub_port, certs())).await;
     let inj = connect_tunnel(hub_port, "src-t4").await;
 
+    let mut silent_streams = Vec::new();
     for i in 0..K {
-        let sid = format!("t4-s{i}");
-        let mut resp = inj.register_stream(sid.clone()).await;
-        let _ = &mut resp; // silent stream: return path not consumed
-        inj.send_open(
-            &sid,
-            "eg",
-            Some(&backend_addr.to_string()),
-            StreamProto::Tcp,
-        )
-        .await
-        .expect("open");
+        let sid = interflow_testkit::opaque_stream_id(&format!("t4-s{i}"));
+        silent_streams.push(open_inner_tls(&inj, "src-t4", sid, &backend_addr.to_string()).await);
     }
     eventually(
         || active.load(Ordering::SeqCst) == K,
@@ -420,6 +445,7 @@ async fn source_re_register_sweep_notifies_egress_streams() {
     // own session rebuild (a single edge reconnect could orphan every
     // in-flight stream on a Mac).
     let _inj2 = connect_tunnel(hub_port, "src-t4").await;
+    drop(silent_streams);
 
     eventually(
         || active.load(Ordering::SeqCst) == 0,
@@ -432,7 +458,7 @@ async fn source_re_register_sweep_notifies_egress_streams() {
         "all K streams must go through the unified close-out"
     );
 
-    hub.shutdown().await.expect("hub shutdown");
+    hub.shutdown_graceful().await.expect("hub shutdown");
 }
 
 // ---------------------------------------------------------------------------
@@ -453,16 +479,13 @@ async fn normal_source_close_still_releases_backend() {
     let _agent = spawn_agent_registered(agent_config("eg", hub_port, certs())).await;
     let inj = connect_tunnel(hub_port, "inj-reg").await;
 
-    let mut resp = inj.register_stream("reg".to_string()).await;
-    let _ = &mut resp;
-    inj.send_open(
-        "reg",
-        "eg",
-        Some(&backend_addr.to_string()),
-        StreamProto::Tcp,
+    let tls = open_inner_tls(
+        &inj,
+        "inj-reg",
+        interflow_testkit::opaque_stream_id("reg"),
+        &backend_addr.to_string(),
     )
-    .await
-    .expect("open");
+    .await;
     eventually(
         || active.load(Ordering::SeqCst) == 1,
         Duration::from_secs(10),
@@ -470,7 +493,10 @@ async fn normal_source_close_still_releases_backend() {
     )
     .await;
 
-    inj.send_close("reg").await.expect("source Close");
+    drop(tls);
+    inj.send_close(interflow_testkit::opaque_stream_id("reg"))
+        .await
+        .expect("source Close");
     eventually(
         || active.load(Ordering::SeqCst) == 0,
         Duration::from_secs(5),
@@ -478,5 +504,5 @@ async fn normal_source_close_still_releases_backend() {
     )
     .await;
 
-    hub.shutdown().await.expect("hub shutdown");
+    hub.shutdown_graceful().await.expect("hub shutdown");
 }

@@ -27,11 +27,11 @@
 //! dispatch tables as a fallback. All blocking points (`frames.recv` /
 //! response send / wind-down Close) sit under the token or a timeout, so
 //! structurally no await can hang
-//! (docs/bug/2026-09-14-egress-fd-leak-session-rebuild.md).
+//!.
 //!
 //! Open-flood resource defenses (2026-09-12 backlog: open-flood DoS surface;
 //! hardened 2026-09-16 with per-target isolation — see
-//! `docs/bug/2026-09-16-egress-global-rate-limit-starvation.md`):
+//! `(internal design notes)`):
 //!
 //! - **per-target circuit breaker** (`egress_target_breaker_*`): connect
 //!   -phase failures are counted per backend target in a sliding window; a
@@ -64,93 +64,26 @@ use crate::agent::ingress_udp::UDP_RECV_BUF;
 use crate::agent::rules::RuleStore;
 use crate::agent::target_breaker::{BreakerDecision, BreakerKind, TargetBreakers};
 use crate::config::{AgentConfig, EgressRule, SecurityConfig};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use interflow_core::config::params::BreakerPolicy;
 use interflow_core::error::{InterflowError, Result};
-use interflow_core::protocol::{CloseReason, FrameType, StreamProto};
+use interflow_core::protocol::{CloseReason, StreamProto};
 use interflow_core::security::EventRateLimiter;
+use interflow_core::tls::extract_cn_from_chain;
+use interflow_core::tunnel::inner_udp::{
+    self, ControlFrame, DatagramReassembler, SessionId, SessionReject,
+};
 use interflow_core::tunnel::{AgentTunnel, IncomingStream, TunnelData};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
-
-/// Bounded wait for sending back to the hub (response-direction send): when
-/// the upstream channel is full/stalled (a pathological one-sided data
-/// plane), the read side kills the stream rather than hang — fd release
-/// takes priority over the last in-flight segment of data.
-const RESPONSE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Session-level send-path stall threshold: send **demand** exists yet
-/// nothing has gotten through for this long ⇒ the session (not the
-/// individual stream) is declared wedged and torn down for reconnect.
-///
-/// The unit that actually failed is the session: when the whole send path
-/// stalls, letting the per-stream guard above execute N streams one by one
-/// is slower and noisier than failing the session once (design note from
-/// the 2026-09-16 quic egress-stall case file). 3× the per-stream timeout
-/// keeps the escalation strictly behind per-stream protection.
-const SESSION_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Session-wide send-path health: two lock-free clocks (same pattern as the
-/// pump's `SharedProgress`) — last send **attempt** (demand) vs last send
-/// **success**. Starvation is only declared when demand outlives success; an
-/// idle session with no sends is healthy by definition.
-///
-/// Only the response-**data** send path participates: the Close-echo path
-/// deliberately abandons its 1s sends during teardown ("expected during
-/// session teardown") and must not count as unfulfilled demand.
-struct SendPathHealth {
-    /// `tokio::time::Instant` keeps paused-clock unit tests exact.
-    epoch: tokio::time::Instant,
-    last_attempt_us: AtomicU64,
-    last_success_us: AtomicU64,
-}
-
-impl SendPathHealth {
-    fn new() -> Self {
-        Self {
-            epoch: tokio::time::Instant::now(),
-            last_attempt_us: AtomicU64::new(0),
-            last_success_us: AtomicU64::new(0),
-        }
-    }
-
-    fn note_attempt(&self) {
-        self.last_attempt_us
-            .store(self.elapsed_us(), Ordering::Release);
-    }
-
-    fn note_success(&self) {
-        self.last_success_us
-            .store(self.elapsed_us(), Ordering::Release);
-    }
-
-    /// How long send demand has existed without a single success; `None`
-    /// when healthy (no pending demand, or successes keep flowing).
-    fn demand_starved_for(&self) -> Option<Duration> {
-        let last_attempt = self.last_attempt_us.load(Ordering::Acquire);
-        let last_success = self.last_success_us.load(Ordering::Acquire);
-        if last_attempt <= last_success {
-            return None; // every demand has been met
-        }
-        Some(Duration::from_micros(
-            self.elapsed_us().saturating_sub(last_success),
-        ))
-    }
-
-    #[allow(clippy::cast_possible_truncation)] // wraps after ~585k years; the epoch is per-session
-    fn elapsed_us(&self) -> u64 {
-        tokio::time::Instant::now()
-            .checked_duration_since(self.epoch)
-            .map_or(0, |d| d.as_micros() as u64)
-    }
-}
 
 /// Bounded wait for the wind-down Close notification: the wind-down path
 /// (including session teardown) never hangs on a full-channel send; on
@@ -158,25 +91,10 @@ impl SendPathHealth {
 /// reclamation).
 const CLOSE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Bounded drain window after backend EOF.
-///
-/// After the backend sends FIN, under half-close semantics the source may
-/// still have an in-flight request tail to land (HTTP pipelining, client
-/// shutdown(write), etc.): within the window we keep consuming `frames` and
-/// writing to the backend; when the window ends, close out and release the
-/// fd. This replaces "waiting indefinitely for the peer's `_close_`" — a
-/// lost hub-side close notification (the historical try-send drop path) once
-/// left `write_half` and the backend fd lingering for the whole session
-/// (docs/bug/2026-09-14-intrasession-orphan-stream-fd-leak.md).
-/// Note: this is a fallback anchored on the certain fact "the backend is
-/// dead", not an idle timeout — the design decision of no per-stream idle
-/// timeout (to avoid killing SSE/HMR long connections on false positives)
-/// stands unchanged.
-const BACKEND_EOF_DRAIN_GRACE: Duration = Duration::from_secs(5);
-
 /// Egress session resource policy: dial/write-stall timeouts (pure duration
 /// parameters, no cross-session state).
 #[allow(clippy::struct_field_names)] // each of the three timeouts governs one path; their semantics resist merged naming
+#[derive(Clone, Copy)]
 pub struct EgressPolicy {
     /// Tolerance for a single stalled backend frame write: beyond it the
     /// stream is killed.
@@ -219,7 +137,7 @@ impl From<&AgentConfig> for BreakerPolicy {
 /// consuming quota, otherwise the local concurrency cap goes blind to
 /// cross-session leftovers — creating fresh counters per session was one of
 /// the root causes of the defenses going blind during the fd leak
-/// (docs/bug/2026-09-14-egress-fd-leak-session-rebuild.md).
+///.
 pub struct EgressRuntime {
     /// Local cap on concurrent incoming streams (0 = unlimited); a second
     /// gate beyond the hub quota.
@@ -260,48 +178,69 @@ impl EgressRuntime {
 /// The egress handler.
 pub struct EgressHandler {
     agent_id: String,
-    tunnel: AgentTunnel,
-    /// Cross-session rule truth (in-memory + write-through persistence); the
+    /// Cross-session rule truth (in-memory); the
     /// hot path matches against a local snapshot.
     store: Arc<RuleStore>,
-    security: SecurityConfig,
-    /// Session resource policy (timeout parameters).
-    policy: EgressPolicy,
-    /// Agent-level flood-line defenses (shared across sessions).
-    runtime: Arc<EgressRuntime>,
-    /// Session token: the lifecycle anchor of all forwarders — session end
-    /// (watchdog/disconnect/shutdown) makes them exit in place, and backend
-    /// connection fds release with the task.
-    session: CancellationToken,
-    /// Session-level task tracker: forwarders hang off it and close out
-    /// boundedly in the teardown sequence.
-    tracker: TaskTracker,
     command_rx: Option<mpsc::Receiver<EgressCommand>>,
     /// Request-direction new-stream events (handed over by dispatch,
     /// take-once).
     incoming: mpsc::Receiver<IncomingStream>,
-    /// E2e (inner TLS) runtime; `None` = mode off, plain streams only.
-    e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
+    /// Session-scoped plumbing shared with every per-stream handler.
+    sess: EgressSession,
 }
 
-/// Exit categories of the read task (backend -> hub): the basis on which the
-/// main loop wakes up to self-heal.
-///
-/// Before 37808dc, after the read task exited the main loop still blocked
-/// indefinitely in `frames.recv()`, waiting for a peer `_close_` that might
-/// never come — `write_half` and the backend fd lingered for the whole
-/// session. A oneshot send-then-recv loses no signal, so read-task exit is
-/// guaranteed to arrive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendExit {
-    /// Clean backend EOF: the main loop enters a [`BACKEND_EOF_DRAIN_GRACE`]
-    /// bounded drain, then closes out.
-    CleanEof,
-    /// Sending back to the hub failed/stalled (this stream's response
-    /// direction is pathological): the main loop closes out immediately.
-    UpstreamSick,
-    /// Error reading the backend: the main loop closes out immediately.
-    ReadError,
+enum UdpAssociationCommand {
+    Send(SessionId, Bytes),
+    Close(SessionId),
+}
+
+type UdpSessionSenders = Arc<std::sync::Mutex<HashMap<SessionId, mpsc::Sender<Bytes>>>>;
+type UdpControlStreams = Arc<std::sync::Mutex<HashMap<SessionId, quinn::StreamId>>>;
+
+/// Session-scoped egress plumbing: the handles every per-stream handler
+/// needs beyond its rule snapshot. Assembled once per session (the same
+/// fields [`EgressHandler::new`] receives beyond the agent id, rule store,
+/// and channels), borrowed by in-session calls and cloned into spawned
+/// tasks.
+pub(crate) struct EgressSession {
+    pub(crate) tunnel: AgentTunnel,
+    pub(crate) security: SecurityConfig,
+    /// Session resource policy (timeout parameters).
+    pub(crate) policy: EgressPolicy,
+    /// Agent-level flood-line defenses (shared across sessions).
+    pub(crate) runtime: Arc<EgressRuntime>,
+    /// Session token: the lifecycle anchor of all forwarders — session end
+    /// (watchdog/disconnect/shutdown) makes them exit in place, and backend
+    /// connection fds release with the task.
+    pub(crate) session: CancellationToken,
+    /// Session-level task tracker: forwarders hang off it and close out
+    /// boundedly in the teardown sequence.
+    pub(crate) tracker: TaskTracker,
+    /// Mandatory inner-TLS runtime (startup-assembled).
+    pub(crate) e2e: Arc<crate::agent::e2e::E2eRuntime>,
+}
+
+impl Clone for EgressSession {
+    fn clone(&self) -> Self {
+        Self {
+            tunnel: self.tunnel.clone(),
+            security: self.security.clone(),
+            policy: self.policy,
+            runtime: Arc::clone(&self.runtime),
+            session: self.session.clone(),
+            tracker: self.tracker.clone(),
+            e2e: Arc::clone(&self.e2e),
+        }
+    }
+}
+
+/// Per-association UDP plumbing shared by the session reader, the datagram
+/// dispatcher, and backend tasks (all cheap-clone handles).
+#[derive(Clone)]
+struct UdpAssociationChannels {
+    senders: UdpSessionSenders,
+    controls: UdpControlStreams,
+    command_tx: mpsc::Sender<UdpAssociationCommand>,
 }
 
 impl EgressHandler {
@@ -325,32 +264,637 @@ impl EgressHandler {
         }
     }
 
-    #[allow(clippy::too_many_arguments, clippy::missing_const_for_fn)]
-    pub fn new(
-        agent_id: String,
-        tunnel: AgentTunnel,
-        store: Arc<RuleStore>,
-        security: SecurityConfig,
-        policy: EgressPolicy,
-        runtime: Arc<EgressRuntime>,
-        session: CancellationToken,
-        tracker: TaskTracker,
-        command_rx: Option<mpsc::Receiver<EgressCommand>>,
-        incoming: mpsc::Receiver<IncomingStream>,
-        e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
-    ) -> Self {
-        Self {
-            agent_id,
-            tunnel,
-            store,
+    /// Runs one long-lived egress UDP inner QUIC association.
+    ///
+    /// Every inner control `OPEN` is authenticated by the QUIC mTLS verifier
+    /// first; target selection, policy, breaker, rate, and concurrency checks
+    /// run only after that handshake. No DNS or LAN UDP dial can occur for a
+    /// malformed, wrong-CN, foreign-anchor, or revoked peer.
+    async fn run_udp_inner_quic_association(
+        stream_id: interflow_core::protocol::StreamId,
+        rules: Vec<EgressRule>,
+        frames: mpsc::Receiver<TunnelData>,
+        sess: EgressSession,
+        idle_timeout: Duration,
+    ) {
+        let association_token = sess.session.child_token();
+        let tunnel = sess.tunnel.clone();
+        let runtime = Arc::clone(&sess.runtime);
+        let e2e = Arc::clone(&sess.e2e);
+        let carrier = match inner_udp::accept_inner_quic(
+            tunnel.clone(),
+            stream_id,
+            frames,
+            e2e.material(),
+            inner_udp::CarrierDirection::Egress,
+            e2e.handshake_timeout,
+        )
+        .await
+        {
+            Ok(carrier) => carrier,
+            Err(e) => {
+                let reason = if e.to_string().contains("timed out") {
+                    "timeout"
+                } else {
+                    crate::agent::e2e::failure_reason_of(&std::io::Error::other(e.to_string()))
+                };
+                crate::agent::e2e::record_handshake_failure(crate::agent::e2e::SIDE_EGRESS, reason);
+                Self::finish(
+                    &tunnel,
+                    stream_id,
+                    CloseReason::E2eHandshakeFailed,
+                    true,
+                    &runtime.active,
+                )
+                .await;
+                return;
+            }
+        };
+        crate::agent::e2e::record_handshake_ok(crate::agent::e2e::SIDE_EGRESS);
+        metrics::counter!("interflow_agent_inner_quic_handshakes_total", "side" => "egress")
+            .increment(1);
+        metrics::gauge!("interflow_agent_inner_quic_associations_active").increment(1.0);
+
+        let senders: UdpSessionSenders = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let controls: UdpControlStreams = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (command_tx, mut command_rx) = mpsc::channel::<UdpAssociationCommand>(256);
+        let udp = UdpAssociationChannels {
+            senders: Arc::clone(&senders),
+            controls: Arc::clone(&controls),
+            command_tx: command_tx.clone(),
+        };
+        tokio::spawn(Self::dispatch_inner_udp_datagrams(
+            carrier.clone(),
+            Arc::clone(&senders),
+        ));
+        // The inner QUIC TLS verifier is unbound because the outer source is
+        // opaque. The first encrypted control frame is an identity hello that
+        // must match the certificate just authenticated by inner QUIC.
+        let Ok(Ok(first_control)) =
+            tokio::time::timeout(Duration::from_millis(250), carrier.accept_bi()).await
+        else {
+            carrier.close();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            metrics::gauge!("interflow_agent_inner_quic_associations_active").decrement(1.0);
+            Self::finish(
+                &tunnel,
+                stream_id,
+                CloseReason::E2eHandshakeFailed,
+                true,
+                &runtime.active,
+            )
+            .await;
+            return;
+        };
+        let identity = match read_inner_udp_control(&carrier, first_control).await {
+            Ok(ControlFrame::Identity {
+                source_principal,
+                source_fingerprint,
+            }) => Ok((source_principal, source_fingerprint)),
+            Ok(_) => Err(InterflowError::protocol("expected inner UDP identity")),
+            Err(e) => Err(e),
+        };
+        let identity_valid = (|| -> bool {
+            let Ok((source_principal, source_fingerprint)) = &identity else {
+                return false;
+            };
+            let Some(peer_leaf) = carrier
+                .peer_certificates()
+                .and_then(|chain| chain.first().cloned())
+            else {
+                debug!("inner UDP identity has no captured peer certificate");
+                return false;
+            };
+            let peer_cn =
+                extract_cn_from_chain(std::slice::from_ref(&peer_leaf)).unwrap_or_default();
+            let peer_fingerprint: [u8; 32] = Sha256::digest(peer_leaf.as_ref()).into();
+            peer_cn == *source_principal && peer_fingerprint == *source_fingerprint
+        })();
+        if !identity_valid {
+            debug!("first inner UDP identity rejected: {identity:?}");
+            carrier.close();
+            // Let the inner CONNECTION_CLOSE packet ride the outer Data path
+            // before the outer Close tears down the relay state.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            metrics::gauge!("interflow_agent_inner_quic_associations_active").decrement(1.0);
+            Self::finish(
+                &tunnel,
+                stream_id,
+                CloseReason::E2eHandshakeFailed,
+                true,
+                &runtime.active,
+            )
+            .await;
+            return;
+        }
+
+        loop {
+            tokio::select! {
+                accepted = carrier.accept_bi() => {
+                    match accepted {
+                        Ok(control) => {
+                            if let Err(e) = Self::handle_inner_udp_session(
+                                &carrier,
+                                control,
+                                &rules,
+                                &sess,
+                                idle_timeout,
+                                &association_token,
+                                udp.clone(),
+                            ).await {
+                                debug!("inner UDP session rejected or ended: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            debug!("inner QUIC association ended: {e}");
+                            break;
+                        }
+                    }
+                }
+                command = command_rx.recv() => {
+                    let Some(command) = command else { break };
+                    match command {
+                        UdpAssociationCommand::Send(session, payload) => {
+                            let Ok(fragments) =
+                                inner_udp::encode_datagram_fragments(session, &payload)
+                            else {
+                                metrics::counter!("interflow_udp_fragment_invalid_total")
+                                    .increment(1);
+                                Self::close_inner_session(&carrier, &controls, session).await;
+                                continue;
+                            };
+                            let mut failed = false;
+                            for fragment in fragments {
+                                if carrier.send_datagram(fragment).await.is_err() {
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                            if failed {
+                                break;
+                            }
+                        }
+                        UdpAssociationCommand::Close(session) => {
+                            let existed = senders
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&session)
+                                .is_some();
+                            Self::close_inner_session(&carrier, &controls, session).await;
+                            if existed {
+                                runtime.active.fetch_sub(1, Ordering::Relaxed);
+                                metrics::gauge!("interflow_agent_incoming_streams_active")
+                                    .decrement(1.0);
+                            }
+                        }
+                    }
+                }
+                () = association_token.cancelled() => break,
+            }
+        }
+
+        association_token.cancel();
+        carrier.close();
+        senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        metrics::gauge!("interflow_agent_inner_quic_associations_active").decrement(1.0);
+        Self::finish(
+            &tunnel,
+            stream_id,
+            CloseReason::CloseFrame,
+            true,
+            &runtime.active,
+        )
+        .await;
+    }
+
+    async fn dispatch_inner_udp_datagrams(
+        carrier: inner_udp::InnerQuicCarrier,
+        senders: UdpSessionSenders,
+    ) {
+        let mut reassembler = DatagramReassembler::default();
+        loop {
+            let datagram = match carrier.recv_datagram().await {
+                Ok(datagram) => datagram,
+                Err(e) => {
+                    debug!("UDP egress inner datagram dispatcher ended: {e}");
+                    break;
+                }
+            };
+            if datagram.len() < 16 {
+                metrics::counter!("interflow_udp_fragment_invalid_total").increment(1);
+                continue;
+            }
+            let Ok(session) = datagram[..16].try_into().map(SessionId) else {
+                metrics::counter!("interflow_udp_fragment_invalid_total").increment(1);
+                continue;
+            };
+            let sender = senders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session)
+                .cloned();
+            let Some(sender) = sender else {
+                metrics::counter!("interflow_udp_fragment_invalid_total").increment(1);
+                continue;
+            };
+            match reassembler.push(&datagram) {
+                Ok(Some(payload)) => {
+                    if sender.try_send(payload).is_err() {
+                        metrics::counter!("interflow_udp_rate_limited", "direction" => "ingress")
+                            .increment(1);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    metrics::counter!("interflow_udp_fragment_invalid_total").increment(1);
+                }
+            }
+        }
+    }
+
+    async fn handle_inner_udp_session(
+        carrier: &inner_udp::InnerQuicCarrier,
+        control: quinn::StreamId,
+        rules: &[EgressRule],
+        sess: &EgressSession,
+        idle_timeout: Duration,
+        association_token: &CancellationToken,
+        udp: UdpAssociationChannels,
+    ) -> Result<()> {
+        let EgressSession {
             security,
             policy,
             runtime,
+            ..
+        } = sess;
+        let UdpAssociationChannels {
+            senders,
+            controls,
+            command_tx,
+        } = udp;
+        let open = match tokio::time::timeout(
+            Duration::from_millis(250),
+            read_inner_udp_control(carrier, control),
+        )
+        .await
+        {
+            Ok(Ok(ControlFrame::Open {
+                session,
+                source_principal,
+                source_fingerprint,
+                selector,
+            })) => (session, source_principal, source_fingerprint, selector),
+            Ok(Ok(_)) => return Err(InterflowError::protocol("expected inner UDP OPEN")),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(InterflowError::connection("inner UDP OPEN timed out")),
+        };
+        let (session, source_principal, source_fingerprint, selector) = open;
+        let Some(peer_leaf) = carrier
+            .peer_certificates()
+            .and_then(|chain| chain.first().cloned())
+        else {
+            write_inner_udp_control(
+                carrier,
+                control,
+                &ControlFrame::Reject(session, SessionReject::SecurityDenied),
+            )
+            .await?;
+            let _ = carrier.finish(control).await;
+            return Ok(());
+        };
+        let peer_cn = extract_cn_from_chain(std::slice::from_ref(&peer_leaf)).unwrap_or_default();
+        let peer_fingerprint: [u8; 32] = Sha256::digest(peer_leaf.as_ref()).into();
+        if peer_cn != source_principal || peer_fingerprint != source_fingerprint {
+            metrics::counter!(
+                "interflow_agent_open_dropped_total",
+                "reason" => "inner_udp_identity_mismatch"
+            )
+            .increment(1);
+            write_inner_udp_control(
+                carrier,
+                control,
+                &ControlFrame::Reject(session, SessionReject::SecurityDenied),
+            )
+            .await?;
+            let _ = carrier.finish(control).await;
+            return Ok(());
+        }
+        if senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&session)
+        {
+            let frame = ControlFrame::Reject(session, SessionReject::LocalLimit);
+            write_inner_udp_control(carrier, control, &frame).await?;
+            let _ = carrier.finish(control).await;
+            return Ok(());
+        }
+
+        let target = match selector {
+            interflow_core::tunnel::TargetSelector::Default => rules
+                .iter()
+                .find(|rule| rule.target_protocol == StreamProto::Udp)
+                .map(|rule| rule.target_addr.to_string()),
+            interflow_core::tunnel::TargetSelector::Address(address) => Some(address),
+            interflow_core::tunnel::TargetSelector::Service(service) => rules
+                .iter()
+                .find(|rule| rule.target_protocol == StreamProto::Udp && rule.name == service)
+                .map(|rule| rule.target_addr.to_string()),
+        }
+        .unwrap_or_default();
+
+        let reject = if target.is_empty() {
+            Some(SessionReject::NoTarget)
+        } else if !Self::is_target_allowed(&target, security)
+            || runtime
+                .breakers
+                .as_ref()
+                .is_some_and(|breaker| breaker.check(&target) == BreakerDecision::Reject)
+        {
+            Some(SessionReject::SecurityDenied)
+        } else if runtime
+            .open_rate_limiter
+            .as_ref()
+            .is_some_and(|limiter| !limiter.check())
+        {
+            Some(SessionReject::RateLimited)
+        } else if runtime.max_incoming_streams > 0
+            && runtime.active.load(Ordering::Relaxed) >= runtime.max_incoming_streams
+        {
+            Some(SessionReject::LocalLimit)
+        } else {
+            None
+        };
+
+        if let Some(reason) = reject {
+            metrics::counter!(
+                "interflow_agent_open_dropped_total",
+                "reason" => format!("inner_udp_{reason:?}")
+            )
+            .increment(1);
+            write_inner_udp_control(carrier, control, &ControlFrame::Reject(session, reason))
+                .await?;
+            let _ = carrier.finish(control).await;
+            return Ok(());
+        }
+
+        let prev = runtime.active.fetch_add(1, Ordering::Relaxed);
+        metrics::gauge!("interflow_agent_incoming_streams_active").increment(1.0);
+        Self::warn_high_water(runtime, prev + 1);
+        let (backend_tx, backend_rx) = mpsc::channel(64);
+        senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session, backend_tx);
+        controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session, control);
+        write_inner_udp_control(carrier, control, &ControlFrame::Accept(session)).await?;
+        metrics::counter!("interflow_agent_inner_quic_sessions_total").increment(1);
+
+        let session_token = association_token.child_token();
+        tokio::spawn(Self::read_inner_udp_control(
+            carrier.clone(),
+            control,
             session,
-            tracker,
+            UdpAssociationChannels {
+                senders: Arc::clone(&senders),
+                controls: Arc::clone(&controls),
+                command_tx: command_tx.clone(),
+            },
+            Arc::clone(runtime),
+            session_token,
+        ));
+        Self::spawn_inner_udp_backend(
+            session,
+            target,
+            backend_rx,
+            command_tx,
+            *policy,
+            runtime.breakers.clone(),
+            association_token.clone(),
+            idle_timeout,
+        );
+        Ok(())
+    }
+
+    async fn read_inner_udp_control(
+        carrier: inner_udp::InnerQuicCarrier,
+        control: quinn::StreamId,
+        session: SessionId,
+        udp: UdpAssociationChannels,
+        runtime: Arc<EgressRuntime>,
+        token: CancellationToken,
+    ) {
+        let UdpAssociationChannels {
+            senders,
+            controls,
+            command_tx,
+        } = udp;
+        tokio::select! {
+            () = token.cancelled() => {}
+            // Any close, malformed frame, or EOF ends this session; cleanup
+            // is identical and handled below.
+            _ = read_inner_udp_control(&carrier, control) => {}
+        }
+        let existed = senders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session)
+            .is_some();
+        controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session);
+        let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
+        if existed {
+            runtime.active.fetch_sub(1, Ordering::Relaxed);
+            metrics::gauge!("interflow_agent_incoming_streams_active").decrement(1.0);
+        }
+    }
+
+    async fn close_inner_session(
+        carrier: &inner_udp::InnerQuicCarrier,
+        controls: &UdpControlStreams,
+        session: SessionId,
+    ) {
+        let control = controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session);
+        if let Some(control) = control
+            && let Ok(frame) = ControlFrame::Close(session).encode()
+        {
+            let _ = carrier.write_all(control, &frame).await;
+            let _ = carrier.finish(control).await;
+        }
+    }
+
+    fn spawn_inner_udp_backend(
+        session: SessionId,
+        target_addr: String,
+        mut backend_rx: mpsc::Receiver<Bytes>,
+        command_tx: mpsc::Sender<UdpAssociationCommand>,
+        policy: EgressPolicy,
+        breakers: Option<Arc<TargetBreakers>>,
+        session_token: CancellationToken,
+        idle_timeout: Duration,
+    ) {
+        let resolve_timeout = policy.resolve_timeout;
+        tokio::spawn(async move {
+            let resolved =
+                match tokio::time::timeout(resolve_timeout, tokio::net::lookup_host(&target_addr))
+                    .await
+                {
+                    Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
+                    Ok(Err(e)) => {
+                        error!("Failed to resolve UDP target {target_addr}: {e}");
+                        if let Some(breakers) = &breakers {
+                            breakers.note_failure(&target_addr);
+                        }
+                        let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
+                        return;
+                    }
+                    Err(_) => {
+                        error!("UDP target resolve timed out: {target_addr}");
+                        if let Some(breakers) = &breakers {
+                            breakers.note_failure(&target_addr);
+                        }
+                        let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
+                        return;
+                    }
+                };
+            let safe_address = resolved
+                .into_iter()
+                .find(|sa| !crate::agent::ssrf_deny::is_ip_ssrf_blocked(sa.ip()));
+            let Some(address) = safe_address else {
+                error!(
+                    "Security block: all resolved IPs for UDP target {target_addr} hit the SSRF blocklist"
+                );
+                let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
+                return;
+            };
+            let bind_addr = if address.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let Ok(bind_address) = bind_addr.parse() else {
+                return;
+            };
+            let Ok(socket) = crate::agent::ingress_udp::bind_udp_socket(bind_address) else {
+                error!("UDP socket bind failed ({bind_address})");
+                return;
+            };
+            if socket.connect(address).await.is_err() {
+                error!("UDP connect failed {target_addr}");
+                if let Some(breakers) = &breakers {
+                    breakers.note_failure(&target_addr);
+                }
+                let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
+                return;
+            }
+            if let Some(breakers) = &breakers {
+                breakers.note_success(&target_addr);
+            }
+            let socket = Arc::new(socket);
+            let last_active = Arc::new(std::sync::Mutex::new(Instant::now()));
+            let child_token = session_token.child_token();
+
+            let mut write_task = {
+                let socket = Arc::clone(&socket);
+                let last_active = Arc::clone(&last_active);
+                let token = child_token.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            () = token.cancelled() => break,
+                            packet = backend_rx.recv() => {
+                                let Some(packet) = packet else { break };
+                                if packet.is_empty() {
+                                    continue;
+                                }
+                                if socket.send(&packet).await.is_err() {
+                                    break;
+                                }
+                                metrics::counter!("interflow_udp_egress_datagrams_tx").increment(1);
+                                *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+                            }
+                        }
+                    }
+                })
+            };
+
+            let mut read_task = {
+                let socket = Arc::clone(&socket);
+                let last_active = Arc::clone(&last_active);
+                let command_tx = command_tx.clone();
+                let token = child_token.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; UDP_RECV_BUF];
+                    loop {
+                        tokio::select! {
+                            () = token.cancelled() => break,
+                            result = socket.recv(&mut buf) => {
+                                let Ok(n) = result else { break };
+                                if n == UDP_RECV_BUF {
+                                    metrics::counter!("interflow_udp_egress_truncated").increment(1);
+                                    continue;
+                                }
+                                if command_tx
+                                    .send(UdpAssociationCommand::Send(
+                                        session,
+                                        Bytes::copy_from_slice(&buf[..n]),
+                                    ))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                metrics::counter!("interflow_udp_egress_datagrams_rx").increment(1);
+                                *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+                            }
+                        }
+                    }
+                })
+            };
+
+            tokio::select! {
+                _ = &mut write_task => {}
+                _ = &mut read_task => {}
+                () = child_token.cancelled() => {}
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) + idle_timeout,
+                )) => {
+                    metrics::counter!("interflow_udp_egress_idle_timeout").increment(1);
+                }
+            }
+            child_token.cancel();
+            let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
+        });
+    }
+
+    pub(crate) const fn new(
+        agent_id: String,
+        store: Arc<RuleStore>,
+        command_rx: Option<mpsc::Receiver<EgressCommand>>,
+        incoming: mpsc::Receiver<IncomingStream>,
+        sess: EgressSession,
+    ) -> Self {
+        Self {
+            agent_id,
+            store,
             command_rx,
             incoming,
-            e2e,
+            sess,
         }
     }
 
@@ -362,13 +906,8 @@ impl EgressHandler {
         // session), refreshed after command changes — per-stream matching is
         // lock-free.
         let mut rules = self.store.egress_snapshot().await;
-        let security = self.security;
-        let policy = self.policy;
-        let runtime = self.runtime;
-        let session = self.session;
-        let tracker = self.tracker;
-        let e2e = self.e2e;
         let store = self.store;
+        let sess = self.sess;
 
         for rule in &rules {
             info!(
@@ -377,36 +916,12 @@ impl EgressHandler {
             );
         }
 
-        let tunnel = self.tunnel;
         let mut command_rx = self.command_rx;
         let mut incoming = self.incoming;
 
-        // Session-wide send-path health (see SendPathHealth): evaluated on a
-        // 1s cadence in the main loop — no cross-task signaling needed.
-        let send_health = Arc::new(SendPathHealth::new());
-        let mut health_tick = tokio::time::interval(Duration::from_secs(1));
-        health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         loop {
             tokio::select! {
-                // Session-level send-path health: demand present but nothing
-                // getting through past SESSION_SEND_STALL_TIMEOUT ⇒ fail the
-                // session once and reconnect, instead of letting the
-                // per-stream 10s guard execute streams one by one.
-                _ = health_tick.tick() => {
-                    if let Some(starved) = send_health.demand_starved_for()
-                        && starved >= SESSION_SEND_STALL_TIMEOUT
-                    {
-                        error!(
-                            "Egress send path starved for {starved:?} (demand present, no success) — failing session for reconnect"
-                        );
-                        return Err(InterflowError::connection(
-                            "egress send path starved session-wide (send stall)".to_string(),
-                        ));
-                    }
-                }
-                // Handle rule add/remove commands (all with an
-                // acknowledgment; the store persists first, then memory)
+                // Handle rule add/remove commands (all acknowledged)
                 cmd_opt = async {
                     if let Some(rx) = &mut command_rx {
                         rx.recv().await
@@ -447,19 +962,7 @@ impl EgressHandler {
                 // supervisor's existing reconnect path.
                 ev = incoming.recv() => {
                     if let Some(stream) = ev {
-                        Self::handle_incoming_stream(
-                            stream,
-                            &tunnel,
-                            &rules,
-                            &security,
-                            &policy,
-                            &runtime,
-                            &session,
-                            &tracker,
-                            &send_health,
-                            e2e.as_ref(),
-                        )
-                        .await;
+                        Self::handle_incoming_stream(stream, &sess, &rules).await;
                     } else {
                         error!("Egress incoming-stream channel closed (tunnel dead), triggering session reconnect");
                         return Err(InterflowError::connection(
@@ -493,60 +996,71 @@ impl EgressHandler {
     /// function (inline rejection and forwarder wind-down) funnels uniquely
     /// into [`Self::finish`] for the decrement, so increment-first balances
     /// on every path.
-    #[allow(clippy::too_many_arguments)] // session-scoped plumbing (tunnel/rules/security/policy/runtime/session/tracker)
     async fn handle_incoming_stream(
         stream: IncomingStream,
-        tunnel: &AgentTunnel,
+        sess: &EgressSession,
         rules: &[EgressRule],
-        security: &SecurityConfig,
-        policy: &EgressPolicy,
-        runtime: &Arc<EgressRuntime>,
-        session: &CancellationToken,
-        tracker: &TaskTracker,
-        send_health: &Arc<SendPathHealth>,
-        e2e: Option<&Arc<crate::agent::e2e::E2eRuntime>>,
     ) {
+        let EgressSession {
+            tunnel,
+            runtime,
+            tracker,
+            ..
+        } = sess;
         let IncomingStream { open, frames } = stream;
-        let stream_id = open.stream_id.clone();
+        let stream_id = open.stream_id;
         let prev_active = runtime.active.fetch_add(1, Ordering::Relaxed);
         metrics::gauge!("interflow_agent_incoming_streams_active").increment(1.0);
         Self::warn_high_water(runtime, prev_active + 1);
 
         let proto = StreamProto::from_frame_flags(open.flags);
 
-        // Open payload = "{source_agent}:{target_addr}" (the hub rewrites
-        // the initiator's qualified id in; egress cares about target_addr
-        // for dialing and source_agent for the e2e identity binding; either
-        // part may be empty = absent).
-        let payload = String::from_utf8_lossy(&open.data);
-        let (src_agent, dynamic_target) =
-            payload.split_once(':').map_or(("", None), |(src, target)| {
-                (src, (!target.is_empty()).then(|| target.to_string()))
-            });
+        // Opens carry only the opaque source identity — the
+        // requester's circuit rides the header field (the former payload hex
+        // and the `src:target` split are gone). The LAN target stays
+        // encrypted in the inner layer (TLS for TCP, QUIC for UDP).
+        let src_agent = match open.origin {
+            interflow_core::protocol::FrameOrigin::Agent(c) => c.to_hex(),
+            _ => String::new(),
+        };
 
-        // E2e declaration on the stream (Open `FLAG_E2E`; TCP only — UDP
-        // streams stay phase-1 plaintext, RFC §7).
-        let e2e_requested =
-            proto == StreamProto::Tcp && open.flags & interflow_core::protocol::FLAG_E2E != 0;
+        // E2e declaration on the stream. UDP has no plaintext fallback.
+        let e2e_requested = open.flags & interflow_core::protocol::FLAG_E2E != 0;
+
+        if runtime.max_incoming_streams > 0
+            && runtime.active.load(Ordering::Relaxed) > runtime.max_incoming_streams
+        {
+            metrics::counter!(
+                "interflow_agent_open_dropped_total",
+                "reason" => CloseReason::LocalLimit.to_string()
+            )
+            .increment(1);
+            Self::finish(
+                tunnel,
+                stream_id,
+                CloseReason::LocalLimit,
+                true,
+                &runtime.active,
+            )
+            .await;
+            return;
+        }
 
         // Downgrade rejection (RFC §4/A5): in `required` mode a TCP stream
         // without the e2e declaration is a stripped flag or an old/foreign
         // initiator — closed fail-closed before any policy/dial work, never
         // a plaintext forward.
-        if matches!(e2e, Some(rt) if rt.mode == crate::config::E2eMode::Required)
-            && proto == StreamProto::Tcp
-            && !e2e_requested
-        {
+        if !e2e_requested {
             crate::agent::e2e::record_handshake_failure(
                 crate::agent::e2e::SIDE_EGRESS,
                 crate::agent::e2e::REASON_NOT_NEGOTIATED,
             );
             warn!(
-                "e2e required: rejecting non-e2e TCP stream {stream_id} (stripped FLAG_E2E or legacy peer), source={src_agent}"
+                "e2e required: rejecting non-e2e {proto:?} stream {stream_id} (stripped FLAG_E2E or legacy peer), source={src_agent}"
             );
             Self::finish(
                 tunnel,
-                &stream_id,
+                stream_id,
                 CloseReason::E2eHandshakeFailed,
                 true,
                 &runtime.active,
@@ -556,164 +1070,32 @@ impl EgressHandler {
         }
 
         let matched_rule = rules.iter().find(|r| r.target_protocol == proto);
-        let target = dynamic_target.or_else(|| {
-            // Static fallback: exact protocol match only, never fall
-            // through to the first rule (misrouting guard).
-            matched_rule.map(|r| r.target_addr.to_string())
-        });
 
-        let Some(target) = target else {
-            warn!(
-                "rejecting target-less stream (no dynamic target and no exact protocol match rule): stream_id={}, proto={:?}, source={}",
-                stream_id, proto, open.source
-            );
-            Self::finish(
-                tunnel,
-                &stream_id,
-                CloseReason::NoTarget,
-                true,
-                &runtime.active,
-            )
-            .await;
-            return;
-        };
-
-        if !Self::is_target_allowed(&target, security) {
-            warn!(
-                "Security block: denying access to target {} (source: {})",
-                target, open.source
-            );
-            Self::finish(
-                tunnel,
-                &stream_id,
-                CloseReason::SecurityDenied,
-                true,
-                &runtime.active,
-            )
-            .await;
+        if proto == StreamProto::Tcp {
+            // Dynamic target and policy checks happen only after the inner
+            // handshake and encrypted selector have been validated.
+            tracker.spawn(Self::run_tcp_forwarder(
+                stream_id,
+                rules.to_vec(),
+                frames,
+                src_agent.clone(),
+                sess.clone(),
+            ));
             return;
         }
 
-        // Isolation gate: a target whose connect-phase failures clustered
-        // within the window is tripped OPEN — reject pre-dial, without
-        // consuming the shared open-rate budget (one dead target's retry
-        // storm must not starve healthy targets; per-stream rejections stay
-        // at debug, the trip/recovery transitions log once in the table).
-        if let Some(breakers) = &runtime.breakers
-            && breakers.check(&target) == BreakerDecision::Reject
-        {
-            metrics::counter!(
-                "interflow_agent_open_dropped_total",
-                "reason" => CloseReason::TargetCircuitOpen.to_string()
-            )
-            .increment(1);
-            debug!(
-                "target circuit open, rejecting stream without dial: stream_id={}, target={}, source={}",
-                stream_id, target, open.source
+        if proto == StreamProto::Udp {
+            let idle_timeout = matched_rule.map_or(
+                Duration::from_mins(1),
+                EgressRule::effective_udp_idle_timeout,
             );
-            Self::finish(
-                tunnel,
-                &stream_id,
-                CloseReason::TargetCircuitOpen,
-                true,
-                &runtime.active,
-            )
-            .await;
-            return;
-        }
-
-        // Stream-open rate limit (churn reflection-surface budget;
-        // agent-level bucket, accumulated across sessions). Charged only now
-        // — everything above this line rejects without doing (or paying for)
-        // dial work.
-        if let Some(limiter) = &runtime.open_rate_limiter
-            && !limiter.check()
-        {
-            metrics::counter!(
-                "interflow_agent_open_dropped_total",
-                "reason" => CloseReason::RateLimited.to_string()
-            )
-            .increment(1);
-            warn!(
-                "stream open rate limit exceeded, rejecting new stream: stream_id={}, source={}",
-                stream_id, open.source
-            );
-            Self::finish(
-                tunnel,
-                &stream_id,
-                CloseReason::RateLimited,
-                true,
-                &runtime.active,
-            )
-            .await;
-            return;
-        }
-
-        // Local concurrent stream cap (a second gate beyond the hub
-        // quota; agent-level count)
-        if runtime.max_incoming_streams > 0
-            && runtime.active.load(Ordering::Relaxed) > runtime.max_incoming_streams
-        {
-            metrics::counter!(
-                "interflow_agent_open_dropped_total",
-                "reason" => CloseReason::LocalLimit.to_string()
-            )
-            .increment(1);
-            warn!(
-                "local concurrent stream limit ({}) reached, rejecting new stream: stream_id={}, source={}",
-                runtime.max_incoming_streams, stream_id, open.source
-            );
-            Self::finish(
-                tunnel,
-                &stream_id,
-                CloseReason::LocalLimit,
-                true,
-                &runtime.active,
-            )
-            .await;
-            return;
-        }
-
-        info!(
-            "Opening backend stream: {} -> {} ({:?})",
-            stream_id, target, proto
-        );
-        match proto {
-            StreamProto::Tcp => {
-                tracker.spawn(Self::run_tcp_forwarder(
-                    stream_id,
-                    target,
-                    frames,
-                    tunnel.clone(),
-                    policy.backend_write_timeout,
-                    policy.resolve_timeout,
-                    policy.connect_timeout,
-                    Arc::clone(runtime),
-                    session.clone(),
-                    Arc::clone(send_health),
-                    e2e.cloned(),
-                    e2e_requested,
-                    src_agent.to_string(),
-                ));
-            }
-            StreamProto::Udp => {
-                let idle_timeout = matched_rule.map_or(
-                    Duration::from_mins(1),
-                    EgressRule::effective_udp_idle_timeout,
-                );
-                Self::spawn_udp_forwarder(
-                    stream_id,
-                    target,
-                    frames,
-                    tunnel.clone(),
-                    idle_timeout,
-                    policy.resolve_timeout,
-                    Arc::clone(runtime),
-                    session.clone(),
-                    tracker,
-                    Arc::clone(send_health),
-                );
-            }
+            tracker.spawn(Self::run_udp_inner_quic_association(
+                stream_id,
+                rules.to_vec(),
+                frames,
+                sess.clone(),
+                idle_timeout,
+            ));
         }
     }
 
@@ -733,87 +1115,83 @@ impl EgressHandler {
     /// - **session token**: session end (watchdog/disconnect/shutdown)
     ///   exits in place — both halves release the backend fd as the task
     ///   drops. This is the structural fix for the fd-leak root cause
-    ///   (docs/bug/2026-09-14-egress-fd-leak-session-rebuild.md).
-    #[allow(clippy::too_many_arguments)]
+    ///  .
     async fn run_tcp_forwarder(
-        stream_id: String,
-        target_addr: String,
+        stream_id: interflow_core::protocol::StreamId,
+        rules: Vec<EgressRule>,
         mut frames: mpsc::Receiver<TunnelData>,
-        tunnel: AgentTunnel,
-        write_timeout: Duration,
-        resolve_timeout: Duration,
-        connect_timeout: Duration,
-        runtime: Arc<EgressRuntime>,
-        session: CancellationToken,
-        send_health: Arc<SendPathHealth>,
-        e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
-        e2e_requested: bool,
         src_agent: String,
+        sess: EgressSession,
     ) {
-        // 0. E2e (inner TLS) handshake phase — dial-after-handshake (RFC
+        let EgressSession {
+            tunnel,
+            security,
+            policy,
+            runtime,
+            e2e,
+            ..
+        } = sess;
+        let write_timeout = policy.backend_write_timeout;
+        let resolve_timeout = policy.resolve_timeout;
+        let connect_timeout = policy.connect_timeout;
+        // 0. Mandatory inner TLS handshake phase — dial-after-handshake (RFC
         //    §3.3): the backend DNS resolve/TCP connect below runs only
         //    after the peer is cryptographically confirmed, so a malicious
         //    hub cannot drive a plaintext dial into the LAN with a
-        //    redirected stream. `required` failures close here with zero
-        //    dial; `opportunistic` failures resume the plain path below
-        //    with the buffered peer bytes replayed to the backend.
-        let mut preloaded: Bytes = Bytes::new();
-        let e2e_tls = if let Some(rt) = &e2e
-            && e2e_requested
+        //    redirected stream. A failed or absent handshake closes here
+        //    with zero dial; there is no plaintext fallback.
+        let adapter = interflow_core::tunnel::e2e::E2eTunnelIo::egress(
+            std::mem::replace(&mut frames, mpsc::channel(1).1),
+            tunnel.clone(),
+            stream_id,
+        );
+        let acceptor = match e2e.server_acceptor_unbound() {
+            Ok(a) => a,
+            Err(e) => {
+                // Startup-assembled material gone stale mid-session: fail closed.
+                crate::agent::e2e::record_handshake_failure(
+                    crate::agent::e2e::SIDE_EGRESS,
+                    "protocol",
+                );
+                error!(
+                    "inner TLS acceptor build failed for {stream_id} (source {src_agent}): {e}; closing stream"
+                );
+                Self::finish(
+                    &tunnel,
+                    stream_id,
+                    CloseReason::E2eHandshakeFailed,
+                    true,
+                    &runtime.active,
+                )
+                .await;
+                return;
+            }
+        };
+        let (tls, close_reason, target_addr) = match interflow_core::tunnel::e2e::inner_tls_accept(
+            adapter,
+            acceptor,
+            e2e.handshake_timeout,
+        )
+        .await
         {
-            let adapter = interflow_core::tunnel::e2e::E2eTunnelIo::egress(
-                std::mem::replace(&mut frames, mpsc::channel(1).1),
-                tunnel.clone(),
-                stream_id.clone(),
-            );
-            let expected_client = crate::agent::e2e::bare_agent_id(&src_agent);
-            let acceptor = match rt.server_acceptor(expected_client) {
-                Ok(a) => a,
-                Err(e) => {
-                    // Startup-assembled material gone stale mid-session:
-                    // fail closed in every mode.
-                    crate::agent::e2e::record_handshake_failure(
-                        crate::agent::e2e::SIDE_EGRESS,
-                        "protocol",
-                    );
-                    error!(
-                        "e2e acceptor build failed for {stream_id} (source {src_agent}): {e}; closing stream"
-                    );
-                    Self::finish(
-                        &tunnel,
-                        &stream_id,
-                        CloseReason::E2eHandshakeFailed,
-                        true,
-                        &runtime.active,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            match interflow_core::tunnel::e2e::inner_tls_accept(
-                adapter,
-                acceptor,
-                rt.handshake_timeout,
-            )
-            .await
-            {
-                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Established(tls, reason) => {
-                    crate::agent::e2e::record_handshake_ok(crate::agent::e2e::SIDE_EGRESS);
-                    Some((tls, reason))
-                }
-                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { parts, error } => {
-                    let reason = crate::agent::e2e::failure_reason_of(&error);
-                    crate::agent::e2e::record_handshake_failure(
-                        crate::agent::e2e::SIDE_EGRESS,
-                        reason,
-                    );
-                    if rt.mode == crate::config::E2eMode::Required {
-                        warn!(
-                            "e2e handshake failed ({reason}: {error}), closing stream {stream_id} without dial (required mode)"
+            interflow_core::tunnel::e2e::E2eHandshakeOutcome::Established(mut tls, reason) => {
+                crate::agent::e2e::record_handshake_ok(crate::agent::e2e::SIDE_EGRESS);
+                let hello = match tokio::time::timeout(
+                    e2e.handshake_timeout,
+                    interflow_core::tunnel::InnerStreamHello::read(&mut tls),
+                )
+                .await
+                {
+                    Ok(Ok(hello)) => hello,
+                    Ok(Err(e)) => {
+                        error!("inner selector read failed for {stream_id}: {e}");
+                        crate::agent::e2e::record_handshake_failure(
+                            crate::agent::e2e::SIDE_EGRESS,
+                            "protocol",
                         );
                         Self::finish(
                             &tunnel,
-                            &stream_id,
+                            stream_id,
                             CloseReason::E2eHandshakeFailed,
                             true,
                             &runtime.active,
@@ -821,16 +1199,137 @@ impl EgressHandler {
                         .await;
                         return;
                     }
-                    info!(
-                        "e2e handshake failed ({reason}: {error}), falling back to plaintext stream {stream_id}"
+                    Err(_) => {
+                        error!("inner selector read timed out for {stream_id}");
+                        crate::agent::e2e::record_handshake_failure(
+                            crate::agent::e2e::SIDE_EGRESS,
+                            "protocol",
+                        );
+                        Self::finish(
+                            &tunnel,
+                            stream_id,
+                            CloseReason::E2eHandshakeFailed,
+                            true,
+                            &runtime.active,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let (_, server_conn) = tls.get_ref();
+                let Some(peer_leaf) = server_conn.peer_certificates().and_then(|c| c.first())
+                else {
+                    error!("inner TLS completed without a peer leaf for {stream_id}");
+                    crate::agent::e2e::record_handshake_failure(
+                        crate::agent::e2e::SIDE_EGRESS,
+                        "protocol",
                     );
-                    frames = parts.rx;
-                    preloaded = parts.buffered;
-                    None
+                    Self::finish(
+                        &tunnel,
+                        stream_id,
+                        CloseReason::E2eHandshakeFailed,
+                        true,
+                        &runtime.active,
+                    )
+                    .await;
+                    return;
+                };
+                let peer_cn =
+                    extract_cn_from_chain(std::slice::from_ref(peer_leaf)).unwrap_or_default();
+                let peer_fingerprint: [u8; 32] = Sha256::digest(peer_leaf.as_ref()).into();
+                if peer_cn != hello.source_principal || peer_fingerprint != hello.source_fingerprint
+                {
+                    error!(
+                        "inner selector identity mismatch for {stream_id}: claimed {}, presented {peer_cn}",
+                        hello.source_principal
+                    );
+                    crate::agent::e2e::record_handshake_failure(
+                        crate::agent::e2e::SIDE_EGRESS,
+                        "protocol",
+                    );
+                    Self::finish(
+                        &tunnel,
+                        stream_id,
+                        CloseReason::E2eHandshakeFailed,
+                        true,
+                        &runtime.active,
+                    )
+                    .await;
+                    return;
                 }
+                let target_addr_selected = match hello.selector {
+                    interflow_core::tunnel::TargetSelector::Default => rules
+                        .iter()
+                        .find(|r| r.target_protocol == StreamProto::Tcp)
+                        .map(|r| r.target_addr.to_string()),
+                    interflow_core::tunnel::TargetSelector::Address(addr) => Some(addr),
+                    interflow_core::tunnel::TargetSelector::Service(service) => rules
+                        .iter()
+                        .find(|r| r.target_protocol == StreamProto::Tcp && r.name == service)
+                        .map(|r| r.target_addr.to_string()),
+                }
+                .unwrap_or_default();
+                if target_addr_selected.is_empty()
+                    || !Self::is_target_allowed(&target_addr_selected, &security)
+                    || runtime
+                        .breakers
+                        .as_ref()
+                        .is_some_and(|b| b.check(&target_addr_selected) == BreakerDecision::Reject)
+                {
+                    let close_reason = if target_addr_selected.is_empty() {
+                        CloseReason::NoTarget
+                    } else if !Self::is_target_allowed(&target_addr_selected, &security) {
+                        CloseReason::SecurityDenied
+                    } else {
+                        CloseReason::TargetCircuitOpen
+                    };
+                    metrics::counter!(
+                        "interflow_agent_open_dropped_total",
+                        "reason" => close_reason.to_string()
+                    )
+                    .increment(1);
+                    Self::finish(&tunnel, stream_id, close_reason, true, &runtime.active).await;
+                    return;
+                }
+                // Charge the open budget only for work that will actually
+                // dial: inner identity/target/breaker rejections must not let
+                // one dead target drain the shared stream budget.
+                if let Some(limiter) = &runtime.open_rate_limiter
+                    && !limiter.check()
+                {
+                    metrics::counter!(
+                        "interflow_agent_open_dropped_total",
+                        "reason" => CloseReason::RateLimited.to_string()
+                    )
+                    .increment(1);
+                    Self::finish(
+                        &tunnel,
+                        stream_id,
+                        CloseReason::RateLimited,
+                        true,
+                        &runtime.active,
+                    )
+                    .await;
+                    return;
+                }
+                (tls, reason, target_addr_selected)
             }
-        } else {
-            None
+            interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { error } => {
+                let reason = crate::agent::e2e::failure_reason_of(&error);
+                crate::agent::e2e::record_handshake_failure(crate::agent::e2e::SIDE_EGRESS, reason);
+                warn!(
+                    "inner TLS handshake failed ({reason}: {error}), closing stream {stream_id} without dial"
+                );
+                Self::finish(
+                    &tunnel,
+                    stream_id,
+                    CloseReason::E2eHandshakeFailed,
+                    true,
+                    &runtime.active,
+                )
+                .await;
+                return;
+            }
         };
 
         // 1. Resolve-then-check-then-connect: tokio::net::lookup_host
@@ -851,7 +1350,7 @@ impl EgressHandler {
                 }
                 Self::finish(
                     &tunnel,
-                    &stream_id,
+                    stream_id,
                     CloseReason::ConnectFailed,
                     true,
                     &runtime.active,
@@ -869,7 +1368,7 @@ impl EgressHandler {
                 }
                 Self::finish(
                     &tunnel,
-                    &stream_id,
+                    stream_id,
                     CloseReason::ConnectFailed,
                     true,
                     &runtime.active,
@@ -888,7 +1387,7 @@ impl EgressHandler {
             );
             Self::finish(
                 &tunnel,
-                &stream_id,
+                stream_id,
                 CloseReason::SecurityDenied,
                 true,
                 &runtime.active,
@@ -911,7 +1410,7 @@ impl EgressHandler {
                 }
                 Self::finish(
                     &tunnel,
-                    &stream_id,
+                    stream_id,
                     CloseReason::ConnectFailed,
                     true,
                     &runtime.active,
@@ -929,7 +1428,7 @@ impl EgressHandler {
                 }
                 Self::finish(
                     &tunnel,
-                    &stream_id,
+                    stream_id,
                     CloseReason::ConnectFailed,
                     true,
                     &runtime.active,
@@ -946,299 +1445,44 @@ impl EgressHandler {
             stream_id, target_addr
         );
 
-        // 1b. E2e-established streams pump through the inner TLS layer: all
-        //     tunnel bytes are ciphertext from here on. The stream close on
-        //     the backend-EOF path goes out via the pump's TLS shutdown
-        //     epilogue (the adapter's close_response); the peer-close path
-        //     needs none — so only the counter/gauge bookkeeping follows.
-        if let Some((tls, close_reason)) = e2e_tls {
-            let sid = stream_id.clone();
-            let t2 = tunnel.clone();
-            let outcome = interflow_core::tunnel::pump::pump_duplex(
-                stream,
-                tls,
-                &interflow_core::tunnel::pump::PumpConfig {
-                    // Egress TCP forwarders have no per-stream idle budget
-                    // by design (an SSE-style backend may stay legitimately
-                    // silent); MAX encodes "no idle teardown".
-                    idle_timeout: Duration::MAX,
-                    write_stall_timeout: write_timeout,
-                    idle_timeout_counter: "interflow_agent_e2e_egress_stream_idle_timeout",
-                    write_stall_counter: "interflow_agent_e2e_egress_backend_write_stall",
-                    log_label: "egress-e2e",
-                },
-                &stream_id,
-                async move { t2.unregister_incoming_stream(&sid).await },
-            )
-            .await;
-            let reason = close_reason.get().unwrap_or(CloseReason::CloseFrame);
-            debug!(
-                "e2e stream {stream_id} ended: {:?} (relayed={})",
-                reason, outcome.response_relayed
-            );
-            // Unified wind-down: the TLS close_notify rode Data frames; the
-            // stream Close response is sent here when we ended the stream
-            // (peer-initiated ends need no echo — the hub already reaped it).
-            let echo_close =
-                !matches!(reason, CloseReason::CloseFrame | CloseReason::SessionClosed);
-            Self::finish(&tunnel, &stream_id, reason, echo_close, &runtime.active).await;
-            return;
-        }
-
-        let (read_half, mut write_half) = stream.into_split();
-
-        // 1c. Opportunistic fallback replay: peer bytes buffered during the
-        //     failed handshake attempt go to the backend before anything
-        //     else (ordering preserved).
-        if !preloaded.is_empty() {
-            match tokio::time::timeout(write_timeout, write_half.write_all(&preloaded)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    error!("Fallback replay write to backend failed: {e}");
-                    Self::finish(
-                        &tunnel,
-                        &stream_id,
-                        CloseReason::BackendClosed,
-                        true,
-                        &runtime.active,
-                    )
-                    .await;
-                    return;
-                }
-                Err(_) => {
-                    error!("Fallback replay write stalled, killing stream: {stream_id}");
-                    Self::finish(
-                        &tunnel,
-                        &stream_id,
-                        CloseReason::BackendWriteTimeout,
-                        true,
-                        &runtime.active,
-                    )
-                    .await;
-                    return;
-                }
-            }
-        }
-
-        // 2. Read task (backend -> hub): cancel/session force exit (when the
-        //    backend goes silent the read blocks in read_buf; polling a flag
-        //    cannot interrupt a blocked read, so the token is mandatory).
-        //    Exit notifies the main loop via oneshot (send-then-recv loses
-        //    no signal) — when the read task dies first, the main loop no
-        //    longer waits indefinitely for the peer's `_close_`; the fd
-        //    self-heals and releases.
-        let cancel = CancellationToken::new();
-        let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<BackendExit>();
-        let read_task = {
-            let tunnel = tunnel.clone();
-            let stream_id = stream_id.clone();
-            let cancel = cancel.clone();
-            let session = session.clone();
-            let send_health = Arc::clone(&send_health);
-            let mut read_half = read_half;
-            async move {
-                // 1 MiB cap: exceeding it triggers backpressure (stop
-                // reading upstream), avoiding unbounded growth
-                const MAX_BUFFER: usize = 1024 * 1024;
-                const READ_CHUNK: usize = 64 * 1024; // same value as hub::quic::READ_CHUNK (TCP payload-stream read chunk)
-                let mut buffer = BytesMut::with_capacity(READ_CHUNK);
-                let exit = loop {
-                    // Backpressure: stop reading when remaining capacity is
-                    // low; wait for the send to drain
-                    if buffer.capacity() < 1024 {
-                        if buffer.len() >= MAX_BUFFER {
-                            tokio::select! {
-                                () = cancel.cancelled() => break BackendExit::UpstreamSick,
-                                () = session.cancelled() => break BackendExit::UpstreamSick,
-                                () = tokio::time::sleep(Duration::from_millis(1)) => {}
-                            }
-                            continue;
-                        }
-                        buffer.reserve(READ_CHUNK);
-                    }
-                    tokio::select! {
-                        () = cancel.cancelled() => break BackendExit::UpstreamSick,
-                        () = session.cancelled() => break BackendExit::UpstreamSick,
-                        r = read_half.read_buf(&mut buffer) => match r {
-                            Ok(0) => {
-                                debug!("Backend connection closed: {}", stream_id);
-                                // Note: we do **not** echo a Close response
-                                // here — under half-close semantics the
-                                // backend has only FIN'd its write side;
-                                // the read side can still receive. Echoing
-                                // immediately would make the hub tear the
-                                // stream down on the spot, and request-tail
-                                // data arriving within the drain window
-                                // would be rejected as "Stream not found".
-                                // The echo is deferred to the end of the
-                                // drain and done uniformly and boundedly by
-                                // finish().
-                                break BackendExit::CleanEof;
-                            }
-                            Ok(_) => {
-                                let data = buffer.split().freeze();
-                                // Bounded send back: the read task must not
-                                // hang when the upstream channel is
-                                // full/stalled (otherwise the fd lingers
-                                // inside a blocked send — leak path #2)
-                                // Session send-path health: a frame to deliver
-                                // is demand; the success note clears it.
-                                send_health.note_attempt();
-                                match tokio::time::timeout(
-                                    RESPONSE_SEND_TIMEOUT,
-                                    tunnel.send_data_response(&stream_id, data),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(())) => {
-                                        send_health.note_success();
-                                    }
-                                    Ok(Err(e)) => {
-                                        error!("Failed to send to hub: {}", e);
-                                        break BackendExit::UpstreamSick;
-                                    }
-                                    Err(_) => {
-                                        error!(
-                                            "Send to hub stalled for over {:?}, killing stream read side: {}",
-                                            RESPONSE_SEND_TIMEOUT, stream_id
-                                        );
-                                        break BackendExit::UpstreamSick;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to read from backend: {}", e);
-                                break BackendExit::ReadError;
-                            }
-                        }
-                    }
-                };
-                // If the main loop already closed out, the receiving end is
-                // dropped; a failed send is harmless
-                let _ = exit_tx.send(exit);
-            }
-        };
-        let read_task = tokio::spawn(read_task);
-
-        // 3. Forward loop (tunnel -> backend): bounded writes, a stall kills
-        //    the stream; the session token takes priority. Exits keep
-        //    CloseReason::CloseFrame (peer Close, no echo) as the default.
-        //
-        //    When the backend side dies first (read task exits): clean EOF
-        //    enters a bounded drain (an in-flight request tail can still
-        //    land under half-close semantics), and upstream pathology closes
-        //    out immediately — `write_half` and the backend fd no longer
-        //    depend on the arrival of the peer's `_close_` (whose loss once
-        //    left fds lingering for a whole session).
-        let mut exit_reason = CloseReason::CloseFrame;
-        // Some(deadline) = backend EOF drain mode (the Close response is
-        // deferred until the drain ends).
-        let mut eof_drain: Option<tokio::time::Instant> = None;
-        loop {
-            tokio::select! {
-                biased;
-                // Session end (watchdog/disconnect/shutdown): exit
-                // immediately. biased attributes the teardown instant (when
-                // cancel and recv-None are both ready) to session_closed
-                // rather than dispatch_poison, for more accurate metric
-                // semantics.
-                () = session.cancelled() => {
-                    exit_reason = CloseReason::SessionClosed;
-                    break;
-                }
-                // Read task exit (this branch is only enabled while not yet
-                // in drain mode): EOF -> drain window; pathology ->
-                // immediate close-out
-                res = &mut exit_rx, if eof_drain.is_none() => {
-                    match res {
-                        Ok(BackendExit::CleanEof) => {
-                            eof_drain = Some(tokio::time::Instant::now() + BACKEND_EOF_DRAIN_GRACE);
-                            debug!(
-                                "Backend EOF, entering {:?} drain window: {} -> {}",
-                                BACKEND_EOF_DRAIN_GRACE, stream_id, target_addr
-                            );
-                        }
-                        Ok(BackendExit::UpstreamSick | BackendExit::ReadError) | Err(_) => {
-                            exit_reason = CloseReason::BackendClosed;
-                            break;
-                        }
-                    }
-                }
-                frame = frames.recv() => {
-                    let Some(frame) = frame else {
-                        // dispatch poisoned or tunnel dead
-                        exit_reason = CloseReason::DispatchPoison;
-                        break;
-                    };
-                    match frame.stream_type {
-                        FrameType::Data if !frame.data.is_empty() => {
-                            match tokio::time::timeout(
-                                write_timeout,
-                                write_half.write_all(&frame.data),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => {
-                                    error!("Failed to write to backend: {}", e);
-                                    exit_reason = CloseReason::BackendClosed;
-                                    break;
-                                }
-                                Err(_) => {
-                                    error!(
-                                        "Backend write stalled for over {:?}, killing stream: {} -> {}",
-                                        write_timeout, stream_id, target_addr
-                                    );
-                                    exit_reason = CloseReason::BackendWriteTimeout;
-                                    break;
-                                }
-                            }
-                        }
-                        FrameType::Close => break,
-                        _ => {}
-                    }
-                }
-                // Drain window elapsed: the backend has FIN'd and the
-                // in-flight request tail has had enough time; close out and
-                // release the fd. (with biased, frames comes first: while
-                // frames keep arriving within the window they are consumed
-                // first; once idle, the deadline hits. None -> pending:
-                // select pre-constructs each branch future, so we must not
-                // destructure on None even when the precondition is false)
-                () = async {
-                    match eof_drain {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                }, if eof_drain.is_some() => {
-                    exit_reason = CloseReason::BackendClosed;
-                    break;
-                }
-            }
-        }
-
-        // 4. Wind-down: force-stop the read task (both halves drop as the
-        //    task exits, truly closing the backend connection), notify the
-        //    hub + clean up the dispatch-table entry. Closures initiated by
-        //    the peer/session end do not echo; the Close response of the EOF
-        //    drain path is sent here uniformly and boundedly (deferred to
-        //    here so the stream stays alive on the hub side during the
-        //    half-close drain).
-        cancel.cancel();
-        let _ = read_task.await;
-        drop(write_half);
-        let echo_close = !matches!(
-            exit_reason,
-            CloseReason::CloseFrame | CloseReason::SessionClosed
-        );
-        Self::finish(
-            &tunnel,
-            &stream_id,
-            exit_reason,
-            echo_close,
-            &runtime.active,
+        // 1b. Established streams pump through the inner TLS layer: all tunnel
+        //     bytes are ciphertext from here on. The pump's locally observed
+        //     outcome is authoritative; the adapter's Close token is only a
+        //     fallback for races where no local half reached EOF.
+        let sid = stream_id;
+        let t2 = tunnel.clone();
+        let outcome = interflow_core::tunnel::pump::pump_duplex(
+            stream,
+            tls,
+            &interflow_core::tunnel::pump::PumpConfig {
+                // Egress TCP forwarders have no per-stream idle budget by
+                // design (an SSE-style backend may stay legitimately silent);
+                // MAX encodes "no idle teardown".
+                idle_timeout: Duration::MAX,
+                write_stall_timeout: write_timeout,
+                idle_timeout_counter: "interflow_agent_e2e_egress_stream_idle_timeout",
+                write_stall_counter: "interflow_agent_e2e_egress_backend_write_stall",
+                log_label: "egress-e2e",
+            },
+            CloseReason::BackendClosed,
+            interflow_core::tunnel::pump::DUPLEX_LOCAL_EOF_DRAIN,
+            stream_id,
+            async move { t2.unregister_incoming_stream(sid).await },
         )
         .await;
+        let reason = outcome
+            .close_reason
+            .or_else(|| close_reason.get())
+            .unwrap_or(CloseReason::CloseFrame);
+        debug!(
+            "inner TLS stream {stream_id} ended: {:?} (relayed={})",
+            reason, outcome.response_relayed
+        );
+        // Unified wind-down: the TLS close_notify rode Data frames; the
+        // stream Close response is sent here when we ended the stream
+        // (peer-initiated ends need no echo — the hub already reaped it).
+        let echo_close = !matches!(reason, CloseReason::CloseFrame | CloseReason::SessionClosed);
+        Self::finish(&tunnel, stream_id, reason, echo_close, &runtime.active).await;
     }
 
     /// Unified forwarder wind-down: counting, Close echo as needed (bounded —
@@ -1252,7 +1496,7 @@ impl EgressHandler {
     /// from normal teardown (route-level negative caching, 2026-09-16).
     async fn finish(
         tunnel: &AgentTunnel,
-        stream_id: &str,
+        stream_id: interflow_core::protocol::StreamId,
         reason: CloseReason,
         echo_close: bool,
         active: &AtomicUsize,
@@ -1264,7 +1508,7 @@ impl EgressHandler {
         if echo_close {
             match tokio::time::timeout(
                 CLOSE_NOTIFY_TIMEOUT,
-                tunnel.send_close_response(stream_id, reason.as_str()),
+                tunnel.send_close_response(stream_id, reason),
             )
             .await
             {
@@ -1301,284 +1545,6 @@ impl EgressHandler {
     ///   (every exit path cancels then joins — fixing the old lingering
     ///   where "after an idle exit, join hung forever on a blocked recv");
     ///   session end releases the whole stream in place.
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_udp_forwarder(
-        stream_id: String,
-        target_addr: String,
-        frames: mpsc::Receiver<TunnelData>,
-        tunnel: AgentTunnel,
-        idle_timeout: Duration,
-        resolve_timeout: Duration,
-        runtime: Arc<EgressRuntime>,
-        session: CancellationToken,
-        tracker: &TaskTracker,
-        send_health: Arc<SendPathHealth>,
-    ) {
-        tracker.spawn(async move {
-            let resolved =
-                match tokio::time::timeout(resolve_timeout, tokio::net::lookup_host(&target_addr))
-                    .await
-                {
-                    Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
-                    Ok(Err(e)) => {
-                        error!("Failed to resolve UDP target address {}: {}", target_addr, e);
-                        if let Some(b) = &runtime.breakers {
-                            b.note_failure(&target_addr);
-                        }
-                        Self::finish(
-                            &tunnel,
-                            &stream_id,
-                            CloseReason::ConnectFailed,
-                            true,
-                            &runtime.active,
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(_) => {
-                        error!(
-                            "UDP target address resolution timed out {}: exceeded {:?}, killing stream",
-                            target_addr, resolve_timeout
-                        );
-                        if let Some(b) = &runtime.breakers {
-                            b.note_failure(&target_addr);
-                        }
-                        Self::finish(
-                            &tunnel,
-                            &stream_id,
-                            CloseReason::ConnectFailed,
-                            true,
-                            &runtime.active,
-                        )
-                        .await;
-                        return;
-                    }
-                };
-            let safe_addr = resolved
-                .into_iter()
-                .find(|sa| !crate::agent::ssrf_deny::is_ip_ssrf_blocked(sa.ip()));
-            let Some(sa) = safe_addr else {
-                error!(
-                    "Security block: all resolved IPs for UDP target {} hit the SSRF blocklist",
-                    target_addr
-                );
-                Self::finish(
-                    &tunnel,
-                    &stream_id,
-                    CloseReason::SecurityDenied,
-                    true,
-                    &runtime.active,
-                )
-                .await;
-                return;
-            };
-
-            let bind_addr = match sa {
-                std::net::SocketAddr::V4(_) => std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
-                std::net::SocketAddr::V6(_) => std::net::SocketAddr::from(([0u16; 8], 0)),
-            };
-            let socket = match crate::agent::ingress_udp::bind_udp_socket(bind_addr) {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("UDP socket bind failed ({bind_addr}): {e}");
-                    Self::finish(
-                        &tunnel,
-                        &stream_id,
-                        CloseReason::ConnectFailed,
-                        true,
-                        &runtime.active,
-                    )
-                    .await;
-                    return;
-                }
-            };
-            if let Err(e) = socket.connect(sa).await {
-                error!("UDP connect failed {target_addr}: {e}");
-                if let Some(b) = &runtime.breakers {
-                    b.note_failure(&target_addr);
-                }
-                Self::finish(
-                    &tunnel,
-                    &stream_id,
-                    CloseReason::ConnectFailed,
-                    true,
-                    &runtime.active,
-                )
-                .await;
-                return;
-            }
-            if let Some(b) = &runtime.breakers {
-                b.note_success(&target_addr);
-            }
-            let socket = Arc::new(socket);
-            let last_active = Arc::new(std::sync::Mutex::new(Instant::now()));
-            // Close frame (peer reclaim) flag: decides whether to echo Close
-            // on exit
-            let peer_closed = Arc::new(AtomicBool::new(false));
-            // per-stream child token: every forwarder exit path cancels it
-            // uniformly to reap the child tasks
-            let stream_token = session.child_token();
-
-            // Write task (tunnel -> backend): each Data payload is one
-            // complete datagram
-            let write_task = {
-                let socket = socket.clone();
-                let last_active = last_active.clone();
-                let peer_closed = peer_closed.clone();
-                let token = stream_token.clone();
-                let mut frames = frames;
-                async move {
-                    loop {
-                        tokio::select! {
-                            () = token.cancelled() => break,
-                            d = frames.recv() => match d {
-                                Some(td) => match td.stream_type {
-                                    FrameType::Data if !td.data.is_empty() => {
-                                        if let Err(e) = socket.send(&td.data).await {
-                                            warn!("UDP send to backend failed: {e}");
-                                            break;
-                                        }
-                                        metrics::counter!("interflow_udp_egress_datagrams_tx")
-                                            .increment(1);
-                                        *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
-                                    }
-                                    FrameType::Close => {
-                                        peer_closed.store(true, Ordering::Relaxed);
-                                        break;
-                                    }
-                                    _ => {}
-                                },
-                                // Channel closed = dispatch poisoned /
-                                // session ended
-                                None => break,
-                            },
-                        }
-                    }
-                }
-            };
-            let write_task = tokio::spawn(write_task);
-
-            // Read task (backend -> tunnel): return path bounded
-            let read_task = {
-                let socket = socket.clone();
-                let last_active = last_active.clone();
-                let tunnel = tunnel.clone();
-                let stream_id = stream_id.clone();
-                let token = stream_token.clone();
-                let send_health = Arc::clone(&send_health);
-                async move {
-                    let mut buf = vec![0u8; UDP_RECV_BUF];
-                    loop {
-                        tokio::select! {
-                            () = token.cancelled() => break,
-                            r = socket.recv(&mut buf) => match r {
-                                Ok(0) => {} // zero-length datagram: skip
-                                Ok(n) => {
-                                    if n == UDP_RECV_BUF {
-                                        metrics::counter!("interflow_udp_egress_truncated")
-                                            .increment(1);
-                                        warn!("Backend datagram likely truncated ({n} bytes), dropping");
-                                        continue;
-                                    }
-                                    let data = Bytes::copy_from_slice(&buf[..n]);
-                                    send_health.note_attempt();
-                                    match tokio::time::timeout(
-                                        RESPONSE_SEND_TIMEOUT,
-                                        tunnel.send_data_response(&stream_id, data),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(())) => {
-                                            send_health.note_success();
-                                        }
-                                        Ok(Err(e)) => {
-                                            error!("UDP send to hub failed: {e}");
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            error!(
-                                                "UDP send to hub stalled for over {:?}, killing stream read side: {}",
-                                                RESPONSE_SEND_TIMEOUT, stream_id
-                                            );
-                                            break;
-                                        }
-                                    }
-                                    metrics::counter!("interflow_udp_egress_datagrams_rx")
-                                        .increment(1);
-                                    *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
-                                }
-                                Err(e) => {
-                                    warn!("UDP recv from backend error: {e}");
-                                    break;
-                                }
-                            },
-                        }
-                    }
-                }
-            };
-            let read_task = tokio::spawn(read_task);
-
-            // Idle supervision: reclaim when the bidirectional last_active
-            // exceeds idle_timeout. A JoinHandle already polled to
-            // completion by select cannot be awaited again (it would
-            // panic); per the completed branch, await only the still-
-            // pending task.
-            enum Exit {
-                ReadDone,
-                WriteDone,
-                Idle,
-                Session,
-            }
-            let deadline = tokio::time::Instant::from_std(
-                *last_active.lock().unwrap_or_else(std::sync::PoisonError::into_inner) + idle_timeout,
-            );
-            let mut read_task = read_task;
-            let mut write_task = write_task;
-            let which = tokio::select! {
-                _ = &mut read_task => Exit::ReadDone,
-                _ = &mut write_task => Exit::WriteDone,
-                () = tokio::time::sleep_until(deadline) => {
-                    metrics::counter!("interflow_udp_egress_idle_timeout").increment(1);
-                    debug!("UDP forwarder idle timeout: stream_id={stream_id}");
-                    Exit::Idle
-                }
-                () = session.cancelled() => Exit::Session,
-            };
-            // Reap the child tasks: cancel the child token first (blocked
-            // recv/send unlock immediately), then finish to release the
-            // slot, and finally, per the completed branch, await only the
-            // still-pending task.
-            stream_token.cancel();
-            // A Close initiated by the peer (ingress) and session end do not
-            // echo; only this side's timeout/poison/backend error notifies
-            // for reclamation
-            let (reason, echo) = match which {
-                Exit::ReadDone => (CloseReason::BackendClosed, true),
-                Exit::WriteDone => {
-                    if peer_closed.load(Ordering::Relaxed) {
-                        (CloseReason::CloseFrame, false)
-                    } else {
-                        (CloseReason::DispatchPoison, true)
-                    }
-                }
-                Exit::Idle => (CloseReason::UdpIdle, true),
-                Exit::Session => (CloseReason::SessionClosed, false),
-            };
-            Self::finish(&tunnel, &stream_id, reason, echo, &runtime.active).await;
-            match which {
-                Exit::ReadDone => {
-                    let _ = write_task.await;
-                }
-                Exit::WriteDone => {
-                    let _ = read_task.await;
-                }
-                Exit::Idle | Exit::Session => {
-                    let _ = tokio::join!(read_task, write_task);
-                }
-            }
-        });
-    }
-
     fn is_target_allowed(target: &str, security: &SecurityConfig) -> bool {
         // Hard SSRF blocklist: however allowed_targets is configured, cloud
         // metadata / link-local are always denied.
@@ -1653,6 +1619,28 @@ impl EgressHandler {
     }
 }
 
+async fn read_inner_udp_control(
+    carrier: &inner_udp::InnerQuicCarrier,
+    stream: quinn::StreamId,
+) -> Result<ControlFrame> {
+    let mut header = [0u8; 2];
+    carrier.read_exact(stream, &mut header).await?;
+    let len = u16::from_be_bytes(header) as usize;
+    let mut body = vec![0u8; len];
+    carrier.read_exact(stream, &mut body).await?;
+    let mut encoded = header.to_vec();
+    encoded.extend(body);
+    Ok(ControlFrame::decode(&encoded)?.0)
+}
+
+async fn write_inner_udp_control(
+    carrier: &inner_udp::InnerQuicCarrier,
+    stream: quinn::StreamId,
+    frame: &ControlFrame,
+) -> Result<()> {
+    carrier.write_all(stream, &frame.encode()?).await
+}
+
 #[cfg(test)]
 #[allow(
     clippy::panic,
@@ -1663,35 +1651,6 @@ impl EgressHandler {
 mod tests {
     use super::*;
     use crate::config::SecurityConfig;
-
-    /// Idle session (no send demand ever) is healthy — the supervisor must
-    /// not trip on a quiet session.
-    #[test]
-    fn send_path_health_idle_is_healthy() {
-        let h = SendPathHealth::new();
-        assert_eq!(h.demand_starved_for(), None);
-    }
-
-    /// Demand met by a success is healthy; unmet demand starves at the rate
-    /// real time advances (paused clock: exactly the slept duration).
-    #[tokio::test(start_paused = true)]
-    async fn send_path_health_starves_only_unmet_demand() {
-        let h = SendPathHealth::new();
-        h.note_attempt();
-        h.note_success();
-        assert_eq!(h.demand_starved_for(), None);
-
-        // A new attempt with no success: starvation grows with time.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        h.note_attempt();
-        assert_eq!(h.demand_starved_for(), Some(Duration::from_secs(5)));
-        tokio::time::sleep(Duration::from_secs(25)).await;
-        assert_eq!(h.demand_starved_for(), Some(Duration::from_secs(30)));
-
-        // Late success clears the starvation.
-        h.note_success();
-        assert_eq!(h.demand_starved_for(), None);
-    }
 
     #[test]
     fn test_is_target_allowed() {

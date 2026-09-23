@@ -1,7 +1,7 @@
 //! E2E: per-target circuit breaker — one dead target must not starve healthy
 //! targets (2026-09-16 starvation regression suite).
 //!
-//! Case file: `docs/bug/2026-09-16-egress-global-rate-limit-starvation.md`.
+//! Case file: `(internal design notes)`.
 //! The incident: an edge route pointed at a dead local backend (config
 //! error) plus a public retry loop flooded the agent with Opens; the
 //! agent-wide stream-open rate budget was charged before the target was even
@@ -37,9 +37,11 @@
     dead_code,
     unused_mut
 )]
-use bytes::Bytes;
-use interflow_core::protocol::{FrameType, StreamProto};
+use interflow_core::protocol::StreamProto;
+use interflow_core::tls::{InnerTlsMaterial, inner_client_config};
 use interflow_core::tunnel::AgentTunnel;
+use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
+use interflow_core::tunnel::{InnerStreamHello, TargetSelector};
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, metrics_harness::counter_value,
@@ -89,7 +91,7 @@ async fn connect_tunnel(
         .await
         .expect("connect+register");
     let tunnel = AgentTunnel::from_sender(
-        agent_id.to_string(),
+        conn.negotiated.circuit_token,
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
@@ -101,54 +103,81 @@ async fn connect_tunnel(
     (tunnel, conn.conn_handle)
 }
 
-/// Open a stream toward `target` and wait until it is rejected (Close
-/// received); returns the elapsed time.
-async fn open_until_rejected(inj: &AgentTunnel, sid: &str, target: &str) -> Duration {
-    let started = std::time::Instant::now();
-    let mut rx = inj.register_stream(sid.to_string()).await;
-    inj.send_open(sid, "eg", Some(target), StreamProto::Tcp)
+/// Establish production-shaped inner TLS and send the encrypted selector.
+async fn open_inner_tls(
+    inj: &AgentTunnel,
+    sid: interflow_core::protocol::StreamId,
+    target: &str,
+) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
+    let rx = inj.register_stream(sid).await;
+    inj.send_open_with(sid, "eg", StreamProto::Tcp, true)
         .await
-        .expect("open");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    loop {
-        let td = tokio::time::timeout_at(deadline, rx.recv())
-            .await
-            .expect("timed out waiting for the rejecting Close")
-            .expect("channel alive");
-        if matches!(td.stream_type, FrameType::Close) {
-            return started.elapsed();
-        }
+        .expect("inner-TLS open");
+    let (cert, key) = certs().named_client_cert("inj");
+    let ca = certs().ca_path().display().to_string();
+    let material = InnerTlsMaterial::from_paths(
+        &[ca.as_str()],
+        &cert.display().to_string(),
+        &key.display().to_string(),
+    )
+    .expect("inner material");
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+        inner_client_config(&material, "eg").expect("inner connector"),
+    ));
+    let adapter = E2eTunnelIo::ingress(rx, inj.clone(), sid);
+    let mut tls = match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
+        E2eHandshakeOutcome::Established(tls, _) => tls,
+        E2eHandshakeOutcome::Failed { error } => panic!("inner TLS handshake: {error}"),
+    };
+    InnerStreamHello {
+        source_principal: "inj".to_owned(),
+        source_fingerprint: material.leaf_fingerprint(),
+        selector: TargetSelector::Address(target.to_owned()),
+        correlation_id: *uuid::Uuid::new_v4().as_bytes(),
     }
+    .write(&mut tls)
+    .await
+    .expect("inner hello");
+    tls
 }
 
-/// Full round trip (open + data + echo reply + close) against `target`.
+/// Open a stream toward `target` and wait until it is rejected.
+async fn open_until_rejected(
+    inj: &AgentTunnel,
+    sid: interflow_core::protocol::StreamId,
+    target: &str,
+) -> Duration {
+    let started = std::time::Instant::now();
+    let mut tls = open_inner_tls(inj, sid, target).await;
+    let mut probe = [0u8; 1];
+    let _ = tokio::time::timeout(Duration::from_secs(8), tls.read(&mut probe))
+        .await
+        .expect("timed out waiting for the rejecting Close")
+        .expect_err("dead target must close the inner stream");
+    started.elapsed()
+}
+
+/// Full round trip against `target`.
 async fn round_trip_closing(
     inj: &AgentTunnel,
-    sid: &str,
+    sid: interflow_core::protocol::StreamId,
     target: &str,
     payload: &[u8],
     deadline: Duration,
 ) -> Vec<u8> {
-    let mut rx = inj.register_stream(sid.to_string()).await;
-    inj.send_open(sid, "eg", Some(target), StreamProto::Tcp)
-        .await
-        .expect("open");
-    inj.send_data(sid, Bytes::copy_from_slice(payload))
-        .await
-        .expect("send");
-    // recv exactly payload.len bytes, panicking on Close
+    let mut tls = open_inner_tls(inj, sid, target).await;
+    tls.write_all(payload).await.expect("send");
+    tls.flush().await.expect("flush");
     let dl = tokio::time::Instant::now() + deadline;
     let mut got = Vec::with_capacity(payload.len());
     while got.len() < payload.len() {
-        let td = tokio::time::timeout_at(dl, rx.recv())
+        let mut chunk = vec![0u8; payload.len() - got.len()];
+        let n = tokio::time::timeout_at(dl, tls.read(&mut chunk))
             .await
             .expect("reply timed out")
-            .expect("channel alive");
-        assert!(
-            !matches!(td.stream_type, FrameType::Close),
-            "stream {sid} closed prematurely (rejected by a defense line)"
-        );
-        got.extend_from_slice(&td.data);
+            .expect("stream alive");
+        assert_ne!(n, 0, "stream {sid} closed prematurely (defense line)");
+        got.extend_from_slice(&chunk[..n]);
     }
     inj.send_close(sid).await.expect("close");
     got
@@ -160,10 +189,10 @@ async fn wait_egress_ready(inj: &AgentTunnel, echo_addr: SocketAddr) {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let sid = format!("probe-{attempt}");
+        let sid = interflow_testkit::opaque_stream_id(&format!("probe-{attempt}"));
         match round_trip_closing(
             inj,
-            &sid,
+            sid,
             &echo_addr.to_string(),
             b"ping",
             Duration::from_secs(2),
@@ -270,7 +299,12 @@ async fn b1_dead_target_storm_does_not_starve_healthy() {
 
     // Phase 1: three dials, all refused — the breaker trips.
     for i in 0..3 {
-        let elapsed = open_until_rejected(&inj, &format!("b1-dial-{i}"), &dead).await;
+        let elapsed = open_until_rejected(
+            &inj,
+            interflow_testkit::opaque_stream_id(&format!("b1-dial-{i}")),
+            &dead,
+        )
+        .await;
         assert!(
             elapsed < Duration::from_secs(4),
             "refused dial must fail fast, got {elapsed:?}"
@@ -280,7 +314,12 @@ async fn b1_dead_target_storm_does_not_starve_healthy() {
 
     // Phase 2: the storm — 50 Opens, all rejected pre-dial, no dial work.
     for i in 0..50 {
-        let elapsed = open_until_rejected(&inj, &format!("b1-storm-{i}"), &dead).await;
+        let elapsed = open_until_rejected(
+            &inj,
+            interflow_testkit::opaque_stream_id(&format!("b1-storm-{i}")),
+            &dead,
+        )
+        .await;
         assert!(
             elapsed < Duration::from_secs(2),
             "circuit-open rejection must be fast, got {elapsed:?}"
@@ -292,7 +331,7 @@ async fn b1_dead_target_storm_does_not_starve_healthy() {
     let healthy_started = std::time::Instant::now();
     let got = round_trip_closing(
         &inj,
-        "b1-healthy",
+        interflow_testkit::opaque_stream_id("b1-healthy"),
         &echo_addr.to_string(),
         b"ping",
         Duration::from_secs(2),
@@ -351,7 +390,12 @@ async fn b2_recovery_after_backend_starts() {
 
     // Storm: trip the breaker on the dead target.
     for i in 0..5 {
-        open_until_rejected(&inj, &format!("b2-storm-{i}"), &dead).await;
+        open_until_rejected(
+            &inj,
+            interflow_testkit::opaque_stream_id(&format!("b2-storm-{i}")),
+            &dead,
+        )
+        .await;
     }
     wait_counter_at_least(BREAKER_OPENED, 1, Duration::from_secs(5)).await;
 
@@ -359,13 +403,18 @@ async fn b2_recovery_after_backend_starts() {
     let revived = echo_on_port(dead.rsplit(':').next().unwrap().parse().unwrap()).await;
 
     // Still within the cooldown: rejected without dialing.
-    open_until_rejected(&inj, "b2-still-open", &dead).await;
+    open_until_rejected(
+        &inj,
+        interflow_testkit::opaque_stream_id("b2-still-open"),
+        &dead,
+    )
+    .await;
 
     // After the cooldown the recovery probe is admitted and round-trips.
     tokio::time::sleep(Duration::from_millis(2600)).await;
     let got = round_trip_closing(
         &inj,
-        "b2-probe",
+        interflow_testkit::opaque_stream_id("b2-probe"),
         &revived.to_string(),
         b"alive",
         Duration::from_secs(5),
@@ -377,7 +426,7 @@ async fn b2_recovery_after_backend_starts() {
     // Fully re-admitted: an immediate second stream succeeds too.
     let got = round_trip_closing(
         &inj,
-        "b2-after",
+        interflow_testkit::opaque_stream_id("b2-after"),
         &revived.to_string(),
         b"again",
         Duration::from_secs(5),
@@ -423,7 +472,12 @@ async fn b3_disabled_breaker_restores_old_behavior() {
     // budget (burst 4 dials; the remaining 6 Opens are rate_limited during
     // the storm itself).
     for i in 0..10 {
-        open_until_rejected(&inj, &format!("b3-storm-{i}"), &dead).await;
+        open_until_rejected(
+            &inj,
+            interflow_testkit::opaque_stream_id(&format!("b3-storm-{i}")),
+            &dead,
+        )
+        .await;
     }
     let cf_delta = counter_value(CLOSED_CONNECT_FAILED) - cf_before;
     assert_eq!(
@@ -441,7 +495,12 @@ async fn b3_disabled_breaker_restores_old_behavior() {
     );
 
     // The healthy stream is starved out: rejected (rate_limited).
-    let elapsed = open_until_rejected(&inj, "b3-starved", &echo_addr.to_string()).await;
+    let elapsed = open_until_rejected(
+        &inj,
+        interflow_testkit::opaque_stream_id("b3-starved"),
+        &echo_addr.to_string(),
+    )
+    .await;
     assert!(
         elapsed < Duration::from_secs(3),
         "rate-limited rejection is fast, got {elapsed:?}"

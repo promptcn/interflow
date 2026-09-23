@@ -2,12 +2,11 @@ use crate::agent::control::{ControlOpError, IngressCommand};
 use crate::agent::rules::RuleStore;
 use crate::config::IngressRule;
 use interflow_core::error::{InterflowError, Result};
-use interflow_core::protocol::StreamProto;
+use interflow_core::protocol::{CloseReason, StreamProto};
 use interflow_core::tunnel::AgentTunnel;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -44,20 +43,25 @@ impl Drop for ListenerGuard {
 pub struct IngressHandler {
     agent_id: String,
     tunnel: AgentTunnel,
-    /// Cross-session rule truth (in-memory + write-through persistence).
+    /// Cross-session rule truth (in-memory).
     store: Arc<RuleStore>,
     /// Session token: the lifecycle anchor of listeners and per-connection
     /// pumps — session end (watchdog/disconnect/shutdown) exits them all,
     /// and client sockets release with the task (no longer relying on the
-    /// idle timeout to die off).
+    /// idle timeout to die).
     session: CancellationToken,
     /// Session-level task tracker: listeners and per-connection pumps hang
     /// off it and close out boundedly in the teardown sequence.
     tracker: TaskTracker,
     command_rx: Option<mpsc::Receiver<IngressCommand>>,
     guard: ListenerGuard,
-    /// E2e (inner TLS) runtime; `None` = mode off, plain streams only.
-    e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
+    /// Mandatory inner-TLS runtime.
+    e2e: Arc<crate::agent::e2e::E2eRuntime>,
+    /// Readiness signal: set once a session has bound every rule in its
+    /// startup snapshot without error. This is the agent's local-serving
+    /// face — the condition `node install` used to fake with TCP probes
+    /// (and what a `Type=notify` unit's READY=1 now waits on).
+    ingress_ready: tokio::sync::watch::Sender<bool>,
 }
 
 impl IngressHandler {
@@ -68,7 +72,8 @@ impl IngressHandler {
         session: CancellationToken,
         tracker: TaskTracker,
         command_rx: Option<mpsc::Receiver<IngressCommand>>,
-        e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
+        e2e: Arc<crate::agent::e2e::E2eRuntime>,
+        ingress_ready: tokio::sync::watch::Sender<bool>,
     ) -> Self {
         Self {
             agent_id,
@@ -79,6 +84,7 @@ impl IngressHandler {
             command_rx,
             guard: ListenerGuard(HashMap::new()),
             e2e,
+            ingress_ready,
         }
     }
 
@@ -87,10 +93,17 @@ impl IngressHandler {
 
         // At session establishment, take the current rule tables from the
         // store (including API additions from the previous session)
+        let mut all_bound = true;
         for rule in self.store.ingress_snapshot().await {
             if let Err(e) = self.start_listener(rule.clone()).await {
                 error!("Failed to start ingress listener {}: {}", rule.name, e);
+                all_bound = false;
             }
+        }
+        if all_bound {
+            // Idempotent across session rebuilds: the watch keeps the
+            // latest value, and readiness only ever turns on.
+            let _ = self.ingress_ready.send(true);
         }
 
         if let Some(mut rx) = self.command_rx.take() {
@@ -116,12 +129,16 @@ impl IngressHandler {
         Ok(())
     }
 
-    /// Add: start the listener first (the fallible runtime side effect),
-    /// then persist; if persistence fails, roll back the listener just
-    /// started. An Ok acknowledgment = the rule is in effect and persisted
-    /// to disk.
+    /// Add: start the listener first (the fallible runtime side effect), then
+    /// record the rule in the store. An Ok acknowledgment = the rule is in
+    /// effect.
     async fn handle_add(&mut self, rule: IngressRule) -> std::result::Result<(), ControlOpError> {
         let name = rule.name.clone();
+        if !rule.listen_addr.ip().is_loopback() {
+            return Err(ControlOpError::Apply(format!(
+                "ingress {name} rejected: listen_addr must be loopback"
+            )));
+        }
         // Same-name replacement: stop the old listener first (the old
         // implementation overwrote the map entry directly, leaking the
         // listener task)
@@ -137,22 +154,10 @@ impl IngressHandler {
                 "failed to start listener: {e}"
             )));
         }
-        match self.store.add_ingress(rule).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Persistence failed: roll back the listener; neither memory
-                // nor the file changed
-                if let Some(handle) = self.guard.0.remove(&name) {
-                    handle.abort();
-                }
-                Err(e.into())
-            }
-        }
+        self.store.add_ingress(rule).await.map_err(Into::into)
     }
 
-    /// Remove: stop the listener first, then persist; if persistence fails,
-    /// compensate by restarting the listener from the rule still in the
-    /// store (memory untouched, the rule keeps serving).
+    /// Remove: stop the listener, then drop the rule from the store.
     async fn handle_remove(&mut self, name: &str) -> std::result::Result<(), ControlOpError> {
         let Some(handle) = self.guard.0.remove(name) else {
             return Err(ControlOpError::NotFound(format!(
@@ -161,35 +166,16 @@ impl IngressHandler {
         };
         info!("Stopping ingress listener: {}", name);
         handle.abort();
-        match self.store.remove_ingress(name).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Compensation: the store's memory was untouched (the
-                // persist-first step failed); restart the listener from the
-                // original rule
-                match self.store.find_ingress(name).await {
-                    Some(rule) => {
-                        if let Err(e2) = self.start_listener(rule).await {
-                            error!(
-                                "Removal of {} failed to persist ({e}) and listener compensation restart failed ({e2}), \
-                                 rule remains in memory but is no longer listening; next session resync will restore it",
-                                name
-                            );
-                        }
-                    }
-                    None => {
-                        warn!(
-                            "Removal of {} failed to persist and the rule is gone from the store, skipping compensation",
-                            name
-                        );
-                    }
-                }
-                Err(e.into())
-            }
-        }
+        self.store.remove_ingress(name).await.map_err(Into::into)
     }
 
     async fn start_listener(&mut self, rule: IngressRule) -> Result<()> {
+        if !rule.listen_addr.ip().is_loopback() {
+            return Err(InterflowError::config(format!(
+                "ingress {} listen_addr must be loopback",
+                rule.name
+            )));
+        }
         match rule.listen_protocol {
             StreamProto::Tcp => self.start_tcp_listener(rule).await,
             StreamProto::Udp => self.start_udp_listener(rule),
@@ -208,11 +194,17 @@ impl IngressHandler {
         let tunnel = self.tunnel.clone();
         let rule_clone = rule.clone();
         let session = self.session.clone();
+        let e2e = Arc::clone(&self.e2e);
         let handle = self.tracker.spawn(async move {
             // Stop on session end (the socket closes as the task drops)
             tokio::select! {
                 () = session.cancelled() => {}
-                () = crate::agent::ingress_udp::run_udp_listener(socket, rule_clone, tunnel) => {}
+                () = crate::agent::ingress_udp::run_udp_listener(
+                    socket,
+                    rule_clone,
+                    tunnel,
+                    e2e,
+                ) => {}
             }
         });
 
@@ -304,13 +296,13 @@ impl IngressHandler {
         socket: tokio::net::TcpStream,
         tunnel: AgentTunnel,
         rule: IngressRule,
-        _agent_id: String,
-        e2e: Option<Arc<crate::agent::e2e::E2eRuntime>>,
+        agent_id: String,
+        e2e: Arc<crate::agent::e2e::E2eRuntime>,
     ) -> Result<()> {
         // Stream idle timeout: close the stream when neither direction has
         // data for this long (default tcp 300s, configurable per rule)
         let idle_timeout = rule.effective_idle_timeout();
-        let stream_id = uuid::Uuid::new_v4().to_string();
+        let stream_id = interflow_core::protocol::StreamId::random()?;
 
         let pump_cfg = interflow_core::tunnel::pump::PumpConfig {
             idle_timeout,
@@ -320,161 +312,102 @@ impl IngressHandler {
             log_label: "ingress",
         };
 
-        // E2e (inner TLS) mode: the inner client handshake runs between the
+        // Mandatory inner TLS: the inner client handshake runs between the
         // Open and the pump; handshake bytes ride ordinary Data frames (the
-        // hub only sees ciphertext). `required` failures close the stream —
-        // never a plaintext fallback (RFC §3/§4).
-        if let Some(rt) = e2e {
-            // Register a dedicated channel (avoids a broadcast storm)
-            let data_rx = tunnel.register_stream(stream_id.clone()).await;
-            if let Err(e) = tunnel
-                .send_open_with(
-                    &stream_id,
-                    &rule.target_agent,
-                    rule.remote_addr.as_deref(),
-                    StreamProto::Tcp,
-                    true,
-                )
-                .await
-            {
-                tunnel.unregister_stream(&stream_id).await;
+        // hub only sees ciphertext). A missing runtime or failed handshake
+        // closes the stream — there is no plaintext fallback (RFC §3/§4).
+        let rt = Arc::clone(&e2e);
+
+        // Register a dedicated channel (avoids a broadcast storm).
+        let data_rx = tunnel.register_stream(stream_id).await;
+        if let Err(e) = tunnel
+            .send_open_with(stream_id, &rule.target_agent, StreamProto::Tcp, true)
+            .await
+        {
+            tunnel.unregister_stream(stream_id).await;
+            return Err(e);
+        }
+
+        let expected_peer = crate::agent::e2e::bare_agent_id(&rule.target_agent);
+        let connector = match rt.client_connector(expected_peer) {
+            Ok(c) => c,
+            Err(e) => {
+                // Startup-assembled material went stale mid-session: fail closed.
+                crate::agent::e2e::record_handshake_failure(
+                    crate::agent::e2e::SIDE_INGRESS,
+                    "protocol",
+                );
+                warn!(
+                    "inner TLS connector build failed for {stream_id} -> {expected_peer}: {e}; closing stream"
+                );
+                tunnel.unregister_stream(stream_id).await;
                 return Err(e);
             }
+        };
 
-            let expected_peer = crate::agent::e2e::bare_agent_id(&rule.target_agent);
-            let connector = match rt.client_connector(expected_peer) {
-                Ok(c) => c,
-                Err(e) => {
-                    // Material assembled at startup; reaching here means it
-                    // went stale mid-session — treat as a required-style
-                    // failure (fail-closed) in every mode.
+        let adapter =
+            interflow_core::tunnel::e2e::E2eTunnelIo::ingress(data_rx, tunnel.clone(), stream_id);
+        match interflow_core::tunnel::e2e::inner_tls_connect(
+            adapter,
+            connector,
+            rt.handshake_timeout,
+        )
+        .await
+        {
+            interflow_core::tunnel::e2e::E2eHandshakeOutcome::Established(mut tls, _reason) => {
+                crate::agent::e2e::record_handshake_ok(crate::agent::e2e::SIDE_INGRESS);
+                let selector = rule.remote_addr.clone().map_or(
+                    interflow_core::tunnel::TargetSelector::Default,
+                    interflow_core::tunnel::TargetSelector::Address,
+                );
+                let hello = interflow_core::tunnel::InnerStreamHello {
+                    source_principal: agent_id.clone(),
+                    source_fingerprint: rt.local_fingerprint(),
+                    selector,
+                    correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+                };
+                if let Err(e) = hello.write(&mut tls).await {
                     crate::agent::e2e::record_handshake_failure(
                         crate::agent::e2e::SIDE_INGRESS,
                         "protocol",
                     );
-                    warn!(
-                        "e2e connector build failed for {stream_id} -> {expected_peer}: {e}; closing stream"
-                    );
-                    tunnel.unregister_stream(&stream_id).await;
-                    return Err(e);
+                    let _ = tunnel.send_close(stream_id).await;
+                    tunnel.unregister_stream(stream_id).await;
+                    return Err(e.into());
                 }
-            };
-
-            let adapter = interflow_core::tunnel::e2e::E2eTunnelIo::ingress(
-                data_rx,
-                tunnel.clone(),
-                stream_id.clone(),
-            );
-            match interflow_core::tunnel::e2e::inner_tls_connect(
-                adapter,
-                connector,
-                rt.handshake_timeout,
-            )
-            .await
-            {
-                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Established(tls, _reason) => {
-                    crate::agent::e2e::record_handshake_ok(crate::agent::e2e::SIDE_INGRESS);
-                    let sid = stream_id.clone();
-                    let t2 = tunnel.clone();
-                    interflow_core::tunnel::pump::pump_duplex(
-                        socket,
-                        tls,
-                        &pump_cfg,
-                        &stream_id,
-                        async move {
-                            // The TLS close_notify rode Data frames; the
-                            // stream Close itself is this side's to send
-                            // (no-op on the peer-close-ended path — the hub
-                            // already reaped the stream).
-                            let _ = t2.send_close(&sid).await;
-                            t2.unregister_stream(&sid).await;
-                        },
-                    )
-                    .await;
-                    return Ok(());
-                }
-                interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { parts, error } => {
-                    let reason = crate::agent::e2e::failure_reason_of(&error);
-                    crate::agent::e2e::record_handshake_failure(
-                        crate::agent::e2e::SIDE_INGRESS,
-                        reason,
-                    );
-                    if rt.mode == crate::config::E2eMode::Required {
-                        // Fail-closed: no plaintext leaves this agent. The
-                        // stream Close is sent here (the shuttle never
-                        // closes on TLS-side death — the opportunistic
-                        // fallback depends on the channel staying live).
-                        warn!(
-                            "e2e handshake failed ({reason}: {error}), closing stream {stream_id} (required mode)"
-                        );
-                        let _ = tunnel.send_close(&stream_id).await;
-                        tunnel.unregister_stream(&stream_id).await;
-                        return Err(InterflowError::connection(format!(
-                            "e2e handshake failed: {error}"
-                        )));
-                    }
-                    // Opportunistic fallback: replay the peer bytes buffered
-                    // during the attempt (an old egress relays banner bytes
-                    // straight back), then resume the plain pump.
-                    info!(
-                        "e2e handshake failed ({reason}: {error}), falling back to plaintext stream {stream_id}"
-                    );
-                    let (rd, mut wr) = socket.into_split();
-                    if !parts.buffered.is_empty() {
-                        match tokio::time::timeout(
-                            CLIENT_WRITE_STALL_TIMEOUT,
-                            wr.write_all(&parts.buffered),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            outcome => {
-                                warn!("fallback replay write failed: {outcome:?}");
-                                tunnel.unregister_stream(&stream_id).await;
-                                return Ok(());
-                            }
-                        }
-                    }
-                    interflow_core::tunnel::pump::pump_tcp_stream(
-                        rd, wr, parts.rx, &tunnel, &stream_id, &pump_cfg,
-                    )
-                    .await;
-                    return Ok(());
-                }
+                let sid = stream_id;
+                let t2 = tunnel.clone();
+                interflow_core::tunnel::pump::pump_duplex(
+                    socket,
+                    tls,
+                    &pump_cfg,
+                    CloseReason::CloseFrame,
+                    Duration::ZERO,
+                    stream_id,
+                    async move {
+                        // The TLS close_notify rode Data frames; the stream
+                        // Close itself is this side's to send (no-op on the
+                        // peer-close-ended path — the hub already reaped it).
+                        let _ = t2.send_close(sid).await;
+                        t2.unregister_stream(sid).await;
+                    },
+                )
+                .await;
+                Ok(())
+            }
+            interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { error } => {
+                let reason = crate::agent::e2e::failure_reason_of(&error);
+                crate::agent::e2e::record_handshake_failure(
+                    crate::agent::e2e::SIDE_INGRESS,
+                    reason,
+                );
+                warn!("inner TLS handshake failed ({reason}: {error}), closing stream {stream_id}");
+                let _ = tunnel.send_close(stream_id).await;
+                tunnel.unregister_stream(stream_id).await;
+                Err(InterflowError::connection(format!(
+                    "inner TLS handshake failed: {error}"
+                )))
             }
         }
-
-        // Plain path (mode off): unchanged behavior.
-        let data_rx = tunnel.register_stream(stream_id.clone()).await;
-
-        // Send the stream-open signal
-        if let Err(e) = tunnel
-            .send_open(
-                &stream_id,
-                &rule.target_agent,
-                rule.remote_addr.as_deref(),
-                StreamProto::Tcp,
-            )
-            .await
-        {
-            tunnel.unregister_stream(&stream_id).await;
-            return Err(e);
-        }
-
-        // Bidirectional pumps (shared implementation, inlined futures
-        // without spawning): either half exiting winds down the whole
-        // stream and unregisters it — when the write half exits first the
-        // read half is cancelled by drop (preventing a half-open socket
-        // from lingering until the idle timeout), and when the read half
-        // exits first it unregisters before flushing the buffer. The
-        // JoinHandle double-poll panic class is structurally excluded
-        // (docs/bug/2026-09-13-select-branch-double-await-joinhandle-panic.md).
-        let (rd, wr) = socket.into_split();
-        interflow_core::tunnel::pump::pump_tcp_stream(
-            rd, wr, data_rx, &tunnel, &stream_id, &pump_cfg,
-        )
-        .await;
-
-        Ok(())
     }
 }

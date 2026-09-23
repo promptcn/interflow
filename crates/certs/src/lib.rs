@@ -1,6 +1,6 @@
 //! Interflow certificate issuance — the single rcgen implementation shared by
-//! `interflow-mesh certs`, the `interflow-expose init` wizard, and the test kit
-//! (design §2.4, docs/design/multi-tenant-mtls-only.md).
+//! the identity issuer and the test kit
+//! (design §2.4, (internal design notes)).
 //!
 //! Two layers:
 //! - [`material`]: in-memory builders (tenant CA / hub server pair / agent
@@ -31,9 +31,9 @@ use std::net::IpAddr;
 /// [`Error::Expired`] for what an expired CA means operationally).
 pub const CA_VALIDITY_DAYS: i64 = 3650;
 
-/// Hub/agent leaf validity: 1 year. There is no revocation infrastructure;
-/// expiry IS the revocation mechanism, so leaves stay short-lived.
-pub const LEAF_VALIDITY_DAYS: i64 = 365;
+/// Hub/agent leaf validity: 1 day. Short lifetimes bound a stolen
+/// credential even before CRL distribution reaches every verifier.
+pub const LEAF_VALIDITY_DAYS: i64 = 1;
 
 /// Errors from issuance and from validating existing on-disk state.
 #[derive(Debug, thiserror::Error)]

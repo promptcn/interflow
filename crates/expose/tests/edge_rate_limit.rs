@@ -1,13 +1,16 @@
 //! e2e: verifies the edge's per-IP new-connection rate limit.
 //!
 //! Scenario 1: with limit=5/min, 127.0.0.1 quickly opening 5 connections
-//! succeeds and the 6th is denied.
-//! Scenario 2: 127.0.0.1 opening 5 + 127.0.0.2 opening 5 both succeed
-//! (per-IP isolation).
-//!
-//! Note: a denied connection manifests as "peer closes before sending any
-//! bytes" — on a rate-limit hit the edge does `drop(stream)` and sends no
-//! HTTP response.
+//! succeeds and the 6th is denied — and since this stack's listener is a
+//! plaintext (fronted-shaped) face, the denial is **answered**: a real
+//! `429 Too Many Requests` + `Retry-After` instead of the zero-byte close
+//! that made fronting proxies synthesize misleading 502s
+//!.
+//! Scenario 2: limit=0 means unlimited.
+//! Scenario 3: the fronted topology default (600/min) admits a
+//! browser-shaped burst of 40 requests in one minute — the exact
+//! "normal traffic must not be collateral damage" guard the deploy-day
+//! validation lacked (only single curls were tried, all 200s).
 
 #![allow(
     clippy::all,
@@ -20,103 +23,60 @@
     dead_code,
     unused_mut
 )]
-use interflow_expose::client::ExposeArgs;
-use interflow_expose::edge::EdgeArgs;
-use interflow_expose::edge::EdgeHubTls;
+use interflow_expose::client::{ExposeArgs, LocalService};
+use interflow_expose::edge::{
+    ControlEndpointTls, DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE, EdgeConfig,
+    EdgeListenerPolicy, IngressPrincipal, Route, WorkspaceTrust,
+};
 use interflow_mesh::config::TransportKind;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-async fn spawn_echo() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
-    let addr = listener.local_addr().expect("echo addr");
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                loop {
-                    match sock.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if sock.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
-fn pick_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-    listener.local_addr().expect("addr").port()
-}
-
-async fn wait_for_tcp(addr: SocketAddr, timeout: Duration) -> std::io::Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(e);
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-}
+use tokio::net::TcpStream;
 
 /// Starts edge (with the given rate limit) + expose client + echo, returns edge_listen.
 async fn spawn_stack(rate_per_ip_per_min: u32) -> SocketAddr {
-    let echo_addr = spawn_echo().await;
-    let edge_port = pick_port();
-    let hub_port = pick_port();
+    let echo_addr = interflow_testkit::echo_server().await.0;
+    let edge_port = interflow_testkit::pick_ephemeral_port();
+    let hub_port = interflow_testkit::pick_ephemeral_port();
     let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
     let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
-    let routes_content = format!(
-        r#"
-[[routes]]
-host = "test.local"
-tenant = "test"
-agent_id = "expose-test"
-remote_addr = "{echo_addr}"
-"#
-    );
-    let routes_path = std::env::temp_dir().join(format!(
-        "interflow_test_routes_{}.toml",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::write(&routes_path, &routes_content).expect("write routes.toml");
-
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
-    let edge_args = EdgeArgs {
+    let (principal_cert, principal_key) = certs.named_client_cert("edge");
+    let edge_config = EdgeConfig {
         listen_addr: edge_listen,
-        hub_listen_addr: hub_listen,
-        routes_path: routes_path.to_string_lossy().into_owned(),
-        tenant_cas: vec![("test".to_string(), certs.ca_path().display().to_string())],
-        proxy_protocol: Default::default(),
-        hub_tls: Some(EdgeHubTls {
-            cert_path: certs.server_cert_path().display().to_string(),
-            key_path: certs.server_key_path().display().to_string(),
-        }),
-        new_conn_rate_per_ip_per_minute: rate_per_ip_per_min,
-        agent_recovery_timeout_secs: 120,
-        ..Default::default()
+        control_listen_addr: hub_listen,
+        control_tls: ControlEndpointTls {
+            cert: certs.server_cert_path(),
+            key: certs.server_key_path(),
+        },
+        workspace_trust: vec![WorkspaceTrust {
+            workspace: "test".to_string(),
+            ca: certs.ca_path(),
+        }],
+        principals: vec![IngressPrincipal {
+            workspace: "test".to_string(),
+            cert: principal_cert,
+            key: principal_key,
+        }],
+        routes: vec![Route {
+            host: "test.local".to_string(),
+            workspace: "test".to_string(),
+            agent_id: "expose-test".to_string(),
+            service_id: "web".to_string(),
+        }],
+        listener: EdgeListenerPolicy {
+            new_conn_rate_per_ip_per_minute: rate_per_ip_per_min,
+            ..EdgeListenerPolicy::default()
+        },
+        agent_recovery_timeout: Duration::from_secs(120),
+        ..EdgeConfig::default()
     };
-    tokio::task::spawn(interflow_expose::edge::run(edge_args));
+    tokio::task::spawn(interflow_expose::edge::run(edge_config));
 
     // Wait only for the hub (not the edge listener, to avoid consuming edge rate-limit tokens)
-    wait_for_tcp(hub_listen, Duration::from_secs(5))
+    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
         .await
         .expect("hub should start within 5s");
     // Give the edge listener a moment to come up
@@ -124,55 +84,77 @@ remote_addr = "{echo_addr}"
 
     let (client_cert, client_key) = certs.client_paths();
     let client_args = ExposeArgs {
-        local_ports: vec![echo_addr.port()],
+        log_name: None,
+        services: vec![LocalService {
+            id: "web".into(),
+            target_addr: echo_addr,
+            overridden: false,
+        }],
         hub_url: format!("https://127.0.0.1:{hub_port}"),
         client_cert: Some(client_cert.display().to_string()),
         client_key: Some(client_key.display().to_string()),
         agent_id: "expose-test".into(),
+        ingress_ca_path: Some(certs.ca_path().display().to_string()),
         ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
     };
-    tokio::task::spawn(async move { interflow_expose::client::start(&client_args)?.join().await });
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let _ = std::fs::remove_file(&routes_path);
+    let client = interflow_expose::client::start(&client_args).expect("expose client start");
+    assert!(
+        interflow_testkit::wait_agent_connected(&client, Duration::from_secs(5)).await,
+        "expose client should register within 5s"
+    );
+    tokio::task::spawn(async move { client.join().await });
     edge_listen
 }
 
-/// Sends an HTTP request with a valid Host header; returns whether any
-/// response bytes arrived. On a rate-limit hit the connection is dropped and
-/// read returns 0 bytes or an error.
-async fn send_request(edge: SocketAddr) -> bool {
+/// Sends an HTTP request with a valid Host header; returns whatever response
+/// bytes arrived (the echo backend mirrors the request on success). `None` =
+/// zero-byte close; a rate-limit denial on this plaintext face answers
+/// `HTTP/1.1 429 …` instead.
+async fn send_request(edge: SocketAddr) -> Option<String> {
     let Ok(mut sock) = TcpStream::connect(edge).await else {
-        return false;
+        return None;
     };
     let req = b"GET / HTTP/1.1\r\nHost: test.local\r\nConnection: close\r\n\r\n";
-    if sock.write_all(req).await.is_err() {
-        return false;
-    }
+    sock.write_all(req).await.ok()?;
     let _ = sock.flush().await;
-    let mut buf = [0u8; 64];
-    matches!(sock.read(&mut buf).await, Ok(n) if n > 0)
+    let mut buf = [0u8; 512];
+    let n = sock.read(&mut buf).await.ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf[..n]).into_owned())
 }
 
+/// The denied connection is **answered**, not dropped mid-air: 429 semantics
+/// with a Retry-After derived from the quota (ceil(60/5) = 12s until the next
+/// token refills).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rate_limit_rejects_beyond_quota() {
     // limit=5/min: the first 5 pass, the 6th is denied (warmup does not consume edge tokens)
     let edge = spawn_stack(5).await;
 
     for i in 0..5 {
+        let answer = send_request(edge).await;
+        assert!(answer.is_some(), "request #{i} should succeed within quota");
         assert!(
-            send_request(edge).await,
-            "request #{i} should succeed within quota"
+            !answer.unwrap().starts_with("HTTP/1.1 429"),
+            "request #{i} is within quota and must not be denied"
         );
     }
 
-    // 6th: rate-limit hit, connection dropped
-    let got_response = send_request(edge).await;
+    // 6th: rate-limit hit — a real 429 answer, not a zero-byte close.
+    let answer = send_request(edge)
+        .await
+        .expect("denial must be answered with bytes, not a bare close");
     assert!(
-        !got_response,
-        "6th request over rate limit should be dropped (no response bytes)"
+        answer.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "6th request over quota must be answered 429, got: {answer}"
+    );
+    assert!(
+        answer.to_ascii_lowercase().contains("retry-after: 12"),
+        "Retry-After must quote one refill interval (ceil(60/5)=12s): {answer}"
     );
 }
 
@@ -182,8 +164,25 @@ async fn rate_limit_zero_means_unlimited() {
     let edge = spawn_stack(0).await;
     for i in 0..20 {
         assert!(
-            send_request(edge).await,
+            send_request(edge).await.is_some(),
             "request #{i} should succeed when rate limit disabled"
+        );
+    }
+}
+
+/// The fronted-topology default quota admits a browser-shaped burst: one SPA
+/// load plus a few page navigations ≈ 30–40 new connections in a minute
+/// (the front proxy opens one connection per proxied request). The old 30/min
+/// default turned exactly this into random 502s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fronted_default_quota_admits_browser_shaped_burst() {
+    let edge = spawn_stack(DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE).await;
+    for i in 0..40 {
+        assert!(
+            send_request(edge)
+                .await
+                .is_some_and(|a| !a.starts_with("HTTP/1.1 429")),
+            "browser-shaped request #{i} must pass under the fronted default quota"
         );
     }
 }

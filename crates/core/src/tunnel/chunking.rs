@@ -3,7 +3,7 @@
 //! `/stream/up` request).
 //!
 //! Why this exists (2026-09-17 GOAWAY churn bug,
-//! docs/bug/2026-09-17-h2-data-frame-budget-goaway-churn.md): HTTP body chunk
+//! (internal design notes)): HTTP body chunk
 //! boundaries become h2 DATA frame boundaries, and h2 ≥ 0.4.16 (anti
 //! framing-overhead DoS hardening) *accounts* those boundaries:
 //!

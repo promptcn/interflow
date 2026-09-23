@@ -1,0 +1,18 @@
+# gitleaks configuration — scoped allowlist for opaque data-plane token
+# fixtures. The v3 data plane authenticates streams with opaque random
+# tokens (no semantic secrets); test and doc fixtures embed obviously-fake
+# token JSON that trips the generic-api-key heuristic. Real key material
+# never enters this repository (policy: SECURITY.md; certificates and keys
+# are issued on demand and git-ignored).
+title = "interflow gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "opaque-token test/doc fixtures (fake data-plane tokens)"
+paths = [
+    '''crates/core/src/tunnel/negotiation\.rs''',
+    '''crates/mesh/tests/e2e_data_plane_stall\.rs''',
+    '''crates/mesh/tests/e2e_request_establish_timeout\.rs''',
+]

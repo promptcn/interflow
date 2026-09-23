@@ -1,0 +1,34 @@
+[package]
+name = "interflow-util"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Shared micro-utilities (endpoint/authority parsing, atomic file writes) with a minimal dependency footprint"
+license.workspace = true
+
+[lib]
+name = "interflow_util"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Authority/endpoint parsing. The `http` types are pure syntax (no network,
+# no IDNA translation) and drag only bytes/fnv/itoa into the graph — the
+# reason this crate exists instead of hanging these helpers off
+# interflow-core, which identity/registrar deliberately do not depend on.
+http = "1.4"
+
+# Atomic replace-on-write (unique same-dir temp file + rename). Already in
+# the lockfile as a dev-dependency of most crates; promoting it here adds no
+# new versions to the graph.
+tempfile = "3"
+
+# Content digests (sha256_hex) for pack manifests / trust bundles / cert
+# fingerprints. Pure computation crates, already in the lockfile via most
+# production crates.
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+thiserror = { workspace = true }

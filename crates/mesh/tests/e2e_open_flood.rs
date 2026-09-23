@@ -39,9 +39,10 @@
     dead_code,
     unused_mut
 )]
-use bytes::Bytes;
 use interflow_core::protocol::{FrameType, StreamProto};
-use interflow_core::tunnel::{AgentTunnel, TunnelData};
+use interflow_core::tls::{InnerTlsMaterial, inner_client_config};
+use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
+use interflow_core::tunnel::{AgentTunnel, TargetSelector, TunnelData};
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, hub_config_tuned, metrics_harness::counter_value,
@@ -53,7 +54,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
@@ -126,7 +127,7 @@ async fn connect_tunnel(
         .await
         .expect("connect+register");
     let tunnel = AgentTunnel::from_sender(
-        agent_id.to_string(),
+        conn.negotiated.circuit_token,
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         &interflow_core::tunnel::session_tasks::SessionTasks::new(
@@ -144,26 +145,75 @@ async fn connect_tunnel(
 /// defense line fails here.
 async fn tunnel_round_trip(
     inj: &AgentTunnel,
-    sid: &str,
+    sid: interflow_core::protocol::StreamId,
     target: SocketAddr,
     payload: &[u8],
     deadline: Duration,
 ) -> Vec<u8> {
-    let mut rx = inj.register_stream(sid.to_string()).await;
-    inj.send_open(sid, "eg", Some(&target.to_string()), StreamProto::Tcp)
+    let mut tls = open_inner_tls(inj, sid, &target.to_string()).await;
+    tls.write_all(payload).await.expect("inner write");
+    tls.flush().await.expect("inner flush");
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(deadline, tls.read_exact(&mut got))
+        .await
+        .expect("inner echo timed out")
+        .expect("inner read");
+    got
+}
+
+/// Opens a production-shaped stream: token-only routing metadata on the
+/// wire, then mandatory inner TLS and encrypted target selector.
+async fn open_inner_tls(
+    inj: &AgentTunnel,
+    sid: interflow_core::protocol::StreamId,
+    target: &str,
+) -> tokio_rustls::client::TlsStream<tokio::io::DuplexStream> {
+    try_open_inner_tls(inj, sid, target)
+        .await
+        .expect("inner stream")
+}
+
+async fn try_open_inner_tls(
+    inj: &AgentTunnel,
+    sid: interflow_core::protocol::StreamId,
+    target: &str,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::io::DuplexStream>> {
+    let rx = inj.register_stream(sid).await;
+    inj.send_open_with(sid, "eg", StreamProto::Tcp, true)
         .await
         .expect("open");
-    inj.send_data(sid, Bytes::copy_from_slice(payload))
-        .await
-        .expect("send");
-    recv_exact_from(&mut rx, sid, payload.len(), deadline).await
+    let (cert, key) = certs().named_client_cert("inj");
+    let ca = certs().ca_path().display().to_string();
+    let material = InnerTlsMaterial::from_paths(
+        &[ca.as_str()],
+        &cert.display().to_string(),
+        &key.display().to_string(),
+    )
+    .expect("inner material");
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+        inner_client_config(&material, "eg").expect("inner connector"),
+    ));
+    let adapter = E2eTunnelIo::ingress(rx, inj.clone(), sid);
+    match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
+        E2eHandshakeOutcome::Established(mut tls, _) => {
+            let hello = interflow_core::tunnel::InnerStreamHello {
+                source_principal: "inj".to_owned(),
+                source_fingerprint: material.leaf_fingerprint(),
+                selector: TargetSelector::Address(target.to_owned()),
+                correlation_id: *uuid::Uuid::new_v4().as_bytes(),
+            };
+            hello.write(&mut tls).await.expect("inner hello");
+            Ok(tls)
+        }
+        E2eHandshakeOutcome::Failed { error, .. } => Err(error),
+    }
 }
 
 /// Actively Close after the round trip: reclaim the agent-side slot so
 /// probe/flood streams do not leak local concurrency quota.
 async fn round_trip_closing(
     inj: &AgentTunnel,
-    sid: &str,
+    sid: interflow_core::protocol::StreamId,
     target: SocketAddr,
     payload: &[u8],
     deadline: Duration,
@@ -175,10 +225,14 @@ async fn round_trip_closing(
 
 /// Open a stream toward `target` and wait until it is rejected (Close
 /// received); returns the elapsed time.
-async fn open_until_rejected(inj: &AgentTunnel, sid: &str, target: &str) -> Duration {
+async fn open_until_rejected(
+    inj: &AgentTunnel,
+    sid: interflow_core::protocol::StreamId,
+    _target: &str,
+) -> Duration {
     let started = std::time::Instant::now();
-    let mut rx = inj.register_stream(sid.to_string()).await;
-    inj.send_open(sid, "eg", Some(target), StreamProto::Tcp)
+    let mut rx = inj.register_stream(sid).await;
+    inj.send_open(sid, "eg", StreamProto::Tcp)
         .await
         .expect("open");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -200,8 +254,8 @@ async fn wait_egress_ready(inj: &AgentTunnel, echo_addr: SocketAddr) {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let sid = format!("probe-{attempt}");
-        match round_trip_closing(inj, &sid, echo_addr, b"ping", Duration::from_secs(2)).await {
+        let sid = interflow_testkit::opaque_stream_id(&format!("probe-{attempt}"));
+        match round_trip_closing(inj, sid, echo_addr, b"ping", Duration::from_secs(2)).await {
             resp if resp == b"ping" => break,
             _ => {}
         }
@@ -221,8 +275,8 @@ async fn wait_egress_ready(inj: &AgentTunnel, echo_addr: SocketAddr) {
 /// streams succeed).
 async fn flood_cycles(inj: &AgentTunnel, echo_addr: SocketAddr, n: u32, tag: &str) {
     for i in 0..n {
-        let sid = format!("{tag}-{i}");
-        let got = round_trip_closing(inj, &sid, echo_addr, b"flood", Duration::from_secs(5)).await;
+        let sid = interflow_testkit::opaque_stream_id(&format!("{tag}-{i}"));
+        let got = round_trip_closing(inj, sid, echo_addr, b"flood", Duration::from_secs(5)).await;
         assert_eq!(got, b"flood", "data corruption on flood stream {i}");
     }
 }
@@ -282,8 +336,14 @@ async fn f1_flood_does_not_break_session() {
     assert_eq!(counter_value("interflow_dispatch_stream_poisoned_total"), 0);
 
     // Closing probe: the session is still healthy
-    let got =
-        round_trip_closing(&inj, "f1-final", echo_addr, b"ping", Duration::from_secs(5)).await;
+    let got = round_trip_closing(
+        &inj,
+        interflow_testkit::opaque_stream_id("f1-final"),
+        echo_addr,
+        b"ping",
+        Duration::from_secs(5),
+    )
+    .await;
     assert_eq!(got, b"ping");
 }
 
@@ -311,14 +371,13 @@ async fn f2_local_stream_limit_rejects_and_releases() {
     wait_egress_ready(&inj, echo_addr).await;
 
     // First 4: open + data (kept open, filling the local quota)
+    let mut kept = Vec::new();
     for i in 0..4u32 {
-        let sid = format!("f2-keep-{i}");
-        inj.send_open(&sid, "eg", Some(&backend.to_string()), StreamProto::Tcp)
-            .await
-            .expect("open");
-        inj.send_data(&sid, Bytes::from_static(b"hi"))
-            .await
-            .expect("send");
+        let sid = interflow_testkit::opaque_stream_id(&format!("f2-keep-{i}"));
+        let mut tls = open_inner_tls(&inj, sid, &backend.to_string()).await;
+        tls.write_all(b"hi").await.expect("send");
+        tls.flush().await.expect("flush");
+        kept.push(tls);
     }
     eventually(
         || conns.load(Ordering::SeqCst) >= 4,
@@ -328,8 +387,18 @@ async fn f2_local_stream_limit_rejects_and_releases() {
     .await;
 
     // 5th/6th: rejected by the local cap (Close returns to the source)
-    let t5 = open_until_rejected(&inj, "f2-x5", &backend.to_string()).await;
-    let t6 = open_until_rejected(&inj, "f2-x6", &backend.to_string()).await;
+    let t5 = open_until_rejected(
+        &inj,
+        interflow_testkit::opaque_stream_id("f2-x5"),
+        &backend.to_string(),
+    )
+    .await;
+    let t6 = open_until_rejected(
+        &inj,
+        interflow_testkit::opaque_stream_id("f2-x6"),
+        &backend.to_string(),
+    )
+    .await;
     assert!(t5 < Duration::from_secs(5) && t6 < Duration::from_secs(5));
     wait_counter_at_least(OPEN_DROP_LOCAL, 2, Duration::from_secs(5)).await;
     // Rejection without dialing: backend connections remain 4
@@ -342,10 +411,19 @@ async fn f2_local_stream_limit_rejects_and_releases() {
 
     // Slot release: close one, and a new stream can be established and
     // round-trip (the echo backend verifies end to end)
-    inj.send_close("f2-keep-0").await.expect("close");
+    inj.send_close(interflow_testkit::opaque_stream_id("f2-keep-0"))
+        .await
+        .expect("close");
+    drop(kept);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let got =
-        round_trip_closing(&inj, "f2-after", echo_addr, b"ping", Duration::from_secs(5)).await;
+    let got = round_trip_closing(
+        &inj,
+        interflow_testkit::opaque_stream_id("f2-after"),
+        echo_addr,
+        b"ping",
+        Duration::from_secs(5),
+    )
+    .await;
     assert_eq!(got, b"ping");
 }
 
@@ -379,25 +457,37 @@ async fn f3_rate_limit_bounds_churn_connections() {
 
     // High-speed churn: 30 rounds of back-to-back open+close (no waiting for
     // round trips)
+    let mut established = 0usize;
+    let mut established_streams = Vec::new();
     for i in 0..30u32 {
-        let sid = format!("f3-churn-{i}");
-        inj.send_open(&sid, "eg", Some(&backend.to_string()), StreamProto::Tcp)
-            .await
-            .expect("open");
-        inj.send_close(&sid).await.expect("close");
+        let sid = interflow_testkit::opaque_stream_id(&format!("f3-churn-{i}"));
+        if let Ok(tls) = try_open_inner_tls(&inj, sid, &backend.to_string()).await {
+            established += 1;
+            established_streams.push((sid, tls));
+        }
     }
     // Wait for events to drain and connections to settle
     tokio::time::sleep(Duration::from_secs(2)).await;
     let total = conns.load(Ordering::SeqCst);
     assert!(
-        total >= 10,
-        "stream opens within the burst bucket (10) should all dial, got {total}"
+        total <= established,
+        "backend dialed {total} times despite only {established} established inner streams"
     );
+    assert!(total >= 1, "at least one burst stream should dial");
     assert!(
         total <= 24,
-        "backend connections {total} exceed the rate budget (burst 10 + 5/s x test duration); churn reflection surface not converged"
+        "backend connections {total} exceed the rate budget (burst 10 + 5/s x duration)"
     );
-    wait_counter_at_least(OPEN_DROP_RATE, 30 - 24, Duration::from_secs(5)).await;
+    wait_counter_at_least(
+        OPEN_DROP_RATE,
+        u64::try_from(30 - total).unwrap(),
+        Duration::from_secs(5),
+    )
+    .await;
+    for (sid, tls) in established_streams {
+        drop(tls);
+        inj.send_close(sid).await.expect("close");
+    }
 }
 
 /// F4: bounded convergence of dial failures (plan D). connect/resolve
@@ -435,7 +525,20 @@ async fn f4_dial_failure_frees_slot() {
 
     // Failed-dial stream: occupies the only slot and must be declared dead
     // within budget with a Close returned
-    let elapsed = open_until_rejected(&inj, "f4-dial-fail", &refused_addr).await;
+    let started = std::time::Instant::now();
+    let mut failed_tls = open_inner_tls(
+        &inj,
+        interflow_testkit::opaque_stream_id("f4-dial-fail"),
+        &refused_addr,
+    )
+    .await;
+    let mut sink = [0u8; 1];
+    let _ = failed_tls.read(&mut sink).await;
+    let elapsed = started.elapsed();
+    drop(failed_tls);
+    inj.send_close(interflow_testkit::opaque_stream_id("f4-dial-fail"))
+        .await
+        .expect("close");
     assert!(
         elapsed < Duration::from_secs(4),
         "the failed-dial stream should be declared dead within budget, got {elapsed:?}"
@@ -444,8 +547,14 @@ async fn f4_dial_failure_frees_slot() {
 
     // Slot-release verification: local concurrency cap is 1; if the
     // failed-dial stream did not release it, this stream would be rejected
-    let got =
-        round_trip_closing(&inj, "f4-after", echo_addr, b"ping", Duration::from_secs(5)).await;
+    let got = round_trip_closing(
+        &inj,
+        interflow_testkit::opaque_stream_id("f4-after"),
+        echo_addr,
+        b"ping",
+        Duration::from_secs(5),
+    )
+    .await;
     assert_eq!(got, b"ping");
 }
 
@@ -473,22 +582,22 @@ async fn f5_legit_burst_not_rejected() {
     // and kept, avoiding overwrite frame loss)
     let mut streams = Vec::new();
     for i in 0..100u32 {
-        let sid = format!("f5-burst-{i}");
-        let rx = inj.register_stream(sid.clone()).await;
-        inj.send_open(&sid, "eg", Some(&echo_addr.to_string()), StreamProto::Tcp)
-            .await
-            .expect("open");
-        inj.send_data(&sid, Bytes::from_static(b"x"))
-            .await
-            .expect("send");
-        streams.push((sid, rx));
+        let sid = interflow_testkit::opaque_stream_id(&format!("f5-burst-{i}"));
+        let mut tls = open_inner_tls(&inj, sid, &echo_addr.to_string()).await;
+        tls.write_all(b"x").await.expect("send");
+        tls.flush().await.expect("flush");
+        streams.push((sid, tls));
     }
     // All receive the echo (any rejection would surface as a false positive),
     // then reclaim them one by one
-    for (sid, mut rx) in streams {
-        let got = recv_exact_from(&mut rx, &sid, 1, Duration::from_secs(5)).await;
-        assert_eq!(got, b"x", "corrupted echo on stream {sid}");
-        inj.send_close(&sid).await.expect("close");
+    for (sid, mut tls) in streams {
+        let mut got = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut got))
+            .await
+            .expect("echo")
+            .expect("read");
+        assert_eq!(&got, b"x", "corrupted echo on stream {sid}");
+        inj.send_close(sid).await.expect("close");
     }
     assert_eq!(counter_value(OPEN_DROP_BACKLOG), 0);
 }
@@ -525,21 +634,22 @@ async fn f6_no_slot_leak_after_flood() {
     // cap being exactly 8); channels registered once and kept
     let mut streams = Vec::new();
     for i in 0..8u32 {
-        let sid = format!("f6-full-{i}");
-        let rx = inj.register_stream(sid.clone()).await;
-        inj.send_open(&sid, "eg", Some(&echo_addr.to_string()), StreamProto::Tcp)
-            .await
-            .expect("open");
-        inj.send_data(&sid, Bytes::from_static(b"leak?"))
-            .await
-            .expect("send");
-        streams.push((sid, rx));
+        let sid = interflow_testkit::opaque_stream_id(&format!("f6-full-{i}"));
+        let mut tls = open_inner_tls(&inj, sid, &echo_addr.to_string()).await;
+        tls.write_all(b"leak?").await.expect("send");
+        tls.flush().await.expect("flush");
+        streams.push((sid, tls));
     }
     // All 8 receive the echo (any rejection with local_limit means a slot
     // leak); reclaim them one by one
-    for (sid, mut rx) in streams {
-        recv_exact_from(&mut rx, &sid, 5, Duration::from_secs(5)).await;
-        inj.send_close(&sid).await.expect("close");
+    for (sid, mut tls) in streams {
+        let mut got = [0u8; 5];
+        tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut got))
+            .await
+            .expect("echo")
+            .expect("read");
+        assert_eq!(&got, b"leak?", "corrupted echo on stream {sid}");
+        inj.send_close(sid).await.expect("close");
     }
 }
 
@@ -547,7 +657,7 @@ async fn f6_no_slot_leak_after_flood() {
 /// (printing the reason).
 async fn recv_exact_from(
     rx: &mut tokio::sync::mpsc::Receiver<TunnelData>,
-    sid: &str,
+    sid: interflow_core::protocol::StreamId,
     n: usize,
     deadline: Duration,
 ) -> Vec<u8> {

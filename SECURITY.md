@@ -18,7 +18,8 @@ problems.** Use one of these private channels instead, in order of preference:
 
 Include whatever you have:
 
-- Affected component and code path (`core` / `mesh` / `expose` / GUI).
+- Affected component and code path (`core` / `mesh` / `expose` / `identity`
+  / `registrar` / `cli` / `certs` / GUI).
 - Steps to reproduce, or a proof of concept (relevant config + commands).
 - Your assessment of the impact and the attacker position it requires
   (e.g. public internet, authenticated agent, hub control API access).
@@ -41,8 +42,11 @@ are described in [THREAT_MODEL.md](THREAT_MODEL.md).
 
 **In scope**
 
-- Vulnerabilities in code shipped from this repository
-  (`crates/core`, `crates/mesh`, `crates/expose`, `src-tauri/`).
+- Vulnerabilities in code shipped from this repository: the production
+  crates (`crates/core`, `crates/mesh`, `crates/expose`, `crates/identity`,
+  `crates/registrar`, `crates/cli`, `crates/certs`, `crates/contract`,
+  `crates/util`) and the GUI (`src-tauri/`). `crates/testkit` is a dev-only
+  harness and out of scope.
 - Vulnerabilities that manifest under documented configurations, including
   defaults.
 

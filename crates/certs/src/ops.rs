@@ -46,8 +46,9 @@ pub enum Outcome {
 /// Wizard-facing bundle: paths of everything under `cert_dir` after
 /// [`generate`].
 pub struct GeneratedCerts {
-    /// Tenant CA certificate PEM (registered on the edge via `--client-ca`;
-    /// also the `ca_path` trust anchor for expose clients).
+    /// Tenant CA certificate PEM (the workspace/tenant trust anchor: loaded
+    /// by mesh hub trust tables and, under the identity-first model, wrapped
+    /// into workspace trust by the pack issuer).
     pub ca_cert: String,
     /// Tenant CA private key PEM (0600; required to issue further agent
     /// certificates — kept on this machine only).
@@ -71,7 +72,7 @@ pub struct AgentCertPaths {
 /// under `cert_dir` (§2.4 layout).
 ///
 /// Thin composite over the `ensure_*` ops (validate-or-create) — the expose
-/// init wizard and test fixtures share the exact code path with the CLI.
+/// issuer and test fixtures share the exact code path.
 pub fn generate(
     cert_dir: &Path,
     hub_names: &[SanName],
@@ -227,7 +228,7 @@ pub fn ensure_agent_cert(
 /// Paths of the gateway material under `<out>/gateway/`.
 ///
 /// - `gateway-ca.crt|key`: the stable gateway anchor CA. Distributed to
-///   every `required`-mode egress as `[e2e] gateway_ca_path` (public
+///   every gateway-serving egress as `[inner_tls] gateway_ca_path` (public
 ///   material).
 /// - `edge.crt|key`: the gateway client pair (CN == `edge`, the expose
 ///   edge's principal). `edge.crt` is a **chain bundle** (leaf first, the
@@ -257,7 +258,7 @@ const GATEWAY_CA_NAME: &str = "gateway";
 
 /// Ensures the gateway material `gateway/gateway-ca.crt|key` +
 /// `gateway/edge.crt|key` exists: a dedicated gateway CA plus its client
-/// pair (RFC docs/design/agent-e2e-encryption.md §3.4/§5.2).
+/// pair (RFC (internal design notes) §3.4/§5.2).
 ///
 /// Independent of the tenant CAs (cross-tenant principal, own anchor).
 /// `force` re-issues the client pair only — never the CA (a replaced CA
@@ -559,14 +560,14 @@ fn validate_existing_ca(paths: &TenantCaPaths, tenant: &str) -> Result<()> {
     if !cert_is_ca(&der)? {
         return Err(Error::Mismatch(format!(
             "{what}: {} is not a CA certificate (missing CA basic constraints) — expected \
-             a certificate issued by `interflow-mesh certs`",
+             a certificate issued by the operator",
             paths.cert.display()
         )));
     }
     if !cert_has_key_cert_sign(&der)? {
         return Err(Error::Mismatch(format!(
             "{what}: {} lacks the KeyCertSign key usage — expected a certificate issued \
-             by `interflow-mesh certs`",
+             by the operator",
             paths.cert.display()
         )));
     }

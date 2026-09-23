@@ -19,8 +19,8 @@ artifacts/
 *.token.*
 
 # Certificates and keys never enter git (policy: 2026-09-15; history purged the
-# same day — any cert material is generated on demand via `interflow-mesh certs`
-# and lives only on the machine that runs it)
+# same day — any cert material is issued on demand by the offline issuer and
+# lives only on the machine that runs it)
 *.key
 *.key~
 *.crt

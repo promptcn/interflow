@@ -113,6 +113,7 @@ async fn agents_listing_is_tenant_scoped() {
     cfg.auth.tenants.push(TenantConfig {
         name: "other".to_string(),
         ca_path: tenant_b_certs().ca_path().display().to_string(),
+        crl_path: Some(tenant_b_certs().crl_path().display().to_string()),
         trusted_gateway: false,
     });
     spawn_hub(cfg).await;

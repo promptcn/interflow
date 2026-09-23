@@ -1,29 +1,19 @@
 //! The agent↔agent inner TLS transport adaptation (e2e encryption).
 //!
-//! Design (docs/design/agent-e2e-encryption.md §3.1): the inner TLS 1.3
+//! Design: the inner TLS 1.3
 //! handshake and record stream ride the tunnel stream as ordinary Data
 //! frames — the hub only ever relays opaque bytes. This module bridges the
 //! frame world (a per-stream `mpsc::Receiver<TunnelData>` + the tunnel's
 //! send methods) to the byte-stream world rustls needs
 //! ([`E2eTunnelIo`]: `AsyncRead` + `AsyncWrite`).
 //!
-//! **Why the pipe indirection** (RFC §10.7 risk note): `tokio-rustls`
-//! consumes the IO on a failed handshake, but the `opportunistic` mode
-//! must recover the receiver *and any peer bytes already buffered* to fall
-//! back to plaintext. So the TLS layer always runs over an in-memory
-//! duplex pipe, and a shuttle task owns the adapter, pumping pipe ↔
-//! adapter for the whole stream lifetime; when the TLS side dies
-//! (handshake error *or* deadline), the shuttle hands the adapter back as
-//! [`E2eFallbackParts`]. The cost is one extra memcpy hop per chunk —
-//! accepted for v1 in exchange for zero hand-rolled rustls state-machine
-//! code (the pipe keeps `tokio_rustls::TlsStream` end-to-end battle-tested
-//! paths).
+//! Failed handshakes fail closed: the tunnel adapter is dropped, and the caller
+//! explicitly closes/unregisters the stream. The pipe/shuttle below preserves
+//! rustls's stream ownership; it does not recover plaintext bytes.
 
 use crate::error::Result;
-use crate::protocol::FrameType;
-use crate::protocol::MAX_FRAME_PAYLOAD;
+use crate::protocol::{FrameType, MAX_FRAME_PAYLOAD, StreamId};
 use crate::tunnel::AgentTunnel;
-use crate::tunnel::pump::parse_close_reason;
 use crate::tunnel::transport::TunnelData;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -38,21 +28,10 @@ use std::time::Duration;
 use tokio::io::DuplexStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
 use crate::protocol::CloseReason;
-
-/// Buffer size of the in-memory duplex pipe between rustls and the shuttle
-/// (one direction must hold a couple of maximum-size TLS records; 64 KiB).
-const PIPE_CAPACITY: usize = 64 * 1024;
-
-/// How long the caller waits for the shuttle to hand the adapter back
-/// after the TLS side died. The handover is normally immediate (the pipe
-/// EOFs the moment the TLS side drops); a hub withholding the stream's
-/// Close response could otherwise stall it forever.
-const FALLBACK_GRACE: Duration = Duration::from_secs(5);
 
 /// Which direction of the tunnel this side drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,36 +43,40 @@ pub enum E2eDirection {
     Egress,
 }
 
+/// Buffer size of the in-memory duplex pipe between rustls and the shuttle
+/// (one direction must hold a couple of maximum-size TLS records; 64 KiB).
+const PIPE_CAPACITY: usize = 64 * 1024;
+
 /// The minimal tunnel send surface the adapter needs, extracted from
 /// [`AgentTunnel`] the same way the pump extracts [`StreamPumpTarget`] —
 /// so the adapter runs in unit tests against a recording mock.
 #[async_trait]
 pub trait E2eIoSink: Send + Sync {
     /// Sends a data frame (request direction, ingress → hub).
-    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()>;
+    async fn send_data(&self, stream_id: StreamId, data: Bytes) -> Result<()>;
     /// Sends a data frame (response direction, egress → hub).
-    async fn send_data_response(&self, stream_id: &str, data: Bytes) -> Result<()>;
+    async fn send_data_response(&self, stream_id: StreamId, data: Bytes) -> Result<()>;
     /// Closes the stream (request direction).
-    async fn send_close(&self, stream_id: &str) -> Result<()>;
-    /// Closes the stream (response direction; empty reason = ordinary close).
-    async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()>;
+    async fn send_close(&self, stream_id: StreamId) -> Result<()>;
+    /// Closes the stream (response direction).
+    async fn send_close_response(&self, stream_id: StreamId, reason: CloseReason) -> Result<()>;
 }
 
 #[async_trait]
 impl E2eIoSink for AgentTunnel {
-    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    async fn send_data(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         Self::send_data(self, stream_id, data).await
     }
 
-    async fn send_data_response(&self, stream_id: &str, data: Bytes) -> Result<()> {
+    async fn send_data_response(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
         Self::send_data_response(self, stream_id, data).await
     }
 
-    async fn send_close(&self, stream_id: &str) -> Result<()> {
+    async fn send_close(&self, stream_id: StreamId) -> Result<()> {
         Self::send_close(self, stream_id).await
     }
 
-    async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()> {
+    async fn send_close_response(&self, stream_id: StreamId, reason: CloseReason) -> Result<()> {
         Self::send_close_response(self, stream_id, reason).await
     }
 }
@@ -131,7 +114,7 @@ pub struct E2eTunnelIo {
     eof: bool,
     reason_slot: Arc<StdMutex<Option<CloseReason>>>,
     sink: Arc<dyn E2eIoSink>,
-    stream_id: String,
+    stream_id: StreamId,
     direction: E2eDirection,
     write_fut: Option<BoxFuture<'static, io::Result<()>>>,
     /// Byte count reported to the caller once `write_fut` completes
@@ -143,20 +126,28 @@ pub struct E2eTunnelIo {
 
 impl E2eTunnelIo {
     /// Ingress-side adapter (request-direction sends).
-    pub fn ingress(rx: mpsc::Receiver<TunnelData>, tunnel: AgentTunnel, stream_id: String) -> Self {
+    pub fn ingress(
+        rx: mpsc::Receiver<TunnelData>,
+        tunnel: AgentTunnel,
+        stream_id: StreamId,
+    ) -> Self {
         Self::with_sink(rx, Arc::new(tunnel), stream_id, E2eDirection::Ingress)
     }
 
     /// Egress-side adapter (response-direction sends).
-    pub fn egress(rx: mpsc::Receiver<TunnelData>, tunnel: AgentTunnel, stream_id: String) -> Self {
+    pub fn egress(
+        rx: mpsc::Receiver<TunnelData>,
+        tunnel: AgentTunnel,
+        stream_id: StreamId,
+    ) -> Self {
         Self::with_sink(rx, Arc::new(tunnel), stream_id, E2eDirection::Egress)
     }
 
     /// Test/alternative-construction entry with an explicit sink.
-    pub fn with_sink(
+    fn with_sink(
         rx: mpsc::Receiver<TunnelData>,
         sink: Arc<dyn E2eIoSink>,
-        stream_id: String,
+        stream_id: StreamId,
         direction: E2eDirection,
     ) -> Self {
         Self {
@@ -175,7 +166,7 @@ impl E2eTunnelIo {
     }
 
     /// A handle onto the peer Close reason this adapter will observe.
-    pub fn reason_handle(&self) -> E2eCloseReason {
+    fn reason_handle(&self) -> E2eCloseReason {
         E2eCloseReason {
             slot: Arc::clone(&self.reason_slot),
         }
@@ -186,22 +177,9 @@ impl E2eTunnelIo {
         self.eof
     }
 
-    /// Hands back the raw parts for an `opportunistic` plaintext fallback:
-    /// the stream's frame channel plus any peer bytes buffered during the
-    /// failed handshake attempt (the caller replays them before resuming
-    /// the plain pump).
-    pub fn into_parts(mut self) -> E2eFallbackParts {
-        let close_reason = self.reason_handle().get();
-        E2eFallbackParts {
-            rx: self.rx,
-            buffered: std::mem::take(&mut self.read_buf).freeze(),
-            close_reason,
-        }
-    }
-
     fn record_close(&mut self, data: &[u8]) {
         self.eof = true;
-        let reason = parse_close_reason(&self.stream_id, data);
+        let reason = CloseReason::from_payload(data);
         *self.reason_slot.lock().expect("e2e reason slot poisoned") = Some(reason);
     }
 
@@ -210,15 +188,15 @@ impl E2eTunnelIo {
             return;
         }
         let sink = Arc::clone(&self.sink);
-        let sid = self.stream_id.clone();
+        let sid = self.stream_id;
         let fut: BoxFuture<'static, io::Result<()>> = match self.direction {
             E2eDirection::Ingress => Box::pin(async move {
-                sink.send_close(&sid)
+                sink.send_close(sid)
                     .await
                     .map_err(|e| io::Error::other(e.to_string()))
             }),
             E2eDirection::Egress => Box::pin(async move {
-                sink.send_close_response(&sid, "")
+                sink.send_close_response(sid, CloseReason::CloseFrame)
                     .await
                     .map_err(|e| io::Error::other(e.to_string()))
             }),
@@ -304,15 +282,15 @@ impl AsyncWrite for E2eTunnelIo {
             let n = buf.len().min(MAX_FRAME_PAYLOAD);
             let chunk = Bytes::copy_from_slice(&buf[..n]);
             let sink = Arc::clone(&this.sink);
-            let sid = this.stream_id.clone();
+            let sid = this.stream_id;
             let fut: BoxFuture<'static, io::Result<()>> = match this.direction {
                 E2eDirection::Ingress => Box::pin(async move {
-                    sink.send_data(&sid, chunk)
+                    sink.send_data(sid, chunk)
                         .await
                         .map_err(|e| io::Error::other(e.to_string()))
                 }),
                 E2eDirection::Egress => Box::pin(async move {
-                    sink.send_data_response(&sid, chunk)
+                    sink.send_data_response(sid, chunk)
                         .await
                         .map_err(|e| io::Error::other(e.to_string()))
                 }),
@@ -389,51 +367,20 @@ impl AsyncWrite for E2eTunnelIo {
     }
 }
 
-/// What the shuttle hands back when the TLS side died: everything needed to
-/// resume the stream as plaintext (opportunistic fallback) or observe the
-/// peer's close token.
-pub struct E2eFallbackParts {
-    /// The stream's frame channel, still live.
-    pub rx: mpsc::Receiver<TunnelData>,
-    /// Peer bytes buffered during the handshake attempt (replay these
-    /// before resuming the plain pump).
-    pub buffered: Bytes,
-    /// The peer Close reason if one was observed mid-attempt.
-    pub close_reason: Option<CloseReason>,
-}
-
-impl E2eFallbackParts {
-    /// A dead receiver (already-closed channel): used when the shuttle
-    /// could not be recovered within the grace window (malicious peer
-    /// withholding the Close response) — the stream is unusable either way.
-    fn dead() -> Self {
-        Self {
-            rx: mpsc::channel(1).1,
-            buffered: Bytes::new(),
-            close_reason: None,
-        }
-    }
-}
-
 /// The outcome of an inner TLS handshake attempt over an [`E2eTunnelIo`].
 ///
-/// `Established` carries the rustls stream (over the internal pipe — keep
-/// pumping it for the stream lifetime) plus the shared close-reason handle.
-/// `Failed` carries the adapter's parts back for the caller's mode
-/// semantics: `required` closes the stream, `opportunistic` replays and
-/// resumes plaintext.
+/// `Established` carries the rustls stream plus the shared close-reason
+/// handle. `Failed` carries only the error: the failed adapter is dropped and
+/// the caller must close/unregister the tunnel stream.
 ///
 /// Generic over the concrete TLS stream (client and server handshake
 /// produce different wrapper types; both satisfy what the pump needs).
 pub enum E2eHandshakeOutcome<T> {
     /// Handshake verified: pump the returned stream.
     Established(T, E2eCloseReason),
-    /// Handshake failed or hit the deadline: everything needed to fall
-    /// back / close out. The error is `TimedOut` when the deadline hit.
-    Failed {
-        parts: E2eFallbackParts,
-        error: io::Error,
-    },
+    /// Handshake failed or hit the deadline. The error is `TimedOut` when
+    /// the deadline hit.
+    Failed { error: io::Error },
 }
 
 /// Runs an inner TLS **client** handshake (ingress side) over the adapter.
@@ -441,8 +388,7 @@ pub enum E2eHandshakeOutcome<T> {
 /// `connector` comes from [`crate::tls::inner_client_config`]; the server
 /// name is the shared [`crate::tls::INNER_SERVER_NAME`] placeholder (the
 /// real identity binding is the verifier's CN check). See
-/// [`E2eHandshakeOutcome`] and the module docs for the pipe/shuttle
-/// mechanics.
+/// [`E2eHandshakeOutcome`].
 pub async fn inner_tls_connect(
     adapter: E2eTunnelIo,
     connector: TlsConnector,
@@ -474,9 +420,11 @@ pub async fn inner_tls_accept(
     .await
 }
 
-/// The shared driver behind connect/accept: rustls talks to a duplex pipe;
-/// a shuttle task pumps the pipe against the adapter and, once the TLS
-/// side dies, hands the adapter back as [`E2eFallbackParts`].
+/// rustls owns its IO for the stream lifetime (and consumes it on handshake
+/// failure). A detached shuttle owns the tunnel adapter and pumps it against
+/// an in-memory duplex pipe, keeping the battle-tested `TlsStream` path. On
+/// TLS-side death the adapter is dropped; unlike the historical migration
+/// mode, no plaintext receiver or buffered bytes are recovered.
 async fn run_inner_tls<F, Fut, T>(
     adapter: E2eTunnelIo,
     deadline: Duration,
@@ -487,41 +435,20 @@ where
     Fut: std::future::Future<Output = io::Result<T>>,
 {
     let reason = adapter.reason_handle();
-    let (fallback_tx, fallback_rx) = oneshot::channel::<E2eFallbackParts>();
     let (tls_side, adapter_side) = tokio::io::duplex(PIPE_CAPACITY);
-
-    // Shuttle: for the whole TLS-side lifetime, pipe bytes ↔ adapter
-    // frames. The moment the TLS side dies (handshake error, deadline drop,
-    // or the eventual stream end → pipe EOF), everything is handed back
-    // IMMEDIATELY — the live channel and any buffered peer bytes; frames
-    // still in flight stay queued in the channel for the fallback consumer.
-    //
-    // The shuttle deliberately does NOT send the stream Close on TLS-side
-    // death: the caller owns that decision (`required` closes explicitly;
-    // `opportunistic` resumes the plain pump on the returned channel — an
-    // eager Close here would tear the fallback stream down at the hub).
     let shuttle = tokio::spawn(async move {
         let mut adapter = adapter;
         let mut pipe = adapter_side;
         let mut buf_to_adapter = vec![0u8; 16 * 1024];
         let mut buf_to_pipe = vec![0u8; 16 * 1024];
-        let mut pipe_dead = false;
         let mut adapter_dead = false;
         loop {
-            if pipe_dead {
-                let _ = fallback_tx.send(adapter.into_parts());
-                return;
-            }
             tokio::select! {
-                // Always enabled: pipe EOF is the TLS-side death detector.
                 r = pipe.read(&mut buf_to_adapter) => match r {
-                    Ok(0) | Err(_) => {
-                        pipe_dead = true;
-                    }
+                    Ok(0) | Err(_) => return,
                     Ok(n) => {
                         if adapter.write_all(&buf_to_adapter[..n]).await.is_err() {
                             adapter_dead = true;
-                            // Surface tunnel-write death to the TLS layer.
                             let _ = pipe.shutdown().await;
                         }
                     }
@@ -529,52 +456,34 @@ where
                 r = adapter.read(&mut buf_to_pipe), if !adapter_dead => match r {
                     Ok(0) | Err(_) => {
                         adapter_dead = true;
-                        // Surface the tunnel-side end to the TLS layer.
                         let _ = pipe.shutdown().await;
                     }
                     Ok(n) => {
                         if pipe.write_all(&buf_to_pipe[..n]).await.is_err() {
-                            pipe_dead = true;
+                            return;
                         }
                     }
                 },
             }
         }
     });
-    // The shuttle outlives the handshake (it keeps pumping for the whole
-    // stream lifetime); detaching here is deliberate.
+    // The shuttle outlives the handshake and pumps for the whole stream
+    // lifetime; detaching it here is deliberate.
     drop(shuttle);
 
     let mut handshake = Box::pin(start(tls_side));
     match tokio::time::timeout(deadline, &mut handshake).await {
         Ok(Ok(stream)) => E2eHandshakeOutcome::Established(stream, reason),
-        Ok(Err(error)) => E2eHandshakeOutcome::Failed {
-            parts: recover_parts(fallback_rx).await,
-            error,
-        },
+        Ok(Err(error)) => E2eHandshakeOutcome::Failed { error },
         Err(_) => {
-            // Deadline: dropping the handshake future drops the pipe's TLS
-            // side; the shuttle observes EOF and returns the parts.
             drop(handshake);
             E2eHandshakeOutcome::Failed {
-                parts: recover_parts(fallback_rx).await,
                 error: io::Error::new(
                     io::ErrorKind::TimedOut,
                     "inner TLS handshake deadline elapsed",
                 ),
             }
         }
-    }
-}
-
-/// Waits (bounded) for the shuttle's handover; on a withheld-Close stall
-/// returns dead parts — the stream is already torn down at the TLS layer.
-async fn recover_parts(rx: oneshot::Receiver<E2eFallbackParts>) -> E2eFallbackParts {
-    match tokio::time::timeout(FALLBACK_GRACE, rx).await {
-        Ok(Ok(parts)) => parts,
-        // Sender dropped without sending (shuttle panicked / already gone)
-        // or the grace window expired.
-        Ok(Err(_)) | Err(_) => E2eFallbackParts::dead(),
     }
 }
 
@@ -587,49 +496,58 @@ async fn recover_parts(rx: oneshot::Receiver<E2eFallbackParts>) -> E2eFallbackPa
 )]
 mod tests {
     use super::*;
+    use crate::protocol::FrameOrigin;
     use crate::tls::{InnerTlsMaterial, inner_client_config, inner_server_config};
-    use crate::tunnel::transport::FrameSource;
     use std::sync::Mutex as StdMutex2;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
     /// Recording sink asserting the adapter's frame sends.
+    fn sid() -> StreamId {
+        StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap()
+    }
+
+    fn sid2() -> StreamId {
+        StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c32").unwrap()
+    }
+
     #[derive(Default)]
     struct MockSink {
         data: StdMutex2<Vec<Bytes>>,
         data_response: StdMutex2<Vec<Bytes>>,
-        closes: StdMutex2<Vec<String>>,
-        close_responses: StdMutex2<Vec<String>>,
+        closes: StdMutex2<Vec<StreamId>>,
+        close_responses: StdMutex2<Vec<StreamId>>,
     }
 
     #[async_trait]
     impl E2eIoSink for MockSink {
-        async fn send_data(&self, _stream_id: &str, data: Bytes) -> Result<()> {
+        async fn send_data(&self, _stream_id: StreamId, data: Bytes) -> Result<()> {
             self.data.lock().unwrap().push(data);
             Ok(())
         }
-        async fn send_data_response(&self, _stream_id: &str, data: Bytes) -> Result<()> {
+        async fn send_data_response(&self, _stream_id: StreamId, data: Bytes) -> Result<()> {
             self.data_response.lock().unwrap().push(data);
             Ok(())
         }
-        async fn send_close(&self, stream_id: &str) -> Result<()> {
-            self.closes.lock().unwrap().push(stream_id.to_string());
+        async fn send_close(&self, stream_id: StreamId) -> Result<()> {
+            self.closes.lock().unwrap().push(stream_id);
             Ok(())
         }
-        async fn send_close_response(&self, stream_id: &str, _reason: &str) -> Result<()> {
-            self.close_responses
-                .lock()
-                .unwrap()
-                .push(stream_id.to_string());
+        async fn send_close_response(
+            &self,
+            stream_id: StreamId,
+            _reason: CloseReason,
+        ) -> Result<()> {
+            self.close_responses.lock().unwrap().push(stream_id);
             Ok(())
         }
     }
 
     fn td(ftype: FrameType, data: &[u8]) -> TunnelData {
         TunnelData {
-            stream_id: "s1".to_string(),
-            source: FrameSource::Response,
+            stream_id: sid(),
+            origin: FrameOrigin::Response,
             data: Bytes::copy_from_slice(data),
             stream_type: ftype,
             flags: 0,
@@ -639,7 +557,7 @@ mod tests {
     fn adapter(sink: Arc<MockSink>) -> (E2eTunnelIo, mpsc::Sender<TunnelData>) {
         let (tx, rx) = mpsc::channel(8);
         let dyn_sink: Arc<dyn E2eIoSink> = sink;
-        let io = E2eTunnelIo::with_sink(rx, dyn_sink, "s1".to_string(), E2eDirection::Ingress);
+        let io = E2eTunnelIo::with_sink(rx, dyn_sink, sid(), E2eDirection::Ingress);
         (io, tx)
     }
 
@@ -675,9 +593,12 @@ mod tests {
         let (mut io, tx) = adapter(Arc::clone(&sink));
         let reason = io.reason_handle();
         tx.send(td(FrameType::Data, b"x")).await.unwrap();
-        tx.send(td(FrameType::Close, b"CLOSE:s1:connect_failed"))
-            .await
-            .unwrap();
+        tx.send(td(
+            FrameType::Close,
+            &[CloseReason::ConnectFailed.as_code()],
+        ))
+        .await
+        .unwrap();
 
         let mut buf = [0u8; 16];
         assert_eq!(io.read(&mut buf).await.unwrap(), 1);
@@ -704,8 +625,7 @@ mod tests {
 
         // Egress direction sends responses instead.
         let (_tx2, rx2) = mpsc::channel(8);
-        let mut io2 =
-            E2eTunnelIo::with_sink(rx2, dyn_sink(&sink), "s1".to_string(), E2eDirection::Egress);
+        let mut io2 = E2eTunnelIo::with_sink(rx2, dyn_sink(&sink), sid(), E2eDirection::Egress);
         io2.write_all(b"server-data").await.unwrap();
         assert_eq!(
             sink.data_response.lock().unwrap().clone(),
@@ -719,41 +639,13 @@ mod tests {
         let sink = Arc::new(MockSink::default());
         let (mut io, _tx) = adapter(Arc::clone(&sink));
         io.shutdown().await.unwrap();
-        assert_eq!(sink.closes.lock().unwrap().clone(), vec!["s1".to_string()]);
+        assert_eq!(sink.closes.lock().unwrap().clone(), vec![sid()]);
         assert!(io.write(b"late").await.is_err());
 
         let (_tx, rx) = mpsc::channel(8);
-        let mut io2 =
-            E2eTunnelIo::with_sink(rx, dyn_sink(&sink), "s2".into(), E2eDirection::Egress);
+        let mut io2 = E2eTunnelIo::with_sink(rx, dyn_sink(&sink), sid2(), E2eDirection::Egress);
         io2.shutdown().await.unwrap();
-        assert_eq!(
-            sink.close_responses.lock().unwrap().clone(),
-            vec!["s2".to_string()]
-        );
-    }
-
-    /// into_parts returns the channel and any buffered peer bytes for the
-    /// plaintext fallback replay.
-    #[tokio::test]
-    async fn into_parts_returns_buffered_bytes() {
-        let sink = Arc::new(MockSink::default());
-        let (mut io, tx) = adapter(Arc::clone(&sink));
-        tx.send(td(FrameType::Data, b"banner-bytes")).await.unwrap();
-        // Partial read: everything beyond the caller's buffer stays in the
-        // adapter's read_buf and must survive into_parts.
-        let mut buf = [0u8; 3];
-        io.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ban");
-        // A further undelivered frame keeps the channel live for the pump.
-        tx.send(td(FrameType::Data, b"next-frame")).await.unwrap();
-
-        let parts = io.into_parts();
-        assert_eq!(parts.buffered, Bytes::from_static(b"ner-bytes"));
-        // The channel still works for the fallback pump.
-        let mut rx = parts.rx;
-        let td = rx.recv().await.expect("channel alive");
-        assert_eq!(td.stream_type, FrameType::Data);
-        assert_eq!(&td.data[..], b"next-frame");
+        assert_eq!(sink.close_responses.lock().unwrap().clone(), vec![sid2()]);
     }
 
     /// A sink wired to the opposite side's channel: everything one adapter
@@ -767,22 +659,26 @@ mod tests {
 
     #[async_trait]
     impl E2eIoSink for WiredSink {
-        async fn send_data(&self, _sid: &str, data: Bytes) -> Result<()> {
+        async fn send_data(&self, _sid: StreamId, data: Bytes) -> Result<()> {
             let _ = self.tx.send(td(FrameType::Data, &data)).await;
             Ok(())
         }
-        async fn send_data_response(&self, _sid: &str, data: Bytes) -> Result<()> {
+        async fn send_data_response(&self, _sid: StreamId, data: Bytes) -> Result<()> {
             let _ = self.tx.send(td(FrameType::Data, &data)).await;
             Ok(())
         }
-        async fn send_close(&self, sid: &str) -> Result<()> {
-            let payload = format!("CLOSE:{sid}:");
-            let _ = self.tx.send(td(FrameType::Close, payload.as_bytes())).await;
+        async fn send_close(&self, _sid: StreamId) -> Result<()> {
+            let _ = self
+                .tx
+                .send(td(FrameType::Close, &[CloseReason::CloseFrame.as_code()]))
+                .await;
             Ok(())
         }
-        async fn send_close_response(&self, sid: &str, reason: &str) -> Result<()> {
-            let payload = format!("CLOSE:{sid}:{reason}");
-            let _ = self.tx.send(td(FrameType::Close, payload.as_bytes())).await;
+        async fn send_close_response(&self, _sid: StreamId, reason: CloseReason) -> Result<()> {
+            let _ = self
+                .tx
+                .send(td(FrameType::Close, &[reason.as_code()]))
+                .await;
             Ok(())
         }
     }
@@ -816,6 +712,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             InnerTlsMaterial {
+                crls: Vec::new(),
                 roots: roots.clone(),
                 cert_chain: chain,
                 key: tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(key),
@@ -837,7 +734,7 @@ mod tests {
             Arc::new(WiredSink {
                 tx: tx_to_b.clone(),
             }),
-            "s1".into(),
+            sid(),
             E2eDirection::Ingress,
         );
         let server_adapter = E2eTunnelIo::with_sink(
@@ -845,7 +742,7 @@ mod tests {
             Arc::new(WiredSink {
                 tx: tx_to_a.clone(),
             }),
-            "s1".into(),
+            sid(),
             E2eDirection::Egress,
         );
 
@@ -899,11 +796,10 @@ mod tests {
         assert_eq!(reason.get(), None);
     }
 
-    /// A handshake failure (server expects a different client CN) must
-    /// hand the channel and any buffered peer bytes back for the plaintext
-    /// fallback — the whole point of the pipe/shuttle indirection.
+    /// A handshake failure (server expects a different client CN) drops the
+    /// failed adapter: there is no recoverable plaintext stream.
     #[tokio::test]
-    async fn failed_handshake_returns_fallback_parts() {
+    async fn failed_handshake_fails_closed() {
         let (mat_1, mat_2) = tls_material("agent-1");
         let (tx_to_b, rx_b) = mpsc::channel(64);
         let (silent_to_a, rx_a) = mpsc::channel(64);
@@ -912,7 +808,7 @@ mod tests {
             Arc::new(WiredSink {
                 tx: tx_to_b.clone(),
             }),
-            "s1".into(),
+            sid(),
             E2eDirection::Ingress,
         );
         let server_adapter = E2eTunnelIo::with_sink(
@@ -920,7 +816,7 @@ mod tests {
             Arc::new(WiredSink {
                 tx: silent_to_a.clone(),
             }),
-            "s1".into(),
+            sid(),
             E2eDirection::Egress,
         );
 
@@ -944,33 +840,30 @@ mod tests {
         // sends its Finished (server-side client-cert verification happens
         // after), so the CLIENT succeeds while the SERVER — the side whose
         // CN expectation was violated, and the side our security model
-        // makes the enforcer (egress) — fails and gets its parts back.
+        // makes the enforcer (egress) — fails closed.
         let (mut tls_client, _) = match client {
             E2eHandshakeOutcome::Established(s, r) => (s, r),
             E2eHandshakeOutcome::Failed { error, .. } => {
                 panic!("client handshake unexpectedly failed: {error}")
             }
         };
-        let (parts, error) = match server {
-            E2eHandshakeOutcome::Failed { parts, error } => (parts, error),
+        let error = match server {
+            E2eHandshakeOutcome::Failed { error } => error,
             E2eHandshakeOutcome::Established(..) => {
                 panic!("server handshake must fail on client CN mismatch")
             }
         };
         assert!(!error.to_string().is_empty());
-        // The receiver is recoverable (the fallback pump's input).
-        drop(parts.rx);
-        // The server's rejection alert reaches the client as a read error.
+        // The server-side failure surfaces to the client as a read error.
         let mut sink_buf = [0u8; 8];
         assert!(tls_client.read(&mut sink_buf).await.is_err());
         drop(tls_client);
     }
 
-    /// The deadline path: nobody answers the handshake, the deadline hits,
-    /// and the parts still come back (bounded by the fallback grace, not
-    /// forever).
+    /// The deadline path: nobody answers the handshake, so the deadline
+    /// closes the attempt immediately.
     #[tokio::test]
-    async fn deadline_expires_and_returns_parts() {
+    async fn deadline_expires_fails_closed() {
         let (mat_1, _mat_2) = tls_material("agent-1");
         // Read side: a channel nobody feeds (silent peer). Write side: a
         // separate discard channel — the adapter must not read its own
@@ -980,7 +873,7 @@ mod tests {
         let adapter = E2eTunnelIo::with_sink(
             rx,
             Arc::new(WiredSink { tx: discard_tx }),
-            "s1".into(),
+            sid(),
             E2eDirection::Ingress,
         );
         let started = std::time::Instant::now();
@@ -997,8 +890,8 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(
-            started.elapsed() < Duration::from_secs(6),
-            "parts recovery must stay inside the grace window"
+            started.elapsed() < Duration::from_secs(1),
+            "deadline must fail without a recovery grace window"
         );
     }
 }

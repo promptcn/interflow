@@ -10,6 +10,7 @@ use std::num::NonZeroU32;
 
 /// Per-IP rate limiter for the hub.
 pub struct AuthRateLimiter {
+    quota: u32,
     inner: RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>,
 }
 
@@ -25,8 +26,15 @@ impl AuthRateLimiter {
         let nz = NonZeroU32::new(per_ip_per_minute)?;
         let quota = Quota::per_minute(nz);
         Some(Self {
+            quota: per_ip_per_minute,
             inner: RateLimiter::keyed(quota),
         })
+    }
+
+    /// The configured per-IP-per-minute quota (denial responses quote it to
+    /// derive a `Retry-After` from the token refill rate).
+    pub const fn quota(&self) -> u32 {
+        self.quota
     }
 
     /// Checks whether `ip` is still within quota. Returns `false` to mean over-limit, reject.

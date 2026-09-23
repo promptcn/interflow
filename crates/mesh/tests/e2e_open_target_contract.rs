@@ -1,9 +1,6 @@
-//! E2E contract: an Open frame with an empty target agent is rejected on
-//! both transport planes — fail-closed everywhere — but through different
-//! gates. These tests pin that divergence as an explicit contract (the
-//! pre-2026-09-18 `frame_open` empty-target branch was dead code left over
-//! from the pre-streaming-upload architecture and has been removed; see the
-//! module docs of `hub/routing.rs` for the reachable rejection points):
+//! E2E contract: semantic targets are resolved by the control plane before
+//! an Open is emitted. An empty target therefore fails during route-lease
+//! negotiation on both transports and never produces a traffic frame.
 //!
 //! - h2 plane: rejected at the upload payload-validation gate
 //!   (`crates/mesh/src/hub/upload.rs`): `valid_agent_id` refuses the empty
@@ -34,9 +31,8 @@
 )]
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
-use interflow_core::protocol::{FrameType, StreamProto};
+use interflow_core::protocol::StreamProto;
 use interflow_core::tls::client::build_client_config;
 use interflow_core::tunnel::quic::{QUIC_ALPN, QuicSessionParams, QuicTunnel};
 use interflow_core::tunnel::session_tasks::SessionTasks;
@@ -52,10 +48,9 @@ fn certs() -> &'static interflow_testkit::certs::TestCerts {
     C.get_or_init(|| interflow_testkit::certs::TestCerts::generate("open-target-contract", "agent"))
 }
 
-/// h2 plane: an Open with an empty target is rejected at the upload payload
-/// gate, before any routing — the `_close_` frame carries the gate's reason.
+/// h2 plane: an empty target is rejected by `POST /route`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn h2_empty_target_open_rejected_at_upload_gate() {
+async fn h2_empty_target_route_lease_rejected() {
     let hub_port = pick_ephemeral_port();
     spawn_hub(hub_config(hub_port, certs(), vec![])).await;
 
@@ -65,7 +60,7 @@ async fn h2_empty_target_open_rejected_at_upload_gate() {
         .await
         .expect("connect+register");
     let tunnel = AgentTunnel::from_sender(
-        "src".to_string(),
+        conn.negotiated.circuit_token,
         &format!("http://127.0.0.1:{hub_port}"),
         conn.send_request,
         &SessionTasks::new(CancellationToken::new()),
@@ -74,36 +69,23 @@ async fn h2_empty_target_open_rejected_at_upload_gate() {
     .expect("tunnel");
     let _conn_handle = conn.conn_handle;
 
-    // The client-side send path performs no target validation — the empty
-    // target reaches the hub's upload payload gate as-is.
-    tunnel
-        .send_open("e0", "", None, StreamProto::Tcp)
+    let err = tunnel
+        .send_open(
+            interflow_testkit::opaque_stream_id("e0"),
+            "",
+            StreamProto::Tcp,
+        )
         .await
-        .expect("open enqueued");
-
-    let mut rx = tunnel.register_stream("e0".to_string()).await;
-    match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-        Ok(Some(td)) => {
-            assert!(
-                matches!(td.stream_type, FrameType::Close),
-                "expected a _close_ rejection frame, got {td:?}"
-            );
-            let reason = String::from_utf8_lossy(&td.data);
-            assert!(
-                reason.contains("invalid open payload"),
-                "the h2 gate's rejection reason must name the payload gate: {reason}"
-            );
-        }
-        other => panic!("expected the empty-target open to be rejected, got {other:?}"),
-    }
+        .expect_err("empty target must not receive a route lease");
+    assert!(
+        err.to_string().contains("route lease rejected"),
+        "unexpected h2 route error: {err}"
+    );
 }
 
-/// QUIC plane: no payload form validation exists; the empty target fails
-/// closed at the tenant-policy gate (the malformed qualified key
-/// `"{tenant}/"` splits to `None`) and the stream is closed without a reason
-/// payload.
+/// QUIC plane: an empty target fails closed during RouteRequest negotiation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn quic_empty_target_open_denied_fail_closed() {
+async fn quic_empty_target_route_lease_rejected() {
     let hub_port = pick_ephemeral_port();
     spawn_hub(hub_quic_config(hub_port, certs(), vec![])).await;
 
@@ -132,23 +114,16 @@ async fn quic_empty_target_open_denied_fail_closed() {
     .expect("quic connect+register");
     let tunnel = AgentTunnel::from_transport(Arc::new(quic));
 
-    tunnel
-        .send_open("q0", "", None, StreamProto::Tcp)
+    let err = tunnel
+        .send_open(
+            interflow_testkit::opaque_stream_id("q0"),
+            "",
+            StreamProto::Tcp,
+        )
         .await
-        .expect("open sent");
-
-    let mut rx = tunnel.register_stream("q0".to_string()).await;
-    match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
-        Ok(Some(td)) => {
-            assert!(
-                matches!(td.stream_type, FrameType::Close),
-                "expected a _close_ frame, got {td:?}"
-            );
-            assert!(
-                td.data.is_empty(),
-                "the QUIC gate closes without a reason payload: {td:?}"
-            );
-        }
-        other => panic!("expected the empty-target open to be denied, got {other:?}"),
-    }
+        .expect_err("empty target must not receive a route lease");
+    assert!(
+        err.to_string().contains("route lease rejected"),
+        "unexpected QUIC route error: {err}"
+    );
 }

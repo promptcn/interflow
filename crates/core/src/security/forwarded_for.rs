@@ -26,7 +26,7 @@
 //! Like the PROXY-protocol path, the derived IP is used for **resource
 //! governance and audit only** — never for identity or ACL decisions
 //! (identity is exclusively mTLS, RFC
-//! `docs/design/multi-tenant-mtls-only.md` §5.2).
+//! `(internal design notes)` §5.2).
 
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
@@ -125,8 +125,9 @@ impl XffPolicy {
         for entry in trusted {
             let net: IpNetwork = entry.trim().parse().map_err(|e| {
                 crate::error::InterflowError::config(format!(
-                    "invalid trusted proxy CIDR '{entry}': {e}"
+                    "invalid trusted proxy CIDR '{entry}'"
                 ))
+                .with_source(e)
             })?;
             parsed.push(net);
         }
@@ -170,34 +171,27 @@ impl XffPolicy {
 /// `X-Forwarded-For` header line in the request head, or `None` when the
 /// header is absent from the buffered region.
 ///
-/// Binary safe: matching happens only on ASCII bytes, mirroring the Host
-/// parser's rules (a multipart body containing non-UTF-8 bytes must not
-/// break the scan). obs-fold continuation lines are not joined — a folded
-/// XFF value is not something a conforming proxy emits, and treating it as
-/// absent is the fail-closed answer.
+/// Head syntax comes from the shared [`http_head`](crate::security::http_head)
+/// parser, so only the header region (never body bytes) is scanned. obs-fold
+/// continuation lines are rejected by the parser itself — a folded head is
+/// malformed and is treated here as an absent header (fail-closed under
+/// `required`); the listener rejects such heads outright before XFF
+/// resolution runs.
 fn rightmost_entry(head: &[u8]) -> Option<&[u8]> {
-    let headers_end = find_headers_end(head).unwrap_or(head.len());
+    // Partial or malformed head: no usable header region. Callers only
+    // invoke resolve() once the listener has buffered a complete head, so
+    // the None arm is defense-in-depth.
+    let crate::security::http_head::HeadParse::Complete(complete) =
+        crate::security::http_head::parse_request_head(head)
+    else {
+        return None;
+    };
     let mut last_value: Option<&[u8]> = None;
-
-    let mut i = 0;
-    while i < headers_end {
-        let line_end = head[i..headers_end]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(headers_end, |p| i + p);
-        let line = trim_cr(&head[i..line_end]);
-
-        if line.len() >= 16 && eq_ignore_ascii_case(&line[..16], b"x-forwarded-for:") {
-            let value = trim_ascii_whitespace(&line[16..]);
-            last_value = Some(value);
+    for header in &complete.headers {
+        if header.name.eq_ignore_ascii_case("x-forwarded-for") {
+            last_value = Some(header.value);
         }
-
-        if line_end == headers_end {
-            break;
-        }
-        i = line_end + 1;
     }
-
     let value = last_value?;
     // Right-most non-empty entry: proxies may append ", <ip>" to a chain the
     // client terminated with a dangling comma.
@@ -207,22 +201,13 @@ fn rightmost_entry(head: &[u8]) -> Option<&[u8]> {
         .find(|entry| !entry.is_empty())
 }
 
-/// Parses one chain entry: bare IPv4/IPv6, with optional `[...]` brackets
-/// around IPv6 (the bracketed form appears in the wild even though RFC 7239
-/// deprecates it for the legacy XFF header).
+/// Parses one chain entry: a bare IPv4/IPv6 address. The `[IPv6]` bracketed
+/// form is RFC 7239-deprecated for this header and is not accepted — a
+/// bracketed right-most entry fails `required` resolution (the deployment
+/// owns its trusted proxies, which emit bare addresses).
 fn parse_ip_entry(entry: &[u8]) -> Option<IpAddr> {
     let s = std::str::from_utf8(entry).ok()?;
-    let s = s.trim();
-    let unbracketed = s
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(s);
-    unbracketed.parse().ok()
-}
-
-/// Trims a trailing `\r` (CRLF line ending).
-fn trim_cr(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\r").unwrap_or(line)
+    s.trim().parse().ok()
 }
 
 /// Trims ASCII whitespace (space + horizontal tab) from both ends.
@@ -234,32 +219,6 @@ fn trim_ascii_whitespace(mut v: &[u8]) -> &[u8] {
         v = &v[..v.len() - 1];
     }
     v
-}
-
-/// ASCII case-insensitive comparison.
-fn eq_ignore_ascii_case(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
-}
-
-/// Locates the end of the HTTP/1.x header region (the blank line). Mirrors
-/// the edge listener's Host parser so both scan exactly the same region.
-const fn find_headers_end(buf: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            return Some(i + 2);
-        }
-        if buf[i] == b'\r'
-            && i + 3 < buf.len()
-            && buf[i + 1] == b'\n'
-            && buf[i + 2] == b'\r'
-            && buf[i + 3] == b'\n'
-        {
-            return Some(i + 4);
-        }
-        i += 1;
-    }
-    None
 }
 
 #[cfg(test)]
@@ -308,16 +267,18 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_bare_and_bracketed_parse() {
+    fn ipv6_bare_parses_bracketed_form_is_rejected() {
         let bare = b"GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 2001:db8::1\r\n\r\n";
         assert_eq!(
             required().resolve(bare),
             XffResolution::Effective("2001:db8::1".parse().unwrap())
         );
+        // RFC 7239 deprecated the bracketed form for X-Forwarded-For: it is
+        // not a valid bare address, so `required` fails closed on it.
         let bracketed = b"GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: [2001:db8::2]\r\n\r\n";
         assert_eq!(
             required().resolve(bracketed),
-            XffResolution::Effective("2001:db8::2".parse().unwrap())
+            XffResolution::Denied(XffError::Invalid)
         );
     }
 

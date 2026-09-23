@@ -1,6 +1,6 @@
 //! Tenant-scoped mTLS trust roots and post-handshake tenant derivation.
 //!
-//! Design (docs/design/multi-tenant-mtls-only.md §2.2): the handshake
+//! Design: the handshake
 //! enforces client-certificate validity against the **merged** root store of
 //! all tenants (a standard rustls `WebPkiClientVerifier` — no custom verifier
 //! trait, no side tables); tenant *ownership* is derived **after** the
@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::RootCertStore;
+use tokio_rustls::rustls::pki_types::CertificateRevocationListDer;
 use tokio_rustls::rustls::pki_types::{CertificateDer, UnixTime};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::server::danger::ClientCertVerifier;
@@ -35,6 +36,8 @@ pub struct TenantTrustRoot {
     pub store: RootCertStore,
     /// The same certificates as `store`, kept raw for merge operations.
     certs: Vec<CertificateDer<'static>>,
+    /// CRLs applied to this tenant's verifier.
+    crls: Vec<CertificateRevocationListDer<'static>>,
     /// Content fingerprint of `store` (sorted per-cert SHA-256, re-hashed) —
     /// the duplicate-tenant-CA detection key.
     fingerprint: [u8; 32],
@@ -44,18 +47,29 @@ impl TenantTrustRoot {
     /// Builds a trust root from PEM bytes (the same multi-certificate
     /// semantics as `load_ca_roots`).
     pub fn from_pem(name: &str, trusted_gateway: bool, pem: &[u8]) -> Result<Self> {
+        Self::from_pem_with_crls(name, trusted_gateway, pem, &[])
+    }
+
+    /// Builds a trust root and attaches CRLs to its verifier.
+    pub fn from_pem_with_crls(
+        name: &str,
+        trusted_gateway: bool,
+        pem: &[u8],
+        crls: &[CertificateRevocationListDer<'static>],
+    ) -> Result<Self> {
         let mut reader = std::io::BufReader::new(pem);
         let mut store = RootCertStore::empty();
         let mut certs = Vec::new();
         let mut cert_hashes: Vec<[u8; 32]> = Vec::new();
         for cert in rustls_pemfile::certs(&mut reader) {
-            let cert: CertificateDer<'static> =
-                cert.map_err(|e| InterflowError::config(format!("tenant CA parse error: {e}")))?;
+            let cert: CertificateDer<'static> = cert.map_err(|e| {
+                InterflowError::config("tenant CA parse error".to_string()).with_source(e)
+            })?;
             let hash: [u8; 32] = Sha256::digest(cert.as_ref()).into();
             cert_hashes.push(hash);
-            store
-                .add(cert.clone())
-                .map_err(|e| InterflowError::config(format!("tenant CA add error: {e}")))?;
+            store.add(cert.clone()).map_err(|e| {
+                InterflowError::config("tenant CA add error".to_string()).with_source(e)
+            })?;
             certs.push(cert);
         }
         if certs.is_empty() {
@@ -73,6 +87,7 @@ impl TenantTrustRoot {
             trusted_gateway,
             store,
             certs,
+            crls: crls.to_vec(),
             fingerprint: hasher.finalize().into(),
         })
     }
@@ -126,14 +141,17 @@ impl TenantVerifier {
         }
         let mut verifiers = Vec::with_capacity(roots.len());
         for root in roots {
-            let verifier = WebPkiClientVerifier::builder(Arc::new(root.store.clone()))
-                .build()
-                .map_err(|e| {
-                    InterflowError::config(format!(
-                        "tenant '{}' client verifier build failed: {e}",
-                        root.name
-                    ))
-                })?;
+            let mut builder = WebPkiClientVerifier::builder(Arc::new(root.store.clone()));
+            if !root.crls.is_empty() {
+                builder = builder.with_crls(root.crls.clone());
+            }
+            let verifier = builder.build().map_err(|e| {
+                InterflowError::config(format!(
+                    "tenant '{}' client verifier build failed",
+                    root.name
+                ))
+                .with_source(e)
+            })?;
             verifiers.push(verifier);
         }
         Ok(Self {
@@ -192,6 +210,10 @@ pub struct TlsPlane {
     pub acceptor: TlsAcceptor,
     /// Tenant derivation for connections that passed the acceptor.
     pub verifier: Arc<TenantVerifier>,
+    /// The acceptor's configuration, for hosts that dispatch connections
+    /// into this plane from another listener (e.g. the ingress's public 443
+    /// SNI-multiplexing the control endpoint).
+    pub config: std::sync::Arc<tokio_rustls::rustls::ServerConfig>,
 }
 
 /// Builds the complete TLS plane from a tenant trust table: the acceptor
@@ -204,11 +226,15 @@ pub fn build_tls_plane(
     min_version: crate::tls::TlsMinVersion,
 ) -> Result<TlsPlane> {
     let verifier = Arc::new(TenantVerifier::new(roots)?);
-    let acceptor = super::server::build_mtls_acceptor_with_roots(
+    let config = std::sync::Arc::new(super::server::build_mtls_server_config_with_roots(
         cert_path,
         key_path,
         &verifier.merged_roots(),
         min_version,
-    )?;
-    Ok(TlsPlane { acceptor, verifier })
+    )?);
+    Ok(TlsPlane {
+        acceptor: TlsAcceptor::from(config.clone()),
+        verifier,
+        config,
+    })
 }

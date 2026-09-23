@@ -1,10 +1,10 @@
 [package]
 name = "interflow-gui"
-version = "0.3.0"
-edition = "2024"
-rust-version = "1.97"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Interflow expose GUI (Tauri 2.0)"
-license = "MIT"
+license.workspace = true
 default-run = "interflow-gui"
 
 [lib]
@@ -23,14 +23,23 @@ path = "src/bin/export_bindings.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-interflow-core = { path = "../crates/core", version = "0.3" }
-interflow-expose = { path = "../crates/expose", version = "0.3" }
-interflow-mesh = { path = "../crates/mesh", version = "0.3" }
+interflow-core = { path = "../crates/core", version = "0.4" }
+interflow-cli = { path = "../crates/cli", version = "0.4" }
+interflow-expose = { path = "../crates/expose", version = "0.4" }
+interflow-identity = { path = "../crates/identity", version = "0.4" }
+interflow-mesh = { path = "../crates/mesh", version = "0.4" }
+# Credential renewal scheduler (one per running node — GUI/binary parity)
+interflow-renewal = { path = "../crates/renewal", version = "0.4" }
+# Atomic profile writes
+interflow-util = { path = "../crates/util", version = "0.4" }
 
 tauri = { version = "2", features = ["tray-icon", "image-png", "specta"] }
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
+# Machine anchor: the GUI is machine-scoped, and the header/tray show which
+# machine the nodes run on (a node is an identity, not a machine).
+gethostname = "1.1"
 
 # IPC contract codegen: TS types + typed invoke/event wrappers are generated
 # from the Rust DTOs (src/bindings.ts) — the frontend never hand-writes them.
@@ -40,18 +49,23 @@ specta-typescript = "0.0.12"
 tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 
 tokio = { workspace = true }
-tokio-util = { workspace = true, features = ["rt"] }
+# Cancellation tokens (ingress engine wrapper, renewal task abort)
+tokio-util = { workspace = true }
 
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
+toml = { workspace = true }
+dirs = "6"
+# Node ids (UUID v4, minted at add time; stable across credential rotations)
+uuid = { version = "1.23", features = ["v4"] }
 
 [dev-dependencies]
 # In-process hub + self-signed certs for the Start/Stop round-trip regression
 # tests (tunnel.rs) — the 2026-09-18 deadlock acceptance gate.
-interflow-testkit = { path = "../crates/testkit", version = "0.3" }
+interflow-testkit = { path = "../crates/testkit", version = "0.4" }
 # Bindings-freshness drift guard test (contract.rs)
 tempfile = "3"
 

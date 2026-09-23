@@ -58,6 +58,24 @@ impl FaultLog {
             .expect("fault log lock poisoned")
             .contains(&point)
     }
+
+    /// Waits until the given point has fired, up to `timeout`.
+    ///
+    /// Fault points fire asynchronously inside engine tasks — e.g. the poll
+    /// loop's AfterConnect panic can land after the agent's "connected"
+    /// state is already observable — so a bare `fired()` snapshot races
+    /// those tasks. Bounded polling keeps the vacuous-green guard while
+    /// removing the race.
+    pub async fn wait_fired(&self, point: FaultPoint, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !self.fired(point) {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        true
+    }
 }
 
 /// Installs (replaces) the global fault plan; returns the consumption log.

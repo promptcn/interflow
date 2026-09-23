@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
+use tokio_rustls::rustls::pki_types::CertificateRevocationListDer;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Minimum TLS protocol version accepted by a server endpoint.
@@ -56,24 +58,28 @@ impl TlsMinVersion {
 pub(crate) fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     check_secret_file_perms(path, Strictness::Lenient)?;
     let file = File::open(path).map_err(|e| {
-        InterflowError::config(format!("failed to open certificate file {path}: {e}"))
+        InterflowError::config(format!("failed to open certificate file {path}")).with_source(e)
     })?;
     let mut reader = BufReader::new(file);
     rustls_pemfile::certs(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| InterflowError::config(format!("failed to load certificates: {e}")))
+        .map_err(|e| {
+            InterflowError::config("failed to load certificates".to_string()).with_source(e)
+        })
 }
 
 /// Loads a PKCS#8 private key from a PEM file. Enforces 0600 permissions.
 pub(crate) fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     check_secret_file_perms(path, Strictness::Strict)?;
     let file = File::open(path).map_err(|e| {
-        InterflowError::config(format!("failed to open private key file {path}: {e}"))
+        InterflowError::config(format!("failed to open private key file {path}")).with_source(e)
     })?;
     let mut reader = BufReader::new(file);
     let keys = rustls_pemfile::pkcs8_private_keys(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| InterflowError::config(format!("failed to load private key: {e}")))?;
+        .map_err(|e| {
+            InterflowError::config("failed to load private key".to_string()).with_source(e)
+        })?;
 
     let Some(key) = keys.into_iter().next() else {
         return Err(InterflowError::config(
@@ -86,15 +92,17 @@ pub(crate) fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 /// Loads PEM-encoded trust roots (CA) for client certificate validation.
 pub(crate) fn load_ca_roots(path: &str) -> Result<RootCertStore> {
     check_secret_file_perms(path, Strictness::Lenient)?;
-    let file = File::open(path)
-        .map_err(|e| InterflowError::config(format!("failed to open CA file {path}: {e}")))?;
+    let file = File::open(path).map_err(|e| {
+        InterflowError::config(format!("failed to open CA file {path}")).with_source(e)
+    })?;
     let mut reader = BufReader::new(file);
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut reader) {
-        let cert = cert.map_err(|e| InterflowError::config(format!("failed to parse CA: {e}")))?;
+        let cert = cert
+            .map_err(|e| InterflowError::config("failed to parse CA".to_string()).with_source(e))?;
         roots
             .add(cert)
-            .map_err(|e| InterflowError::config(format!("failed to add CA: {e}")))?;
+            .map_err(|e| InterflowError::config("failed to add CA".to_string()).with_source(e))?;
     }
     if roots.is_empty() {
         return Err(InterflowError::config(format!(
@@ -104,26 +112,12 @@ pub(crate) fn load_ca_roots(path: &str) -> Result<RootCertStore> {
     Ok(roots)
 }
 
-/// Builds an ALPN=h2 `TlsAcceptor` from `cert_path` and `key_path` (no client cert validation).
-///
-/// `min_version` selects the enforced protocol-version floor.
-///
-/// `Ok(None)` means TLS is not enabled; `Err` means a configuration or file
-/// problem.
-pub fn build_tls_acceptor(
-    cert_path: &str,
-    key_path: &str,
-    min_version: TlsMinVersion,
-) -> Result<Option<TlsAcceptor>> {
-    let certs = load_certs(cert_path)?;
-    let key = load_key(key_path)?;
-    let mut config =
-        TlsServerConfig::builder_with_protocol_versions(min_version.supported_versions())
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| InterflowError::config(format!("TLS configuration error: {e}")))?;
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    Ok(Some(TlsAcceptor::from(Arc::new(config))))
+/// Loads one PEM-encoded X.509 CRL.
+pub fn load_crl(path: &str) -> Result<CertificateRevocationListDer<'static>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| InterflowError::config(format!("cannot open CRL {path}")).with_source(e))?;
+    CertificateRevocationListDer::from_pem_slice(&bytes)
+        .map_err(|e| InterflowError::config(format!("failed to parse CRL {path}")).with_source(e))
 }
 
 /// Builds a `TlsAcceptor` with mTLS enabled (client certificate validation).
@@ -150,50 +144,54 @@ pub fn build_mtls_acceptor(
 /// The multi-tenant plane merges every tenant's roots into one store —
 /// `core::tls::tenant` owns the derivation of *which* tenant anchored a
 /// chain.
-pub fn build_mtls_acceptor_with_roots(
+pub(crate) fn build_mtls_acceptor_with_roots(
     cert_path: &str,
     key_path: &str,
     client_roots: &RootCertStore,
     min_version: TlsMinVersion,
 ) -> Result<TlsAcceptor> {
+    Ok(TlsAcceptor::from(Arc::new(
+        build_mtls_server_config_with_roots(cert_path, key_path, client_roots, min_version)?,
+    )))
+}
+
+/// The `rustls::ServerConfig` behind [`build_mtls_acceptor_with_roots`] —
+/// for listeners that dispatch connections into this plane from another
+/// acceptor (e.g. the ingress's public-port SNI multiplexing).
+pub(crate) fn build_mtls_server_config_with_roots(
+    cert_path: &str,
+    key_path: &str,
+    client_roots: &RootCertStore,
+    min_version: TlsMinVersion,
+) -> Result<TlsServerConfig> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
 
     let verifier =
         tokio_rustls::rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots.clone()))
             .build()
-            .map_err(|e| InterflowError::config(format!("failed to build client verifier: {e}")))?;
+            .map_err(|e| {
+                InterflowError::config("failed to build client verifier".to_string()).with_source(e)
+            })?;
 
     let mut config =
         TlsServerConfig::builder_with_protocol_versions(min_version.supported_versions())
             .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)
-            .map_err(|e| InterflowError::config(format!("mTLS configuration error: {e}")))?;
+            .map_err(|e| {
+                InterflowError::config("mTLS configuration error".to_string()).with_source(e)
+            })?;
     config.alpn_protocols = vec![b"h2".to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok(config)
 }
 
-/// Builds a bare `rustls::ServerConfig` (for QUIC/quinn; the equivalent of
+/// Builds a bare `rustls::ServerConfig` for QUIC/quinn (the equivalent of
 /// the tokio-rustls acceptor).
 ///
-/// `client_ca` provides the mTLS client certificate validation roots;
-/// `None` is one-way TLS. `min_version` selects the enforced
-/// protocol-version floor.
-pub fn build_rustls_server_config(
-    cert_path: &str,
-    key_path: &str,
-    client_ca: Option<&str>,
-    min_version: TlsMinVersion,
-) -> Result<rustls::ServerConfig> {
-    let roots = match client_ca {
-        Some(path) => Some(load_ca_roots(path)?),
-        None => None,
-    };
-    build_rustls_server_config_with_roots(cert_path, key_path, roots.as_ref(), min_version)
-}
-
-/// [`build_rustls_server_config`] with the client trust roots supplied
-/// directly (the multi-tenant QUIC plane merges every tenant's roots).
+/// The client trust roots are supplied directly — the multi-tenant QUIC
+/// plane merges every tenant's roots. `client_roots` provides the mTLS
+/// client certificate validation roots; `None` is one-way TLS.
+/// `min_version` selects the enforced protocol-version floor.
 pub fn build_rustls_server_config_with_roots(
     cert_path: &str,
     key_path: &str,
@@ -206,9 +204,10 @@ pub fn build_rustls_server_config_with_roots(
         let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots.clone()))
             .build()
             .map_err(|e| {
-                crate::error::InterflowError::config(format!(
-                    "failed to build client certificate verifier: {e}"
-                ))
+                crate::error::InterflowError::config(
+                    "failed to build client certificate verifier".to_string(),
+                )
+                .with_source(e)
             })?;
         rustls::ServerConfig::builder_with_protocol_versions(min_version.supported_versions())
             .with_client_cert_verifier(verifier)
@@ -217,14 +216,9 @@ pub fn build_rustls_server_config_with_roots(
             .with_no_client_auth()
     };
     builder.with_single_cert(certs, key).map_err(|e| {
-        crate::error::InterflowError::config(format!("failed to configure server certificate: {e}"))
+        crate::error::InterflowError::config("failed to configure server certificate".to_string())
+            .with_source(e)
     })
-}
-
-/// Extracts the client certificate CN from quinn's `peer_identity()` (for mTLS identity binding).
-pub fn extract_cn_from_quinn_identity(identity: Option<Box<dyn std::any::Any>>) -> Option<String> {
-    let certs = identity.and_then(|any| any.downcast::<Vec<CertificateDer<'static>>>().ok())?;
-    extract_cn_from_chain(&certs)
 }
 
 /// Extracts the CN (Common Name) from a client cert chain, used as the agent identity binding.
@@ -315,13 +309,15 @@ mod min_version_tests {
             }
         }
 
-        let acceptor = build_tls_acceptor(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
-            TlsMinVersion::V1_3,
-        )
-        .unwrap()
-        .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(
+            build_rustls_server_config_with_roots(
+                cert_path.to_str().unwrap(),
+                key_path.to_str().unwrap(),
+                None,
+                TlsMinVersion::V1_3,
+            )
+            .unwrap(),
+        ));
 
         const TLS12_ONLY: &[&tokio_rustls::rustls::SupportedProtocolVersion] =
             &[&tokio_rustls::rustls::version::TLS12];

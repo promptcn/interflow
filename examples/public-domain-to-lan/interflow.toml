@@ -1,0 +1,36 @@
+# Deployment manifest: the single source of truth.
+#
+# Replace relay.example.com with your public control endpoint and
+# app.example.com with the hostname you route. Service addresses stay on the
+# agent side; the public side only ever references the service identity.
+
+[realm]
+id = "example"
+control_endpoint = "relay.example.com:16666"
+
+[public_tls]
+mode = "frontend-proxy"
+
+[identity]
+leaf_ttl = "24h"
+
+[registrar]
+endpoint = "https://registrar.example.com"
+
+[ingress.edge]
+workspaces = ["demo"]
+listen = "0.0.0.0:8443"
+control_listen = "0.0.0.0:16666"
+
+[workspace.demo]
+
+[agent.lan-agent]
+workspace = "demo"
+
+[[agent.lan-agent.services]]
+id = "web"
+address = "127.0.0.1:3000"
+
+[[route]]
+host = "app.example.com"
+service = "demo/lan-agent/web"

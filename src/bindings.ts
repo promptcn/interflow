@@ -5,12 +5,33 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 
 /** Commands */
 export const commands = {
-	loadProfile: () => typedError<Profile, string>(__TAURI_INVOKE("load_profile")),
-	saveProfile: (profile: Profile) => typedError<null, string>(__TAURI_INVOKE("save_profile", { profile })),
-	generateAgentId: () => __TAURI_INVOKE<string>("generate_agent_id"),
-	startTunnel: (config: TunnelConfig) => typedError<null, string>(__TAURI_INVOKE("start_tunnel", { config })),
-	stopTunnel: () => typedError<null, string>(__TAURI_INVOKE("stop_tunnel")),
-	getState: () => typedError<TunnelState, string>(__TAURI_INVOKE("get_state")),
+	/**  Lists the managed nodes (name order). */
+	listNodes: () => typedError<NodeInfo[], string>(__TAURI_INVOKE("list_nodes")),
+	/**
+	 *  Validates a pack directory through the shared funnel and reports what it
+	 *  is — the add flow's preview. Nothing is persisted.
+	 */
+	inspectPack: (packDir: string) => typedError<PackInspection, string>(__TAURI_INVOKE("inspect_pack", { packDir })),
+	/**  Adds a node from a pack directory (kind and name come from the pack). */
+	addNode: (params: AddNodeParams) => typedError<NodeInfo, string>(__TAURI_INVOKE("add_node", { params })),
+	/**  Removes a node (must be stopped). */
+	removeNode: (id: string) => typedError<null, string>(__TAURI_INVOKE("remove_node", { id })),
+	/**
+	 *  Starts one node (user action).
+	 * 
+	 *  Stays synchronous on purpose: the pack-loading `prepare` is file IO that
+	 *  belongs on Tauri's sync-command pool, and the engine spawns go through
+	 *  the runtime handle the manager holds — safe from threads without an
+	 *  ambient Tokio runtime
+	 * .
+	 */
+	startNode: (id: string) => typedError<null, string>(__TAURI_INVOKE("start_node", { id })),
+	/**  Stops one node (user action; clears the start intent). */
+	stopNode: (id: string) => typedError<null, string>(__TAURI_INVOKE("stop_node", { id })),
+	/**  Stops every running node (app quit path). */
+	stopAllNodes: () => typedError<null, string>(__TAURI_INVOKE("stop_all_nodes")),
+	/**  Updates an agent node's runtime preferences (stopped nodes only). */
+	updateNodePrefs: (id: string, prefs: NodePrefs) => typedError<null, string>(__TAURI_INVOKE("update_node_prefs", { id, prefs })),
 	getRecentLogs: () => typedError<LogLine[], string>(__TAURI_INVOKE("get_recent_logs")),
 	/**
 	 *  Clears the backend ring buffer too, not just the frontend view — the
@@ -18,15 +39,98 @@ export const commands = {
 	 *  would resurrect the cleared lines.
 	 */
 	clearLogs: () => typedError<null, string>(__TAURI_INVOKE("clear_logs")),
+	/**
+	 *  This machine's hostname — the GUI is machine-scoped, and the window
+	 *  header/tray anchor on it (nodes are identities, not machines; a machine
+	 *  can run any number of them).
+	 */
+	getHostName: () => typedError<string, string>(__TAURI_INVOKE("get_host_name")),
+	/**  Renders the starter manifest template (the builder form's output). */
+	deployManifestTemplate: (params: ManifestTemplateParams) => typedError<string, string>(__TAURI_INVOKE("deploy_manifest_template", { params })),
+	/**  Reads a manifest (or any text file the deploy pane edits). */
+	deployReadText: (path: string) => typedError<string, string>(__TAURI_INVOKE("deploy_read_text", { path })),
+	/**
+	 *  Saves the deploy pane's manifest text back to its path (atomic enough for
+	 *  an editor pane: write-to-temp + rename).
+	 */
+	deployWriteText: (path: string, text: string) => typedError<null, string>(__TAURI_INVOKE("deploy_write_text", { path, text })),
+	/**  Validates a manifest; returns the human-readable report lines. */
+	deployValidate: (manifest: string) => typedError<string[], string>(__TAURI_INVOKE("deploy_validate", { manifest })),
+	/**  Issues identities + packs from the manifest (the deploy page's Apply). */
+	deployApply: (manifest: string, issuer: string, out: string) => typedError<string[], string>(__TAURI_INVOKE("deploy_apply", { manifest, issuer, out })),
+	/**
+	 *  Lists the packs of a dist tree (the page's pack cards), enriched with
+	 *  the local node matching each pack's identity — the "update local node"
+	 *  hook (P1-2).
+	 */
+	deployListPacks: (outRoot: string) => typedError<DeployPackDto[], string>(__TAURI_INVOKE("deploy_list_packs", { outRoot })),
+	/**  Seals a pack directory into a distributable `.iflowpack`. */
+	deploySealPack: (packDir: string, outFile: string, passphrase: string) => typedError<null, string>(__TAURI_INVOKE("deploy_seal_pack", { packDir, outFile, passphrase })),
+	/**
+	 *  Installs a sealed `.iflowpack` into the GUI-managed packs root — the
+	 *  import half of "drag a pack in, add as node".
+	 */
+	deployInstallSealed: (sealed: string, passphrase: string) => typedError<ImportedPackDto, string>(__TAURI_INVOKE("deploy_install_sealed", { sealed, passphrase })),
+	/**
+	 *  Updates a local node's pack in place from a dist-tree pack directory
+	 *  (P1-2: the GUI side of `node install`): stop → identity-checked swap
+	 *  (state carried, `.previous` kept) → restore the start intent.
+	 */
+	deployUpdateNode: (nodeId: string, sourceDir: string) => typedError<UpdatedNodeDto, string>(__TAURI_INVOKE("deploy_update_node", { nodeId, sourceDir })),
+	/**  Rotates one node's credential (issues the next generation). */
+	deployRotate: (manifest: string, issuer: string, node: string, pack: string | null) => typedError<string[], string>(__TAURI_INVOKE("deploy_rotate", { manifest, issuer, node, pack })),
+	/**  Revokes a pack (deny list + CRL). */
+	deployRevoke: (issuer: string, pack: string, reason: string) => typedError<string[], string>(__TAURI_INVOKE("deploy_revoke", { issuer, pack, reason })),
 };
 
 /** Events */
 export const events = {
 	log: makeEvent<LogEvent>("log"),
-	tunnelState: makeEvent<TunnelStateEvent>("tunnel-state"),
+	nodeState: makeEvent<NodeStateEvent>("node-state"),
 };
 
 /* Types */
+/**  Parameters for adding a node (frontend add flow → Rust). */
+export type AddNodeParams = {
+	/**  Directory of the installed Credential Pack. */
+	pack_dir: string,
+	/**  Transport toward the hub; absent = h2 (agent nodes only). */
+	transport: Transport | null,
+	/**  Hub QUIC address; absent = derived (agent nodes only). */
+	hub_quic_addr: string | null,
+};
+
+/**  One rendered pack in a `plan apply` output tree (deploy page cards). */
+export type DeployPackDto = {
+	/**  Directory name under `<out>/packs/` (e.g. `ingress-edge`). */
+	dir_name: string,
+	kind: NodeKindDto,
+	node: string,
+	/**  Rotation generation (u32 on the wire — specta forbids BigInt). */
+	generation: number,
+	expires: string,
+	principal: string,
+	/**
+	 *  The local node added from this pack's identity, if any — the
+	 *  "update this local node to this generation" hook (P1-2).
+	 */
+	local_node: LocalNodeRefDto | null,
+};
+
+/**  `deploy_install_sealed` result: ready to "add as node". */
+export type ImportedPackDto = {
+	pack_dir: string,
+	inspection: PackInspection,
+};
+
+/**  A local node matching a dist pack's identity (Deploy page cards). */
+export type LocalNodeRefDto = {
+	id: string,
+	name: string,
+	/**  Generation of the pack currently in place. */
+	generation: number,
+};
+
 /**  `log` event payload (tracing capture pump → frontend log panel). */
 export type LogEvent = LogLine;
 
@@ -36,71 +140,194 @@ export type LogLine = {
 	level: string,
 	target: string,
 	message: string,
+	/**
+	 *  Node attribution: the `node` field the engine crates (and the node
+	 *  manager itself) attach to their events — the pack's node name.
+	 *  `None` = not attributable to one node (shown only in the all-nodes
+	 *  view).
+	 */
+	node: string | null,
 };
 
-/**  Persisted expose profile (mirrors expose `profile::Profile`). */
-export type Profile = {
-	/**  Hub URL (e.g. `https://hub.example.com:6666`). */
-	hub_url?: string | null,
-	/**  Client certificate PEM path (mTLS identity; CN must equal agent_id). */
-	client_cert?: string | null,
-	/**  Client key PEM path (0600). */
-	client_key?: string | null,
-	/**
-	 *  agent_id used by this machine's expose (edge routes.toml must
-	 *  reference the same id).
-	 */
-	agent_id?: string | null,
-	/**
-	 *  Path to the trusted hub CA certificate PEM (required when the hub uses
-	 *  a self-signed cert).
-	 */
-	ca_path?: string | null,
-	/**  Local ports used last time (for GUI form prefill). */
-	local_ports?: number[] | null,
-	/**  Transport toward the hub: `h2` (default) or `quic`. */
-	transport?: Transport | null,
-	/**
-	 *  Hub QUIC address (`host:port`); `None` derives it at runtime from
-	 *  `hub_url`'s host:port.
-	 */
-	hub_quic_addr?: string | null,
+/**  Parameters of the manifest template builder (mirrors `interflow setup`). */
+export type ManifestTemplateParams = {
+	realm: string,
+	control_endpoint: string,
+	registrar_endpoint: string,
+	host: string,
+	agent: string,
+	service: string,
+	service_address: string,
 };
 
-/**  Transport toward the hub (wire form mirrors mesh `TransportKind`). */
-export type Transport = "h2" | "quic";
+/**  A serve-side mesh rule (pack-signed; the GUI shows it read-only). */
+export type MeshEgressRuleDto = {
+	name: string,
+	protocol: MeshProtocolDto,
+	target_addr: string,
+};
 
-/**  Parameters for starting the tunnel (frontend form → Rust). */
-export type TunnelConfig = {
-	local_ports: number[],
-	hub_url: string,
-	client_cert: string,
-	client_key: string,
-	agent_id: string,
-	ca_path: string | null,
-	/**  Transport toward the hub; absent = h2 (the default). */
+/**  A listen-side mesh rule (pack-signed; the GUI shows it read-only). */
+export type MeshIngressRuleDto = {
+	name: string,
+	/**  Local listen address (loopback). */
+	listen: string,
+	protocol: MeshProtocolDto,
+	/**  The peer agent that dials `remote_addr` on its own network. */
+	target_agent: string,
+	remote_addr: string,
+};
+
+/**  Wire protocol of a mesh rule (wire form of manifest `MeshProtocol`). */
+export type MeshProtocolDto = "tcp" | "udp";
+
+/**  One managed node (list rows, detail panes). */
+export type NodeInfo = {
+	id: string,
+	kind: NodeKindDto,
+	/**  Display name (the pack's node name). */
+	name: string,
+	/**
+	 *  The identity the pack carries (`realm/workspace/kind/node`);
+	 *  `None` = the pack was unreadable at restore (placeholder).
+	 */
+	principal: string | null,
+	/**
+	 *  Unique log attribution value (name + id prefix) — the `node` field
+	 *  this node's captured log lines carry and the "This node" filter
+	 *  matches on.
+	 */
+	attribution: string,
+	/**  Directory of the installed Credential Pack. */
+	pack_dir: string,
+	state: NodeStateDto,
+	/**  Start intent: the node should be (and, on launch, will be) running. */
+	desired_running: boolean,
+	/**  Agent nodes only. */
 	transport: Transport | null,
-	/**  Hub QUIC address; absent = derived from the hub URL's host:port. */
+	/**  Agent nodes only; `None` derives from the control endpoint. */
 	hub_quic_addr: string | null,
+	/**
+	 *  Services the pack declares, with the effective dial address (expose
+	 *  agents; empty for other kinds).
+	 */
+	services: ServiceAddressDto[],
+	/**
+	 *  Site-to-site rules the pack declares (mesh agents; empty for other
+	 *  kinds). Pack-signed truth, shown read-only.
+	 */
+	mesh_ingress_rules: MeshIngressRuleDto[],
+	/**  Serve-side mesh rules (mesh agents; empty for other kinds). */
+	mesh_egress_rules: MeshEgressRuleDto[],
+	/**  Public/control listener the pack declares (hub/ingress). */
+	listen: string | null,
+	/**  Rotation generation of the pack (display cache for update hints). */
+	generation: number,
 };
 
 /**
- *  Tunnel lifecycle state (wire form mirrors mesh `AgentState`, externally
- *  tagged: `"Connecting" | { "Connected": … } | …`). `backoff_secs` narrows
- *  u64 → u32: specta forbids BigInt-style exports, and a reconnect backoff
- *  beyond u32::MAX seconds is meaningless.
+ *  What a node is — derived from its Credential Pack (wire form of
+ *  `node::NodeKind`).
  */
-export type TunnelState = "Connecting" | ({ Connected: {
+export type NodeKindDto = "expose_agent" | "mesh_agent" | "hub" | "ingress";
+
+/**  Agent runtime preferences (updatable while the node is stopped). */
+export type NodePrefs = {
+	transport: Transport | null,
+	hub_quic_addr: string | null,
+	/**
+	 *  The **complete** preference set for service addresses (full-state
+	 *  replacement, same semantics as `transport`): each entry overrides
+	 *  the pack default for that service id; an empty list reverts every
+	 *  service to its default.
+	 */
+	service_addresses: ServiceAddressPrefDto[],
+};
+
+/**
+ *  Node lifecycle (wire form of `node::NodeState`; `backoff_secs` narrows
+ *  u64 → u32: specta forbids BigInt-style exports, and a backoff beyond
+ *  u32::MAX seconds is meaningless).
+ */
+export type NodeStateDto = "Starting" | "Connecting" | ({ Connected: {
 	agent_id: string,
 } }) & { Failed?: never; Reconnecting?: never } | ({ Reconnecting: {
 	reason: string,
 	backoff_secs: number,
-} }) & { Connected?: never; Failed?: never } | "Stopped" | ({ Failed: {
+} }) & { Connected?: never; Failed?: never } | "Running" | "Stopping" | "Stopped" | ({ Failed: {
 	error: string,
 } }) & { Connected?: never; Reconnecting?: never };
 
-/**  `tunnel-state` event payload (emitted from the TunnelManager state sink). */
-export type TunnelStateEvent = TunnelState;
+/**  `node-state` event payload: which node transitioned to what. */
+export type NodeStateEvent = {
+	id: string,
+	state: NodeStateDto,
+};
+
+/**
+ *  What the add-node flow shows after a pack directory is picked (validated
+ *  through the same funnel the start path uses).
+ */
+export type PackInspection = {
+	kind: NodeKindDto,
+	name: string,
+	/**
+	 *  The identity the pack carries (`realm/workspace/kind/node`) — a node
+	 *  is an identity, not a machine; one identity runs at most once here.
+	 */
+	principal: string,
+	/**  Agents dial it; hubs/ingress show their listen address. */
+	control_endpoint: string,
+	/**
+	 *  Expose services the pack declares (ids; the pack's manifest-issued
+	 *  default addresses show up in the node detail after adding).
+	 */
+	services: string[],
+	/**
+	 *  Mesh rule counts (mesh agents). u32 on the wire — specta forbids
+	 *  BigInt-style types, and rule counts beyond u32 are meaningless.
+	 */
+	mesh_ingress: number,
+	mesh_egress: number,
+	/**  Listen address (hub/ingress). */
+	listen: string | null,
+};
+
+/**
+ *  One service an agent node declares, with the address the agent will
+ *  actually dial (pack default unless a machine-local preference overrides
+ *  it — what is shown is what runs).
+ */
+export type ServiceAddressDto = {
+	id: string,
+	/**  Manifest-issued default from the pack. */
+	default_address: string,
+	/**  Effective dial target (override if set, else the default). */
+	effective_address: string,
+	/**  A machine-local preference overrides the default. */
+	overridden: boolean,
+};
+
+/**  One machine-local service-address preference (expose agents). */
+export type ServiceAddressPrefDto = {
+	id: string,
+	address: string,
+};
+
+/**
+ *  Transport toward the hub/control endpoint (wire form mirrors mesh
+ *  `TransportKind`).
+ */
+export type Transport = "h2" | "quic";
+
+/**  `deploy_update_node` result: what the swap did plus the refreshed node. */
+export type UpdatedNodeDto = {
+	node: NodeInfo,
+	generation_from: number,
+	generation_to: number,
+	/**  The node had a running intent and was restarted onto the new pack. */
+	restarted: boolean,
+};
 
 /* Tauri Specta runtime */
 async function typedError<T, E>(result: Promise<T>): Promise<{ status: "ok"; data: T } | { status: "error"; error: E }> {

@@ -1,10 +1,10 @@
 [package]
 name = "interflow-mesh"
-version = "0.3.0"
-edition = "2024"
-rust-version = "1.97"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Site-to-site TCP tunnel: any TCP traffic between two private networks via a public hub"
-license = "MIT"
+license.workspace = true
 
 [lib]
 name = "interflow_mesh"
@@ -21,10 +21,16 @@ path = "src/main.rs"
 fault-injection = ["interflow-core/fault-injection"]
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.3" }
-# Certificate issuance behind the `certs` subcommand (single rcgen
-# implementation shared with the expose wizard and the test kit)
-interflow-certs = { path = "../certs", version = "0.3" }
+interflow-core = { path = "../core", version = "0.4" }
+interflow-contract = { path = "../contract", version = "0.4" }
+# Shared endpoint/authority parsing (QUIC SNI, SSRF host extraction)
+interflow-util = { path = "../util", version = "0.4" }
+# Shared rcgen issuance + name validation (single implementation behind the
+# identity issuer and the test kit; mesh config validation checks names)
+interflow-certs = { path = "../certs", version = "0.4" }
+# Credential Pack bootstrap + renewal (product site-to-site path)
+interflow-identity = { path = "../identity", version = "0.4" }
+interflow-renewal = { path = "../renewal", version = "0.4" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -40,18 +46,11 @@ http-body-util = "0.1.3"
 
 # TLS support (rustls-only) — some mesh code uses rustls types directly
 rustls = "0.23"
-rustls-pemfile = "2.2.0"
 tokio-rustls = "0.26.4"
-rustls-pki-types = "1.15"
-rustls-native-certs = "0.8.4"
 
-# Config file parsing
+# Config model serialization (pack bootstrap + testkit JSON handoff)
 serde = { version = "1.0", features = ["derive"] }
-toml = "1"
 serde_json = "1.0.150"
-# Control API rule write-back: comment-preserving TOML round-trip (version aligned
-# with the existing dependency tree)
-toml_edit = { version = "0.25", features = ["serde"] }
 
 # Logging
 tracing = "0.1.44"
@@ -59,13 +58,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # Metrics
 metrics = "0.24.6"
-metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 
 # Security
-governor = "0.10.4"
-x509-parser = "0.18"
 sha2 = "0.11"
-hex = "0.4"
 ipnetwork = "0.21.1"
 subtle = "2.6"
 
@@ -76,6 +71,8 @@ thiserror = "2"
 bytes = "1.12"
 futures = "0.3"
 uuid = { version = "1.23", features = ["v4", "serde"] }
+# Full-jitter backoff between reconnect attempts (rand 0.9, aligned with testkit)
+rand = "0.9"
 
 # Command-line arguments
 clap = { version = "4.6", features = ["derive"] }
@@ -87,7 +84,7 @@ chrono = "0.4"
 # Shared test/bench harness (dev-dependency cycle: testkit depends on mesh,
 # supported by cargo, same pattern as tokio/tokio-test; testkit stays out of the
 # production dependency graph)
-interflow-testkit = { path = "../testkit", version = "0.3", features = ["fault-injection"] }
+interflow-testkit = { path = "../testkit", version = "0.4", features = ["fault-injection"] }
 # paused-clock unit tests (egress send-path health)
 tokio = { workspace = true, features = ["test-util"] }
 # bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion
@@ -95,12 +92,16 @@ tokio = { workspace = true, features = ["test-util"] }
 libc = "0.2"
 # e2e test logging (output goes to the test writer when RUST_LOG=interflow=debug)
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# certs_cli: fresh per-test certificate directories
+# fresh per-test sandbox/certificate directories (pack unit tests, e2e)
 tempfile = "3"
+# unit tests: config-schema fixtures are written in TOML (one serialization of
+# the serde schema; the engine handoff is JSON)
+toml = "1"
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
 # e2e assertions on metrics counters (in-process recorder installed for direct snapshot reads)
 metrics = "0.24.6"
-metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# loss_hol bench artifact metadata: RFC 3339 timestamps (no chrono in the bench)
+time = { version = "0.3", features = ["formatting"] }
 
 # ============================================================================
 # Benchmarks

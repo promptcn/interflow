@@ -1,0 +1,19 @@
+[Unit]
+Description=Interflow hub node promptcn
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+TimeoutStartSec=30s
+ExecStart=/usr/local/bin/interflow-mesh hub --pack /srv/interflow/packs/hub-promptcn
+Restart=always
+RestartSec=5
+User=interflow
+Group=interflow
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/interflow/packs/hub-promptcn
+
+[Install]
+WantedBy=multi-user.target

@@ -1,19 +1,23 @@
-//! Typed close reason for tunnel stream Close frames (the `CLOSE:{sid}:{token}`
-//! payload).
+//! Typed close reason for tunnel stream Close frames.
 //!
-//! Single source of truth for the reason tokens the agent egress produces
-//! ([`CloseReason::as_str`]) and every consumer classifies by
-//! ([`CloseReason::from_token`]). Until 2026-09-17 the enum lived privately in
+//! Single source of truth for the reason codes the agent egress produces
+//! ([`CloseReason::as_code`]) and every consumer classifies by
+//! ([`CloseReason::from_code`]). Until 2026-09-17 the enum lived privately in
 //! the mesh egress and downstream consumers (the expose edge route breaker)
 //! matched raw strings against hand-copied token lists — adding a reason could
 //! silently drift between producer and consumers
-//! (docs/bug/2026-09-17-edge-route-breaker-stuck-open.md).
+//!. The wire format
+//! carries the reason as a single u8 code
+//! from the shared `interflow_contract::close_reason_code` table; the
+//! snake_case tokens below remain the metrics labels.
 //!
-//! Wire compatibility: tokens are plain ASCII words in the Close payload. An
-//! unknown token from a newer peer decodes to [`CloseReason::Other`] and
-//! round-trips unchanged — never a protocol error. The hub stays token-opaque
-//! (charset-validating relay) and does not interpret this enum.
+//! Wire compatibility: hub and agent deploy as one paired build (single
+//! format epoch, no version skew) — any code this build does not recognize
+//! is treated as the ordinary reason-less close
+//! ([`CloseReason::CloseFrame`]). The hub stays code-opaque (length-checked
+//! relay) and does not interpret this enum.
 
+use interflow_contract::close_reason_code as code;
 use std::fmt;
 
 /// Why a tunnel stream ended (agent egress producer → hub relay → edge
@@ -53,16 +57,13 @@ pub enum CloseReason {
     /// The inner agent↔agent TLS handshake (e2e encryption) failed, timed
     /// out, or never happened on a stream that required it — the stream is
     /// closed instead of degrading to plaintext (fail-closed; RFC
-    /// docs/design/agent-e2e-encryption.md §3.5/§4).
+    /// (internal design notes) §3.5/§4).
     E2eHandshakeFailed,
-    /// A token this build does not know (newer peer); preserved verbatim so
-    /// relays and logs never lie about what the peer said.
-    Other(String),
 }
 
 impl CloseReason {
-    /// The wire token / metrics label for this reason.
-    pub fn as_str(&self) -> &str {
+    /// The metrics label / display token for this reason.
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::NoTarget => "no_target",
             Self::SecurityDenied => "security_denied",
@@ -77,32 +78,58 @@ impl CloseReason {
             Self::UdpIdle => "udp_idle",
             Self::SessionClosed => "session_closed",
             Self::E2eHandshakeFailed => "e2e_handshake_failed",
-            Self::Other(token) => token,
         }
     }
 
-    /// Decodes a wire token; the empty token is the ordinary reason-less
-    /// close ([`CloseReason::CloseFrame`]), and anything unrecognized becomes
-    /// [`CloseReason::Other`] carrying the token verbatim (forward
-    /// compatibility).
-    pub fn from_token(token: &str) -> Self {
-        match token {
-            // The empty token is the ordinary reason-less close; "close_frame"
-            // is its canonical name (both decode identically).
-            "" | "close_frame" => Self::CloseFrame,
-            "no_target" => Self::NoTarget,
-            "security_denied" => Self::SecurityDenied,
-            "connect_failed" => Self::ConnectFailed,
-            "backend_write_timeout" => Self::BackendWriteTimeout,
-            "backend_closed" => Self::BackendClosed,
-            "dispatch_poison" => Self::DispatchPoison,
-            "rate_limited" => Self::RateLimited,
-            "target_circuit_open" => Self::TargetCircuitOpen,
-            "local_limit" => Self::LocalLimit,
-            "udp_idle" => Self::UdpIdle,
-            "session_closed" => Self::SessionClosed,
-            "e2e_handshake_failed" => Self::E2eHandshakeFailed,
-            other => Self::Other(other.to_string()),
+    /// The u8 Close payload code (the shared
+    /// `interflow_contract::close_reason_code` table).
+    pub const fn as_code(&self) -> u8 {
+        match self {
+            Self::CloseFrame => code::CLOSE_FRAME,
+            Self::NoTarget => code::NO_TARGET,
+            Self::SecurityDenied => code::SECURITY_DENIED,
+            Self::ConnectFailed => code::CONNECT_FAILED,
+            Self::BackendWriteTimeout => code::BACKEND_WRITE_TIMEOUT,
+            Self::BackendClosed => code::BACKEND_CLOSED,
+            Self::DispatchPoison => code::DISPATCH_POISON,
+            Self::RateLimited => code::RATE_LIMITED,
+            Self::TargetCircuitOpen => code::TARGET_CIRCUIT_OPEN,
+            Self::LocalLimit => code::LOCAL_LIMIT,
+            Self::UdpIdle => code::UDP_IDLE,
+            Self::SessionClosed => code::SESSION_CLOSED,
+            Self::E2eHandshakeFailed => code::E2E_HANDSHAKE_FAILED,
+        }
+    }
+
+    /// Decodes a u8 Close payload code. Code 0 and any unrecognized code
+    /// decode to the ordinary reason-less close ([`CloseReason::CloseFrame`])
+    /// — peers are deployed as one paired build, so an unknown code is not a
+    /// newer-peer case to preserve, just an ordinary close.
+    pub const fn from_code(value: u8) -> Self {
+        match value {
+            code::NO_TARGET => Self::NoTarget,
+            code::SECURITY_DENIED => Self::SecurityDenied,
+            code::CONNECT_FAILED => Self::ConnectFailed,
+            code::BACKEND_WRITE_TIMEOUT => Self::BackendWriteTimeout,
+            code::BACKEND_CLOSED => Self::BackendClosed,
+            code::DISPATCH_POISON => Self::DispatchPoison,
+            code::RATE_LIMITED => Self::RateLimited,
+            code::TARGET_CIRCUIT_OPEN => Self::TargetCircuitOpen,
+            code::LOCAL_LIMIT => Self::LocalLimit,
+            code::UDP_IDLE => Self::UdpIdle,
+            code::SESSION_CLOSED => Self::SessionClosed,
+            code::E2E_HANDSHAKE_FAILED => Self::E2eHandshakeFailed,
+            _ => Self::CloseFrame,
+        }
+    }
+
+    /// Decodes a Close frame payload slice (exactly one code byte expected;
+    /// empty or longer payloads are the ordinary close — the hub relays
+    /// length-checked, agents produce exactly one byte).
+    pub const fn from_payload(payload: &[u8]) -> Self {
+        match payload {
+            [b] => Self::from_code(*b),
+            _ => Self::CloseFrame,
         }
     }
 }
@@ -118,10 +145,9 @@ impl fmt::Display for CloseReason {
 mod tests {
     use super::*;
 
-    /// Every defined token round-trips through the codec; unknown tokens are
-    /// preserved verbatim (a newer peer's reason must survive an older relay).
+    /// Every defined reason round-trips through the wire code.
     #[test]
-    fn tokens_round_trip() {
+    fn codes_round_trip() {
         let known = [
             CloseReason::NoTarget,
             CloseReason::SecurityDenied,
@@ -137,46 +163,45 @@ mod tests {
             CloseReason::SessionClosed,
             CloseReason::E2eHandshakeFailed,
         ];
+        // Codes are pairwise distinct — the table cannot drift into aliasing.
+        let mut codes: Vec<u8> = known.iter().map(CloseReason::as_code).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), known.len(), "reason codes must be distinct");
         for reason in &known {
             assert_eq!(
-                CloseReason::from_token(reason.as_str()),
+                CloseReason::from_code(reason.as_code()),
                 *reason,
-                "token {} must round-trip",
-                reason.as_str()
+                "code {} must round-trip",
+                reason.as_code()
             );
+            assert_eq!(CloseReason::from_payload(&[reason.as_code()]), *reason);
         }
     }
 
     #[test]
-    fn unknown_token_becomes_other_and_survives_relay() {
-        let decoded = CloseReason::from_token("new_future_reason");
-        assert_eq!(decoded, CloseReason::Other("new_future_reason".into()));
-        // Round-trips verbatim: an older relay never mangles a newer reason.
+    fn unknown_codes_and_malformed_payloads_decode_to_ordinary_close() {
+        // Paired single-epoch deploys: an unrecognized code has no
+        // newer-peer meaning to preserve — it is an ordinary close.
+        assert_eq!(CloseReason::from_code(13), CloseReason::CloseFrame);
+        assert_eq!(CloseReason::from_code(255), CloseReason::CloseFrame);
         assert_eq!(
-            CloseReason::from_token(decoded.as_str()),
-            CloseReason::Other("new_future_reason".into())
+            CloseReason::from_code(code::CLOSE_FRAME),
+            CloseReason::CloseFrame
         );
-    }
-
-    /// The empty token is the ordinary reason-less close on the wire
-    /// (`CLOSE:{sid}:`), so it must decode to `CloseFrame`, never to a
-    /// *named* reason or `Other`.
-    #[test]
-    fn empty_token_is_the_ordinary_close() {
-        assert_eq!(CloseReason::from_token(""), CloseReason::CloseFrame);
-        // And CloseFrame itself still round-trips through the empty token.
-        assert_eq!(CloseReason::CloseFrame.as_str(), "close_frame");
+        // Empty / oversized payloads: ordinary close.
+        assert_eq!(CloseReason::from_payload(&[]), CloseReason::CloseFrame);
         assert_eq!(
-            CloseReason::from_token(CloseReason::CloseFrame.as_str()),
+            CloseReason::from_payload(&[code::CONNECT_FAILED, 0]),
             CloseReason::CloseFrame
         );
     }
 
     /// Tokens must stay `snake_case` words — they end up as metrics label
-    /// values and hub `close_reason_of` only relays `[A-Za-z0-9_.-]+`.
+    /// values.
     #[test]
     fn tokens_are_metrics_label_safe() {
-        for reason in [
+        let all = [
             CloseReason::NoTarget,
             CloseReason::SecurityDenied,
             CloseReason::ConnectFailed,
@@ -190,7 +215,8 @@ mod tests {
             CloseReason::UdpIdle,
             CloseReason::SessionClosed,
             CloseReason::E2eHandshakeFailed,
-        ] {
+        ];
+        for reason in all {
             let token = reason.as_str();
             assert!(
                 token

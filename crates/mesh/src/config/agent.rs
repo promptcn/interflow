@@ -1,8 +1,12 @@
-//! Agent configuration schema.
+//! Agent engine configuration model.
 //!
-//! All structs use `deny_unknown_fields`. When the `[control]` section is
-//! enabled, `auth_token` must be configured; binding to a non-loopback address
-//! requires an explicit `allow_remote = true` (foot-gun protection).
+//! Constructed programmatically: the pack bootstrap (`crate::pack`) derives
+//! it from a Credential Pack, the embedded expose edge assembles it
+//! in-memory, and the dev soak harness hands it across the process boundary
+//! as JSON. Structs keep `deny_unknown_fields` so handoffs reject unknown
+//! fields. When the `[control]` section is enabled, `auth_token` must be
+//! configured; binding to a non-loopback address requires an explicit
+//! `allow_remote = true` (foot-gun protection).
 
 use interflow_core::config::LoggingConfig;
 use interflow_core::config::params::BreakerPolicy;
@@ -13,21 +17,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Current configuration schema version.
+/// `[transport]` is endpoint-symmetric with the hub, so one tuning shape and
+/// one set of defaults govern both peers.
 ///
-/// v3 (2026-09-16, config-governance step 4): added the `[transport]`
-/// section (`[transport.h2]` / `[transport.quic]`, endpoint-symmetric with
-/// the hub) — previously these transport-layer values were hard-coded per
-/// endpoint and the hub-side QUIC knobs could not take effect against the
-/// agent's constants.
-pub const AGENT_CONFIG_VERSION: u32 = 3;
-
 /// Agent configuration root structure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
-    /// Schema version; must equal [`AGENT_CONFIG_VERSION`].
-    pub config_version: u32,
     /// Basic agent information.
     pub agent: AgentInfo,
     /// Ingress rules (local listener → remote agent).
@@ -114,10 +110,9 @@ pub struct AgentConfig {
     /// TLS client configuration (optional).
     #[serde(default)]
     pub tls: Option<TlsConfig>,
-    /// E2e encryption (agent↔agent inner TLS); default off = behavior
-    /// unchanged.
+    /// Mandatory agent↔agent inner TLS material and handshake policy.
     #[serde(default)]
-    pub e2e: E2eConfig,
+    pub inner_tls: InnerTlsConfig,
     /// Transport-layer tuning, endpoint-symmetric with the hub's
     /// `[transport]` (see [`crate::config::transport`]).
     #[serde(default)]
@@ -152,7 +147,6 @@ impl Default for AgentConfig {
     /// programmatic defaults can never drift apart.
     fn default() -> Self {
         Self {
-            config_version: AGENT_CONFIG_VERSION,
             agent: AgentInfo::default(),
             ingress: Vec::new(),
             egress: Vec::new(),
@@ -170,7 +164,7 @@ impl Default for AgentConfig {
             control: ControlConfig::default(),
             security: SecurityConfig::default(),
             tls: None,
-            e2e: E2eConfig::default(),
+            inner_tls: InnerTlsConfig::default(),
             transport: AgentTransportConfig::default(),
             logging: LoggingConfig::default(),
         }
@@ -274,6 +268,15 @@ pub struct AgentInfo {
     /// pins a value (tests, unusually slow links).
     #[serde(default)]
     pub task_stall_timeout_secs: Option<u64>,
+    /// Log attribution name override (display only). `None` = the agent
+    /// `id` — on the product paths the id IS the pack's node name. Embedders
+    /// hosting several agents in one process (the GUI) set this to a
+    /// per-slot unique value so captured log lines stay separable even when
+    /// two nodes share a name across realms/workspaces; registration,
+    /// certificate, and ACL semantics never read it. The hub-side
+    /// counterpart is `ServerConfig::node_name`.
+    #[serde(default)]
+    pub log_name: Option<String>,
 }
 
 impl Default for AgentInfo {
@@ -290,7 +293,15 @@ impl Default for AgentInfo {
             poll_idle_timeout_secs: None,
             request_establish_timeout_secs: None,
             task_stall_timeout_secs: None,
+            log_name: None,
         }
+    }
+}
+
+impl AgentInfo {
+    /// The value log sites attribute this agent's events to (display only).
+    pub fn effective_log_name(&self) -> &str {
+        self.log_name.as_deref().unwrap_or(&self.id)
     }
 }
 
@@ -300,7 +311,8 @@ impl Default for AgentInfo {
 pub struct IngressRule {
     /// Rule name (unique identifier, used for add/remove via the control API).
     pub name: String,
-    /// Local listen address.
+    /// Loopback-only local listen address. Agent ingress is an access point for
+    /// local applications, never a public listener.
     pub listen_addr: SocketAddr,
     /// Listen protocol: `tcp` (default) or `udp`.
     ///
@@ -460,74 +472,46 @@ pub struct TlsConfig {
     pub hub_cert_fingerprint: Option<String>,
 }
 
-/// The per-tenant e2e encryption (agent↔agent inner TLS) mode.
-///
-/// Security semantics exist only for [`E2eMode::Required`] (encrypted) and
-/// [`E2eMode::Off`] (current per-hop behavior); `opportunistic` is a
-/// migration-window observation mode whose plaintext fallback cannot
-/// distinguish an old peer from an active downgrade — never a security
-/// claim (RFC docs/design/agent-e2e-encryption.md §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum E2eMode {
-    /// Streams carry the inner TLS layer; a failed/absent handshake closes
-    /// the stream — never a plaintext fallback (fail-closed).
-    Required,
-    /// Attempt the inner TLS handshake; on failure fall back to plaintext
-    /// (migration window only).
-    Opportunistic,
-    /// Current behavior: per-hop TLS only, the hub terminates TLS and sees
-    /// tunnel payloads.
-    #[default]
-    Off,
-}
-
-/// E2e encryption (agent↔agent inner TLS) configuration
-/// (RFC docs/design/agent-e2e-encryption.md §5.1).
+/// Mandatory agent↔agent inner TLS configuration.
 ///
 /// The inner layer reuses the `[tls]` client certificate pair verbatim —
 /// no new key material. The tenant anchor for verifying peers is the same
 /// file the agent already holds as `[tls] ca_path` (single-CA model);
-/// `gateway_ca_path` / `extra_trusted_cas` add the gateway anchor and
+/// `ingress_ca_path` / `extra_trusted_cas` add the ingress anchor and
 /// cross-tenant exception anchors. Startup-only: the e2e runtime is
 /// assembled once and does not participate in rule reload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct E2eConfig {
-    /// Mode (default `off`).
-    pub mode: E2eMode,
+pub struct InnerTlsConfig {
     /// Handshake deadline in seconds for both sides (default 10; 0 is
     /// rejected — guards the stream table against handshake dribble).
     #[serde(default = "default_e2e_handshake_timeout_secs")]
     pub handshake_timeout_secs: u64,
     /// Egress side: the stable gateway anchor CA PEM
-    /// (`certs gateway issue` output). In `required` mode, gateway streams
-    /// must complete the inner handshake against this anchor — without it
-    /// there is no cryptographically verifiable gateway exemption, only a
-    /// hub assertion (spoofable), so such streams are rejected.
+    /// (operator-issued material). Gateway streams must complete the
+    /// inner handshake against this anchor — without it there is no
+    /// cryptographically verifiable gateway exemption, only a hub assertion
+    /// (spoofable), so such streams are rejected.
     #[serde(default)]
-    pub gateway_ca_path: Option<String>,
+    pub ingress_ca_path: Option<String>,
     /// Cross-tenant exception anchors: the peer tenants' CA PEMs for ACL
     /// exception flows. Keep the set minimal — it is an audit item (RFC
     /// §8.2 #4).
     #[serde(default)]
     pub extra_trusted_cas: Vec<String>,
+    /// PEM CRLs checked in addition to chain validity. Reload clears cached
+    /// resumption state and closes revoked peers.
+    #[serde(default)]
+    pub crl_paths: Vec<String>,
 }
 
-impl E2eConfig {
-    /// Whether the inner TLS layer participates at all.
-    pub fn enabled(&self) -> bool {
-        self.mode != E2eMode::Off
-    }
-}
-
-impl Default for E2eConfig {
+impl Default for InnerTlsConfig {
     fn default() -> Self {
         Self {
-            mode: E2eMode::default(),
             handshake_timeout_secs: default_e2e_handshake_timeout_secs(),
-            gateway_ca_path: None,
+            ingress_ca_path: None,
             extra_trusted_cas: Vec::new(),
+            crl_paths: Vec::new(),
         }
     }
 }
@@ -617,7 +601,6 @@ mod tests {
     #[test]
     fn agent_parses_with_optional_sections() {
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "test-agent"
@@ -633,7 +616,6 @@ listen_addr = "127.0.0.1:3001"
 target_agent = "agent-2"
 "#;
         let cfg: AgentConfig = toml::from_str(toml_str).expect("parse");
-        assert_eq!(cfg.config_version, 3);
         assert_eq!(cfg.agent.id, "test-agent");
         assert_eq!(cfg.ingress.len(), 1);
     }
@@ -642,7 +624,6 @@ target_agent = "agent-2"
     fn open_flood_guard_fields_default_and_override() {
         // Defaults
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "x"
@@ -661,7 +642,6 @@ hub_url = "http://hub"
 
         // Explicit overrides (fields with 0 = disabled semantics)
         let toml_str = r#"
-config_version = 3
 egress_resolve_timeout_secs = 2
 egress_connect_timeout_secs = 3
 max_incoming_streams = 0
@@ -691,7 +671,6 @@ hub_url = "http://hub"
     #[test]
     fn agent_rejects_unknown_field() {
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "x"
@@ -705,7 +684,6 @@ totaly_misspelled = true
     #[test]
     fn ingress_udp_fields_parse_with_defaults() {
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "x"
@@ -735,7 +713,6 @@ remote_addr = "10.0.0.1:53"
     #[test]
     fn ingress_tcp_default_protocol_and_idle() {
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "x"
@@ -755,7 +732,6 @@ target_agent = "eg"
     #[test]
     fn ingress_udp_overrides_parse() {
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "x"
@@ -782,7 +758,6 @@ udp_egress_bytes_per_sec = 0
     #[test]
     fn invalid_listen_protocol_rejected() {
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "x"
@@ -801,7 +776,6 @@ target_agent = "eg"
     #[test]
     fn egress_udp_fields_parse() {
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "x"
@@ -834,7 +808,6 @@ udp_idle_timeout_secs = 30
     #[test]
     fn serde_partial_defaults_match_programmatic_default() {
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "test-agent"
@@ -851,58 +824,60 @@ hub_url = "https://hub.example.com:6666"
         assert_eq!(d.egress_target_breaker_failure_threshold, 5);
         assert_eq!(d.egress_target_breaker_window_secs, 10);
         assert_eq!(d.egress_target_breaker_cooldown_secs, 30);
-        // e2e defaults to fully off (old configs parse with zero behavior
-        // change).
-        assert_eq!(d.e2e.mode, E2eMode::Off);
-        assert_eq!(d.e2e.handshake_timeout_secs, 10);
+        // Inner TLS is non-optional, but defaults remain deployment-neutral.
+        assert_eq!(d.inner_tls.handshake_timeout_secs, 10);
+        assert!(d.inner_tls.ingress_ca_path.is_none());
     }
 
-    /// The `[e2e]` section parses with its documented shape; a partial
+    /// The `[inner_tls]` section parses with its documented shape; a partial
     /// section keeps the defaults for the omitted fields.
     #[test]
-    fn e2e_section_parses() {
+    fn inner_tls_section_parses() {
         let toml_str = r#"
-config_version = 3
 
 [agent]
 id = "a1"
 hub_url = "https://hub.example.com:6666"
 
-[e2e]
-mode = "required"
-gateway_ca_path = "certs/gateway-ca.crt"
+[inner_tls]
+ingress_ca_path = "certs/gateway-ca.crt"
 extra_trusted_cas = ["certs/globex-ca.crt", "certs/initech-ca.crt"]
 "#;
         let parsed: AgentConfig = toml::from_str(toml_str).expect("parse");
-        assert_eq!(parsed.e2e.mode, E2eMode::Required);
-        assert_eq!(parsed.e2e.handshake_timeout_secs, 10); // default kept
+        assert_eq!(parsed.inner_tls.handshake_timeout_secs, 10); // default kept
         assert_eq!(
-            parsed.e2e.gateway_ca_path.as_deref(),
+            parsed.inner_tls.ingress_ca_path.as_deref(),
             Some("certs/gateway-ca.crt")
         );
-        assert_eq!(parsed.e2e.extra_trusted_cas.len(), 2);
-        assert!(parsed.e2e.enabled());
-
-        // opportunistic parses; the unknown-mode typo must not.
-        let opportunistic: AgentConfig = toml::from_str(
-            "config_version = 3\n[agent]\nid = \"a\"\nhub_url = \"https://h\"\n\n[e2e]\nmode = \"opportunistic\"\n",
-        )
-        .expect("parse opportunistic");
-        assert_eq!(opportunistic.e2e.mode, E2eMode::Opportunistic);
-        assert!(
-            toml::from_str::<AgentConfig>(
-                "config_version = 3\n[agent]\nid = \"a\"\nhub_url = \"https://h\"\n\n[e2e]\nmode = \"preferred\"\n"
-            )
-            .is_err(),
-            "the rejected alias must stay rejected (naming is a security-semantics decision, RFC §4)"
-        );
+        assert_eq!(parsed.inner_tls.extra_trusted_cas.len(), 2);
     }
 
-    /// `deny_unknown_fields` on the e2e section makes old binaries reject
-    /// the new fields = forced paired upgrade, fail-fast (RFC §6).
+    /// The retired legacy `[e2e]` section is an unknown field: paired upgrade is
+    /// explicit and fail-fast.
     #[test]
-    fn e2e_section_rejects_unknown_fields() {
-        let toml_str = "config_version = 3\n[agent]\nid = \"a\"\nhub_url = \"https://h\"\n\n[e2e]\nmode = \"off\"\nmin_version = \"1.3\"\n";
+    fn e2e_section_is_removed() {
+        let toml_str =
+            "[agent]\nid = \"a\"\nhub_url = \"https://h\"\n\n[e2e]\nmode = \"required\"\n";
         assert!(toml::from_str::<AgentConfig>(toml_str).is_err());
+    }
+
+    /// Log attribution: `None` defaults to the id (product path — the id IS
+    /// the pack node name); an override wins verbatim and never disturbs the
+    /// serde-defaults-equal-programmatic-defaults contract.
+    #[test]
+    fn log_name_defaults_to_id_and_overrides() {
+        let cfg = AgentConfig::for_identity("desktop", "https://hub");
+        assert_eq!(cfg.agent.effective_log_name(), "desktop");
+
+        let toml_str = r#"
+
+[agent]
+id = "desktop"
+hub_url = "https://hub"
+log_name = "desktop·a1b2"
+"#;
+        let parsed: AgentConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(parsed.agent.effective_log_name(), "desktop·a1b2");
+        assert_eq!(parsed.agent.id, "desktop");
     }
 }

@@ -1,10 +1,10 @@
 [package]
 name = "interflow-core"
-version = "0.3.0"
-edition = "2024"
-rust-version = "1.97"
-description = "HTTP/2 tunnel primitives shared by interflow-expose and interflow-mesh"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "HTTP/2 tunnel primitives shared by the ingress engine and interflow-mesh"
+license.workspace = true
 
 [lib]
 name = "interflow_core"
@@ -20,12 +20,13 @@ fault-injection = []
 workspace = true
 
 [dependencies]
+interflow-contract = { path = "../contract", version = "0.4" }
+
 # Async runtime
 tokio = { workspace = true }
 
 # HTTP/2
 hyper = { version = "1.10", features = ["full", "http2"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
 http = "1.4"
 http-body-util = "0.1.3"
 
@@ -43,8 +44,14 @@ dirs = { workspace = true }
 # Error handling
 thiserror = "2"
 
+# Audit-chain timestamps (ISO 8601 UTC, second precision); also used by the
+# inner-TLS verifier tests to construct explicit validity windows
+time = { version = "0.3", features = ["formatting", "macros"] }
+
 # Byte buffers (frame codec)
 bytes = "1.12"
+# Cryptographically random inner UDP session/datagram identifiers
+getrandom = "0.4.3"
 
 # Logging / metrics
 tracing = "0.1.44"
@@ -54,12 +61,12 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 
 # QUIC transport (rustls provider matches the rustls above: aws-lc-rs)
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+quinn-proto = { version = "0.11.17", default-features = false, features = ["rustls-aws-lc-rs", "log"] }
 
 # TLS (rustls-only, openssl forbidden)
 rustls = "0.23"
 rustls-pemfile = "2.2.0"
 tokio-rustls = "0.26.4"
-rustls-pki-types = "1.15"
 rustls-native-certs = "0.8.4"
 
 # mTLS: extract the CN from client certificates for agent identity binding
@@ -71,6 +78,9 @@ hex = "0.4"
 
 # Security: per-IP token-bucket rate limiting
 governor = "0.10.4"
+# Security: HTTP/1.x request-head syntax for the shared edge peek parser
+# (Host routing / XFF / ACME HTTP-01)
+httparse = "1.10"
 # Security: PROXY protocol v2 preamble parsing (edge public + hub agent planes
 # behind nginx; v1 is deliberately not accepted — nginx always sends v2)
 ppp = "2.3"
@@ -81,13 +91,15 @@ tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
+# Property-based tests for the hand-written wire codecs (tests/frame_proptest.rs):
+# arbitrary bytes, mutations, truncations, splices — the decoder must never
+# panic and must preserve its buffer-consumption contract.
+proptest = "1.7"
 # Self-signed certificates for the TLS min-version handshake test (the single
 # rcgen implementation; core keeps issuance out of its production graph)
-interflow-certs = { path = "../certs", version = "0.3" }
+interflow-certs = { path = "../certs", version = "0.4" }
 # Paused clock (start_paused) for unit tests to deterministically verify the INCOMING_SEND_TIMEOUT path
 tokio = { workspace = true, features = ["test-util"] }
-# Constructing explicit (expired) validity windows in inner-TLS verifier tests
-time = "0.3"
 
 # ============================================================================
 # Benchmarks (criterion)

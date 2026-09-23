@@ -1,6 +1,6 @@
 //! Per-target connect-phase circuit breaker (egress hardening, 2026-09-16).
 //!
-//! Companion case file: `docs/bug/2026-09-16-egress-global-rate-limit-starvation.md`
+//! Companion case file: `(internal design notes)`
 //! — a dead backend target whose public caller retried in a loop drained the
 //! agent-wide stream-open rate budget (charged before the target was even
 //! parsed), starving every healthy route on the same agent. The breaker adds
@@ -25,7 +25,7 @@
 //!   receiving the agent's `target_circuit_open`): it counts toward tripping
 //!   while CLOSED but never re-arms an OPEN entry — two breaker layers
 //!   feeding each other's cooldowns is an interlock, not isolation
-//!   (docs/bug/2026-09-17-edge-route-breaker-stuck-open.md §3.3).
+//!  .
 //!
 //! State machine (per target, agent-level, survives session rebuilds — same
 //! rationale as the rate limiter in [`super::egress::EgressRuntime`]):
@@ -217,7 +217,7 @@ impl TargetBreakers {
     /// direct failure while CLOSED, but is a no-op while OPEN: second-hand
     /// evidence must never extend an outage, or two breaker layers lock each
     /// other open (the §3.3 interlock of
-    /// docs/bug/2026-09-17-edge-route-breaker-stuck-open.md).
+    /// (internal design notes)).
     pub fn note_soft_failure(&self, target: &str) {
         self.record_failure(target, true);
     }

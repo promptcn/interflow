@@ -1,0 +1,4 @@
+# Local apply output: Credential Packs (dist/ is globally ignored) and the
+# offline issuer store — never committed.
+issuer/
+dist/

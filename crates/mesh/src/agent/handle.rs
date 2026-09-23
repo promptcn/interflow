@@ -13,6 +13,8 @@
 use interflow_core::error::Result;
 use interflow_core::tunnel::{AgentTunnel, SessionSlot};
 use serde::Serialize;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -60,6 +62,8 @@ pub struct AgentHandle {
     tracker: TaskTracker,
     slot: SessionSlot,
     join: JoinHandle<Result<()>>,
+    established: Arc<AtomicU64>,
+    ingress_ready: watch::Receiver<bool>,
 }
 
 /// Context used inside the supervisor to emit state/events.
@@ -67,10 +71,15 @@ pub struct AgentHandle {
 pub(crate) struct EventSink {
     pub(crate) state_tx: watch::Sender<AgentState>,
     pub(crate) event_tx: mpsc::Sender<AgentEvent>,
+    /// Monotonic session-establishment count, mirrored to the handle.
+    pub(crate) established: Arc<AtomicU64>,
 }
 
 impl EventSink {
     pub(crate) fn set_state(&self, state: AgentState) {
+        if matches!(state, AgentState::Connected { .. }) {
+            self.established.fetch_add(1, Ordering::Relaxed);
+        }
         // watch's send only errors when every receiver is gone; a GUI/CLI
         // going away must not affect the agent itself.
         let _ = self.state_tx.send(state.clone());
@@ -90,6 +99,8 @@ impl AgentHandle {
         tracker: TaskTracker,
         slot: SessionSlot,
         join: JoinHandle<Result<()>>,
+        established: Arc<AtomicU64>,
+        ingress_ready: watch::Receiver<bool>,
     ) -> Self {
         Self {
             state_rx,
@@ -98,7 +109,21 @@ impl AgentHandle {
             tracker,
             slot,
             join,
+            established,
+            ingress_ready,
         }
+    }
+
+    /// Monotonic count of established sessions — one per completed connect
+    /// (the initial session plus every supervisor rebuild).
+    ///
+    /// Observers that must not miss a rebuild read this instead of watching
+    /// state transitions: a watch channel keeps only the latest value, so a
+    /// fast Connected → Reconnecting → Connected cycle can be invisible to a
+    /// state watcher that was not scheduled between the two transitions.
+    /// The counter cannot miss it.
+    pub fn sessions_established(&self) -> u64 {
+        self.established.load(Ordering::Relaxed)
     }
 
     /// The embedder-facing tunnel: rides across session rebuilds.
@@ -121,6 +146,32 @@ impl AgentHandle {
     /// Subscribe to state changes (multiple consumers can each clone).
     pub fn subscribe_state(&self) -> watch::Receiver<AgentState> {
         self.state_rx.clone()
+    }
+
+    /// Resolves once every configured ingress listener has been bound by a
+    /// session (the agent's local-serving face), or `false` when the
+    /// supervisor ended first (fatal error / shutdown) without ever getting
+    /// there.
+    ///
+    /// This is the agent-side readiness signal: hub connectivity is
+    /// supervised reconnect by design and never gates readiness — only the
+    /// local listener surface does, the same condition `node install`'s
+    /// now-removed TCP probes waited on. An agent with no ingress rules
+    /// signals ready at its first session too (the watch starts `false` and
+    /// the handler's empty snapshot trivially binds).
+    pub async fn wait_ingress_ready(&self) -> bool {
+        let mut rx = self.ingress_ready.clone();
+        if *rx.borrow() {
+            return true;
+        }
+        // `changed` errors when every sender is gone (the supervisor task
+        // and its client clones dropped) — readiness can no longer turn on.
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether the supervisor task has ended (for any reason).
@@ -188,14 +239,15 @@ impl AgentHandle {
 /// connection attempts keep failing outright (see `AgentClient::supervise`).
 pub(crate) fn backoff_duration(attempt: u32) -> Duration {
     use interflow_core::config::params::liveness::{BACKOFF_CAP, BACKOFF_FLOOR};
+    use rand::Rng;
+
     let cap_secs = BACKOFF_CAP.as_secs();
     let exp = attempt.min(6); // 2^6 = 64 > 30; anything larger is capped anyway
     let max = cap_secs.min(1_u64 << exp).max(BACKOFF_FLOOR.as_secs());
-    // Use the top 64 bits of a v4 UUID as the random source (v4 is itself
-    // random); the modulo result is < max <= 30, so no truncation risk.
-    #[allow(clippy::cast_possible_truncation)]
-    let rand = (uuid::Uuid::new_v4().as_u128() % u128::from(max)) as u64;
-    Duration::from_secs(rand.max(BACKOFF_FLOOR.as_secs()))
+    // Full jitter from the thread-local RNG: a uniform sample over
+    // [floor, max] seconds with no modulo bias.
+    let secs = rand::rng().random_range(BACKOFF_FLOOR.as_secs()..=max);
+    Duration::from_secs(secs)
 }
 
 #[cfg(test)]
@@ -204,8 +256,8 @@ mod tests {
 
     /// Shape contract of the backoff distribution: for every attempt count,
     /// every sample lies in `[1s, min(2^attempt, 30s)]` — never zero, never
-    /// above the cap. (The jitter source is a fresh UUID, so the bound is
-    /// checked statistically over many samples.)
+    /// above the cap. (The jitter source is `rand`'s thread-local RNG, so the
+    /// bound is checked statistically over many samples.)
     #[test]
     fn backoff_duration_stays_within_exponential_cap() {
         for attempt in 1_u32..=12 {

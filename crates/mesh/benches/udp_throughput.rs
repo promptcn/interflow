@@ -78,6 +78,18 @@ fn bench_group(
 
     for size in [64usize, 512, 1200, 1472] {
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        // Keep one public source address across all criterion samples. The
+        // The data plane intentionally amortizes the inner QUIC association
+        // and inner session handshake across datagrams; measuring a new source
+        // per sample would benchmark session churn, not steady-state forwarding.
+        let socket = rt
+            .block_on(async {
+                interflow_mesh::agent::ingress_udp::bind_udp_socket(
+                    "127.0.0.1:0".parse().expect("addr"),
+                )
+            })
+            .expect("client bind");
+        let sock = std::sync::Arc::new(socket);
         group.throughput(Throughput::Bytes(
             (size * DATAGRAMS_PER_ITER).saturating_mul(2) as u64, // sent + received
         ));
@@ -85,11 +97,9 @@ fn bench_group(
             format!("{transport}_size_{size}"),
             &payload,
             |b, payload| {
-                b.to_async(rt).iter(|| async {
-                    let sock = interflow_mesh::agent::ingress_udp::bind_udp_socket(
-                        "127.0.0.1:0".parse().expect("addr"),
-                    )
-                    .expect("client bind");
+                b.to_async(rt).iter(|| {
+                    let sock = std::sync::Arc::clone(&sock);
+                    async move {
                     let mut buf = vec![0u8; 65535];
                     let mut lost = 0usize;
                     for _ in 0..DATAGRAMS_PER_ITER {
@@ -130,6 +140,7 @@ fn bench_group(
                         eprintln!("[bench] lost {lost}/{D} datagrams (counted in the timing, reflecting path stalls)");
                     }
                     std::hint::black_box(lost);
+                }
                 });
             },
         );

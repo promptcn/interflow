@@ -6,13 +6,11 @@
 //!   ([`crate::protocol::frame`]). The previous "one full HTTP exchange per
 //!   frame" shape pinned single-stream throughput at 1/RTT (measured
 //!   ~172µs/frame for a 64B datagram on loopback).
-//! - Direction semantics live at the frame layer: response-direction frames
-//!   carry `source_agent = "_response_"` (the same sentinel the hub's QUIC
-//!   relay uses, [`RESPONSE_SOURCE`]); request-direction frames carry the real
-//!   agent id — the `x-direction` header is retired.
+//! - Direction semantics live at the frame layer's flags: response-direction
+//!   frames carry `FLAG_RESPONSE` (with the zero circuit marker); request
+//!   direction carries the random circuit token negotiated at registration.
 //! - The Open frame carries stream-creation metadata: `FLAG_UDP` is set per
-//!   protocol, and the payload is `"{target_agent}:{target_addr}"` (the same
-//!   encoding as the QUIC backend).
+//!   protocol, and the payload is a route token.
 //! - Upload response body ending = death signal: the agent immediately
 //!   rebuilds the upload (implicit re-registration on the hub side heals it,
 //!   fully symmetric with a `/poll` disconnect); the h2 connection itself
@@ -22,23 +20,27 @@
 //!
 //! Error signaling: frame-level rejection (ACL / stream quota / target not
 //! registered) no longer has a per-frame HTTP status — the hub sends a
-//! `"_close_"` frame over `/poll` carrying `CLOSE:{sid}:{reason}`, and the
-//! pump side reuses the existing Close stream-teardown path. `send_open`
-//! returning Ok only means the frame entered the uplink channel.
+//! hub-origin Close frame over `/poll` (the stream id in the header, the u8
+//! reason code in the payload), and the pump side reuses the existing Close
+//! stream-teardown path. `send_open` returning Ok only means the frame
+//! entered the uplink channel.
 
 use crate::error::{InterflowError, Result};
-use crate::protocol::{FrameType, StreamProto, frame as wire};
+use crate::protocol::{
+    CircuitToken, CloseReason, FrameType, RouteToken, StreamId, StreamProto, frame as wire,
+};
 use crate::tunnel::agent::H2Liveness;
 use crate::tunnel::chunking::ChunkHygiene;
 use crate::tunnel::session_tasks::{Beat, SessionTasks, beat_interval};
-use crate::tunnel::transport::{RESPONSE_SOURCE, TunnelData, TunnelDispatch, TunnelTransport};
+use crate::tunnel::transport::{TunnelData, TunnelDispatch, TunnelTransport};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, StreamBody, combinators::BoxBody};
 use hyper::body::Frame;
 use hyper::client::conn::http2::SendRequest;
 use hyper::{Request, StatusCode};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::Duration;
@@ -66,7 +68,7 @@ pub fn empty_request_body() -> H2RequestBody {
 
 /// The HTTP/2 tunnel backend.
 pub(crate) struct H2Tunnel {
-    agent_id: String,
+    circuit: CircuitToken,
     /// Session-termination token (a same-node clone passed in at construction): `shutdown()` cancels it,
     /// stopping the upload/poll background tasks.
     token: CancellationToken,
@@ -76,6 +78,10 @@ pub(crate) struct H2Tunnel {
     /// already closed, so `send` errors → the pump tears the stream down (TCP
     /// semantics, no silent frame drops).
     up_tx: Arc<Mutex<mpsc::Sender<Bytes>>>,
+    /// Shared h2 request sender used for route-lease control requests.
+    sender: Arc<Mutex<SendRequest<H2RequestBody>>>,
+    /// Semantic target → opaque route token, valid for this h2 session only.
+    routes: StdMutex<HashMap<String, RouteToken>>,
 }
 
 /// How one h2 poll round ended. Cancellation is modeled as its own outcome
@@ -96,6 +102,57 @@ enum PollOutcome {
 }
 
 impl H2Tunnel {
+    /// Resolves (and caches) one semantic target into a session-scoped route
+    /// token via the h2 control endpoint.
+    async fn resolve_route(&self, target_agent: &str) -> Result<RouteToken> {
+        let cached = self
+            .routes
+            .lock()
+            .map_err(|_| InterflowError::protocol("route cache poisoned"))?
+            .get(target_agent)
+            .copied();
+        if let Some(route) = cached {
+            return Ok(route);
+        }
+        if target_agent.len() > 256 {
+            return Err(InterflowError::protocol("route target is too long"));
+        }
+        let body = http_body_util::Full::new(Bytes::copy_from_slice(target_agent.as_bytes()))
+            .map_err(|never| match never {})
+            .boxed();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/route")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .body(body)
+            .map_err(|e| {
+                InterflowError::connection("failed to build route request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("route lease timed out"))??;
+        if response.status() != StatusCode::OK {
+            return Err(InterflowError::connection(format!(
+                "route lease rejected: {}",
+                response.status()
+            )));
+        }
+        let body = response.into_body().collect().await?;
+        let parsed: crate::tunnel::negotiation::RouteResponse =
+            serde_json::from_slice(&body.to_bytes())?;
+        self.routes
+            .lock()
+            .map_err(|_| InterflowError::protocol("route cache poisoned"))?
+            .insert(target_agent.to_owned(), parsed.route_token);
+        Ok(parsed.route_token)
+    }
+
     /// Creates the tunnel backend from an established HTTP/2 connection.
     ///
     /// Registration is done by the caller (`AgentClient`); this method only
@@ -110,7 +167,7 @@ impl H2Tunnel {
     /// critical-task stall timeout. `tasks` owns the session token (the
     /// cascade target of the death contract) and the task tracker.
     pub fn new(
-        agent_id: String,
+        circuit: CircuitToken,
         hub_url: &str,
         sender: SendRequest<H2RequestBody>,
         tasks: &SessionTasks,
@@ -132,7 +189,7 @@ impl H2Tunnel {
         // 2026-09-16 hardening these were fire-and-forget spawns — an upload
         // or poll task death went entirely unobserved.
         let upload_sender = sender.clone();
-        let upload_agent_id = agent_id.clone();
+        let upload_circuit = circuit;
         let upload_hub_url = hub_url.to_string();
         let upload_up_tx = up_tx.clone();
         let upload_shutdown = shutdown.clone();
@@ -142,7 +199,7 @@ impl H2Tunnel {
             move |beat| {
                 Self::run_upload_loop(
                     upload_sender,
-                    upload_agent_id,
+                    upload_circuit,
                     upload_hub_url,
                     upload_up_tx,
                     upload_shutdown,
@@ -155,17 +212,18 @@ impl H2Tunnel {
         );
 
         let dispatch_for_poll = dispatch.clone();
-        let agent_id_for_poll = agent_id.clone();
+        let circuit_for_poll = circuit;
         let hub_url_for_poll = hub_url.to_string();
         let up_tx_for_poll = up_tx.clone();
         let token_for_poll = shutdown.clone();
         let poll_tasks = tasks.clone();
+        let sender_for_tunnel = sender.clone();
 
         tasks.spawn_critical("h2-poll", Some(liveness.task_stall_timeout), move |beat| {
             async move {
                 Self::run_poll_loop(
-                    sender,
-                    agent_id_for_poll,
+                    sender_for_tunnel,
+                    circuit_for_poll,
                     hub_url_for_poll,
                     &dispatch_for_poll,
                     token_for_poll,
@@ -189,10 +247,12 @@ impl H2Tunnel {
         });
 
         Self {
-            agent_id,
+            circuit,
             token: shutdown,
             dispatch,
             up_tx,
+            sender,
+            routes: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -219,15 +279,15 @@ impl H2Tunnel {
         &self,
         frame_type: FrameType,
         flags: u8,
-        stream_id: &str,
-        source: &str,
+        stream_id: StreamId,
+        circuit: CircuitToken,
         payload: &[u8],
     ) -> Result<()> {
-        let mut buf = BytesMut::with_capacity(64 + payload.len());
-        wire::encode_frame(frame_type, flags, stream_id, source, payload, &mut buf).ok_or_else(
+        let mut buf = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
+        wire::encode_frame(frame_type, flags, stream_id, circuit, payload, &mut buf).ok_or_else(
             || {
                 InterflowError::stream(
-                    "frame encoding failed (field length limit exceeded)".to_string(),
+                    "frame encoding failed (flags/type-field contract violation)".to_string(),
                 )
             },
         )?;
@@ -239,19 +299,24 @@ impl H2Tunnel {
     /// `RxStream` downlink). The two enqueues complete under the same
     /// `up_tx` lock, guaranteeing frame boundaries are not interleaved by
     /// concurrent senders.
-    async fn send_data_frame(&self, stream_id: &str, source: &str, data: Bytes) -> Result<()> {
-        let mut header = BytesMut::with_capacity(64 + stream_id.len() + source.len());
+    async fn send_data_frame(&self, stream_id: StreamId, flags: u8, data: Bytes) -> Result<()> {
+        let circuit = if flags & crate::protocol::FLAG_RESPONSE != 0 {
+            CircuitToken::ZERO
+        } else {
+            self.circuit
+        };
+        let mut header = BytesMut::with_capacity(wire::FRAME_HEADER_LEN);
         wire::encode_frame_header(
             FrameType::Data,
-            0,
+            flags,
             stream_id,
-            source,
+            circuit,
             data.len(),
             &mut header,
         )
         .ok_or_else(|| {
             InterflowError::stream(
-                "frame encoding failed (field length limit exceeded)".to_string(),
+                "frame encoding failed (flags/type-field contract violation)".to_string(),
             )
         })?;
         let tx = self.up_tx.lock().await;
@@ -292,7 +357,7 @@ impl H2Tunnel {
     #[allow(clippy::too_many_arguments)]
     async fn run_upload_loop(
         sender: Arc<Mutex<SendRequest<H2RequestBody>>>,
-        agent_id: String,
+        circuit: CircuitToken,
         hub_url: String,
         up_tx_slot: Arc<Mutex<mpsc::Sender<Bytes>>>,
         shutdown: CancellationToken,
@@ -325,7 +390,7 @@ impl H2Tunnel {
             let builder = Request::builder()
                 .method("POST")
                 .uri(format!("{hub_url}/stream/up"))
-                .header("x-agent-id", &agent_id);
+                .header("x-circuit-token", circuit.to_hex());
             let req = match builder.body(body) {
                 Ok(r) => r,
                 Err(e) => {
@@ -482,7 +547,7 @@ impl H2Tunnel {
     #[allow(clippy::too_many_arguments)]
     async fn run_poll_loop(
         sender: Arc<Mutex<SendRequest<H2RequestBody>>>,
-        agent_id: String,
+        circuit: CircuitToken,
         hub_url: String,
         dispatch: &TunnelDispatch,
         shutdown: CancellationToken,
@@ -511,7 +576,7 @@ impl H2Tunnel {
                     error!("hub connection lost: {}", e);
                     break;
                 }
-                match Self::build_poll_request(&agent_id, &hub_url) {
+                match Self::build_poll_request(circuit, &hub_url) {
                     Ok(req) => Ok(sender_locked.send_request(req)),
                     Err(e) => {
                         error!("failed to prepare request: {}", e);
@@ -546,7 +611,7 @@ impl H2Tunnel {
                     };
                     Self::drain_poll_response(
                         resp,
-                        &agent_id,
+                        &circuit,
                         &mut buffer,
                         dispatch,
                         &up_tx,
@@ -581,14 +646,14 @@ impl H2Tunnel {
     }
 
     /// Builds the `/poll` request (without the sender; the caller sends it).
-    fn build_poll_request(agent_id: &str, hub_url: &str) -> Result<Request<H2RequestBody>> {
+    fn build_poll_request(circuit: CircuitToken, hub_url: &str) -> Result<Request<H2RequestBody>> {
         let builder = Request::builder()
             .method("GET")
             .uri(format!("{hub_url}/poll"))
-            .header("x-agent-id", agent_id);
-        builder
-            .body(empty_request_body())
-            .map_err(|e| InterflowError::connection(format!("failed to build request: {e}")))
+            .header("x-circuit-token", circuit.to_hex());
+        builder.body(empty_request_body()).map_err(|e| {
+            InterflowError::connection("failed to build request".to_string()).with_source(e)
+        })
     }
 
     /// Handles the `/poll` response: the outcome classifies how the round
@@ -610,7 +675,7 @@ impl H2Tunnel {
     #[allow(clippy::too_many_arguments)]
     async fn drain_poll_response(
         resp_result: hyper::Result<hyper::Response<hyper::body::Incoming>>,
-        agent_id: &str,
+        circuit: &CircuitToken,
         buffer: &mut BytesMut,
         dispatch: &TunnelDispatch,
         up_tx: &Arc<Mutex<mpsc::Sender<Bytes>>>,
@@ -675,7 +740,7 @@ impl H2Tunnel {
                     buffer.extend_from_slice(&data);
                     while let Some(tunnel_data) = TunnelDispatch::decode_tunnel_data(buffer) {
                         if tunnel_data.stream_type == FrameType::Ping {
-                            Self::spawn_pong(tasks, agent_id, up_tx);
+                            Self::spawn_pong(tasks, circuit, up_tx);
                             continue;
                         }
                         dispatch.dispatch(tunnel_data).await;
@@ -697,12 +762,18 @@ impl H2Tunnel {
     /// blocking `send` on a full uplink channel must not stall the poll read
     /// loop — a full channel is itself an uplink outage, and the hub will
     /// age the session out via `last_pong`, which is semantically correct.
-    fn spawn_pong(tasks: &SessionTasks, agent_id: &str, up_tx: &Arc<Mutex<mpsc::Sender<Bytes>>>) {
-        let agent_id = agent_id.to_string();
+    fn spawn_pong(
+        tasks: &SessionTasks,
+        circuit: &CircuitToken,
+        up_tx: &Arc<Mutex<mpsc::Sender<Bytes>>>,
+    ) {
+        let circuit = *circuit;
         let up_tx = up_tx.clone();
         tasks.spawn_auxiliary(async move {
-            let mut buf = BytesMut::with_capacity(64 + agent_id.len());
-            if wire::encode_frame(FrameType::Pong, 0, "", &agent_id, &[], &mut buf).is_none() {
+            let mut buf = BytesMut::with_capacity(wire::FRAME_HEADER_LEN);
+            if wire::encode_frame(FrameType::Pong, 0, StreamId::ZERO, circuit, &[], &mut buf)
+                .is_none()
+            {
                 return;
             }
             let sent = {
@@ -739,56 +810,64 @@ fn upload_body_stream(
 impl TunnelTransport for H2Tunnel {
     async fn send_open_with(
         &self,
-        stream_id: &str,
+        stream_id: StreamId,
         target_agent: &str,
-        target_addr: Option<&str>,
         proto: StreamProto,
         e2e: bool,
     ) -> Result<()> {
-        // Open frame payload: "{target_agent}:{target_addr}" (same encoding
-        // as the QUIC backend; the hub parses it with split_once(':'); the
-        // agent id charset contains no colon).
-        let payload = format!("{target_agent}:{}", target_addr.unwrap_or(""));
-        let flags = proto.as_flag() | if e2e { crate::protocol::FLAG_E2E } else { 0 };
+        let route = self.resolve_route(target_agent).await?;
+        let flags = proto.as_flag() | (u8::from(e2e) * crate::protocol::FLAG_E2E);
+        // The Open payload is the raw 16-byte route token (the former hex
+        // spelling is gone).
         self.send_frame(
             FrameType::Open,
             flags,
             stream_id,
-            &self.agent_id,
-            payload.as_bytes(),
+            self.circuit,
+            &route.to_bytes(),
         )
         .await
     }
 
-    async fn send_data(&self, stream_id: &str, data: Bytes) -> Result<()> {
-        self.send_data_frame(stream_id, &self.agent_id, data).await
+    async fn send_data(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
+        self.send_data_frame(stream_id, 0, data).await
     }
 
-    async fn send_data_response(&self, stream_id: &str, data: Bytes) -> Result<()> {
-        self.send_data_frame(stream_id, RESPONSE_SOURCE, data).await
-    }
-
-    async fn send_close(&self, stream_id: &str) -> Result<()> {
-        self.send_frame(FrameType::Close, 0, stream_id, &self.agent_id, b"")
+    async fn send_data_response(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
+        self.send_data_frame(stream_id, crate::protocol::FLAG_RESPONSE, data)
             .await
     }
 
-    async fn send_close_response(&self, stream_id: &str, reason: &str) -> Result<()> {
+    async fn send_close(&self, stream_id: StreamId) -> Result<()> {
         self.send_frame(
             FrameType::Close,
             0,
             stream_id,
-            RESPONSE_SOURCE,
-            reason.as_bytes(),
+            self.circuit,
+            &[CloseReason::CloseFrame.as_code()],
         )
         .await
     }
 
-    async fn register_stream(&self, stream_id: String) -> tokio::sync::mpsc::Receiver<TunnelData> {
+    async fn send_close_response(&self, stream_id: StreamId, reason: CloseReason) -> Result<()> {
+        self.send_frame(
+            FrameType::Close,
+            crate::protocol::FLAG_RESPONSE,
+            stream_id,
+            CircuitToken::ZERO,
+            &[reason.as_code()],
+        )
+        .await
+    }
+
+    async fn register_stream(
+        &self,
+        stream_id: StreamId,
+    ) -> tokio::sync::mpsc::Receiver<TunnelData> {
         self.dispatch.register_stream(stream_id).await
     }
 
-    async fn unregister_stream(&self, stream_id: &str) {
+    async fn unregister_stream(&self, stream_id: StreamId) {
         self.dispatch.unregister_stream(stream_id).await;
     }
 
@@ -798,7 +877,7 @@ impl TunnelTransport for H2Tunnel {
         self.dispatch.take_incoming_streams()
     }
 
-    async fn unregister_incoming_stream(&self, stream_id: &str) {
+    async fn unregister_incoming_stream(&self, stream_id: StreamId) {
         self.dispatch.unregister_incoming_stream(stream_id).await;
     }
 

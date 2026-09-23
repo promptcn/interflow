@@ -41,11 +41,13 @@ fn two_tenant_hub(port: u16, cross_rule: bool) -> HubConfig {
         TenantConfig {
             name: "a".to_string(),
             ca_path: tenant_a().ca_path().display().to_string(),
+            crl_path: Some(tenant_a().crl_path().display().to_string()),
             trusted_gateway: false,
         },
         TenantConfig {
             name: "b".to_string(),
             ca_path: tenant_b().ca_path().display().to_string(),
+            crl_path: Some(tenant_b().crl_path().display().to_string()),
             trusted_gateway: false,
         },
     ];

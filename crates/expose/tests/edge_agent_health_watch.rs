@@ -1,5 +1,5 @@
 //! Edge internal-agent outer supervision (regression tests for
-//! docs/bug/2026-09-16-edge-self-dial-agent-no-reregister.md §4.3/§4.4).
+//! (internal design notes) §4.3/§4.4).
 //!
 //! The edge's internal agent is now a supervised auto-reconnect client; its
 //! own failures are normal operation. What must never happen again is the
@@ -75,7 +75,7 @@ async fn wedged_supervisor_trips_the_watch() {
     let started = std::time::Instant::now();
     let reason = tokio::time::timeout(
         Duration::from_secs(8),
-        watch_agent_health(&agent, Duration::from_secs(2)),
+        watch_agent_health(agent.subscribe_state(), Duration::from_secs(2)),
     )
     .await
     .expect("watch must trip on a wedged supervisor")
@@ -108,7 +108,7 @@ async fn wedged_first_registration_fails_startup_boundedly() {
     let started = std::time::Instant::now();
     let res = tokio::time::timeout(
         Duration::from_secs(5),
-        wait_initial_registration(&agent, Duration::from_secs(1)),
+        wait_initial_registration("test-edge", &agent, Duration::from_secs(1)),
     )
     .await
     .expect("wait_initial_registration must be bounded");
@@ -140,7 +140,7 @@ async fn struggling_but_alive_supervisor_never_trips_the_watch() {
     // first cycles) stay inside it; observe ~6s without a trip.
     let outcome = tokio::time::timeout(
         Duration::from_secs(6),
-        watch_agent_health(&agent, Duration::from_secs(5)),
+        watch_agent_health(agent.subscribe_state(), Duration::from_secs(5)),
     )
     .await;
     assert!(
@@ -164,7 +164,7 @@ async fn healthy_agent_never_trips_the_watch() {
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(2),
-        watch_agent_health(&agent, Duration::from_secs(1)),
+        watch_agent_health(agent.subscribe_state(), Duration::from_secs(1)),
     )
     .await;
     assert!(
@@ -197,7 +197,7 @@ async fn dead_supervisor_trips_the_watch_via_stream_end() {
     let started = std::time::Instant::now();
     let reason = tokio::time::timeout(
         Duration::from_secs(10),
-        watch_agent_health(&agent, Duration::from_secs(60)),
+        watch_agent_health(agent.subscribe_state(), Duration::from_secs(60)),
     )
     .await
     .expect("watch must trip on a dead supervisor")

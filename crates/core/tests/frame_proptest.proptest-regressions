@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9d58d94e2e2e998f7f1a01daa7802c6b8b7d6faa883d21559dd6b62751b903cf # shrinks to frames = [(Open, 0, "", "�\0\0\0\0�\0��\0\0�\0�\0\0\0��\0��\0���\0\0\0�\0\0�\0\0\0\0�\0�\0���\0�\0����\0\0\0\0�����\0\0���\0��\0\0�\0�\0\0\0��\0\0\0��\0�\0�\0\0\0��\0\0�\0���\0\0���\0\0����\0��\0���\0��\0���\0", [])]
+cc 2ccb85f510ad9caf6c61d6f1da2e63b1e9c54dba2f3b717119d0e1743ea33af4 # shrinks to ft = Open, flags = 0, stream_id = "", source = "", payload = []
+cc 5a0983b52ffe92a06a5748820d0e4d1d34f36383232605ea2e37b74bf5144d58 # shrinks to ft = Open, flags = 0, stream_id = "", source = "���\0�\0�\0\0\0���\0�\0����\0\0\0���\0���\0\0\0�\0\0\0\0\0\0\0\0�\0�\0��\0\0\0�\0\0��\0\0�\0\0\0\0�\0\0\0���\0���\0\0\0\0�\0\0��\0��\0�\0��\0��\0\0\0��\0��\0��\0\0�\0�\0��\0���\0\0\0�\0\0\0��\0��\0\0", payload = []
+cc b6004e8977d2cf93b69b536cf3b5ace9e4d015b8f9fcd9625c28fd78036da2e6 # shrinks to ft = Open, flags = 0, stream_id = "\0\0\0���\0\0\0��\0\0��\0��\0�\0\0�\0���\0\0\0���\0��\0���\0����\0\0\0��\0\0\0��\0\0\0�\0\0�\0���\0\0�\0��\0���\0��\0\0\0���\0\0����\0\0\0�����\0\0\0\0�\0\0\0\0\0�\0\0��\0\0�\0����\0��", source = "", payload = [], mutations = [], tail = []
