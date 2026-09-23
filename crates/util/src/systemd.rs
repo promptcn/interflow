@@ -9,14 +9,15 @@
 //! The protocol is one unix-datagram write (systemd's `sd_notify(3)` without
 //! libsystemd): connect to `$NOTIFY_SOCKET`, send `READY=1\n`. Outside systemd
 //! (GUI, manual runs, tests) the variable is unset and this is a no-op.
-
-use std::os::unix::net::UnixDatagram;
+//! Non-unix targets have no systemd, so readiness signalling there is
+//! unconditionally inert.
 
 /// Notify the service manager that this process is ready.
 ///
 /// Returns `false` when there is no `NOTIFY_SOCKET` (not running under a
 /// `Type=notify` unit) or the notification could not be delivered — readiness
 /// signalling is best-effort by design, never a startup failure.
+#[cfg(unix)]
 pub fn notify_ready() -> bool {
     match std::env::var("NOTIFY_SOCKET") {
         Ok(socket) if !socket.is_empty() => send_ready(&socket),
@@ -24,7 +25,15 @@ pub fn notify_ready() -> bool {
     }
 }
 
+/// Non-unix targets: there is no systemd to notify, so readiness is vacuous.
+#[cfg(not(unix))]
+pub fn notify_ready() -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn send_ready(socket: &str) -> bool {
+    use std::os::unix::net::UnixDatagram;
     // systemd uses `@` as a prefix marker for the abstract namespace, where
     // the path is NUL-terminated bytes rather than a filesystem path.
     let path = if let Some(abstract_name) = socket.strip_prefix('@') {
@@ -41,9 +50,10 @@ fn send_ready(socket: &str) -> bool {
     datagram.send(b"READY=1\n").is_ok()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixDatagram;
 
     #[test]
     fn sends_ready_line_to_a_bound_socket() {
