@@ -88,7 +88,7 @@ jobs:
           set +e
           cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --lib > /tmp/t.log 2>&1
           rc=$?
-          if [ $rc -ne 0 ]; then { echo "## unit tests (lib) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::unit tests (lib): $l"; done; fi
           exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
@@ -98,7 +98,7 @@ jobs:
           set +e
           cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --bins > /tmp/t.log 2>&1
           rc=$?
-          if [ $rc -ne 0 ]; then { echo "## unit tests (bins) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::unit tests (bins): $l"; done; fi
           exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
@@ -108,7 +108,7 @@ jobs:
           set +e
           cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --doc > /tmp/t.log 2>&1
           rc=$?
-          if [ $rc -ne 0 ]; then { echo "## unit tests (doc) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::unit tests (doc): $l"; done; fi
           exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
@@ -121,7 +121,7 @@ jobs:
           set +e
           cargo test -p interflow-mesh --all-features --no-fail-fast --test '*' -- --test-threads=1 > /tmp/t.log 2>&1
           rc=$?
-          if [ $rc -ne 0 ]; then { echo "## e2e tests (mesh, serial) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::e2e tests (mesh, serial): $l"; done; fi
           exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
@@ -131,7 +131,7 @@ jobs:
           set +e
           cargo test --workspace --exclude interflow-gui --exclude interflow-mesh --all-features --no-fail-fast --test '*' -- --test-threads=1 > /tmp/t.log 2>&1
           rc=$?
-          if [ $rc -ne 0 ]; then { echo "## e2e tests (rest, serial) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::e2e tests (rest, serial): $l"; done; fi
           exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
