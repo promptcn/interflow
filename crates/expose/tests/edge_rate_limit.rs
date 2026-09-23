@@ -5,7 +5,6 @@
 //! plaintext (fronted-shaped) face, the denial is **answered**: a real
 //! `429 Too Many Requests` + `Retry-After` instead of the zero-byte close
 //! that made fronting proxies synthesize misleading 502s
-//!.
 //! Scenario 2: limit=0 means unlimited.
 //! Scenario 3: the fronted topology default (600/min) admits a
 //! browser-shaped burst of 40 requests in one minute — the exact

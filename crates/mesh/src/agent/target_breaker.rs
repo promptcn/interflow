@@ -24,8 +24,7 @@
 //!   [`TargetBreakers::note_soft_failure`] is derivative (e.g. the edge
 //!   receiving the agent's `target_circuit_open`): it counts toward tripping
 //!   while CLOSED but never re-arms an OPEN entry — two breaker layers
-//!   feeding each other's cooldowns is an interlock, not isolation
-//!  .
+//!   feeding each other's cooldowns is an interlock, not isolation.
 //!
 //! State machine (per target, agent-level, survives session rebuilds — same
 //! rationale as the rate limiter in [`super::egress::EgressRuntime`]):

@@ -80,7 +80,13 @@ jobs:
           # The rustls client in the ACME runtime reads an explicit CA file;
           # exporting SSL_CERT_FILE additionally covers any system-root path.
       - name: cargo test
-        run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast
+        run: |
+          # Unit targets in parallel; integration tests (--test '*') serially:
+          # they share the ephemeral-port pool and the project's own `just
+          # test-e2e` runs them with --test-threads=1 for exactly this
+          # reason (parallel picks race the hub binds).
+          cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --lib --bins --doc
+          cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --test '*' -- --test-threads=1
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
           INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem

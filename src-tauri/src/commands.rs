@@ -116,7 +116,6 @@ pub fn remove_node(state: State<'_, SharedState>, id: String) -> Result<(), Stri
 /// belongs on Tauri's sync-command pool, and the engine spawns go through
 /// the runtime handle the manager holds — safe from threads without an
 /// ambient Tokio runtime
-///.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value

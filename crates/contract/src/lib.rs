@@ -32,7 +32,6 @@ pub mod caps {
 }
 
 /// Close reason codes — the u8 payload of a Close frame
-///.
 ///
 /// One shared table so the agent egress producer, the hub relay, and edge
 /// consumers cannot drift. The snake_case token spellings live in

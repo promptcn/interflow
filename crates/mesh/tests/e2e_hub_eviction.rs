@@ -834,7 +834,6 @@ async fn real_agent_survives_aggressive_heartbeat() {
 /// frames with a hard cap of 100 and no release path, so the 101st Ping
 /// GOAWAY'd the whole connection (`too_many_data_frames`) — in production at
 /// 15s cadence this was the deterministic 25:14.1 session churn
-///.
 ///
 /// With a 1s heartbeat the same counter trips at ~101s; a Pong-answering
 /// poll surviving ~110 cycles proves the bomb is defused (the hub's

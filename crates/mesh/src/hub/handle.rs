@@ -49,6 +49,9 @@ pub struct HubHandle {
     /// The run outcome, delivered by the monitor task when the hub ends
     /// (either path: user shutdown or self-failure).
     result: oneshot::Receiver<Result<()>>,
+    /// The actually-bound listener address, set by the monitor once the
+    /// readiness signal fires (a `:0` config port materializes there).
+    bound_addr: std::sync::Arc<std::sync::OnceLock<std::net::SocketAddr>>,
 }
 
 /// Maps a joined run future to the terminal lifecycle + result pair.
@@ -94,6 +97,7 @@ impl HubHandle {
         let (state_tx, state_rx) = watch::channel(HubLifecycle::Starting);
         let (result_tx, result_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = oneshot::channel();
+        let bound_addr = std::sync::Arc::new(std::sync::OnceLock::new());
 
         let run_token = shutdown_token.clone();
         let mut task: JoinHandle<Result<()>> =
@@ -103,12 +107,13 @@ impl HubHandle {
         // Owns the run task's JoinHandle; `shutdown_graceful` gets the
         // outcome through `result` instead of racing for the join.
         let monitor_token = shutdown_token.clone();
+        let bound_addr_slot = bound_addr.clone();
         tokio::spawn(async move {
-            // Phase 1 — readiness: the run future fires `ready` once the
-            // listeners are up, or ends first (bind failure drops the
-            // ready sender before firing it).
-            let ready = tokio::select! {
-                ready = ready_rx => ready.is_ok(),
+            // Phase 1 — readiness: the run future fires `ready` (carrying
+            // the bound address) once the listeners are up, or ends first
+            // (bind failure drops the ready sender before firing it).
+            let ready_addr = tokio::select! {
+                addr = ready_rx => addr.ok(),
                 joined = &mut task => {
                     let (lifecycle, result) = join_outcome(joined);
                     let _ = state_tx.send(lifecycle);
@@ -116,14 +121,15 @@ impl HubHandle {
                     return;
                 }
             };
-            if !ready {
+            let Some(addr) = ready_addr else {
                 // ready_rx resolved Err without the task ending: the server
                 // dropped the sender without firing — treat as failure.
                 let (lifecycle, result) = join_outcome(task.await);
                 let _ = state_tx.send(lifecycle);
                 let _ = result_tx.send(result);
                 return;
-            }
+            };
+            let _ = bound_addr_slot.set(addr);
             let _ = state_tx.send(HubLifecycle::Running);
 
             // Phase 2 — run to completion: external shutdown (user) or a
@@ -145,7 +151,16 @@ impl HubHandle {
             state: state_rx,
             shutdown_token,
             result: result_rx,
+            bound_addr,
         })
+    }
+
+    /// The actually-bound listener address, available once the hub reaches
+    /// `Running`. A `:0` (kernel-assigned) listen port materializes here —
+    /// embedders that host a hub on an ephemeral port read it from this
+    /// instead of racing a pick-then-bind window.
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.bound_addr.get().copied()
     }
 
     /// Current lifecycle snapshot.

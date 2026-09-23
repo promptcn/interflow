@@ -24,8 +24,7 @@ use interflow_mesh::agent::{AgentClient, AgentState};
 use interflow_mesh::config::{EgressRule, TransportKind};
 use interflow_mesh::hub::HubServer;
 use interflow_testkit::{
-    agent_config, agent_quic_config, echo_server, hub_config, hub_quic_config, pick_ephemeral_port,
-    wait_agent_connected,
+    agent_config, agent_quic_config, echo_server, hub_config, hub_quic_config, wait_agent_connected,
 };
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -39,22 +38,20 @@ fn certs() -> &'static interflow_testkit::certs::TestCerts {
 /// and releases its port.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hub_run_until_returns_and_releases_port() {
-    let hub_port = pick_ephemeral_port();
-    let cfg = hub_config(hub_port, certs(), vec![]);
+    // Port 0 = kernel-assigned at bind: no pick-then-bind race window under
+    // parallel `cargo test` (the readiness signal carries the real address).
+    let cfg = hub_config(0, certs(), vec![]);
     let server = HubServer::new(cfg).expect("hub build");
 
     let token = CancellationToken::new();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let hub_task = {
         let token = token.clone();
-        tokio::spawn(async move { server.run_until(token).await })
+        tokio::spawn(async move { server.run_until_signalled(token, ready_tx).await })
     };
-
-    // Wait for the listener to be ready before shutting down (avoids a false
-    // positive while the bind has not finished yet)
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
-    interflow_testkit::wait_for_tcp(addr, Duration::from_secs(5))
-        .await
-        .expect("hub listener ready");
+    // The signal IS the readiness contract (TCP bound + QUIC up) — no port
+    // probing needed.
+    let hub_port = ready_rx.await.expect("hub listeners ready").port();
 
     token.cancel();
     let result = tokio::time::timeout(Duration::from_secs(15), hub_task)
@@ -76,16 +73,18 @@ async fn hub_run_until_returns_and_releases_port() {
 /// notices the disconnect, and it can be gracefully closed out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hub_shutdown_drains_registered_agent() {
-    let hub_port = pick_ephemeral_port();
     let (echo_addr, _echo) = echo_server().await;
 
-    let cfg = hub_config(hub_port, certs(), Vec::new());
+    // Port 0 = kernel-assigned; the readiness signal carries the real port.
+    let cfg = hub_config(0, certs(), vec![]);
     let server = HubServer::new(cfg).expect("hub build");
     let token = CancellationToken::new();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let hub_task = {
         let token = token.clone();
-        tokio::spawn(async move { server.run_until(token).await })
+        tokio::spawn(async move { server.run_until_signalled(token, ready_tx).await })
     };
+    let hub_port = ready_rx.await.expect("hub listeners ready").port();
 
     // egress agent connects directly to the hub
     let mut agent_cfg = agent_config("egress", hub_port, certs());
@@ -148,15 +147,18 @@ async fn hub_shutdown_drains_registered_agent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hub_shutdown_closes_quic_endpoint() {
     let (echo_addr, _echo) = echo_server().await;
-    let hub_port = pick_ephemeral_port();
 
-    let cfg = hub_quic_config(hub_port, certs(), Vec::new());
+    // Port 0 = kernel-assigned; the readiness signal carries the real port
+    // (QUIC shares it as the dual-stack second listener).
+    let cfg = hub_quic_config(0, certs(), Vec::new());
     let server = HubServer::new(cfg).expect("hub build");
     let token = CancellationToken::new();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let hub_task = {
         let token = token.clone();
-        tokio::spawn(async move { server.run_until(token).await })
+        tokio::spawn(async move { server.run_until_signalled(token, ready_tx).await })
     };
+    let hub_port = ready_rx.await.expect("hub listeners ready").port();
 
     // QUIC egress agent
     let mut agent_cfg = agent_quic_config("shutdown-egress", hub_port, certs());

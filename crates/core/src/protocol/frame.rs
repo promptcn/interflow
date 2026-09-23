@@ -1,5 +1,4 @@
 //! Wire frame encoding/decoding
-//!.
 //!
 //! Frame format — fixed 41-byte header, all integers big-endian:
 //! ```text

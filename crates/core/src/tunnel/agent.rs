@@ -212,7 +212,6 @@ impl AgentTunnel {
 }
 
 /// Hot-swappable session slot: the embedder-facing tunnel backend
-///.
 ///
 /// Holds the transport of the *current* hub session. The agent supervisor
 /// installs a fresh backend on every session establishment and withdraws it

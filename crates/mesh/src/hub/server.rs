@@ -152,14 +152,16 @@ impl HubServer {
     }
 
     /// [`Self::run_until`] with an external readiness signal: `ready` fires
-    /// once the TCP listener is bound and the QUIC listener is up, just
-    /// before the accept loop starts. Callers that need "accepting by the
-    /// time this returns" (embedding, test harnesses) get an exact signal
-    /// instead of probing the port.
+    /// with the actually-bound listener address once the TCP listener is
+    /// bound and the QUIC listener is up, just before the accept loop starts.
+    /// Callers that need "accepting by the time this returns" (embedding,
+    /// test harnesses) get an exact signal instead of probing the port — and
+    /// a `:0` (kernel-assigned) listen address materializes here, which lets
+    /// parallel tests own ports without any pick-then-bind race window.
     pub async fn run_until_signalled(
         self,
         shutdown: tokio_util::sync::CancellationToken,
-        ready: tokio::sync::oneshot::Sender<()>,
+        ready: tokio::sync::oneshot::Sender<std::net::SocketAddr>,
     ) -> Result<()> {
         self.run_until_inner(shutdown, Some(ready)).await
     }
@@ -167,7 +169,7 @@ impl HubServer {
     async fn run_until_inner(
         self,
         shutdown: tokio_util::sync::CancellationToken,
-        ready: Option<tokio::sync::oneshot::Sender<()>>,
+        ready: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
     ) -> Result<()> {
         let (listen_addr, node) = {
             let config = self.state.config.read().await;
@@ -181,6 +183,14 @@ impl HubServer {
             )
         };
         let listener = TcpListener::bind(&listen_addr).await?;
+        let bound_addr = listener.local_addr()?;
+        // A `:0` listen address (kernel-assigned port) materializes here:
+        // write the concrete endpoint back so the QUIC dual-stack listener
+        // (which shares the port) and later config readers see the real
+        // address, not the placeholder.
+        if listen_addr.port() == 0 {
+            self.state.config.write().await.server.listen_addr = bound_addr;
+        }
         info!(node = %node, "Hub server listening on: {listen_addr}");
 
         // Background task group: QUIC listener / per-connection tasks
@@ -213,7 +223,7 @@ impl HubServer {
         // anyone waiting on the readiness signal may connect now. A dropped
         // receiver just means nobody is waiting.
         if let Some(ready) = ready {
-            let _ = ready.send(());
+            let _ = ready.send(bound_addr);
         }
 
         loop {

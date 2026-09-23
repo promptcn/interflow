@@ -160,7 +160,6 @@ pub fn run() {
             // is injected too: it lets the (synchronous) manager spawn
             // engines from any thread — including Tauri's sync-command
             // pool, which has no ambient Tokio runtime
-            //.
             let nodes_app = app.handle().clone();
             let manager = NodeManager::new(
                 tauri::async_runtime::handle().inner().clone(),

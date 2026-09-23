@@ -27,7 +27,6 @@
 //! dispatch tables as a fallback. All blocking points (`frames.recv` /
 //! response send / wind-down Close) sit under the token or a timeout, so
 //! structurally no await can hang
-//!.
 //!
 //! Open-flood resource defenses (2026-09-12 backlog: open-flood DoS surface;
 //! hardened 2026-09-16 with per-target isolation — see
@@ -137,7 +136,6 @@ impl From<&AgentConfig> for BreakerPolicy {
 /// consuming quota, otherwise the local concurrency cap goes blind to
 /// cross-session leftovers — creating fresh counters per session was one of
 /// the root causes of the defenses going blind during the fd leak
-///.
 pub struct EgressRuntime {
     /// Local cap on concurrent incoming streams (0 = unlimited); a second
     /// gate beyond the hub quota.
@@ -1114,8 +1112,7 @@ impl EgressHandler {
     ///   tunnel dead -> kill the stream and notify;
     /// - **session token**: session end (watchdog/disconnect/shutdown)
     ///   exits in place — both halves release the backend fd as the task
-    ///   drops. This is the structural fix for the fd-leak root cause
-    ///  .
+    ///   drops. This is the structural fix for the fd-leak root cause.
     async fn run_tcp_forwarder(
         stream_id: interflow_core::protocol::StreamId,
         rules: Vec<EgressRule>,

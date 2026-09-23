@@ -97,7 +97,6 @@ pub trait TunnelTransport: Send + Sync + 'static {
     /// [`TunnelTransport::send_open`] with the per-stream e2e (inner TLS)
     /// declaration: `true` sets [`crate::protocol::FLAG_E2E`] on the Open
     /// frame, asking the target agent for the agent↔agent TLS layer
-    ///.
     async fn send_open_with(
         &self,
         stream_id: StreamId,
@@ -327,7 +326,6 @@ impl TunnelDispatch {
     /// poisoning path never triggers, so table entries must be released
     /// uniformly by the termination contract
     /// ([`TunnelTransport::shutdown`])
-    ///.
     pub(crate) async fn close_all_request_streams(&self) -> usize {
         let mut map = self.req_streams.write().await;
         let n = map.len();

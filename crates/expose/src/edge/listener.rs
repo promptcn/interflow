@@ -23,9 +23,9 @@
 //! - Probe accounting (2026-09-17): recovery evidence must not depend on the
 //!   peer Close reason's arrival timing — an HTTP/1.1 keepalive client hangs
 //!   up first and the `backend_closed` token structurally never lands
-//!  . A probe that
-//!   relayed response bytes to the client without a failure reason is
-//!   therefore itself recovery evidence, classified by [`route_evidence`]
+//!   up first and the `backend_closed` token structurally never lands.
+//!   A probe that relayed response bytes to the client without a failure
+//!   reason is therefore itself recovery evidence, classified by [`route_evidence`]
 //!   from the pump's locally-observed [`StreamOutcome`].
 
 use super::HTTP_HEAD_MAX_BYTES;
@@ -920,7 +920,6 @@ pub(super) enum ConnAdmission {
 /// or XFF-restored). A denial records metrics + audit and logs at WARN — a
 /// security rejection that was invisible at the production INFO level
 /// already cost one full misdirected diagnostic round
-///.
 pub(super) fn gate_connection(
     node: &str,
     effective_ip: IpAddr,

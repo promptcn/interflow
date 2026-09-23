@@ -1077,7 +1077,6 @@ impl EstablishedSession {
 /// handle has already been polled to completion, so the result can only be
 /// taken inside the branch body — awaiting that handle again outside the
 /// branch is a second poll, which tokio panics on
-///.
 enum SessionEnd {
     Shutdown,
     Disconnected,
@@ -1100,7 +1099,6 @@ enum SessionEnd {
 /// of waiting forever: `run_session` must always return so the supervisor
 /// reaches its next reconnect iteration; an unbounded join here is exactly
 /// how a wedged wind-down turns into a never-reconnecting agent
-///.
 async fn join_or_abort<T>(
     handle: &mut tokio::task::JoinHandle<T>,
     grace: Duration,

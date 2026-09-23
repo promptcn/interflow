@@ -22,7 +22,6 @@
 //! consumer task that holds no lock — sinks may read the manager back,
 //! which the GUI's tray refresh does. Before this split, sinks ran under
 //! the manager lock and that read-back self-deadlocked Start
-//!.
 //!
 //! Lifecycle per node:
 //! - **start** (user): `prepare` from the pack (outside the lock), build the
@@ -598,7 +597,6 @@ pub type PersistSink = Arc<dyn Fn(&[crate::profile::NodeEntry]) + Send + Sync>;
 /// consumer task alone turns them into sink calls, lock-free. Before this
 /// split, sinks were called directly under the manager lock and the GUI's
 /// read-back tray refresh self-deadlocked Start
-///.
 enum ManagerEvent {
     State {
         id: NodeId,

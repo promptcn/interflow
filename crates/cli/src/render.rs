@@ -1,6 +1,5 @@
 //! Rendered deployment artifacts: systemd units, nginx fragments and the
 //! server bootstrap script — all pure functions of the manifest
-//!.
 //!
 //! `plan apply` writes them next to the packs (`--out`); `node install`
 //! re-derives the unit on the server from the pack itself. Every unit has
