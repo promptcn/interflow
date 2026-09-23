@@ -23,7 +23,6 @@ export const commands = {
 	 *  belongs on Tauri's sync-command pool, and the engine spawns go through
 	 *  the runtime handle the manager holds — safe from threads without an
 	 *  ambient Tokio runtime
-	 * .
 	 */
 	startNode: (id: string) => typedError<null, string>(__TAURI_INVOKE("start_node", { id })),
 	/**  Stops one node (user action; clears the start intent). */

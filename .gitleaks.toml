@@ -10,9 +10,10 @@ title = "interflow gitleaks config"
 useDefault = true
 
 [allowlist]
-description = "opaque-token test/doc fixtures (fake data-plane tokens)"
+description = "opaque-token test/doc fixtures (fake data-plane tokens); target/ is the export-time bindings-regeneration build cache (gitignored, toolchain-written binaries trip heuristics)"
 paths = [
     '''crates/core/src/tunnel/negotiation\.rs''',
     '''crates/mesh/tests/e2e_data_plane_stall\.rs''',
     '''crates/mesh/tests/e2e_request_establish_timeout\.rs''',
+    '''target/''',
 ]
