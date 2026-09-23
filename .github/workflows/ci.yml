@@ -79,18 +79,37 @@ jobs:
           docker cp $(docker ps -qf ancestor=ghcr.io/letsencrypt/pebble):/test/certs/pebble.minica.pem /tmp/pebble.minica.pem
           # The rustls client in the ACME runtime reads an explicit CA file;
           # exporting SSL_CERT_FILE additionally covers any system-root path.
+      # Test steps tee full output to a log and, on failure, append the
+      # failure extract to the job summary: anonymous API readers cannot
+      # download run logs, but check-run summaries ARE public — this is the
+      # failure-visibility channel for outside collaborators.
       - name: unit tests (lib)
-        run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --lib
+        run: |
+          set +e
+          cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --lib > /tmp/t.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then { echo "## unit tests (lib) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
           INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
       - name: unit tests (bins)
-        run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --bins
+        run: |
+          set +e
+          cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --bins > /tmp/t.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then { echo "## unit tests (bins) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
           INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
       - name: unit tests (doc)
-        run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --doc
+        run: |
+          set +e
+          cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --doc > /tmp/t.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then { echo "## unit tests (doc) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
           INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
@@ -98,12 +117,22 @@ jobs:
       # test-e2e`): they share the ephemeral-port pool and parallel picks
       # race the hub binds. Split per crate so a failure names the crate.
       - name: e2e tests (mesh, serial)
-        run: cargo test -p interflow-mesh --all-features --no-fail-fast --test '*' -- --test-threads=1
+        run: |
+          set +e
+          cargo test -p interflow-mesh --all-features --no-fail-fast --test '*' -- --test-threads=1 > /tmp/t.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then { echo "## e2e tests (mesh, serial) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
           INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
       - name: e2e tests (rest, serial)
-        run: cargo test --workspace --exclude interflow-gui --exclude interflow-mesh --all-features --no-fail-fast --test '*' -- --test-threads=1
+        run: |
+          set +e
+          cargo test --workspace --exclude interflow-gui --exclude interflow-mesh --all-features --no-fail-fast --test '*' -- --test-threads=1 > /tmp/t.log 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then { echo "## e2e tests (rest, serial) — failures"; grep -E 'FAILED|panicked at|^failures:' -A3 /tmp/t.log | head -40; } >> "$GITHUB_STEP_SUMMARY"; fi
+          exit $rc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
           INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
