@@ -152,7 +152,7 @@ pub(crate) fn spawn(
             match event {
                 Some(Ok(event)) => info!(node = %node_owned, "acme event: {event:?}"),
                 Some(Err(event)) => {
-                    warn!(node = %node_owned, "acme event (backoff/retry): {event:?}")
+                    warn!(node = %node_owned, "acme event (backoff/retry): {event:?}");
                 }
                 None => {
                     error!(node = %node_owned, "acme event loop terminated unexpectedly");

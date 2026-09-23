@@ -1045,7 +1045,10 @@ impl NodeManager {
                 })
                 .collect();
             entry.spec.pack_mesh.clone_from(&installed.node_config.mesh);
-            entry.spec.pack_listen.clone_from(&installed.node_config.listen);
+            entry
+                .spec
+                .pack_listen
+                .clone_from(&installed.node_config.listen);
         }
 
         if desired_running {
