@@ -79,8 +79,18 @@ jobs:
           docker cp $(docker ps -qf ancestor=ghcr.io/letsencrypt/pebble):/test/certs/pebble.minica.pem /tmp/pebble.minica.pem
           # The rustls client in the ACME runtime reads an explicit CA file;
           # exporting SSL_CERT_FILE additionally covers any system-root path.
-      - name: unit tests (lib/bins/doc)
-        run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --lib --bins --doc
+      - name: unit tests (lib)
+        run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --lib
+        env:
+          INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
+          INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
+      - name: unit tests (bins)
+        run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --bins
+        env:
+          INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
+          INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
+      - name: unit tests (doc)
+        run: cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --doc
         env:
           INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
           INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
