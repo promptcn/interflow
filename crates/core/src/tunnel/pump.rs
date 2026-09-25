@@ -187,6 +187,12 @@ pub struct StreamOutcome {
     /// merely closed without failure" — a bare connect-and-abort proves
     /// nothing about route health.
     pub response_relayed: bool,
+    /// Whether the shared idle budget expired — no data flowed in either
+    /// direction for `PumpConfig::idle_timeout`. The stream was cut by the
+    /// budget, not by either endpoint: callers use this to tell the operator
+    /// their (long silent) request outlived the timeout, not that the peer
+    /// died.
+    pub idle_expired: bool,
 }
 
 /// Bidirectionally pumps one TCP tunnel stream.
@@ -227,6 +233,11 @@ where
     // gate caught on 2026-09-16: receive-only streams died at exactly
     // idle_timeout of stream age no matter how much response data flowed).
     let progress = SharedProgress::new();
+    // Either half may expire the budget first; the write half owns the
+    // outcome, so the flag rides an atomic (same discipline as
+    // `response_relayed` in `pump_duplex`).
+    let idle_expired = Arc::new(AtomicBool::new(false));
+    let idle_flag = Arc::clone(&idle_expired);
 
     // Read half: socket → tunnel (request direction).
     let read_half = async {
@@ -241,6 +252,7 @@ where
             }
             let Some(remaining) = progress.remaining(cfg.idle_timeout) else {
                 metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                idle_flag.store(true, Ordering::Release);
                 debug!("{label} stream idle timeout (read side): {stream_id}");
                 break;
             };
@@ -276,10 +288,12 @@ where
         let mut outcome = StreamOutcome {
             close_reason: None,
             response_relayed: false,
+            idle_expired: false,
         };
         loop {
             let Some(remaining) = progress.remaining(cfg.idle_timeout) else {
                 metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                idle_flag.store(true, Ordering::Release);
                 debug!("{label} stream idle timeout (write side): {stream_id}");
                 break;
             };
@@ -315,6 +329,7 @@ where
                 Err(_) => {}
             }
         }
+        outcome.idle_expired = idle_expired.load(Ordering::Acquire);
         outcome
     };
 
@@ -404,6 +419,11 @@ where
     let progress = SharedProgress::new();
     let response_relayed = Arc::new(AtomicBool::new(false));
     let relay_observer = Arc::clone(&response_relayed);
+    // Either half may expire the shared idle budget first; the tunnel half
+    // owns the outcome, so the flag rides an atomic alongside
+    // `response_relayed`.
+    let idle_expired = Arc::new(AtomicBool::new(false));
+    let idle_flag = Arc::clone(&idle_expired);
     // Each half owns the crossed halves of the two endpoints (the same
     // single-reader/single-writer split the plain pump gets for free from
     // `TcpStream::into_split`).
@@ -420,6 +440,7 @@ where
             }
             let Some(remaining) = progress.remaining(cfg.idle_timeout) else {
                 metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                idle_flag.store(true, Ordering::Release);
                 debug!("{label} e2e stream idle timeout (local side): {stream_id}");
                 break;
             };
@@ -457,6 +478,7 @@ where
         let mut outcome = StreamOutcome {
             close_reason: None,
             response_relayed: false,
+            idle_expired: false,
         };
         let mut buf = BytesMut::with_capacity(16 * 1024);
         loop {
@@ -465,6 +487,7 @@ where
             }
             let Some(remaining) = progress.remaining(cfg.idle_timeout) else {
                 metrics::counter!(cfg.idle_timeout_counter).increment(1);
+                idle_flag.store(true, Ordering::Release);
                 debug!("{label} e2e stream idle timeout (tunnel side): {stream_id}");
                 break;
             };
@@ -503,6 +526,7 @@ where
         // Tunnel side done: half-close the local endpoint so its reader
         // sees the end (best effort — a dead socket still ends the pump).
         let _ = local_wr.shutdown().await;
+        outcome.idle_expired = idle_expired.load(Ordering::Acquire);
         outcome
     };
 
@@ -540,6 +564,7 @@ where
                 Err(_) => StreamOutcome {
                     close_reason: Some(local_eof_reason),
                     response_relayed: response_relayed.load(Ordering::Acquire),
+                    idle_expired: idle_expired.load(Ordering::Acquire),
                 },
             };
             (&mut cut_delivery).await;

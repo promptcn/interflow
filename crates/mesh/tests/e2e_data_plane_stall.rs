@@ -47,8 +47,7 @@ use interflow_core::tls::{TlsMinVersion, build_mtls_acceptor};
 use interflow_mesh::agent::{AgentClient, AgentState};
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
 use interflow_testkit::{
-    agent_config, hub_config_tuned, pick_ephemeral_port, spawn_agent_registered, spawn_hub,
-    wait_agent_connected,
+    agent_config, hub_config_tuned, spawn_agent_registered, spawn_hub, wait_agent_connected,
 };
 use std::future::Future;
 use std::net::SocketAddr;
@@ -72,11 +71,10 @@ fn certs() -> &'static interflow_testkit::certs::TestCerts {
 
 #[tokio::test]
 async fn forced_watchdog_rebuilds_session_on_real_hub() {
-    let hub_port = pick_ephemeral_port();
     // Heartbeats disabled: the poll stream stays silent for a long time (no
     // Ping); at that point only the watchdog can distinguish stall from idle
     let hub_cfg = hub_config_tuned(
-        hub_port,
+        0,
         certs(),
         vec![],
         HubSecurityConfig::default(),
@@ -86,6 +84,7 @@ async fn forced_watchdog_rebuilds_session_on_real_hub() {
         },
     );
     let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut cfg = agent_config("stall-real", hub_port, certs());
     cfg.agent.poll_idle_timeout_secs = Some(2);
@@ -478,10 +477,12 @@ fn counter_sum(text: &str, metric: &str) -> f64 {
 #[tokio::test]
 async fn data_plane_heartbeat_metrics_flow() {
     // Process-level exporter: only this test installs it within this binary
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{}", pick_ephemeral_port())
-        .parse()
-        .expect("metrics addr");
-    interflow_core::telemetry::init_metrics(metrics_addr, "/metrics");
+    // (port 0 = kernel-assigned; init_metrics returns the bound address)
+    let metrics_addr = interflow_core::telemetry::init_metrics(
+        "127.0.0.1:0".parse().expect("metrics addr"),
+        "/metrics",
+    )
+    .expect("metrics exporter installed");
     // Wait for the exporter listener to be ready
     let mut ready = false;
     for _ in 0..50 {
@@ -496,9 +497,8 @@ async fn data_plane_heartbeat_metrics_flow() {
         "the Prometheus exporter should be ready within the test"
     );
 
-    let hub_port = pick_ephemeral_port();
     let hub_cfg = hub_config_tuned(
-        hub_port,
+        0,
         certs(),
         vec![],
         HubSecurityConfig::default(),
@@ -509,6 +509,7 @@ async fn data_plane_heartbeat_metrics_flow() {
         },
     );
     let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let agent = spawn_agent_registered(agent_config("metrics-agent", hub_port, certs())).await;
 

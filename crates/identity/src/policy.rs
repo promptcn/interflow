@@ -9,6 +9,7 @@ use crate::issuance::{sign_policy, verify_policy_signature};
 use crate::manifest::MeshProtocol;
 use crate::{Error, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use hex;
 use interflow_contract::Generation;
 use interflow_util::sha256_hex;
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,11 @@ use std::path::Path;
 /// missing key means a truncated or forged document and must fail loudly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePolicy {
-    /// Rotation generation shared with the enclosing Credential Pack.
+    /// Rotation generation. The pack-embedded snapshot shares the pack's
+    /// generation at render time; after that the policy generation evolves
+    /// on its own (signed policy updates bump it without re-signing any
+    /// identity), and every node refuses a generation lower than the
+    /// highest it has applied.
     pub generation: Generation,
     pub routes: Vec<PolicyRoute>,
     pub services: Vec<PolicyService>,
@@ -33,6 +38,12 @@ pub struct RuntimePolicy {
     /// cross-workspace admission table from these entries; agents resolve
     /// their local data-plane rules from the same signed bytes.
     pub mesh: Vec<PolicyMeshStream>,
+    /// The serve-side mesh rules: what each agent offers to dial for its
+    /// peers. Serve agents derive their engine egress rules — and the egress
+    /// allowlist (`allowed_targets`) — from these entries, so adding or
+    /// widening an offer is a policy change, not an identity re-sign.
+    #[serde(default)]
+    pub mesh_egress: Vec<PolicyMeshEgress>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -63,24 +74,62 @@ pub struct IngressAuthorization {
 
 /// One authorized site-to-site stream: `source_agent` may ask
 /// `target_agent` to dial `remote_addr` (the target declares the matching
-/// egress rule, so both sides of the flow are signer-approved).
+/// egress rule, so both sides of the flow are signer-approved). Carries the
+/// listen-side rule face: the serving agent binds `listen` under this
+/// `name` and applies `idle_timeout_secs` to the stream.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PolicyMeshStream {
     pub source_workspace: String,
     pub source_agent: String,
     pub target_workspace: String,
     pub target_agent: String,
+    /// The listen-side rule name (rule identity on the serving agent).
+    pub name: String,
+    /// The loopback listen address (`host:port`) on the source agent.
+    pub listen: String,
     pub remote_addr: String,
     pub protocol: MeshProtocol,
+    /// Stream idle budget override (defaults per protocol when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+}
+
+/// One serve-side mesh rule as signed into the policy: the offer an agent
+/// makes to its peers — exactly one of `target_addr` (one concrete service)
+/// or `target_cidr` (an authorized range, any port inside it). The serving
+/// agent derives its engine egress rules and its egress allowlist from
+/// these entries.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PolicyMeshEgress {
+    /// The serving agent's workspace.
+    pub workspace: String,
+    /// The serving agent's id.
+    pub agent: String,
+    pub name: String,
+    pub protocol: MeshProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_cidr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_idle_timeout_secs: Option<u64>,
+}
+
+impl PolicyMeshEgress {
+    /// The allowlist entry this offer contributes (`host:port` or `ip/prefix`).
+    pub fn authorization(&self) -> &str {
+        self.target_cidr
+            .as_deref()
+            .or(self.target_addr.as_deref())
+            .unwrap_or("")
+    }
 }
 
 impl RuntimePolicy {
     /// Renders the policy for a manifest (derived — the manifest stays the
-    /// desired-state source of truth).
-    pub(crate) fn from_manifest(
-        manifest: &crate::manifest::Manifest,
-        generation: Generation,
-    ) -> Self {
+    /// desired-state source of truth). Public: `plan apply`'s policy-update
+    /// path signs exactly this derivation.
+    pub fn from_manifest(manifest: &crate::manifest::Manifest, generation: Generation) -> Self {
         let mut services = Vec::new();
         for (agent, config) in &manifest.agent {
             for service in &config.services {
@@ -119,12 +168,30 @@ impl RuntimePolicy {
                     source_agent: agent.clone(),
                     target_workspace: target.workspace.clone(),
                     target_agent: rule.target_agent.clone(),
+                    name: rule.name.clone(),
+                    listen: rule.listen.clone(),
                     remote_addr: rule.remote_addr.clone(),
                     protocol: rule.protocol,
+                    idle_timeout_secs: rule.idle_timeout_secs,
                 });
             }
         }
         mesh.sort();
+        let mut mesh_egress = Vec::new();
+        for (agent, config) in &manifest.agent {
+            for rule in &config.mesh_egress {
+                mesh_egress.push(PolicyMeshEgress {
+                    workspace: config.workspace.clone(),
+                    agent: agent.clone(),
+                    name: rule.name.clone(),
+                    protocol: rule.protocol,
+                    target_addr: rule.target_addr.clone(),
+                    target_cidr: rule.target_cidr.clone(),
+                    udp_idle_timeout_secs: rule.udp_idle_timeout_secs,
+                });
+            }
+        }
+        mesh_egress.sort();
         Self {
             generation,
             routes: manifest
@@ -138,6 +205,7 @@ impl RuntimePolicy {
             services,
             ingress_authorizations: authorizations,
             mesh,
+            mesh_egress,
         }
     }
 
@@ -171,6 +239,26 @@ impl RuntimePolicy {
         let policy = Self::parse(bytes)?;
         verify_policy_signature(verifier, bytes, signature)?;
         Ok(policy)
+    }
+
+    /// Parses a hex-encoded verifying key (the trust bundle's `policy_key`
+    /// face) — the shape the hub's publication endpoint and reload watchers
+    /// carry.
+    pub fn verifying_key_from_hex(verifier_hex: &str) -> Result<VerifyingKey> {
+        let key_bytes = hex::decode(verifier_hex.trim())
+            .map_err(|e| Error::trust("policy verifying key".to_string()).with_source(e))?;
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&key_bytes);
+        VerifyingKey::from_bytes(&arr)
+            .map_err(|e| Error::trust("policy verifying key".to_string()).with_source(e))
+    }
+
+    /// Verifies a signature against a hex-encoded verifying key (the trust
+    /// bundle's `policy_key` face) — the shape the hub's publication
+    /// endpoint and reload watchers carry.
+    pub fn verify_with_hex_key(bytes: &[u8], signature: &[u8], verifier_hex: &str) -> Result<Self> {
+        let verifier = Self::verifying_key_from_hex(verifier_hex)?;
+        Self::verify(bytes, signature, &verifier)
     }
 
     /// Enforces anti-rollback: `persisted` is the highest generation this node
@@ -251,6 +339,7 @@ mod tests {
             services: vec![],
             ingress_authorizations: vec![],
             mesh: vec![],
+            mesh_egress: vec![],
         };
         policy.check_not_rollback(2).unwrap();
         let err = policy.check_not_rollback(4).unwrap_err();
@@ -290,9 +379,57 @@ target_addr = "10.0.0.5:80"
         assert_eq!(stream.source_workspace, "a");
         assert_eq!(stream.target_workspace, "b");
         assert_eq!(stream.remote_addr, "10.0.0.5:80");
+        // The listen-side rule face rides the same signed row.
+        assert_eq!(stream.name, "svc");
+        assert_eq!(stream.listen, "127.0.0.1:3001");
         // Cross-workspace streams are exactly what the hub's admission
         // table derives from.
         assert_ne!(stream.source_workspace, stream.target_workspace);
+        // The serve-side offers are signed too — one per egress rule.
+        assert_eq!(policy.mesh_egress.len(), 1);
+        let offer = &policy.mesh_egress[0];
+        assert_eq!(offer.workspace, "b");
+        assert_eq!(offer.agent, "lan-b");
+        assert_eq!(offer.authorization(), "10.0.0.5:80");
+    }
+
+    /// Range offers sign the CIDR face: the authorization entry a serve
+    /// agent widens its allowlist with.
+    #[test]
+    fn mesh_egress_face_signs_range_offers() {
+        let manifest = crate::manifest::Manifest::parse(
+            r#"
+[realm]
+id = "promptcn"
+[registrar]
+endpoint = "https://registrar.example.com"
+[mesh.hub.central]
+endpoint = "hub.example.com:6666"
+[workspace.main]
+[agent.lan-a]
+workspace = "main"
+[[agent.lan-a.mesh_ingress]]
+name = "svc"
+listen = "127.0.0.1:3001"
+target_agent = "lan-b"
+remote_addr = "127.0.0.1:8055"
+[agent.lan-b]
+workspace = "main"
+[[agent.lan-b.mesh_egress]]
+name = "loopback"
+target_cidr = "127.0.0.0/8"
+udp_idle_timeout_secs = 90
+"#,
+        )
+        .unwrap();
+        let policy = RuntimePolicy::from_manifest(&manifest, 4);
+        let offer = &policy.mesh_egress[0];
+        assert_eq!(offer.authorization(), "127.0.0.0/8");
+        assert_eq!(offer.udp_idle_timeout_secs, Some(90));
+        // Round trip through the canonical signed bytes keeps the face.
+        let bytes = policy.to_bytes().unwrap();
+        let parsed = RuntimePolicy::parse(&bytes).unwrap();
+        assert_eq!(parsed, policy);
     }
 
     /// The policy signs service **ids** only — where the agent dials is

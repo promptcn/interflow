@@ -285,7 +285,7 @@ mod tests {
         // sends do not depend on data-channel consumption.
         agents.write().await.insert(
             id.to_string(),
-            Arc::new(RwLock::new(AgentSession::new(circuit, None))),
+            Arc::new(RwLock::new(AgentSession::new(circuit, None, None))),
         );
     }
 

@@ -19,7 +19,10 @@ pub const FORMAT_VERSION: u8 = 1;
 ///
 /// The value is monotonic within a deployment's signed objects. A Credential
 /// Pack and the Trust Bundle and Runtime Policy embedded in it must carry the
-/// same generation.
+/// same generation. A Runtime Policy *update* (delivered outside the pack —
+/// `state/policy` or the control plane) rides the same counter on its own
+/// cadence: it must be ≥ the embedded snapshot's generation, and every node
+/// refuses anything older than the highest it has applied.
 pub type Generation = u64;
 
 /// Capability bits for the QUIC Hello/HelloAck handshake (u32 bitfield on the

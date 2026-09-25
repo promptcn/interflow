@@ -49,7 +49,7 @@ use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_testkit::{
     agent_config, hub_config, metrics_harness::counter_value, metrics_harness::eventually,
     metrics_harness::init_tracing, metrics_harness::metrics_handle,
-    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_agent_registered, spawn_hub,
+    metrics_harness::wait_counter_at_least, spawn_agent_registered, spawn_hub,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -191,8 +191,10 @@ async fn open_inner_tls(
 async fn session_rebuild_releases_silent_streams_without_accumulation() {
     let _ = metrics_handle(); // install the recorder as early as possible: the metrics macros cache per callsite
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    let mut hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    // First bind :0 (owned); the loop below restarts the hub on the
+    // materialized concrete port — the agent's hub_url is baked.
+    let mut hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
 
     let (silent_addr, accepted, active) = silent_backend().await;
     // Registration gate: round 0's Opens address this egress immediately;
@@ -252,7 +254,7 @@ async fn session_rebuild_releases_silent_streams_without_accumulation() {
 
         // Restart the hub and wait for the agent to reconnect (the next round
         // uses the new session's egress)
-        hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+        hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await; // pinned concrete port
         let deadline = tokio::time::Instant::now() + RECONNECT_DEADLINE;
         loop {
             if matches!(agent.state(), AgentState::Connected { .. }) {

@@ -45,7 +45,7 @@ use interflow_core::tunnel::{InnerStreamHello, TargetSelector};
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, hub_config, metrics_harness::counter_value, metrics_harness::metrics_handle,
-    pick_ephemeral_port, spawn_agent_registered, spawn_hub,
+    spawn_agent_registered, spawn_hub,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -295,8 +295,8 @@ async fn recv_response_data<R: tokio::io::AsyncRead + Unpin>(rx: &mut R, n: usiz
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backend_eof_without_peer_close_releases_fd() {
     let _ = metrics_handle();
-    let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
 
     let (backend_addr, active) = close_after_echo_backend(b"ping").await;
     // Registration gate: an Open routed to an unregistered target is torn
@@ -354,8 +354,8 @@ async fn backend_eof_without_peer_close_releases_fd() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backend_eof_drain_window_delivers_late_request_tail() {
     let _ = metrics_handle();
-    let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
 
     let (backend_addr, tail, active) = half_close_backend(b"ping").await;
     // Registration gate: an Open routed to an unregistered target is torn
@@ -413,8 +413,8 @@ async fn backend_eof_drain_window_delivers_late_request_tail() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_re_register_sweep_notifies_egress_streams() {
     let _ = metrics_handle();
-    let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
 
     const K: usize = 3;
     let (backend_addr, active) = silent_backend().await;
@@ -469,8 +469,8 @@ async fn source_re_register_sweep_notifies_egress_streams() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn normal_source_close_still_releases_backend() {
     let _ = metrics_handle();
-    let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
 
     let (backend_addr, active) = silent_backend().await;
     // Registration gate: an Open routed to an unregistered target is torn

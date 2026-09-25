@@ -10,11 +10,14 @@
 //! - `node` —— NodeManager: multi-node lifecycle, renewal beside every
 //!   engine, bounded death-restart (framework-free domain logic)
 //! - `commands` —— Tauri invoke API
-//! - `tray` —— tray icon/menu + hide on window close
+//! - `tray` —— tray icon/menu + the window ↔ tray lifecycle: close and
+//!   (on Windows) minimize hide to the tray; tray click/menu, relaunch and
+//!   dock reopen all restore
 
 mod commands;
 mod contract;
 mod deploy;
+mod deploy_prefs;
 mod node;
 mod profile;
 mod tracing_capture;
@@ -48,9 +51,13 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::get_recent_logs,
             commands::clear_logs,
             commands::get_host_name,
+            commands::get_version_info,
             commands::deploy_manifest_template,
+            commands::deploy_mesh_template,
             commands::deploy_read_text,
             commands::deploy_write_text,
+            commands::deploy_parse_manifest,
+            commands::deploy_edit_manifest,
             commands::deploy_validate,
             commands::deploy_apply,
             commands::deploy_list_packs,
@@ -59,6 +66,11 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::deploy_update_node,
             commands::deploy_rotate,
             commands::deploy_revoke,
+            commands::deploy_add_node,
+            commands::deploy_generate_passphrase,
+            commands::deploy_seal_to_downloads,
+            commands::deploy_prefs_load,
+            commands::deploy_prefs_save,
         ])
         .events(tauri_specta::collect_events![
             contract::NodeStateEvent,
@@ -136,16 +148,13 @@ pub fn run() {
     #[cfg(debug_assertions)]
     export_bindings("../src/bindings.ts").expect("failed to export src/bindings.ts");
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Second launch: focus the existing main window
-            use tauri::Manager;
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-                let _ = win.set_focus();
-            }
+            // Second launch: restore + focus the existing main window
+            tray::show_main_window(app);
         }))
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
@@ -153,6 +162,15 @@ pub fn run() {
 
             let (log_tx, log_rx) = tokio::sync::mpsc::channel(256);
             tracing_capture::init(log_tx);
+
+            // Same identity the engines log at startup — the GUI's own log
+            // panel (and any excerpt of it) names the build it came from.
+            tracing::info!(
+                node = "gui",
+                "interflow-gui starting (build {}): version {}",
+                interflow_buildinfo::BUILD_TAG,
+                env!("CARGO_PKG_VERSION")
+            );
 
             // The node manager is GUI-framework-free domain logic; its UI
             // side effects (frontend event + tray refresh, profile
@@ -200,15 +218,40 @@ pub fn run() {
             tray::setup(app.handle())?;
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 // Window close = hide to tray; nodes keep running
                 api.prevent_close();
-                let _ = window.hide();
+                tray::hide_to_tray(window);
             }
+            // Minimize = hide to tray (Windows only; macOS keeps the
+            // standard Dock minimize). Tauri 2 has no first-class Minimized
+            // event — the tao windowing layer doesn't emit one — so the
+            // canonical detection is the minimize transition's Resized
+            // event plus the authoritative is_minimized() (Win32 IsIconic).
+            // When upstream grows a Minimized variant, this arm is the
+            // single place to swap.
+            #[cfg(target_os = "windows")]
+            tauri::WindowEvent::Resized(_) if window.is_minimized().unwrap_or(false) => {
+                tray::hide_to_tray(window);
+            }
+            _ => {}
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // macOS: clicking the dock icon while the window is tray-hidden
+    // (close-to-menubar) reopens it — the dock is that platform's primary
+    // restore path. No run-event handling needed elsewhere.
+    #[cfg(target_os = "macos")]
+    app.run(|app, event| {
+        if let tauri::RunEvent::Reopen { .. } = event {
+            tray::show_main_window(app);
+        }
+    });
+
+    #[cfg(not(target_os = "macos"))]
+    app.run(|_, _| {});
 }
 
 /// Node state → frontend `node-state` event + tray refresh. Runs on the

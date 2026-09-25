@@ -17,6 +17,7 @@
 //! Workspace / Node / Principal / Service / Route.
 
 pub mod credentials;
+pub mod expiry;
 pub mod issuance;
 pub mod manifest;
 pub mod pack;

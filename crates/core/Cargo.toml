@@ -20,7 +20,7 @@ fault-injection = []
 workspace = true
 
 [dependencies]
-interflow-contract = { path = "../contract", version = "0.4" }
+interflow-contract = { path = "../contract", version = "0.5" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -75,14 +75,19 @@ x509-parser = "0.18"
 # Cert pinning: SHA256 fingerprint verification + hex encode/decode
 sha2 = "0.11"
 hex = "0.4"
+# Audit-log rotation: gzip-compressing sealed segments (flate2 is already
+# in the dependency tree via the QUIC/TLS ecosystem; miniz_oxide backend,
+# pure Rust, no new system dependencies)
+flate2 = "1"
 
 # Security: per-IP token-bucket rate limiting
 governor = "0.10.4"
 # Security: HTTP/1.x request-head syntax for the shared edge peek parser
 # (Host routing / XFF / ACME HTTP-01)
 httparse = "1.10"
-# Security: PROXY protocol v2 preamble parsing (edge public + hub agent planes
-# behind nginx; v1 is deliberately not accepted — nginx always sends v2)
+# Security: PROXY protocol v1/v2 preamble parsing (edge public + hub agent
+# planes behind nginx; v1 accepted from trusted proxies only — stock nginx
+# stream emits v1, untrusted signatures of either version stay rejected)
 ppp = "2.3"
 # Security: trusted-proxy CIDR matching for the PROXY protocol trust matrix
 ipnetwork = "0.21.1"
@@ -97,9 +102,11 @@ criterion = { version = "0.8", default-features = false, features = ["async_toki
 proptest = "1.7"
 # Self-signed certificates for the TLS min-version handshake test (the single
 # rcgen implementation; core keeps issuance out of its production graph)
-interflow-certs = { path = "../certs", version = "0.4" }
+interflow-certs = { path = "../certs", version = "0.5" }
 # Paused clock (start_paused) for unit tests to deterministically verify the INCOMING_SEND_TIMEOUT path
 tokio = { workspace = true, features = ["test-util"] }
+# Audit rotation/persistence unit tests: isolated segment directories
+tempfile = "3"
 
 # ============================================================================
 # Benchmarks (criterion)

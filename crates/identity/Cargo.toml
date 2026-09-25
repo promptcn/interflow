@@ -11,10 +11,10 @@ name = "interflow_identity"
 path = "src/lib.rs"
 
 [dependencies]
-interflow-contract = { path = "../contract", version = "0.4" }
+interflow-contract = { path = "../contract", version = "0.5" }
 # Shared endpoint/authority parsing (SAN extraction, manifest endpoint
 # validation); deliberately NOT interflow-core — identity stays light
-interflow-util = { path = "../util", version = "0.4" }
+interflow-util = { path = "../util", version = "0.5" }
 
 # X.509 issuance with URI SAN support (SPIFFE-like principal paths).
 rcgen = { version = "0.14", features = ["x509-parser"] }
@@ -32,9 +32,17 @@ humantime = "2.3"
 thiserror = { workspace = true }
 hex = { workspace = true }
 
+# Rejection logging on the fail-keep policy-update path (state/policy).
+tracing = "0.1"
+
 # Policy signing (realm issuer policy key, independent of X.509 CAs).
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 getrandom = "0.3"
+
+# Range egress authorization (`mesh_egress.target_cidr`) — the same crate
+# the engine matches with (`is_target_allowed`), so manifest validation and
+# runtime matching can never drift apart.
+ipnetwork = "0.21.1"
 
 # Sealed Credential Packs (.iflowpack = age-encrypted tar).
 age = "0.11"

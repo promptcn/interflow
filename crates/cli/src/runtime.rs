@@ -7,6 +7,7 @@
 //! so the bytes the issuer signed are the bytes the engine runs.
 
 use interflow_core::error::{InterflowError, Result};
+use interflow_core::security::{ProxyProtocolConfig, ProxyProtocolMode};
 use interflow_expose::edge::{
     AcmeOptions, ControlEndpointTls, DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE,
     DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE, EdgeConfig, EdgeListenerPolicy, IngressPrincipal,
@@ -34,6 +35,30 @@ pub fn resolve_new_conn_rate(public_tls: &str, edge: Option<&NodeEdgeConfig>) ->
     match public_tls {
         "frontend-proxy" | "manual" => DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE,
         _ => DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE,
+    }
+}
+
+/// Resolves the control listener's PROXY protocol negotiation for an
+/// ingress pack.
+///
+/// Topology-derived, same discipline as [`resolve_new_conn_rate`]: no
+/// manifest field, no pack re-signing. Fronted topologies sit behind the
+/// nginx stream fragment, which emits PROXY protocol (v1 on stock nginx)
+/// on every SNI-map target — including the mTLS-passthrough control leg —
+/// so the embedded hub must consume the preamble and re-key its per-IP
+/// admission on the real client IP. Mode `On` (not `Required`): the edge's
+/// internal workspace agents self-dial the control endpoint headerless
+/// over loopback, and `On` is also what makes the zero-downtime rollout
+/// order (new binaries first, nginx conf switch second) work — a headerless
+/// leg is a plain direct connection. Direct topologies (`acme`) keep the
+/// default (off): nothing fronts the control listener.
+pub fn resolve_control_proxy_protocol(public_tls: &str) -> ProxyProtocolConfig {
+    match public_tls {
+        "frontend-proxy" | "manual" => ProxyProtocolConfig {
+            mode: ProxyProtocolMode::On,
+            trusted_proxies: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
+        },
+        _ => ProxyProtocolConfig::default(),
     }
 }
 
@@ -265,6 +290,7 @@ pub fn build_edge_config(
                 .map_err(pack_error)?
                 .1,
         },
+        control_proxy_protocol: resolve_control_proxy_protocol(&pack.node_config.public_tls),
         workspace_trust,
         principals,
         routes,
@@ -406,7 +432,11 @@ pub fn normalize_endpoint(endpoint: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{NodeEdgeConfig, resolve_local_services, resolve_new_conn_rate};
+    use super::{
+        NodeEdgeConfig, resolve_control_proxy_protocol, resolve_local_services,
+        resolve_new_conn_rate,
+    };
+    use interflow_core::security::ProxyProtocolMode;
     use interflow_identity::pack::NodeService;
     use std::collections::BTreeMap;
 
@@ -533,5 +563,19 @@ mod tests {
             600
         );
         assert_eq!(resolve_new_conn_rate("acme", Some(&edge(None))), 30);
+    }
+
+    /// Fronted topologies derive control-listener pp `On` with loopback
+    /// trust (the nginx stream fragment emits the preamble on the control
+    /// leg); direct topologies stay off — nothing fronts the listener.
+    #[test]
+    fn control_proxy_protocol_topology_defaults() {
+        for fronted in ["frontend-proxy", "manual"] {
+            let cfg = resolve_control_proxy_protocol(fronted);
+            assert_eq!(cfg.mode, ProxyProtocolMode::On, "topology {fronted}");
+            assert_eq!(cfg.trusted_proxies, vec!["127.0.0.1", "::1"]);
+        }
+        let direct = resolve_control_proxy_protocol("acme");
+        assert_eq!(direct.mode, ProxyProtocolMode::Off);
     }
 }

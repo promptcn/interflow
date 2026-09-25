@@ -47,7 +47,7 @@ use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, hub_config_tuned, metrics_harness::counter_value,
     metrics_harness::eventually, metrics_harness::init_tracing, metrics_harness::metrics_handle,
-    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_hub,
+    metrics_harness::wait_counter_at_least, spawn_hub,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -296,19 +296,19 @@ async fn f1_flood_does_not_break_session() {
     let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
-    let hub_port = pick_ephemeral_port();
     let security = interflow_mesh::config::HubSecurityConfig {
         channel_send_timeout_secs: 2,
         ..interflow_mesh::config::HubSecurityConfig::default()
     };
-    spawn_hub(hub_config_tuned(
-        hub_port,
+    let hub = spawn_hub(hub_config_tuned(
+        0,
         certs(),
         vec![],
         security,
         interflow_mesh::config::HeartbeatConfig::default(),
     ))
     .await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = echo_server().await;
 
     let mut eg = agent_config("eg", hub_port, certs());
@@ -357,8 +357,8 @@ async fn f2_local_stream_limit_rejects_and_releases() {
     let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = echo_server().await;
     let (backend, conns, _active) = counting_backend().await;
 
@@ -436,8 +436,8 @@ async fn f3_rate_limit_bounds_churn_connections() {
     let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = echo_server().await;
     let (backend, conns, _active) = counting_backend().await;
 
@@ -506,12 +506,12 @@ async fn f4_dial_failure_frees_slot() {
     let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = echo_server().await;
     // A closed local port: the connection is guaranteed to be refused
     // (ECONNREFUSED), deterministic across environments
-    let refused_addr = format!("127.0.0.1:{}", interflow_testkit::pick_ephemeral_port());
+    let refused_addr = interflow_testkit::refused_addr().to_string();
 
     let mut eg = agent_config("eg", hub_port, certs());
     eg.egress_connect_timeout_secs = 1;
@@ -568,8 +568,8 @@ async fn f5_legit_burst_not_rejected() {
     let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = echo_server().await;
 
     let eg = agent_config("eg", hub_port, certs()); // all defaults: 100/s + burst 256 + local 256
@@ -612,8 +612,8 @@ async fn f6_no_slot_leak_after_flood() {
     let _serial = serial_lock().await;
     let _ = metrics_handle(); // Install the recorder as early as possible: the metrics macros cache per callsite, emissions before installation are invisible
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = echo_server().await;
 
     let mut eg = agent_config("eg", hub_port, certs());

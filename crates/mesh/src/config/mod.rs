@@ -12,12 +12,13 @@ pub mod transport;
 pub mod validate;
 
 pub use agent::{
-    AgentConfig, AgentInfo, ControlConfig, EgressRule, IngressRule, InnerTlsConfig, SecurityConfig,
-    TlsConfig as AgentTlsConfig, TransportKind,
+    AgentConfig, AgentInfo, ControlConfig, EgressRule, EgressTarget, IngressRule, InnerTlsConfig,
+    SecurityConfig, TlsConfig as AgentTlsConfig, TransportKind,
 };
 pub use hub::{
     AclConfig, AclRule, AuthConfig, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig,
-    HubTransportConfig, MetricsConfig, ServerConfig, TenantConfig, TlsConfig as HubTlsConfig,
+    HubTransportConfig, MetricsConfig, PolicyAdminConfig, ServerConfig, TenantConfig,
+    TlsConfig as HubTlsConfig,
 };
 pub use interflow_core::config::LoggingConfig;
 pub use interflow_core::telemetry::LogFormat;

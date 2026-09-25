@@ -9,8 +9,12 @@ import { commands, events } from "./bindings";
 import type { Event } from "@tauri-apps/api/event";
 import type {
   AddNodeParams,
+  DeployContextDto,
+  EditActionDto,
+  IssueNodeParams,
   LogLine,
   ManifestTemplateParams,
+  MeshTemplateParams,
   NodeKindDto,
   NodePrefs,
   NodeStateDto,
@@ -18,19 +22,46 @@ import type {
 
 export type {
   AddNodeParams,
+  AddedNodeDto,
+  AgentRoleDto,
+  AgentSummaryDto,
+  CreateNodeDto,
+  CredentialHealthDto,
+  DeployContextDto,
   DeployPackDto,
+  EditActionDto,
+  EditedManifestDto,
+  HubDto,
+  IdentityModeDto,
   ImportedPackDto,
+  IngressNodeDto,
+  IssueMeshEgressDto,
+  IssueMeshIngressDto,
+  IssueNodeKindDto,
+  IssueNodeParams,
+  IssueServiceSpecDto,
+  LeafTtlBoundsDto,
   LogLine,
+  ManifestEgressRuleDto,
+  ManifestIngressRuleDto,
+  ManifestServiceDto,
+  ManifestSummaryDto,
   ManifestTemplateParams,
   MeshEgressRuleDto,
   MeshIngressRuleDto,
   MeshProtocolDto,
+  MeshTemplateParams,
   NodeInfo,
   NodeKindDto,
   NodePrefs,
   NodeStateDto,
   PackInspection,
+  PublicTlsModeDto,
+  RealmDto,
+  RouteDto,
+  SealedPackDto,
   Transport,
+  VersionInfo,
 } from "./bindings";
 
 /// Result commands return a typed `{status: ok|error}` envelope instead of
@@ -55,12 +86,20 @@ export const api = {
   getRecentLogs: () => unwrap(commands.getRecentLogs()),
   clearLogs: () => unwrap(commands.clearLogs()),
   getHostName: () => unwrap(commands.getHostName()),
+  getVersionInfo: () => unwrap(commands.getVersionInfo()),
   // Deploy (operator) surface — the plan/rotate/revoke/pack twins.
   deployManifestTemplate: (params: ManifestTemplateParams) =>
     unwrap(commands.deployManifestTemplate(params)),
+  deployMeshTemplate: (params: MeshTemplateParams) =>
+    unwrap(commands.deployMeshTemplate(params)),
   deployReadText: (path: string) => unwrap(commands.deployReadText(path)),
   deployWriteText: (path: string, text: string) =>
     unwrap(commands.deployWriteText(path, text)),
+  // Manifest form editor — the document model's read/transform pair (pure;
+  // the file write stays with Save).
+  deployParseManifest: (text: string) => unwrap(commands.deployParseManifest(text)),
+  deployEditManifest: (text: string, action: EditActionDto) =>
+    unwrap(commands.deployEditManifest(text, action)),
   deployValidate: (manifest: string) => unwrap(commands.deployValidate(manifest)),
   deployApply: (manifest: string, issuer: string, out: string) =>
     unwrap(commands.deployApply(manifest, issuer, out)),
@@ -75,6 +114,13 @@ export const api = {
     unwrap(commands.deployRotate(manifest, issuer, node, pack)),
   deployRevoke: (issuer: string, pack: string, reason: string) =>
     unwrap(commands.deployRevoke(issuer, pack, reason)),
+  // Issue wizard — the `node add` + seal-with-generated-passphrase twin.
+  deployAddNode: (params: IssueNodeParams) => unwrap(commands.deployAddNode(params)),
+  deployGeneratePassphrase: () => unwrap(commands.deployGeneratePassphrase()),
+  deploySealToDownloads: (packDir: string, passphrase: string) =>
+    unwrap(commands.deploySealToDownloads(packDir, passphrase)),
+  deployPrefsLoad: () => unwrap(commands.deployPrefsLoad()),
+  deployPrefsSave: (recent: DeployContextDto[]) => unwrap(commands.deployPrefsSave(recent)),
 };
 
 /// Both listeners resolve to an unlisten fn (App keeps them for cleanup).
@@ -102,6 +148,25 @@ export function stateText(state: NodeStateDto | null): string {
     if (state.Failed) return `Failed: ${state.Failed.error}`;
   }
   return "Unknown";
+}
+
+/// Remaining-lifetime text (mirrors identity::expiry::format_remaining —
+/// one vocabulary across GUI, hub log, and doctor).
+export function formatRemainingSecs(secs: number): string {
+  if (secs <= 0) return "expired";
+  if (secs < 86400) return "<1d";
+  return `${Math.floor(secs / 86400)}d`;
+}
+
+/// The phase-driven class suffix for credential surfaces: warn = amber,
+/// critical = red (the dirty-build visual language), healthy = muted.
+export function leafPhaseClass(
+  credential: { phase: string } | null | undefined,
+): string {
+  if (!credential) return "";
+  return credential.phase === "warn" || credential.phase === "critical"
+    ? `leaf-${credential.phase}`
+    : "";
 }
 
 export function stateColor(state: NodeStateDto | null): string {

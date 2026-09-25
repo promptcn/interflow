@@ -57,9 +57,20 @@ pub struct AcmeRuntime {
     challenge_config: Arc<ServerConfig>,
     host_allowlist: Arc<HashSet<String>>,
     shutdown_token: tokio_util::sync::CancellationToken,
+    /// The actually-bound HTTP-01/redirect listener address, filled by the
+    /// :80 task once its bind succeeds (best-effort by design: the bind can
+    /// fail non-fatally, leaving this permanently unset).
+    http_bound: std::sync::Arc<std::sync::OnceLock<SocketAddr>>,
 }
 
 impl AcmeRuntime {
+    /// The actually-bound HTTP-01/redirect listener address, once the :80
+    /// task's bind succeeds. `None` before the bind, or for good when the
+    /// bind failed (non-fatal) — a `:0` http_listen materializes here.
+    pub fn http_local_addr(&self) -> Option<SocketAddr> {
+        self.http_bound.get().copied()
+    }
+
     /// The server config for ordinary TLS handshakes (the live certificate;
     /// swapped by the renewal loop).
     pub fn default_config(&self) -> Arc<ServerConfig> {
@@ -174,6 +185,8 @@ pub(crate) fn spawn(
     };
     let http_shutdown = shutdown_token.clone();
     let node_owned = node.to_string();
+    let http_bound = std::sync::Arc::new(std::sync::OnceLock::new());
+    let http_bound_handle = std::sync::Arc::clone(&http_bound);
     tokio::spawn(async move {
         let listener = match tokio::select! {
             () = http_shutdown.cancelled() => return,
@@ -188,6 +201,15 @@ pub(crate) fn spawn(
                 return;
             }
         };
+        let bound = listener
+            .local_addr()
+            .inspect_err(|e| {
+                warn!(node = %node_owned, "acme http listener local_addr failed: {e}");
+            })
+            .ok();
+        if let Some(bound) = bound {
+            let _ = http_bound_handle.set(bound);
+        }
         info!(node = %node_owned, "acme http listener started: {http_listen} (HTTP-01 + redirect)");
         loop {
             let (mut stream, peer) = tokio::select! {
@@ -232,6 +254,7 @@ pub(crate) fn spawn(
         challenge_config,
         host_allowlist,
         shutdown_token,
+        http_bound,
     })
 }
 

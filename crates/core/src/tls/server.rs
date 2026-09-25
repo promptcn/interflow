@@ -238,6 +238,23 @@ pub fn extract_cn_from_chain(certs: &[CertificateDer]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extracts the leaf certificate's validity window as unix seconds
+/// `(not_before, not_after)` — the hub-side input to credential-expiry
+/// phasing (the hub sees the connecting certificate and nothing else).
+///
+/// `None` means: no certificate / parse failure. The webpki verifier has
+/// already validated the window at handshake time (expired certificates
+/// never get this far); this reads it, it does not judge it.
+pub fn extract_leaf_validity_from_chain(certs: &[CertificateDer]) -> Option<(i64, i64)> {
+    let leaf = certs.first()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;
+    let validity = parsed.validity();
+    Some((
+        validity.not_before.timestamp(),
+        validity.not_after.timestamp(),
+    ))
+}
+
 /// Reads the leaf certificate's subject CN from a PEM file.
 ///
 /// The file-level counterpart of [`extract_cn_from_chain`], used for the
@@ -262,6 +279,54 @@ mod tests {
     #[test]
     fn extract_cn_from_empty_chain_is_none() {
         assert!(extract_cn_from_chain(&[]).is_none());
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::missing_docs_in_private_items
+)]
+mod leaf_validity_tests {
+    use super::*;
+
+    fn leaf_chain(validity: interflow_certs::Validity) -> Vec<CertificateDer<'static>> {
+        let ca =
+            interflow_certs::build_ca("validity", interflow_certs::Validity::ca_default()).unwrap();
+        let loaded = interflow_certs::LoadedCa::from_material(&ca).unwrap();
+        let leaf = loaded
+            .build_server_cert(
+                &[interflow_certs::SanName::Dns("hub.test".to_owned())],
+                validity,
+            )
+            .unwrap();
+        rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// The hub-side expiry input reads exactly the issued window: a
+    /// backdated leaf (90d TTL with 81d consumed) reports not_before /
+    /// not_after as issued, not "now".
+    #[test]
+    fn reads_the_issued_validity_window() {
+        let now = time::OffsetDateTime::now_utc();
+        let validity = interflow_certs::Validity {
+            not_before: now - time::Duration::days(81),
+            not_after: now + time::Duration::days(9),
+        };
+        let chain = leaf_chain(validity);
+        let (not_before, not_after) = extract_leaf_validity_from_chain(&chain).unwrap();
+        // Second precision; the issued values, not the observation time.
+        assert!((not_before - (now - time::Duration::days(81)).unix_timestamp()).abs() <= 1);
+        assert!((not_after - (now + time::Duration::days(9)).unix_timestamp()).abs() <= 1);
+    }
+
+    #[test]
+    fn empty_chain_is_none() {
+        assert!(extract_leaf_validity_from_chain(&[]).is_none());
     }
 }
 

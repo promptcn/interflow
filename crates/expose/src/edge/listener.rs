@@ -206,30 +206,32 @@ impl EdgeListener {
         Self::run_inner(self, None).await
     }
 
-    /// [`run`] with an external readiness signal: `ready` fires once the
-    /// listen port is bound, just before the accept loop starts. Callers
+    /// [`run`] with an external readiness signal: `ready` carries the
+    /// actually-bound listen address once the port is bound, just before
+    /// the accept loop starts (a `:0` port materializes there). Callers
     /// that need "accepting by the time this returns" (the edge's readiness
     /// barrier, the GUI's ingress engine) get an exact signal instead of
     /// probing the port.
     pub async fn run_signalled(
         self,
-        ready: tokio::sync::oneshot::Sender<()>,
+        ready: tokio::sync::oneshot::Sender<std::net::SocketAddr>,
     ) -> std::io::Result<()> {
         Self::run_inner(self, Some(ready)).await
     }
 
     async fn run_inner(
         self,
-        ready: Option<tokio::sync::oneshot::Sender<()>>,
+        ready: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
     ) -> std::io::Result<()> {
         let listener = TcpListener::bind(self.listen_addr).await?;
+        let bound = listener.local_addr()?;
         if let Some(ready) = ready {
-            let _ = ready.send(());
+            let _ = ready.send(bound);
         }
         info!(
             node = %self.node,
             "Edge public listener started: {} ({} routes)",
-            self.listen_addr,
+            bound,
             self.router.len()
         );
 
@@ -877,6 +879,7 @@ where
     let outcome = StreamOutcome {
         close_reason: outcome.close_reason.or_else(|| peer_close_reason.get()),
         response_relayed: outcome.response_relayed,
+        idle_expired: outcome.idle_expired,
     };
     // Feed the route breaker from the classified evidence: a failing dial
     // counts (and re-arms), the agent's own breaker verdict counts without
@@ -1051,6 +1054,7 @@ mod tests {
         StreamOutcome {
             close_reason,
             response_relayed,
+            idle_expired: false,
         }
     }
 

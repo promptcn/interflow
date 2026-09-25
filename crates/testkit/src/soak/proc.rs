@@ -14,8 +14,8 @@ use interflow_core::protocol::StreamProto;
 use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
     AclConfig, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, ControlConfig, EgressRule,
-    HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig, HubTlsConfig, IngressRule,
-    LoggingConfig, MetricsConfig, ServerConfig, TenantConfig, TransportKind,
+    EgressTarget, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig, HubTlsConfig,
+    IngressRule, LoggingConfig, MetricsConfig, ServerConfig, TenantConfig, TransportKind,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -58,6 +58,7 @@ pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) ->
             listen_addr: metrics,
             path: "/metrics".to_string(),
         },
+        policy: Default::default(),
         audit: Default::default(),
         logging: LoggingConfig {
             // Own-crate debug on top of info: the QUIC transport-stats sampler
@@ -88,7 +89,7 @@ pub fn egress_agent_config(
     let mut cfg = base_agent_config("egress", hub_endpoint, transport, certs);
     cfg.egress = vec![EgressRule {
         name: "sse".to_string(),
-        target_addr: backend,
+        target: EgressTarget::Addr(backend),
         target_protocol: StreamProto::Tcp,
         udp_idle_timeout_secs: None,
     }];
@@ -189,6 +190,69 @@ fn base_agent_config(
 
 /// Serialize a config to the JSON handoff file consumed by
 /// `interflow-soak-node`.
+/// Bound-address handoff from a hub subprocess: the runner reads it back
+/// instead of pre-picking ports (`:0` materializes in the child).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HubReadyFile {
+    pub listen: SocketAddr,
+    pub metrics: Option<SocketAddr>,
+}
+
+/// Bound ingress-address handoff from an agent subprocess.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentReadyFile {
+    pub ingress: std::collections::HashMap<String, SocketAddr>,
+}
+
+/// Atomic (tmp+rename) ready-file write: the reader either sees the old
+/// file or the complete new one, never a torn write.
+pub fn write_hub_ready(path: &Path, ready: HubReadyFile) -> SoakResult<()> {
+    write_ready_atomic(path, &ready)
+}
+
+pub fn write_agent_ready(path: &Path, ready: AgentReadyFile) -> SoakResult<()> {
+    write_ready_atomic(path, &ready)
+}
+
+fn write_ready_atomic<T: serde::Serialize>(path: &Path, payload: &T) -> SoakResult<()> {
+    let tmp = path.with_extension("ready.tmp");
+    let text = serde_json::to_string(payload)
+        .map_err(|e| SoakError::msg(format!("serialize ready file {}: {e}", path.display())))?;
+    std::fs::write(&tmp, text)
+        .map_err(|e| SoakError::msg(format!("write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        SoakError::msg(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })
+}
+
+/// Poll a ready file until it parses (the child writes it atomically once
+/// every listener is bound) or the timeout elapses. A stale file from a
+/// previous run is the caller's business: delete it before spawning.
+pub async fn wait_ready_file<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    timeout: Duration,
+) -> SoakResult<T> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(ready) = serde_json::from_str(&text) {
+                return Ok(ready);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(SoakError::msg(format!(
+                "ready file {} not written within {timeout:?}",
+                path.display()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 pub fn write_json<T: serde::Serialize>(path: &Path, cfg: &T) -> SoakResult<()> {
     let text = serde_json::to_string(cfg)
         .map_err(|e| SoakError::msg(format!("serialize {}: {e}", path.display())))?;
@@ -218,6 +282,7 @@ pub fn spawn_mesh(
     log_path: &Path,
     name: &'static str,
     extra_env: &[(&str, &str)],
+    ready_path: Option<&Path>,
 ) -> SoakResult<MeshProcess> {
     let open = || {
         std::fs::OpenOptions::new()
@@ -227,6 +292,9 @@ pub fn spawn_mesh(
     };
     let mut cmd = Command::new(bin);
     cmd.arg(subcommand).arg("--json").arg(config_path);
+    if let Some(ready) = ready_path {
+        cmd.arg("--ready-file").arg(ready);
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

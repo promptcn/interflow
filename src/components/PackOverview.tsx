@@ -13,6 +13,7 @@ export default function PackOverview({
   onRefresh,
   onOpenPack,
   onUpdateLocal,
+  onIssuePack,
 }: {
   packs: DeployPackDto[];
   out: string;
@@ -22,6 +23,7 @@ export default function PackOverview({
   onRefresh: () => void;
   onOpenPack: (dirName: string) => void;
   onUpdateLocal: (pack: DeployPackDto) => void;
+  onIssuePack: () => void;
 }) {
   const updateAvailable = (pack: DeployPackDto) =>
     !!pack.local_node && pack.local_node.generation < pack.generation;
@@ -44,6 +46,9 @@ export default function PackOverview({
           </button>
           <button disabled={busy} onClick={onRefresh}>
             Refresh
+          </button>
+          <button className="primary" disabled={busy} onClick={onIssuePack} title="append a node to the manifest, apply, seal into Downloads">
+            + Issue pack…
           </button>
         </div>
       </div>

@@ -1,0 +1,10 @@
+[package]
+name = "interflow-buildinfo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Compile-time build identity (one BUILD_TAG for every Interflow binary)"
+
+[lints]
+workspace = true

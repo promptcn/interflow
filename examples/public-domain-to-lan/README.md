@@ -87,7 +87,18 @@ curl --fail -H 'Host: app.example.com' http://127.0.0.1:8443/
    interflow plan apply --manifest interflow.toml --issuer issuer --out dist
    ```
 
-3. Distribute only the packs (or seal them first with `interflow pack seal`):
+   More agents later — no TOML editing (the append is non-destructive and
+   the edited manifest is fully validated before anything is written):
+
+   ```bash
+   interflow node add agent/<name> --manifest interflow.toml --service web:127.0.0.1:3001
+   interflow plan apply --manifest interflow.toml --issuer issuer --out dist
+   ```
+
+3. Distribute only the packs (or seal them first —
+   `interflow pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
+   writes the `.iflowpack` beside the pack and prints the 144-bit
+   passphrase once):
 
    | Host | Material |
    |---|---|

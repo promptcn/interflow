@@ -13,9 +13,7 @@
     unused_mut
 )]
 use interflow_mesh::agent::AgentState;
-use interflow_testkit::{
-    agent_config, certs::TestCerts, hub_config, pick_ephemeral_port, spawn_agent,
-};
+use interflow_testkit::{agent_config, certs::TestCerts, hub_config, spawn_agent};
 use std::time::Duration;
 use tokio::net::TcpStream;
 
@@ -29,9 +27,8 @@ fn certs() -> &'static TestCerts {
 /// never reaches Connected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn untrusted_ca_agent_fails_to_register() {
-    let hub_port = pick_ephemeral_port();
-    let hub_cfg = hub_config(hub_port, certs(), vec![]);
-    let _hub = interflow_testkit::spawn_hub(hub_cfg).await;
+    let _hub = interflow_testkit::spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     // A different TestCerts instance = a different CA the hub never trusted.
     let rogue = TestCerts::generate("rogue", "bad-agent");
@@ -74,9 +71,8 @@ async fn untrusted_ca_agent_fails_to_register() {
 /// The trusted-CA control case registers normally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trusted_ca_agent_can_register() {
-    let hub_port = pick_ephemeral_port();
-    let hub_cfg = hub_config(hub_port, certs(), vec![]);
-    let _hub = interflow_testkit::spawn_hub(hub_cfg).await;
+    let _hub = interflow_testkit::spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let cfg = agent_config("good-agent", hub_port, certs());
     let agent_handle = spawn_agent(cfg);

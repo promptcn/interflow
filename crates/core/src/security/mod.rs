@@ -9,7 +9,10 @@ pub mod http_head;
 pub mod proxy_protocol;
 pub mod rate_limit;
 
-pub use audit::{AuditEvent, AuditKind, AuditSink};
+pub use audit::{
+    AuditEvent, AuditKind, AuditSink, AuditVerifyError, AuditVerifyReport, discover_audit_files,
+    verify_audit_files,
+};
 pub use conn_limit::{ConnGuard, ConnTracker};
 pub use forwarded_for::{XffError, XffMode, XffPolicy, XffResolution};
 pub use http_head::{

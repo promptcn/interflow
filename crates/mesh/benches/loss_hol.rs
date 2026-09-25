@@ -48,7 +48,7 @@ use interflow_testkit::config::{
 };
 use interflow_testkit::impair::{DropPattern, ImpairConfig, TcpImpairProxy, UdpImpairProxy};
 use interflow_testkit::metrics::{LatencyStats, fmt_ms, latency_stats};
-use interflow_testkit::stack::{pick_ephemeral_port, spawn_agent, spawn_hub, wait_for_tcp};
+use interflow_testkit::stack::{spawn_agent, spawn_hub};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -335,19 +335,16 @@ async fn run_scenario(
     rep: u32,
     seed: u64,
 ) -> Result<ScenarioResult, String> {
-    let hub_port = pick_ephemeral_port();
-    let hub_addr: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
-    let ingress_port = pick_ephemeral_port();
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
-
     let interval = Duration::from_millis(args.chunk_interval_ms);
     let (backend_addr, _backend, backend_task) = sse_backend(args.chunk_bytes, interval).await;
 
     // Hub: TLS + QUIC dual stack (the same hub shape for both transports,
     // ensuring comparability)
-    let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
+    let mut hub_cfg = hub_quic_config(0, certs(), Vec::new());
     unlock_stream_limits(&mut hub_cfg);
     let hub = spawn_hub(hub_cfg).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
+    let hub_addr: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
     // Impairment proxies (egress↔hub link; ingress connects directly without
     // impairment)
@@ -412,11 +409,15 @@ async fn run_scenario(
     ingress_cfg.tls = Some(tls);
     ingress_cfg.ingress = vec![tcp_ingress_rule(
         "sse",
-        ingress_addr,
+        "127.0.0.1:0".parse().unwrap(),
         "egress",
         Some(backend_addr),
     )];
     let ingress = spawn_agent(ingress_cfg);
+    let ingress_addr = ingress
+        .wait_ingress_addr("sse", Duration::from_secs(20))
+        .await
+        .expect("ingress listener bound");
 
     // Ready → sample → collect events (failures still flow into the teardown
     // close-out, no leaks: a leaked agent's supervisor retries forever and
@@ -435,9 +436,6 @@ async fn run_scenario(
                 ingress.state()
             ));
         }
-        wait_for_tcp(ingress_addr, Duration::from_secs(10))
-            .await
-            .map_err(|e| format!("ingress listener not ready: {e}"))?;
 
         // Consumers: N concurrent streams, sampling for the full duration
         let duration = Duration::from_secs(args.duration_secs);

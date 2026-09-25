@@ -53,9 +53,36 @@ pub struct HubConfig {
     /// Audit log.
     #[serde(default)]
     pub audit: AuditConfig,
+    /// The signed-policy publication face: what `PUT /policy` verifies
+    /// against and where accepted updates persist. Absent on non-pack hubs
+    /// (the embedded expose edge) — the endpoint then 404s.
+    #[serde(default)]
+    pub policy: PolicyAdminConfig,
     /// Logging configuration.
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+/// The signed-policy publication face (`PUT /policy`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct PolicyAdminConfig {
+    /// The ed25519 policy verifying key (hex) — the trust bundle's
+    /// `policy_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_key_hex: Option<String>,
+    /// Where accepted updates persist (`<pack>/state/policy`) — the same
+    /// files the reload watcher polls and nodes' manual drops use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_policy_dir: Option<std::path::PathBuf>,
+    /// The pack's embedded policy snapshot (`<pack>/policy`) — served when
+    /// no update has been published yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_policy_dir: Option<std::path::PathBuf>,
+    /// The generation this hub currently serves (anti-rollback floor for
+    /// publications).
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// Hub-side transport tuning: h2 keepalive plus the QUIC listener section.

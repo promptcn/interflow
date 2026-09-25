@@ -13,6 +13,7 @@
 use interflow_core::error::Result;
 use interflow_core::tunnel::{AgentTunnel, SessionSlot};
 use serde::Serialize;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -20,6 +21,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+use crate::agent::ingress_addrs::IngressAddrs;
 
 /// Agent lifecycle state (broadcast via watch; each change overwrites the
 /// old value).
@@ -64,6 +67,7 @@ pub struct AgentHandle {
     join: JoinHandle<Result<()>>,
     established: Arc<AtomicU64>,
     ingress_ready: watch::Receiver<bool>,
+    ingress_addrs: Arc<IngressAddrs>,
 }
 
 /// Context used inside the supervisor to emit state/events.
@@ -92,6 +96,7 @@ impl EventSink {
 }
 
 impl AgentHandle {
+    #[allow(clippy::too_many_arguments)] // channel/state handles are passed explicitly one by one
     pub(crate) const fn new(
         state_rx: watch::Receiver<AgentState>,
         events_rx: mpsc::Receiver<AgentEvent>,
@@ -101,6 +106,7 @@ impl AgentHandle {
         join: JoinHandle<Result<()>>,
         established: Arc<AtomicU64>,
         ingress_ready: watch::Receiver<bool>,
+        ingress_addrs: Arc<IngressAddrs>,
     ) -> Self {
         Self {
             state_rx,
@@ -111,6 +117,7 @@ impl AgentHandle {
             join,
             established,
             ingress_ready,
+            ingress_addrs,
         }
     }
 
@@ -172,6 +179,24 @@ impl AgentHandle {
             }
         }
         false
+    }
+
+    /// The actually-bound listen address of an ingress rule, once a session
+    /// has bound it. A `:0` (kernel-assigned) listen port materializes here —
+    /// this is how a `:0` ingress config is observed without racing a
+    /// pick-then-bind window. The address is pinned across session rebuilds,
+    /// so it stays valid (and identical) after a reconnect.
+    pub fn ingress_addr(&self, rule: &str) -> Option<SocketAddr> {
+        self.ingress_addrs.get(rule)
+    }
+
+    /// Resolve once the rule has a bound address, or `None` on timeout.
+    ///
+    /// The address is already recorded by the time the session's ingress
+    /// handlers report readiness, so pairing this with
+    /// [`wait_ingress_ready`](Self::wait_ingress_ready) is race-free.
+    pub async fn wait_ingress_addr(&self, rule: &str, timeout: Duration) -> Option<SocketAddr> {
+        self.ingress_addrs.wait_addr(rule, timeout).await
     }
 
     /// Whether the supervisor task has ended (for any reason).

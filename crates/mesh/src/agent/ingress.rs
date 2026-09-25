@@ -1,10 +1,12 @@
 use crate::agent::control::{ControlOpError, IngressCommand};
+use crate::agent::ingress_addrs::IngressAddrs;
 use crate::agent::rules::RuleStore;
 use crate::config::IngressRule;
 use interflow_core::error::{InterflowError, Result};
 use interflow_core::protocol::{CloseReason, StreamProto};
 use interflow_core::tunnel::AgentTunnel;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -55,6 +57,14 @@ pub struct IngressHandler {
     tracker: TaskTracker,
     command_rx: Option<mpsc::Receiver<IngressCommand>>,
     guard: ListenerGuard,
+    /// The rule each currently-bound listener serves (the reconcile base for
+    /// signed-policy reloads: a same-name rule with different fields is a
+    /// replace, not a skip).
+    bound: HashMap<String, IngressRule>,
+    /// Agent-scoped table of actually-bound listener addresses: a `:0` port
+    /// materializes here at bind and the next session rebuild re-binds the
+    /// same concrete address (port pinning — see [`IngressAddrs`]).
+    addrs: Arc<IngressAddrs>,
     /// Mandatory inner-TLS runtime.
     e2e: Arc<crate::agent::e2e::E2eRuntime>,
     /// Readiness signal: set once a session has bound every rule in its
@@ -65,6 +75,7 @@ pub struct IngressHandler {
 }
 
 impl IngressHandler {
+    #[allow(clippy::too_many_arguments)] // session wiring handles are passed explicitly one by one
     pub fn new_with_tunnel(
         agent_id: String,
         tunnel: AgentTunnel,
@@ -72,6 +83,7 @@ impl IngressHandler {
         session: CancellationToken,
         tracker: TaskTracker,
         command_rx: Option<mpsc::Receiver<IngressCommand>>,
+        addrs: Arc<IngressAddrs>,
         e2e: Arc<crate::agent::e2e::E2eRuntime>,
         ingress_ready: tokio::sync::watch::Sender<bool>,
     ) -> Self {
@@ -83,6 +95,8 @@ impl IngressHandler {
             tracker,
             command_rx,
             guard: ListenerGuard(HashMap::new()),
+            bound: HashMap::new(),
+            addrs,
             e2e,
             ingress_ready,
         }
@@ -120,6 +134,9 @@ impl IngressHandler {
                         info!("Handled List command, returning {} rules", views.len());
                         let _ = resp_tx.send(views);
                     }
+                    IngressCommand::Sync(desired) => {
+                        self.handle_sync(desired).await;
+                    }
                 }
             }
         } else {
@@ -127,6 +144,61 @@ impl IngressHandler {
         }
 
         Ok(())
+    }
+
+    /// Signed-policy reload: reconcile the live listener set against the
+    /// new rule face. Added or changed rules bind (same-name change stops
+    /// the old listener first); removed rules stop. The store (rule truth)
+    /// has already been replaced by the reloader — this only reconciles the
+    /// runtime face, so a listener that fails to bind is loud but never
+    /// reverts the signed truth.
+    async fn handle_sync(&mut self, desired: Vec<IngressRule>) {
+        let mut added = 0usize;
+        let mut changed = 0usize;
+        let mut removed = 0usize;
+        // Stop listeners whose rule is gone.
+        let names: Vec<String> = self.bound.keys().cloned().collect();
+        for name in names {
+            if !desired.iter().any(|r| r.name == name) {
+                if let Some(handle) = self.guard.0.remove(&name) {
+                    info!("Policy reload stopped ingress listener: {name}");
+                    handle.abort();
+                }
+                self.addrs.remove(&name);
+                self.bound.remove(&name);
+                removed += 1;
+            }
+        }
+        // Bind new rules and replace changed ones.
+        for rule in desired {
+            let name = rule.name.clone();
+            let unchanged = self
+                .bound
+                .get(&name)
+                .is_some_and(|current| *current == rule);
+            if unchanged {
+                continue;
+            }
+            let is_change = self.bound.contains_key(&name);
+            if let Some(old) = self.guard.0.remove(&name) {
+                info!("Policy reload replacing ingress listener: {name}");
+                old.abort();
+            }
+            match self.start_listener(rule).await {
+                Ok(()) => {
+                    if is_change {
+                        changed += 1;
+                    } else {
+                        added += 1;
+                    }
+                }
+                Err(e) => {
+                    error!("Policy reload failed to bind ingress listener {name}: {e}");
+                    self.bound.remove(&name);
+                }
+            }
+        }
+        info!("Policy reload reconciled ingress listeners: +{added} ~{changed} -{removed}");
     }
 
     /// Add: start the listener first (the fallible runtime side effect), then
@@ -166,7 +238,21 @@ impl IngressHandler {
         };
         info!("Stopping ingress listener: {}", name);
         handle.abort();
+        self.addrs.remove(name);
+        self.bound.remove(name);
         self.store.remove_ingress(name).await.map_err(Into::into)
+    }
+
+    /// The address a rule's listener should bind: a `:0` config with a
+    /// previously-bound address pins to that concrete address so the port is
+    /// stable across session rebuilds; anything else binds as configured.
+    fn bind_target(&self, rule: &IngressRule) -> SocketAddr {
+        if rule.listen_addr.port() == 0
+            && let Some(pinned) = self.addrs.get(&rule.name)
+        {
+            return pinned;
+        }
+        rule.listen_addr
     }
 
     async fn start_listener(&mut self, rule: IngressRule) -> Result<()> {
@@ -176,10 +262,13 @@ impl IngressHandler {
                 rule.name
             )));
         }
+        let name = rule.name.clone();
         match rule.listen_protocol {
-            StreamProto::Tcp => self.start_tcp_listener(rule).await,
-            StreamProto::Udp => self.start_udp_listener(rule),
-        }
+            StreamProto::Tcp => self.start_tcp_listener(rule.clone()).await,
+            StreamProto::Udp => self.start_udp_listener(rule.clone()),
+        }?;
+        self.bound.insert(name, rule);
+        Ok(())
     }
 
     fn start_udp_listener(&mut self, rule: IngressRule) -> Result<()> {
@@ -188,8 +277,28 @@ impl IngressHandler {
             rule.listen_addr, rule.target_agent
         );
 
-        let socket = crate::agent::ingress_udp::bind_udp_socket(rule.listen_addr)
-            .map_err(InterflowError::Io)?;
+        let target = self.bind_target(&rule);
+        let socket = match crate::agent::ingress_udp::bind_udp_socket(target) {
+            Ok(s) => s,
+            // A pinned `:0` rebind can find the address taken (another
+            // process grabbed it between sessions) — fall back to the
+            // configured address and let the fresh bind re-record.
+            Err(e) if target != rule.listen_addr => {
+                warn!(
+                    "pinned ingress addr rebind failed ({e}); falling back to {}",
+                    rule.listen_addr
+                );
+                crate::agent::ingress_udp::bind_udp_socket(rule.listen_addr)
+                    .map_err(InterflowError::Io)?
+            }
+            Err(e) => return Err(InterflowError::Io(e)),
+        };
+        let actual = socket.local_addr().map_err(InterflowError::Io)?;
+        self.addrs.set(&rule.name, actual);
+        info!(
+            "Ingress (UDP) listener bound: {} -> {}",
+            actual, rule.target_agent
+        );
 
         let tunnel = self.tunnel.clone();
         let rule_clone = rule.clone();
@@ -218,9 +327,27 @@ impl IngressHandler {
             rule.listen_addr, rule.target_agent
         );
 
-        let listener = TcpListener::bind(rule.listen_addr)
-            .await
-            .map_err(InterflowError::Io)?;
+        let target = self.bind_target(&rule);
+        let listener = match TcpListener::bind(target).await {
+            Ok(l) => l,
+            // Same pinned-rebind fallback as the UDP path above.
+            Err(e) if target != rule.listen_addr => {
+                warn!(
+                    "pinned ingress addr rebind failed ({e}); falling back to {}",
+                    rule.listen_addr
+                );
+                TcpListener::bind(rule.listen_addr)
+                    .await
+                    .map_err(InterflowError::Io)?
+            }
+            Err(e) => return Err(InterflowError::Io(e)),
+        };
+        let actual = listener.local_addr().map_err(InterflowError::Io)?;
+        self.addrs.set(&rule.name, actual);
+        info!(
+            "Ingress listener bound: {} -> {}",
+            actual, rule.target_agent
+        );
 
         let agent_id = self.agent_id.clone();
         let tunnel = self.tunnel.clone();
@@ -377,7 +504,7 @@ impl IngressHandler {
                 }
                 let sid = stream_id;
                 let t2 = tunnel.clone();
-                interflow_core::tunnel::pump::pump_duplex(
+                let outcome = interflow_core::tunnel::pump::pump_duplex(
                     socket,
                     tls,
                     &pump_cfg,
@@ -393,6 +520,19 @@ impl IngressHandler {
                     },
                 )
                 .await;
+                // The budget cut a silent stream, not a dead peer: say so
+                // with the knobs that matter, so the operator's first stop
+                // is the manifest, not the journal archaeology.
+                if outcome.idle_expired {
+                    let budget = idle_timeout.as_secs();
+                    info!(
+                        "mesh ingress stream idle timeout: rule {} closed after {budget}s of \
+                         total silence (stream {stream_id}) — for requests that legitimately \
+                         stay silent (non-streaming LLM calls with long thinking), raise \
+                         `idle_timeout_secs` on this rule in the manifest",
+                        rule.name
+                    );
+                }
                 Ok(())
             }
             interflow_core::tunnel::e2e::E2eHandshakeOutcome::Failed { error } => {

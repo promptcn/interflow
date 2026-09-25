@@ -89,6 +89,12 @@ pub fn install(opts: &NodeInstall) -> interflow_core::error::Result<InstallRepor
 
     if system_target {
         ensure_system_user(&opts.user)?;
+        // The unit's ExecStart binary must exist before anything is swapped
+        // in: a missing engine otherwise surfaces only as a `Type=notify`
+        // start timeout whose journal never names the real cause. Non-system
+        // layouts (tests, containers) run no units, so the check is
+        // system-only.
+        ensure_engine_binary_in(Path::new(render::ENGINE_BIN_DIR), kind, mesh_role)?;
     }
 
     // Swap in: existing install becomes `<kind>-<node>.previous`.
@@ -255,6 +261,43 @@ fn running_as_root() -> bool {
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
 }
 
+/// Confirms the engine binary this node's unit will exec is present and
+/// executable. `bin_dir` is injectable so tests can stage a fake layout;
+/// production callers pass [`render::ENGINE_BIN_DIR`].
+fn ensure_engine_binary_in(
+    bin_dir: &Path,
+    kind: PackKind,
+    mesh_role: bool,
+) -> interflow_core::error::Result<()> {
+    let name = render::node_engine_binary(kind, mesh_role);
+    let path = bin_dir.join(name);
+    let missing = || {
+        interflow_core::error::InterflowError::config(format!(
+            "engine binary {} is missing, but this node's systemd unit execs it — copy the \
+             deployment's dist tree to this server and re-run install.sh so dist/bin/{name} \
+             lands in {}",
+            path.display(),
+            bin_dir.display(),
+        ))
+    };
+    let meta = std::fs::metadata(&path).map_err(|_| missing())?;
+    if !meta.is_file() {
+        return Err(missing());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err(interflow_core::error::InterflowError::config(format!(
+                "engine binary {} is present but not executable — a manual copy skipped \
+                 install.sh's permissions; re-run install.sh or chmod +x it",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn systemctl_available() -> bool {
     std::process::Command::new("systemctl")
         .arg("--version")
@@ -406,5 +449,54 @@ mod tests {
     fn wildcard_listens_probe_over_loopback() {
         assert_eq!(probe_address("0.0.0.0:8443"), "127.0.0.1:8443");
         assert_eq!(probe_address("127.0.0.1:16666"), "127.0.0.1:16666");
+    }
+
+    /// The acceptance case from the deployment review: a missing engine
+    /// binary must fail with the binary's full path named, before any unit
+    /// is written — not as an opaque `Type=notify` start timeout later.
+    #[test]
+    fn missing_engine_binary_is_named_in_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A hub node needs interflow-mesh; the layout has nothing.
+        let err =
+            ensure_engine_binary_in(dir.path(), PackKind::Hub, true).expect_err("must refuse");
+        let msg = err.to_string();
+        let expected = dir.path().join("interflow-mesh");
+        assert!(
+            msg.contains(expected.to_str().unwrap()),
+            "the binary's full path must lead the error: {msg}"
+        );
+        assert!(
+            msg.contains("install.sh"),
+            "the remedy must be named: {msg}"
+        );
+
+        // Present but not executable is its own failure.
+        let bin = dir.path().join("interflow-mesh");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let err =
+            ensure_engine_binary_in(dir.path(), PackKind::Hub, true).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("not executable"),
+            "{}",
+            err.to_string()
+        );
+
+        // Executable passes; plain ingress nodes want `interflow`, not
+        // `interflow-mesh`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        ensure_engine_binary_in(dir.path(), PackKind::Hub, true).unwrap();
+        let err = ensure_engine_binary_in(dir.path(), PackKind::Ingress, false)
+            .expect_err("ingress needs `interflow`");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(dir.path().join("interflow").to_str().unwrap()),
+            "{msg}"
+        );
+        assert!(!msg.contains("interflow-mesh"), "{msg}");
     }
 }

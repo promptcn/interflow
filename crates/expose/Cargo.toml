@@ -11,10 +11,12 @@ name = "interflow_expose"
 path = "src/lib.rs"
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.4" }
-interflow-mesh = { path = "../mesh", version = "0.4" }
+interflow-core = { path = "../core", version = "0.5" }
+interflow-mesh = { path = "../mesh", version = "0.5" }
 # Shared endpoint/authority parsing (hub QUIC addr derivation, Host routing)
-interflow-util = { path = "../util", version = "0.4" }
+interflow-util = { path = "../util", version = "0.5" }
+# Compile-time build identity (engine startup log line)
+interflow-buildinfo = { path = "../buildinfo", version = "0.5" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -50,20 +52,17 @@ rustls-acme = { version = "0.15.4", features = ["tokio"] }
 [target.'cfg(unix)'.dependencies]
 rlimit = "0.10"
 
-[build-dependencies]
-chrono = "0.4"
-
 [lints]
 workspace = true
 
 [dev-dependencies]
-interflow-certs = { path = "../certs", version = "0.4" }
+interflow-certs = { path = "../certs", version = "0.5" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tempfile = "3"
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
 # Shared test harness (certs for the QUIC e2e stack; fault-injection for the
 # self-healing tests; production graph unaffected)
-interflow-testkit = { path = "../testkit", version = "0.4", features = ["fault-injection"] }
+interflow-testkit = { path = "../testkit", version = "0.5", features = ["fault-injection"] }
 # e2e assertions on metrics counters (in-process recorder installed for direct snapshot reads)
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 

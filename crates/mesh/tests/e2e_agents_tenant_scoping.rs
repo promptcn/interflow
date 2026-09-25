@@ -6,6 +6,10 @@
 //! returned the whole registry): a hub trusting two tenant CAs, one agent
 //! registered under each; each connection's `/agents` must contain its own
 //! tenant's qualified key and must not leak the other tenant's.
+//!
+//! This file is also where the `/agents` wire contract is pinned (the
+//! `leaf_expiry` credential-health object of 56ecddf), via the typed
+//! consumer mirror in `interflow_testkit::hub_http`.
 
 #![allow(
     clippy::all,
@@ -18,16 +22,16 @@
     dead_code,
     unused_mut
 )]
-use http_body_util::BodyExt;
+use hyper::Request;
 use hyper::client::conn::http2::SendRequest;
-use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use interflow_core::tunnel::H2RequestBody;
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig, TenantConfig};
 use interflow_mesh::hub::qualified_agent_id;
 use interflow_testkit::certs::TestCerts;
 use interflow_testkit::{
-    TEST_TENANT, hub_config_tuned, pick_ephemeral_port, spawn_hub, tls_client_connect_with,
+    LeafPhaseWire, TEST_TENANT, has_agent, hub_config_tuned, list_agents, spawn_hub,
+    tls_client_connect_with,
 };
 
 fn tenant_a_certs() -> &'static TestCerts {
@@ -81,27 +85,10 @@ async fn register(snd: &mut SendRequest<H2RequestBody>, id: &str) -> hyper::Stat
     snd.send_request(req).await.expect("register").status()
 }
 
-async fn list_agents(snd: &mut SendRequest<H2RequestBody>) -> Vec<String> {
-    snd.ready().await.expect("ready");
-    let req = Request::builder()
-        .method("GET")
-        .uri("/agents")
-        .body(interflow_core::tunnel::empty_request_body())
-        .unwrap();
-    let resp: Response<hyper::body::Incoming> = snd.send_request(req).await.expect("agents");
-    assert!(
-        resp.status().is_success(),
-        "authenticated identity should be able to list its own tenant"
-    );
-    let body = resp.into_body().collect().await.expect("body").to_bytes();
-    serde_json::from_slice(&body).expect("agents json")
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agents_listing_is_tenant_scoped() {
-    let port = pick_ephemeral_port();
     let mut cfg = hub_config_tuned(
-        port,
+        0,
         tenant_a_certs(),
         vec![],
         HubSecurityConfig::default(),
@@ -116,7 +103,7 @@ async fn agents_listing_is_tenant_scoped() {
         crl_path: Some(tenant_b_certs().crl_path().display().to_string()),
         trusted_gateway: false,
     });
-    spawn_hub(cfg).await;
+    let port = spawn_hub(cfg).await.local_addr().expect("hub bound").port();
 
     let mut a = connect(port, tenant_a_certs(), tenant_a_certs(), "one").await;
     assert_eq!(register(&mut a, "one").await, 200);
@@ -128,21 +115,38 @@ async fn agents_listing_is_tenant_scoped() {
 
     let list_a = list_agents(&mut a).await;
     assert!(
-        list_a.contains(&own_key),
+        has_agent(&list_a, &own_key),
         "an identity should see its own tenant's agents: {list_a:?}"
     );
     assert!(
-        !list_a.contains(&other_key),
+        !has_agent(&list_a, &other_key),
         "tenant `{TEST_TENANT}` must not observe other-tenant agents: {list_a:?}"
+    );
+
+    // Pin the 56ecddf wire contract alongside the scoping semantics: the
+    // curl-able credential-health object (testkit leaves are issued at
+    // ~96% remaining — deterministically `healthy`).
+    let own = list_a
+        .iter()
+        .find(|e| e.agent == own_key)
+        .expect("own entry (presence asserted above)");
+    let expiry = own
+        .leaf_expiry
+        .as_ref()
+        .expect("testkit leaves parse, so leaf_expiry is present");
+    assert_eq!(expiry.phase, LeafPhaseWire::Healthy);
+    assert!(
+        expiry.remaining_secs > 0,
+        "a freshly issued leaf must report positive remaining time"
     );
 
     let list_b = list_agents(&mut b).await;
     assert!(
-        list_b.contains(&other_key),
+        has_agent(&list_b, &other_key),
         "an identity should see its own tenant's agents: {list_b:?}"
     );
     assert!(
-        !list_b.contains(&own_key),
+        !has_agent(&list_b, &own_key),
         "tenant `other` must not observe `{TEST_TENANT}` agents: {list_b:?}"
     );
 }

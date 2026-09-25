@@ -77,13 +77,15 @@ const READ_CHUNK: usize = 64 * 1024;
 
 /// Starts the QUIC listener. Returns an error when enabled but TLS
 /// certificates are missing (QUIC mandates TLS).
-pub(crate) async fn spawn_quic_listener(hub: std::sync::Arc<HubState>) -> Result<()> {
+pub(crate) async fn spawn_quic_listener(
+    hub: std::sync::Arc<HubState>,
+) -> Result<Option<std::net::SocketAddr>> {
     let (quic_cfg, tcp_listen) = {
         let cfg = hub.config.read().await;
         (cfg.transport.quic.clone(), cfg.server.listen_addr)
     };
     if !quic_cfg.enabled {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(tls) = hub.config.read().await.tls.clone() else {
@@ -141,7 +143,14 @@ pub(crate) async fn spawn_quic_listener(hub: std::sync::Arc<HubState>) -> Result
     server_config.transport_config(Arc::new(transport));
 
     let endpoint = quinn::Endpoint::server(server_config, listen_addr)?;
-    info!("Hub QUIC listener started: {listen_addr} (ALPN: interflow)");
+    let bound = endpoint.local_addr()?;
+    // An explicit `Some(:0)` QUIC port (kernel-assigned) materializes here:
+    // write the concrete endpoint back, mirroring the TCP address write-back,
+    // so config readers and the readiness signal see the real address.
+    if listen_addr.port() == 0 && quic_cfg.listen_addr.is_some() {
+        hub.config.write().await.transport.quic.listen_addr = Some(bound);
+    }
+    info!("Hub QUIC listener started: {bound} (ALPN: interflow)");
 
     let tasks = hub.tasks.clone();
     let shutdown = hub.shutdown.clone();
@@ -174,7 +183,7 @@ pub(crate) async fn spawn_quic_listener(hub: std::sync::Arc<HubState>) -> Result
             }
         }
     });
-    Ok(())
+    Ok(Some(bound))
 }
 
 /// One QUIC connection: control-stream registration + traffic-stream accept
@@ -416,6 +425,7 @@ async fn register_quic_agent(
             tenant: tenant.tenant,
             agent: agent_id.clone(),
             trusted_gateway: tenant.trusted_gateway,
+            leaf_validity_unix: interflow_core::tls::extract_leaf_validity_from_chain(&chain),
         });
     };
     let identity = identity?;
@@ -435,15 +445,16 @@ async fn register_quic_agent(
         if let Some(existing) = agents.get(&agent_key) {
             // QUIC registration overwrites an h2 session (same preemption
             // semantics, mirrored)
-            existing
-                .write()
-                .await
-                .install_channels(circuit, Some(quic_conn.clone()));
+            let mut session = existing.write().await;
+            session.install_channels(circuit, Some(quic_conn.clone()));
+            session.leaf_validity_unix = identity.leaf_validity_unix;
+            drop(session);
             existing.clone()
         } else {
             let arc = Arc::new(RwLock::new(AgentSession::new(
                 circuit,
                 Some(quic_conn.clone()),
+                identity.leaf_validity_unix,
             )));
             agents.insert(agent_key.clone(), arc.clone());
             arc

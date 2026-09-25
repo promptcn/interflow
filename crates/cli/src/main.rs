@@ -5,7 +5,7 @@
 
 mod doctor;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use interflow_cli::plan;
 use interflow_cli::runtime;
 use interflow_identity::pack::CredentialPack;
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "interflow",
-    version,
+    version = interflow_buildinfo::VERSION_WITH_TAG,
     about = "Identity-first tunnels: Ingress / Agent / Service / Route"
 )]
 struct Cli {
@@ -24,30 +24,63 @@ struct Cli {
     command: Command,
 }
 
+/// Which deployment face `setup` renders a starter for.
+#[derive(Subcommand, ValueEnum, Clone, Copy)]
+enum SetupFace {
+    /// Public hostname → LAN service (registrar-tier starter).
+    Expose,
+    /// Site-to-site relay (offline-tier starter).
+    Mesh,
+}
+
+/// `interflow audit …` subcommands.
+#[derive(Subcommand)]
+enum AuditCommand {
+    /// Replay the hash chain across the whole ledger: every record's
+    /// `record_hash` is recomputed, sequences advance, and every
+    /// `previous_hash` links to the preceding record (segments in chain
+    /// order, gzip segments transparent, the active file last).
+    Verify {
+        /// The ledger's `audit.jsonl`, or a directory containing one (a
+        /// pack directory).
+        path: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Create a deployment manifest template (the single source of truth).
     Setup {
+        /// Deployment face the template targets.
+        #[arg(long, value_enum, default_value_t = SetupFace::Expose)]
+        face: SetupFace,
         /// Realm identifier (a trust domain, e.g. `promptcn`).
         #[arg(long, default_value = "promptcn")]
         realm: String,
-        /// Public control endpoint hostname.
+        /// Public control endpoint hostname (expose face).
         #[arg(long, default_value = "relay.example.com")]
         control_endpoint: String,
-        /// Independent identity registrar endpoint.
+        /// Independent identity registrar endpoint (expose face).
         #[arg(long, default_value = "https://registrar.example.com")]
         registrar_endpoint: String,
-        /// First public hostname to route.
+        /// First public hostname to route (expose face).
         #[arg(long, default_value = "app.example.com")]
         host: String,
-        /// Name of the first agent node (the identity; see `(internal design notes)`).
+        /// Name of the first agent node (expose face; the identity; see
+        /// `(internal design notes)`).
         #[arg(long, default_value = "desktop")]
         agent: String,
-        /// Service id + local address for the first agent.
+        /// Service id + local address for the first agent (expose face).
         #[arg(long, default_value = "asr")]
         service: String,
         #[arg(long, default_value = "127.0.0.1:8080")]
         service_address: String,
+        /// Hub node name (mesh face).
+        #[arg(long, default_value = "central")]
+        hub_name: String,
+        /// Hub dial endpoint `host:port` agents reach it at (mesh face).
+        #[arg(long, default_value = "mesh.example.com:6666")]
+        hub_endpoint: String,
         /// Output manifest path.
         #[arg(long, default_value = "interflow.toml")]
         out: PathBuf,
@@ -91,6 +124,12 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// Verify an audit ledger (hash chain across the active file and all
+    /// sealed segments, gzip segments included).
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     /// Diagnose identity, trust, routes, and connectivity in product terms.
     Doctor {
         #[command(subcommand)]
@@ -112,6 +151,11 @@ enum Command {
         /// Output pack directory.
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Rebind the issuer store to this manifest when it is already bound
+        /// to another one (same realm). Only for the same deployment after a
+        /// move/rename — separate scenarios get their own realm + store.
+        #[arg(long)]
+        issuer_allow_shared: bool,
     },
     /// Revoke a credential by pack digest (records a deny entry + CRL).
     Revoke {
@@ -157,6 +201,37 @@ enum NodeOp {
         #[arg(long)]
         passphrase: bool,
     },
+    /// Append a node to the manifest — structured and non-destructive
+    /// (comments and layout stay; the edited manifest must pass the full
+    /// validation funnel before anything is written).
+    Add {
+        /// Node to add: `agent/<name>`, `ingress/<name>` or `hub/<name>`.
+        node: String,
+        #[arg(long, default_value = "interflow.toml")]
+        manifest: PathBuf,
+        /// Agent workspace (default: the manifest's sole workspace, else
+        /// `default`).
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Expose service `id:address`, repeatable (e.g. asr:127.0.0.1:8080).
+        #[arg(long = "service")]
+        service: Vec<String>,
+        /// Mesh listen rule `name:listen:remote@target-agent`, repeatable;
+        /// prefix `udp/` for UDP (listen/remote are IPv4 host:port — IPv6
+        /// or idle_timeout_secs tuning belong in the manifest itself).
+        #[arg(long = "mesh-ingress")]
+        mesh_ingress: Vec<String>,
+        /// Mesh serve rule `name:host:port` or `name:ip/prefix`, repeatable;
+        /// prefix `udp/` for UDP.
+        #[arg(long = "mesh-egress")]
+        mesh_egress: Vec<String>,
+        /// Workspaces this ingress serves, comma-separated (ingress only).
+        #[arg(long, value_delimiter = ',')]
+        ingress_workspaces: Vec<String>,
+        /// Hub dial endpoint `host:port` (hub only).
+        #[arg(long)]
+        endpoint: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -176,6 +251,11 @@ enum PlanCommand {
         /// Output root for packs and proxy configs.
         #[arg(long, default_value = "dist")]
         out: PathBuf,
+        /// Rebind the issuer store to this manifest when it is already bound
+        /// to another one (same realm). Only for the same deployment after a
+        /// move/rename — separate scenarios get their own realm + store.
+        #[arg(long)]
+        issuer_allow_shared: bool,
     },
 }
 
@@ -185,11 +265,17 @@ enum PackCommand {
     Seal {
         #[arg(long)]
         pack: PathBuf,
+        /// Output file (default: beside the pack directory,
+        /// `<pack dir name>.iflowpack`).
         #[arg(long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
         /// Passphrase (reads INTERFLOW_PACK_PASSPHRASE, then prompts).
         #[arg(long)]
         passphrase: bool,
+        /// Generate a 144-bit passphrase, seal with it, print it once —
+        /// skips the prompt entirely.
+        #[arg(long)]
+        generate_passphrase: bool,
         /// age recipient (age1...) instead of a passphrase.
         #[arg(long)]
         recipient: Option<String>,
@@ -232,6 +318,7 @@ async fn main() -> interflow_core::error::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Setup {
+            face,
             realm,
             control_endpoint,
             registrar_endpoint,
@@ -239,6 +326,8 @@ async fn main() -> interflow_core::error::Result<()> {
             agent,
             service,
             service_address,
+            hub_name,
+            hub_endpoint,
             out,
         } => {
             if out.exists() {
@@ -247,9 +336,8 @@ async fn main() -> interflow_core::error::Result<()> {
                     out.display()
                 )));
             }
-            std::fs::write(
-                &out,
-                plan::setup_template(
+            let template = match face {
+                SetupFace::Expose => plan::setup_template(
                     &realm,
                     &control_endpoint,
                     &registrar_endpoint,
@@ -258,11 +346,31 @@ async fn main() -> interflow_core::error::Result<()> {
                     &service,
                     &service_address,
                 ),
-            )?;
+                SetupFace::Mesh => plan::setup_mesh_template(&realm, &hub_name, &hub_endpoint),
+            };
+            std::fs::write(&out, template)?;
             println!("Manifest template written to {}", out.display());
             println!("Next:");
-            println!("  1. edit {} (realm, hostnames, services)", out.display());
-            println!("  2. interflow plan apply --manifest {}", out.display());
+            match face {
+                SetupFace::Expose => {
+                    println!(
+                        "  1. edit {} (or append nodes: interflow node add agent/<name> --service id:address)",
+                        out.display()
+                    );
+                    println!("  2. interflow plan apply --manifest {}", out.display());
+                }
+                // The skeleton ships no placeholder agent — the first node
+                // add is what makes the mesh manifest deployable.
+                SetupFace::Mesh => {
+                    println!(
+                        "  1. service side:   interflow node add agent/<name> --mesh-egress <rule>:127.0.0.1:8080"
+                    );
+                    println!(
+                        "     connect side:   interflow node add agent/<name> --mesh-ingress <rule>:127.0.0.1:8080:127.0.0.1:8080@<peer>"
+                    );
+                    println!("  2. interflow plan apply --manifest {}", out.display());
+                }
+            }
             Ok(())
         }
         Command::Plan { command } => match command {
@@ -276,8 +384,9 @@ async fn main() -> interflow_core::error::Result<()> {
                 manifest,
                 issuer,
                 out,
+                issuer_allow_shared,
             } => {
-                for line in plan::apply(&manifest, &issuer, &out)? {
+                for line in plan::apply(&manifest, &issuer, &out, issuer_allow_shared)? {
                     println!("{line}");
                 }
                 Ok(())
@@ -326,19 +435,80 @@ async fn main() -> interflow_core::error::Result<()> {
                 }
                 Ok(())
             }
+            NodeOp::Add {
+                node,
+                manifest,
+                workspace,
+                service,
+                mesh_ingress,
+                mesh_egress,
+                ingress_workspaces,
+                endpoint,
+            } => {
+                let (kind, name) = plan::AddNodeKind::parse(&node)?;
+                let spec = plan::AddNodeSpec {
+                    kind,
+                    node: name,
+                    workspace,
+                    services: service
+                        .iter()
+                        .map(|token| parse_service_flag(token))
+                        .collect::<interflow_core::error::Result<Vec<_>>>()?,
+                    mesh_ingress: mesh_ingress
+                        .iter()
+                        .map(|token| parse_mesh_ingress_flag(token))
+                        .collect::<interflow_core::error::Result<Vec<_>>>()?,
+                    mesh_egress: mesh_egress
+                        .iter()
+                        .map(|token| parse_mesh_egress_flag(token))
+                        .collect::<interflow_core::error::Result<Vec<_>>>()?,
+                    ingress_workspaces,
+                    hub_endpoint: endpoint,
+                };
+                let outcome = plan::add_node(&manifest, &spec)?;
+                println!(
+                    "✔ {} appended to {} (pack: packs/{}, backup: {}.bak)",
+                    node,
+                    manifest.display(),
+                    outcome.pack_dir_name,
+                    manifest.display()
+                );
+                println!(
+                    "Next: interflow plan apply --manifest {}",
+                    manifest.display()
+                );
+                Ok(())
+            }
         },
         Command::Pack { command } => match command {
             PackCommand::Seal {
                 pack,
                 out,
                 passphrase,
+                generate_passphrase,
                 recipient,
             } => {
+                // Default output: beside the pack directory, named after it.
+                let out = out.unwrap_or_else(|| {
+                    let name = pack
+                        .file_name()
+                        .map_or_else(|| "pack".to_owned(), |n| n.to_string_lossy().into_owned());
+                    pack.with_file_name(format!("{name}.iflowpack"))
+                });
                 let key = if let Some(recipient) = recipient {
                     SealKey::Recipient(recipient)
+                } else if generate_passphrase {
+                    // Generated 144-bit, printed exactly once — the same
+                    // local-terminal trust boundary as typing one in.
+                    let pass = interflow_identity::pack::sealed::generate_passphrase()
+                        .map_err(runtime::pack_error)?;
+                    seal(&pack, &out, &SealKey::Passphrase(pass.clone()))
+                        .map_err(runtime::pack_error)?;
+                    println!("sealed {} → {}", pack.display(), out.display());
+                    println!("passphrase (shown once): {pass}");
+                    return Ok(());
                 } else {
-                    let pass = read_passphrase(passphrase)?;
-                    SealKey::Passphrase(pass)
+                    SealKey::Passphrase(read_passphrase(passphrase)?)
                 };
                 seal(&pack, &out, &key).map_err(runtime::pack_error)?;
                 println!("sealed {} → {}", pack.display(), out.display());
@@ -400,6 +570,39 @@ async fn main() -> interflow_core::error::Result<()> {
                 Ok(())
             }
         },
+        Command::Audit {
+            command: AuditCommand::Verify { path },
+        } => {
+            let files = if path.is_dir() {
+                interflow_core::security::discover_audit_files(&path)
+            } else {
+                vec![path.clone()]
+            };
+            if files.is_empty() {
+                println!("no audit ledger found under {}", path.display());
+                return Ok(());
+            }
+            match interflow_core::security::verify_audit_files(&files) {
+                Ok(report) => {
+                    println!(
+                        "✔ audit ledger verified: {} record(s) across {} file(s), {} chain(s){}",
+                        report.records,
+                        report.segments,
+                        report.chains,
+                        if report.truncated_start {
+                            " (starts mid-chain: older segments were pruned by retention)"
+                        } else {
+                            ""
+                        }
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("✘ audit ledger broken: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Doctor { command } => command.run(),
         Command::Rotate {
             manifest,
@@ -407,6 +610,7 @@ async fn main() -> interflow_core::error::Result<()> {
             node,
             pack: pack_dir,
             out,
+            issuer_allow_shared,
         } => {
             for line in plan::rotate(
                 &manifest,
@@ -414,6 +618,7 @@ async fn main() -> interflow_core::error::Result<()> {
                 &node,
                 pack_dir.as_deref(),
                 out.as_deref(),
+                issuer_allow_shared,
             )? {
                 println!("{line}");
             }
@@ -452,4 +657,98 @@ fn read_passphrase(interactive: bool) -> interflow_core::error::Result<String> {
         ));
     }
     Ok(trimmed)
+}
+
+fn flag_error(message: String) -> interflow_core::error::InterflowError {
+    interflow_core::error::InterflowError::config(message)
+}
+
+/// `id:address` — the address keeps its own colons, so split at the first.
+fn parse_service_flag(token: &str) -> interflow_core::error::Result<plan::AddServiceSpec> {
+    let Some((id, address)) = token.split_once(':') else {
+        return Err(flag_error(format!(
+            "service {token:?} must look like id:address (e.g. asr:127.0.0.1:8080)"
+        )));
+    };
+    if id.is_empty() || address.is_empty() {
+        return Err(flag_error(format!(
+            "service {token:?} has an empty id or address"
+        )));
+    }
+    Ok(plan::AddServiceSpec {
+        id: id.to_owned(),
+        address: address.to_owned(),
+    })
+}
+
+/// `[udp/]name:listen:remote@target-agent`. listen and remote are IPv4
+/// host:port pairs — four colon-separated fields between the name and the
+/// `@`; IPv6 targets or `idle_timeout_secs` tuning belong in the manifest
+/// itself (the structured append is a shorthand, not a replacement).
+fn parse_mesh_ingress_flag(token: &str) -> interflow_core::error::Result<plan::AddMeshIngressSpec> {
+    let (udp, body) = match token.strip_prefix("udp/") {
+        Some(rest) => (true, rest),
+        None => (false, token),
+    };
+    let Some((body, target_agent)) = body.rsplit_once('@') else {
+        return Err(flag_error(format!(
+            "mesh ingress {token:?} must look like name:listen:remote@target-agent \
+             (e.g. ollama:127.0.0.1:11434:127.0.0.1:11434@home-win)"
+        )));
+    };
+    let Some((name, endpoints)) = body.split_once(':') else {
+        return Err(flag_error(format!(
+            "mesh ingress {token:?} has no :listen:remote after the rule name"
+        )));
+    };
+    let fields: Vec<&str> = endpoints.split(':').collect();
+    if fields.len() != 4 || fields.iter().any(|f| f.is_empty()) || name.is_empty() {
+        return Err(flag_error(format!(
+            "mesh ingress {token:?}: listen and remote must be IPv4 host:port pairs \
+             (IPv6 → edit the manifest)"
+        )));
+    }
+    Ok(plan::AddMeshIngressSpec {
+        name: name.to_owned(),
+        listen: format!("{}:{}", fields[0], fields[1]),
+        udp,
+        target_agent: target_agent.to_owned(),
+        remote_addr: format!("{}:{}", fields[2], fields[3]),
+        idle_timeout_secs: None,
+    })
+}
+
+/// `[udp/]name:addr` — `addr` is one concrete `host:port` (target_addr) or
+/// an `ip/prefix` range (target_cidr).
+fn parse_mesh_egress_flag(token: &str) -> interflow_core::error::Result<plan::AddMeshEgressSpec> {
+    let (udp, body) = match token.strip_prefix("udp/") {
+        Some(rest) => (true, rest),
+        None => (false, token),
+    };
+    let Some((name, addr)) = body.split_once(':') else {
+        return Err(flag_error(format!(
+            "mesh egress {token:?} must look like name:host:port or name:ip/prefix \
+             (e.g. ollama:127.0.0.1:11434, loopback:127.0.0.0/8)"
+        )));
+    };
+    if name.is_empty() || addr.is_empty() {
+        return Err(flag_error(format!(
+            "mesh egress {token:?} has an empty name or target"
+        )));
+    }
+    if addr.contains('/') {
+        Ok(plan::AddMeshEgressSpec {
+            name: name.to_owned(),
+            udp,
+            target_addr: None,
+            target_cidr: Some(addr.to_owned()),
+        })
+    } else {
+        Ok(plan::AddMeshEgressSpec {
+            name: name.to_owned(),
+            udp,
+            target_addr: Some(addr.to_owned()),
+            target_cidr: None,
+        })
+    }
 }

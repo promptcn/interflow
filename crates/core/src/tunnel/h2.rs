@@ -153,6 +153,69 @@ impl H2Tunnel {
         Ok(parsed.route_token)
     }
 
+    /// Pulls the hub's current signed policy bundle (`GET /policy`) over
+    /// this session's control plane — the policy watcher's zero-touch
+    /// distribution channel, as a conditional request: `seen` is the
+    /// generation the caller already holds, sent as `x-policy-seen`; a hub
+    /// serving at or below it answers `304` and this returns `Ok(None)`
+    /// (nothing new to apply). `Ok(None)` likewise when the hub carries no
+    /// policy face (an older hub); the caller verifies any served bytes
+    /// against its own trust anchor.
+    pub async fn pull_policy_h2(&self, seen: u64) -> Result<Option<crate::tunnel::PolicyFetch>> {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/policy")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .header("x-policy-seen", seen.to_string())
+            .body(empty_request_body())
+            .map_err(|e| {
+                InterflowError::connection("failed to build policy request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("policy pull timed out"))??;
+        if response.status() == StatusCode::NOT_FOUND
+            || response.status() == StatusCode::NOT_MODIFIED
+        {
+            return Ok(None);
+        }
+        if response.status() != StatusCode::OK {
+            return Err(InterflowError::connection(format!(
+                "policy pull rejected: {}",
+                response.status()
+            )));
+        }
+        let headers = response.headers();
+        let generation = headers
+            .get("x-policy-generation")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| {
+                InterflowError::protocol("policy pull response lacks a generation".to_string())
+            })?;
+        let signature = headers
+            .get("x-policy-signature")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                InterflowError::protocol("policy pull response lacks a signature".to_string())
+            })?;
+        let signature = hex::decode(signature.trim()).map_err(|e| {
+            InterflowError::protocol("policy signature is not hex".to_string()).with_source(e)
+        })?;
+        let body = response.into_body().collect().await?;
+        Ok(Some(crate::tunnel::PolicyFetch {
+            body: body.to_bytes(),
+            signature,
+            generation,
+        }))
+    }
+
     /// Creates the tunnel backend from an established HTTP/2 connection.
     ///
     /// Registration is done by the caller (`AgentClient`); this method only
@@ -808,6 +871,10 @@ fn upload_body_stream(
 
 #[async_trait]
 impl TunnelTransport for H2Tunnel {
+    async fn pull_policy(&self, seen: u64) -> Result<Option<crate::tunnel::PolicyFetch>> {
+        self.pull_policy_h2(seen).await
+    }
+
     async fn send_open_with(
         &self,
         stream_id: StreamId,

@@ -1,11 +1,5 @@
 import { useState } from "react";
-import {
-  api,
-  kindBlurb,
-  type AddNodeParams,
-  type PackInspection,
-  type Transport,
-} from "../api";
+import { api, formatRemainingSecs, kindBlurb, leafPhaseClass, type AddNodeParams, type PackInspection, type Transport } from "../api";
 import { KindBadge } from "./ui";
 
 /// The add-a-node flow: pick a pack directory (or import a sealed
@@ -190,6 +184,15 @@ export default function AddNodeDialog({
                   <dt>Mesh rules</dt>
                   <dd>
                     {inspection.mesh_ingress} ingress · {inspection.mesh_egress} egress
+                  </dd>
+                </>
+              )}
+              {inspection.credential && (
+                <>
+                  <dt>Credentials expire</dt>
+                  <dd className={leafPhaseClass(inspection.credential) || undefined}>
+                    {inspection.credential.not_after} ·{" "}
+                    {formatRemainingSecs(inspection.credential.remaining_secs)} left
                   </dd>
                 </>
               )}

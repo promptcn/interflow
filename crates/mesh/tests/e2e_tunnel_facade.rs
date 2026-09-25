@@ -36,10 +36,9 @@ use interflow_core::tls::{InnerTlsMaterial, inner_client_config};
 use interflow_core::tunnel::AgentTunnel;
 use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
 use interflow_core::tunnel::{InnerStreamHello, TargetSelector};
-use interflow_mesh::config::EgressRule;
+use interflow_mesh::config::{EgressRule, EgressTarget};
 use interflow_testkit::{
-    agent_config, echo_server, hub_config, pick_ephemeral_port, spawn_agent_registered, spawn_hub,
-    wait_agent_connected,
+    agent_config, echo_server, hub_config, spawn_agent_registered, spawn_hub, wait_agent_connected,
 };
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -133,16 +132,19 @@ async fn facade_round_trip(
 async fn facade_rides_across_session_rebuild() {
     // 1. Backend echo server + hub (front → egress allowed)
     let (echo_addr, _echo_handle) = echo_server().await;
-    let hub_port = pick_ephemeral_port();
+    // Port 0 on the first bind (kernel-assigned = owned); the materialized
+    // port is pinned for the restart below — the agents' hub address is
+    // baked into their configs.
     let acls = Vec::new();
-    let hub = spawn_hub(hub_config(hub_port, certs(), acls.clone())).await;
+    let hub = spawn_hub(hub_config(0, certs(), acls.clone())).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
 
     // 2. Egress agent serving the echo backend (waited to Connected: the
     //    first round trip must not race its registration)
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![EgressRule {
         name: "echo".to_string(),
-        target_addr: echo_addr,
+        target: EgressTarget::Addr(echo_addr),
         target_protocol: StreamProto::Tcp,
         udp_idle_timeout_secs: None,
     }];
@@ -197,7 +199,7 @@ async fn facade_rides_across_session_rebuild() {
     //    reconnects on its own backoff, and an Open routed to a
     //    not-yet-registered target is (correctly) rejected with a CLOSE
     //    ("Target agent not registered") — the CI flake this wait removes.
-    let _hub2 = spawn_hub(hub_config(hub_port, certs(), acls)).await;
+    let _hub2 = spawn_hub(hub_config(hub_port, certs(), acls)).await; // pinned concrete port
     assert!(
         wait_agent_connected(&front, Duration::from_secs(30)).await,
         "front agent should re-register after the hub returns (state: {:?})",
@@ -225,7 +227,8 @@ async fn facade_rides_across_session_rebuild() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn empty_slot_register_returns_sealed_channel() {
     // A started-but-never-connected agent: the slot stays empty.
-    let closed_port = pick_ephemeral_port();
+    // Guaranteed-refused by construction (below every ephemeral range).
+    let closed_port = interflow_testkit::refused_addr().port();
     let mut cfg = agent_config("never-connected", closed_port, certs());
     cfg.agent.connect_timeout_secs = 1;
     let agent = interflow_mesh::agent::AgentClient::new(cfg)

@@ -15,9 +15,9 @@ name = "interflow-registrar"
 path = "src/main.rs"
 
 [dependencies]
-interflow-identity = { path = "../identity", version = "0.4" }
+interflow-identity = { path = "../identity", version = "0.5" }
 # Shared endpoint/authority parsing for control-endpoint SAN extraction
-interflow-util = { path = "../util", version = "0.4" }
+interflow-util = { path = "../util", version = "0.5" }
 serde = { workspace = true }
 serde_json = "1"
 clap = { version = "4.6", features = ["derive"] }

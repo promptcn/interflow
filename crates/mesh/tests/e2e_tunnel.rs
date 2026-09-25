@@ -13,10 +13,9 @@
     unused_mut
 )]
 use interflow_core::protocol::StreamProto;
-use interflow_mesh::config::{EgressRule, IngressRule};
+use interflow_mesh::config::{EgressRule, EgressTarget, IngressRule};
 use interflow_testkit::{
-    agent_config, echo_round_trip, echo_server, hub_config, pick_ephemeral_port,
-    spawn_agent_registered, spawn_hub, wait_for_tcp,
+    agent_config, echo_round_trip, echo_server, hub_config, spawn_agent_registered, spawn_hub,
 };
 use std::time::Duration;
 
@@ -32,31 +31,28 @@ async fn full_tunnel_echo_round_trip() {
     // 1. Backend echo server
     let (echo_addr, _echo_handle) = echo_server().await;
 
-    // 2. Ports for each component
-    let hub_port = pick_ephemeral_port();
-    let ingress_listen_port = pick_ephemeral_port();
-
-    // 3. Hub config: allow ingress → egress
-    let hub_cfg = hub_config(hub_port, certs(), Vec::new());
+    // 2. Hub: port 0 = kernel-assigned at bind (no pick-then-bind race)
+    let hub_cfg = hub_config(0, certs(), Vec::new());
     let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
-    // 4. Egress agent: forwards requests to the echo server
+    // 3. Egress agent: forwards requests to the echo server
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![EgressRule {
         name: "echo".to_string(),
-        target_addr: echo_addr,
+        target: EgressTarget::Addr(echo_addr),
 
         target_protocol: StreamProto::Tcp,
         udp_idle_timeout_secs: None,
     }];
     let _egress = spawn_agent_registered(egress_cfg).await;
 
-    // 5. Ingress agent: listens on a local port and forwards streams to the
-    // egress agent
+    // 4. Ingress agent: listens on a kernel-assigned local port and forwards
+    // streams to the egress agent
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         name: "to-egress".to_string(),
-        listen_addr: format!("127.0.0.1:{ingress_listen_port}").parse().unwrap(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
         target_agent: "egress".to_string(),
         remote_addr: Some(echo_addr.to_string()),
 
@@ -67,15 +63,13 @@ async fn full_tunnel_echo_round_trip() {
         udp_egress_bytes_per_sec: 0,
     }];
     let _ingress = spawn_agent_registered(ingress_cfg).await;
-
-    // 6. Wait for the ingress listener to be ready
-    let ingress_addr: std::net::SocketAddr =
-        format!("127.0.0.1:{ingress_listen_port}").parse().unwrap();
-    wait_for_tcp(ingress_addr, Duration::from_secs(15))
+    // The bound-address report IS the readiness contract — no TCP probing.
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
         .await
-        .expect("ingress listener ready");
+        .expect("ingress listener bound");
 
-    // 7. Send data and expect it back unchanged
+    // 5. Send data and expect it back unchanged
     let payload = b"hello interflow tunnel\n".repeat(4);
     let response = echo_round_trip(ingress_addr, &payload)
         .await

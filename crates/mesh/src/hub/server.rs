@@ -67,6 +67,22 @@ pub struct HubServer {
     state: Arc<HubState>,
 }
 
+/// The actually-bound hub listener addresses.
+///
+/// Delivered by [`HubServer::run_until_signalled`]'s readiness signal; `:0`
+/// faces materialize here instead of racing a pick-then-bind window. `quic`
+/// is `None` when QUIC is disabled, and equals `tcp` in derived dual-stack
+/// mode (one shared port).
+#[derive(Debug, Clone, Copy)]
+pub struct HubReady {
+    /// The TCP listener's bound address.
+    pub tcp: std::net::SocketAddr,
+    /// The QUIC listener's bound address (an explicit `Some(:0)`
+    /// `transport.quic.listen_addr` materializes here; written back into
+    /// the shared config the same way the TCP address is).
+    pub quic: Option<std::net::SocketAddr>,
+}
+
 impl HubServer {
     /// Assembles a hub server. The mTLS TLS plane (acceptor + tenant
     /// derivation set) is initialized here; failures return an error
@@ -102,6 +118,35 @@ impl HubServer {
             "mTLS enabled: {} tenant trust root(s), client certs required, identity = (tenant, CN)",
             config.auth.tenants.len()
         );
+        // The policy publication channel: a bad key fails assembly (never a
+        // silently-dead control face).
+        let policy_channel = match (
+            config.policy.verifier_key_hex.clone(),
+            config.policy.state_policy_dir.clone(),
+        ) {
+            (Some(key_hex), Some(dir)) => {
+                let embedded_dir = config
+                    .policy
+                    .embedded_policy_dir
+                    .clone()
+                    .unwrap_or_else(|| dir.clone());
+                // Fail-loud validity probe: hex decodes and names a real
+                // verifying key, or assembly fails.
+                interflow_identity::policy::RuntimePolicy::verifying_key_from_hex(&key_hex)
+                    .map_err(|e| {
+                        InterflowError::config("policy verifying key is malformed".to_string())
+                            .with_source(e)
+                    })?;
+                Some(Arc::new(crate::hub::state::PolicyChannel {
+                    verifier_key_hex: key_hex,
+                    dir,
+                    embedded_dir,
+                    floor: std::sync::atomic::AtomicU64::new(config.policy.generation),
+                    cached: std::sync::RwLock::new(None),
+                }))
+            }
+            _ => None,
+        };
         let config: SharedHubConfig = Arc::new(RwLock::new(config));
         let state = Arc::new(HubState {
             agents: Arc::new(RwLock::new(HashMap::new())),
@@ -113,12 +158,22 @@ impl HubServer {
             rate_limiter,
             stream_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             audit: AuditSink::spawn(&original_audit_config),
+            policy_channel,
+            policy_pull_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            expiry_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conn_tracker,
             tasks: tokio_util::task::TaskTracker::new(),
             shutdown: tokio_util::sync::CancellationToken::new(),
         });
 
         Ok(Self { state })
+    }
+
+    /// The live shared config — the signed-policy reload path swaps the ACL
+    /// table through this handle (effective on the next Open; never a
+    /// listener rebuild).
+    pub fn shared_config(&self) -> crate::hub::SharedHubConfig {
+        Arc::clone(&self.state.config)
     }
 
     /// Runs until the server dies (error or task end) — the embedding entry
@@ -161,7 +216,7 @@ impl HubServer {
     pub async fn run_until_signalled(
         self,
         shutdown: tokio_util::sync::CancellationToken,
-        ready: tokio::sync::oneshot::Sender<std::net::SocketAddr>,
+        ready: tokio::sync::oneshot::Sender<HubReady>,
     ) -> Result<()> {
         self.run_until_inner(shutdown, Some(ready)).await
     }
@@ -169,7 +224,7 @@ impl HubServer {
     async fn run_until_inner(
         self,
         shutdown: tokio_util::sync::CancellationToken,
-        ready: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
+        ready: Option<tokio::sync::oneshot::Sender<HubReady>>,
     ) -> Result<()> {
         let (listen_addr, node) = {
             let config = self.state.config.read().await;
@@ -217,13 +272,16 @@ impl HubServer {
 
         // QUIC dual-stack listener (when enabled; failures propagate
         // immediately — configuration errors must not silently degrade)
-        crate::hub::quic::spawn_quic_listener(state.clone()).await?;
+        let quic_addr = crate::hub::quic::spawn_quic_listener(state.clone()).await?;
 
         // Both listeners are up (TCP bound above, QUIC spawned just before):
         // anyone waiting on the readiness signal may connect now. A dropped
         // receiver just means nobody is waiting.
         if let Some(ready) = ready {
-            let _ = ready.send(bound_addr);
+            let _ = ready.send(HubReady {
+                tcp: bound_addr,
+                quic: quic_addr,
+            });
         }
 
         loop {

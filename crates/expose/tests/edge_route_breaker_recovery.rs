@@ -38,7 +38,7 @@
 use interflow_expose::client::{ExposeArgs, LocalService};
 use interflow_expose::edge::{
     ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, Route,
-    RouteBreakerPolicy, WorkspaceTrust, run,
+    RouteBreakerPolicy, WorkspaceTrust,
 };
 use interflow_mesh::config::TransportKind;
 use interflow_testkit::metrics_harness::{metrics_handle, wait_counter_at_least};
@@ -47,13 +47,16 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// A dead backend target: hold an ephemeral port, release it — nothing
-/// listens there afterwards (connections are refused).
+/// A dead backend target: bind `:0` to materialize a port, then release —
+/// nothing listens there until phase 2 rebinds the backend on the same
+/// concrete port. Unix offers no reserve-but-don't-listen primitive, so the
+/// release-to-revive gap is a physical constraint; it is a few statements
+/// wide and fails loud (the revive bind panics) if another process steals
+/// the port.
 async fn dead_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    tokio::time::sleep(Duration::from_millis(50)).await;
     port
 }
 
@@ -125,18 +128,15 @@ async fn route_breaker_recovers_after_backend_returns() {
         .try_init();
 
     let backend_port = dead_port().await;
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
     // Route breaker: trip after 3 failing closes, cooldown 2s so the
     // recovery phase is fast.
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -167,13 +167,9 @@ async fn route_breaker_recovers_after_backend_returns() {
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    let edge_handle = tokio::task::spawn(run(edge_config));
-    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
-        .await
-        .expect("hub should start within 5s");
-    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
-        .await
-        .expect("edge listener should start within 5s");
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    let edge_listen = edge.public_addr();
+    let hub_port = edge.control_addr().port();
 
     let (client_cert, client_key) = certs.named_client_cert("expose-breaker-recovery");
     let client_args = ExposeArgs {
@@ -276,7 +272,7 @@ async fn route_breaker_recovers_after_backend_returns() {
         );
     }
 
-    edge_handle.abort();
+    edge.shutdown().await.expect("edge shutdown");
     client_handle.abort();
     backend_handle.abort();
 }

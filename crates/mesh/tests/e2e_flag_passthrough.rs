@@ -40,7 +40,7 @@ use interflow_core::protocol::{CircuitToken, RouteToken, StreamId};
 use interflow_core::tunnel::H2RequestBody;
 use interflow_core::tunnel::negotiation::{RegisterResponse, RouteResponse};
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
-use interflow_testkit::{hub_config_tuned, pick_ephemeral_port, spawn_hub};
+use interflow_testkit::{hub_config_tuned, spawn_hub};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -166,15 +166,17 @@ const OPEN_FLAG_COMBOS: [u8; 4] = [0x00, 0x08, 0x10, 0x18];
 /// notification source — the h2 rebuild contract in one table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_flags_survive_hub_relay_rebuild() {
-    let port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config_tuned(
-        port,
+    let port = spawn_hub(hub_config_tuned(
+        0,
         certs(),
         vec![],
         security(),
         HeartbeatConfig::default(),
     ))
-    .await;
+    .await
+    .local_addr()
+    .expect("hub bound")
+    .port();
 
     // Target agent first: Open delivery requires a registered target.
     let mut dst = connect(port, "dst").await;

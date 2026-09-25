@@ -24,11 +24,10 @@
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_mesh::config::{EgressRule, HeartbeatConfig, HubSecurityConfig, IngressRule};
 use interflow_testkit::{
-    agent_config, hub_config, hub_config_tuned, pick_ephemeral_port, spawn_agent, spawn_hub,
-    spawn_udp_echo, spawn_udp_echo_first_delayed, udp_client, udp_echo_round_trip, udp_egress_rule,
+    agent_config, hub_config, hub_config_tuned, spawn_agent, spawn_hub, spawn_udp_echo,
+    spawn_udp_echo_first_delayed, udp_client, udp_echo_round_trip, udp_egress_rule,
     udp_ingress_rule, udp_round_trip_once,
 };
-use std::net::SocketAddr;
 use std::time::Duration;
 
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
@@ -55,24 +54,26 @@ async fn serial_lock() -> tokio::sync::MutexGuard<'static, ()> {
 async fn udp_echo_round_trip_basic() {
     let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let _hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
-    let ingress_port = pick_ephemeral_port();
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
-        format!("127.0.0.1:{ingress_port}").parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
         "egress",
         Some(echo_addr),
     )];
     let _ingress = spawn_agent(ingress_cfg);
 
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
 
     for round in 0..3 {
         let payload = random_payload(64 + round * 37);
@@ -92,24 +93,26 @@ async fn udp_echo_round_trip_basic() {
 async fn udp_multiple_concurrent_clients() {
     let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let _hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
-    let ingress_port = pick_ephemeral_port();
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
-        format!("127.0.0.1:{ingress_port}").parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
         "egress",
         Some(echo_addr),
     )];
     let _ingress = spawn_agent(ingress_cfg);
 
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
 
     // First confirm the stack is ready
     let payload = random_payload(32);
@@ -145,8 +148,8 @@ async fn udp_multiple_concurrent_clients() {
 async fn udp_agent_restart_recovers() {
     let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let _hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
@@ -154,17 +157,19 @@ async fn udp_agent_restart_recovers() {
     let handle1 = start_agent(egress_cfg.clone());
     wait_state(&handle1, Duration::from_secs(10)).await;
 
-    let ingress_port = pick_ephemeral_port();
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
-        format!("127.0.0.1:{ingress_port}").parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
         "egress",
         Some(echo_addr),
     )];
     let _ingress = spawn_agent(ingress_cfg);
 
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
     let payload = random_payload(64);
     let resp = udp_echo_round_trip(ingress_addr, &payload, Duration::from_secs(15))
         .await
@@ -198,24 +203,26 @@ async fn udp_agent_restart_recovers() {
 async fn udp_large_datagrams_no_truncation() {
     let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let _hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
-    let ingress_port = pick_ephemeral_port();
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
-        format!("127.0.0.1:{ingress_port}").parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
         "egress",
         Some(echo_addr),
     )];
     let _ingress = spawn_agent(ingress_cfg);
 
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
 
     for size in [1500usize, 2048, 8192, 65000] {
         let payload = random_payload(size);
@@ -241,19 +248,19 @@ async fn udp_large_datagrams_no_truncation() {
 async fn udp_idle_session_recycled_and_slot_released() {
     let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
-    let hub_port = pick_ephemeral_port();
     let security = HubSecurityConfig {
         max_streams_per_agent: 3,
         ..HubSecurityConfig::default()
     };
     let _hub = spawn_hub(hub_config_tuned(
-        hub_port,
+        0,
         certs(),
         Vec::new(),
         security,
         HeartbeatConfig::default(),
     ))
     .await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     // The hub sees one long-lived association; the local budget is the
@@ -265,20 +272,22 @@ async fn udp_idle_session_recycled_and_slot_released() {
     }];
     let _egress = spawn_agent(egress_cfg);
 
-    let ingress_port = pick_ephemeral_port();
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         idle_timeout_secs: Some(6),
         ..udp_ingress_rule(
             "to-egress",
-            format!("127.0.0.1:{ingress_port}").parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             "egress",
             Some(echo_addr),
         )
     }];
     let _ingress = spawn_agent(ingress_cfg);
 
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
 
     // Stack-readiness probe (retries absorb agent registration latency). Keep
     // its socket alive so the OS cannot reuse this source port for c3 before
@@ -348,8 +357,8 @@ async fn udp_late_reply_after_recycle_does_not_wedge() {
     // The echo backend delays its first reply by 3s; both sides idle 1s → the
     // session is recycled before the reply arrives
     let (echo_addr, _echo) = spawn_udp_echo_first_delayed(Duration::from_secs(3)).await;
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let _hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![EgressRule {
@@ -358,20 +367,22 @@ async fn udp_late_reply_after_recycle_does_not_wedge() {
     }];
     let _egress = spawn_agent(egress_cfg);
 
-    let ingress_port = pick_ephemeral_port();
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         idle_timeout_secs: Some(1),
         ..udp_ingress_rule(
             "to-egress",
-            format!("127.0.0.1:{ingress_port}").parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             "egress",
             Some(echo_addr),
         )
     }];
     let _ingress = spawn_agent(ingress_cfg);
 
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
     let client = udp_client().await;
 
     // A data-plane probe cannot succeed under the delayed reply; use a fixed
@@ -405,14 +416,13 @@ async fn udp_late_reply_after_recycle_does_not_wedge() {
 async fn udp_rate_limit_drops_burst() {
     let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let _hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
-    let ingress_port = pick_ephemeral_port();
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         udp_per_ip_pps: 5,
@@ -420,14 +430,17 @@ async fn udp_rate_limit_drops_burst() {
         udp_egress_bytes_per_sec: 0,
         ..udp_ingress_rule(
             "to-egress",
-            format!("127.0.0.1:{ingress_port}").parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             "egress",
             Some(echo_addr),
         )
     }];
     let _ingress = spawn_agent(ingress_cfg);
 
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
     let client = udp_client().await;
 
     // First confirm the stack is ready (consumes 1 burst quota)
@@ -467,14 +480,13 @@ async fn udp_rate_limit_drops_burst() {
 async fn udp_rate_limit_high_pps_all_pass() {
     let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let _hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
     let _egress = spawn_agent(egress_cfg);
 
-    let ingress_port = pick_ephemeral_port();
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![IngressRule {
         udp_per_ip_pps: 1000,
@@ -482,14 +494,17 @@ async fn udp_rate_limit_high_pps_all_pass() {
         udp_egress_bytes_per_sec: 0,
         ..udp_ingress_rule(
             "to-egress",
-            format!("127.0.0.1:{ingress_port}").parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             "egress",
             Some(echo_addr),
         )
     }];
     let _ingress = spawn_agent(ingress_cfg);
 
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
     let client = udp_client().await;
 
     let probe = random_payload(16);
@@ -521,7 +536,6 @@ async fn udp_rate_limit_high_pps_all_pass() {
 async fn udp_hub_eviction_then_recovery() {
     let _serial = serial_lock().await;
     let (echo_addr, _echo) = spawn_udp_echo().await;
-    let hub_port = pick_ephemeral_port();
     let security = HubSecurityConfig {
         poll_grace_secs: 1,
         ..HubSecurityConfig::default()
@@ -532,13 +546,14 @@ async fn udp_hub_eviction_then_recovery() {
         max_missed: 2,
     };
     let _hub = spawn_hub(hub_config_tuned(
-        hub_port,
+        0,
         certs(),
         Vec::new(),
         security,
         heartbeat,
     ))
     .await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![udp_egress_rule("echo", echo_addr)];
@@ -548,17 +563,19 @@ async fn udp_hub_eviction_then_recovery() {
     let handle1 = start_agent(egress_cfg.clone());
     wait_state(&handle1, Duration::from_secs(10)).await;
 
-    let ingress_port = pick_ephemeral_port();
     let mut ingress_cfg = agent_config("ingress", hub_port, certs());
     ingress_cfg.ingress = vec![udp_ingress_rule(
         "to-egress",
-        format!("127.0.0.1:{ingress_port}").parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
         "egress",
         Some(echo_addr),
     )];
     let _ingress = spawn_agent(ingress_cfg);
 
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}").parse().unwrap();
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
     let payload = random_payload(64);
     let resp = udp_echo_round_trip(ingress_addr, &payload, Duration::from_secs(15))
         .await

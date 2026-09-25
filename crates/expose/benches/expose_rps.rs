@@ -79,7 +79,7 @@ mod setup {
 
     pub async fn spawn_stack() -> (
         SocketAddr,
-        JoinHandle<interflow_core::error::Result<()>>,
+        interflow_testkit::EdgeHandle,
         JoinHandle<Result<(), interflow_core::error::InterflowError>>,
         JoinHandle<()>,
     ) {
@@ -107,16 +107,12 @@ mod setup {
             }
         });
 
-        let edge_port = pick_port();
-        let hub_port = pick_port();
-        let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-        let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
-
         let certs = interflow_testkit::certs::TestCerts::generate("bench", "expose-test");
         let (principal_cert, principal_key) = certs.named_client_cert("edge");
         let edge_config = EdgeConfig {
-            listen_addr: edge_listen,
-            control_listen_addr: hub_listen,
+            // :0 = kernel-assigned; spawn_edge hands back the addresses
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            control_listen_addr: "127.0.0.1:0".parse().unwrap(),
             control_tls: ControlEndpointTls {
                 cert: certs.server_cert_path(),
                 key: certs.server_key_path(),
@@ -140,15 +136,11 @@ mod setup {
             agent_recovery_timeout: Duration::from_secs(120),
             ..EdgeConfig::default()
         };
-        let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_config));
+        let edge_handle = interflow_testkit::spawn_edge(edge_config).await;
+        let edge_listen = edge_handle.public_addr();
+        let hub_port = edge_handle.control_addr().port();
 
         // Wait for the edge listener to be ready
-        wait_for_tcp(edge_listen, Duration::from_secs(5))
-            .await
-            .expect("edge listener should start within 5s");
-        wait_for_tcp(hub_listen, Duration::from_secs(5))
-            .await
-            .expect("hub should start within 5s");
 
         let (client_cert, client_key) = certs.client_paths();
         let client_args = ExposeArgs {
@@ -178,11 +170,6 @@ mod setup {
         // it into memory at startup)
 
         (edge_listen, edge_handle, client_handle, echo_handle)
-    }
-
-    fn pick_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
     }
 
     async fn wait_for_tcp(addr: SocketAddr, timeout: Duration) -> std::io::Result<()> {

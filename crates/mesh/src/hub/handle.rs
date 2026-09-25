@@ -113,7 +113,7 @@ impl HubHandle {
             // the bound address) once the listeners are up, or ends first
             // (bind failure drops the ready sender before firing it).
             let ready_addr = tokio::select! {
-                addr = ready_rx => addr.ok(),
+                addr = ready_rx => addr.ok().map(|r| r.tcp),
                 joined = &mut task => {
                     let (lifecycle, result) = join_outcome(joined);
                     let _ = state_tx.send(lifecycle);

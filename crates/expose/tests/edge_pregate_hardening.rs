@@ -53,18 +53,12 @@ async fn spawn_stack(
     rate_per_ip_per_min: u32,
     audit_path: Option<PathBuf>,
 ) -> (SocketAddr, SocketAddr) {
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let http_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
-    let http_listen: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
-
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -99,20 +93,18 @@ async fn spawn_stack(
             directory_ca: None,
             cache_dir: std::env::temp_dir()
                 .join(format!("interflow-pregate-{}", uuid::Uuid::new_v4())),
-            http_listen,
+            http_listen: "127.0.0.1:0".parse().unwrap(),
         }),
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    tokio::task::spawn(interflow_expose::edge::run(edge_config));
-
-    // Wait only for the hub (+ a moment for the public listeners): touching
-    // :443 or :80 for readiness would consume rate tokens.
-    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
-        .await
-        .expect("hub should start within 5s");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    (edge_listen, http_listen)
+    // spawn_edge's readiness signal involves zero probe connections — the
+    // old "wait only for the hub" dance (rate tokens) is moot.
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    (
+        edge.public_addr(),
+        edge.acme_http_addr().expect("acme :80 face bound"),
+    )
 }
 
 /// Connects to `addr`, retrying briefly while the listener is still binding

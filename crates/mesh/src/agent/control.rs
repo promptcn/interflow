@@ -46,6 +46,12 @@ pub enum RuleCommand<R, V> {
     Remove(String, oneshot::Sender<Result<(), ControlOpError>>),
     /// List rules (with origin annotations).
     List(oneshot::Sender<Vec<V>>),
+    /// Wholesale reconciliation of the live session against a new signed
+    /// policy (the reload path). The rule truth (the store) has already been
+    /// replaced by the reloader; the handler reconciles its runtime face —
+    /// listeners for ingress, the per-session rules snapshot for egress —
+    /// to match `rules`. Fire-and-forget: the reloader owns the audit log.
+    Sync(Vec<R>),
 }
 
 /// The ingress plane's command shape (typed alias — consumers match on it

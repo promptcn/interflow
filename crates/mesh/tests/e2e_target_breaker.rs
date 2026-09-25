@@ -46,7 +46,7 @@ use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, metrics_harness::counter_value,
     metrics_harness::init_tracing, metrics_harness::metrics_handle,
-    metrics_harness::wait_counter_at_least, pick_ephemeral_port, spawn_hub,
+    metrics_harness::wait_counter_at_least, spawn_hub,
 };
 use std::net::SocketAddr;
 use std::sync::OnceLock;
@@ -240,14 +240,16 @@ async fn echo_on_port(port: u16) -> SocketAddr {
     addr
 }
 
-/// A dead target: grab an ephemeral port, briefly hold it, release —
-/// afterwards nothing listens there (connections are refused).
+/// A dead target: bind `:0` to materialize a port, then release — nothing
+/// listens there (connections refused) until the recovery phase rebinds an
+/// echo server on the same concrete port. Unix offers no
+/// reserve-but-don't-listen primitive, so the release-to-revive gap is a
+/// physical constraint; it is a few statements wide and fails loud (the
+/// revive bind panics) if another process steals the port.
 async fn dead_target() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    // Give the OS a moment to actually release the port.
-    tokio::time::sleep(Duration::from_millis(50)).await;
     // Sanity: connecting must be refused right now.
     assert!(
         TcpStream::connect(("127.0.0.1", port)).await.is_err(),
@@ -274,8 +276,8 @@ async fn b1_dead_target_storm_does_not_starve_healthy() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = echo_server().await;
     let dead = dead_target().await;
 
@@ -372,8 +374,8 @@ async fn b2_recovery_after_backend_starts() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = echo_server().await;
     let dead = dead_target().await;
 
@@ -448,8 +450,8 @@ async fn b3_disabled_breaker_restores_old_behavior() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = echo_server().await;
     let dead = dead_target().await;
 

@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 
 /// Rule origin: seeded from the startup policy / changed at runtime via the
-/// control API.
+/// control API / replaced wholesale by a signed-policy reload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleOrigin {
@@ -20,6 +20,8 @@ pub enum RuleOrigin {
     Startup,
     /// Added or changed at runtime via the control API.
     Api,
+    /// Replaced wholesale by a verified signed-policy reload.
+    Policy,
 }
 
 /// `GET /ingress` response entry: rule fields flattened + origin annotation.
@@ -138,6 +140,30 @@ impl RuleStore {
         Ok(())
     }
 
+    /// Wholesale ingress replacement from a verified signed-policy reload
+    /// (origin `Policy`). Atomic under one write lock — a reload is never
+    /// observed half-applied. Control-API-added rules do not survive a
+    /// policy reload: the signed policy is the whole truth.
+    pub async fn replace_ingress(&self, rules: Vec<IngressRule>) {
+        let n = rules.len();
+        let mut inner = self.inner.write().await;
+        inner.ingress = rules.into_iter().map(|r| (r, RuleOrigin::Policy)).collect();
+        drop(inner);
+        rule_change("ingress", "replace", "ok");
+        info!(target: "audit", kind = "ingress", count = n, "policy reload replaced ingress rules");
+    }
+
+    /// Wholesale egress replacement from a verified signed-policy reload
+    /// (origin `Policy`). Atomic under one write lock.
+    pub async fn replace_egress(&self, rules: Vec<EgressRule>) {
+        let n = rules.len();
+        let mut inner = self.inner.write().await;
+        inner.egress = rules.into_iter().map(|r| (r, RuleOrigin::Policy)).collect();
+        drop(inner);
+        rule_change("egress", "replace", "ok");
+        info!(target: "audit", kind = "egress", count = n, "policy reload replaced egress rules");
+    }
+
     /// Ingress rule snapshot (for the handler to start listeners).
     pub async fn ingress_snapshot(&self) -> Vec<IngressRule> {
         self.inner
@@ -250,7 +276,7 @@ mod tests {
     fn egress(name: &str, port: u16) -> EgressRule {
         EgressRule {
             name: name.into(),
-            target_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            target: crate::config::EgressTarget::Addr(format!("127.0.0.1:{port}").parse().unwrap()),
             target_protocol: interflow_core::protocol::StreamProto::Tcp,
             udp_idle_timeout_secs: None,
         }

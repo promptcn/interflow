@@ -1,35 +1,41 @@
-//! PROXY protocol v2 negotiation: restore the real client IP behind a
-//! PROXY-capable front (LB / nginx stream).
+//! PROXY protocol negotiation (v1 + v2): restore the real client IP behind
+//! a PROXY-capable front (LB / nginx stream).
 //!
 //! In the nginx-fronted topology both the edge public listener and the hub
 //! agent plane see every connection arriving from 127.0.0.1 — per-IP rate
 //! limits, per-IP connection caps and audit records all key on the proxy
-//! instead of the client. This module negotiates the PROXY protocol v2
+//! instead of the client. This module negotiates the PROXY protocol
 //! preamble under a strict fail-closed trust matrix. Note: the standard
 //! nginx **HTTP** `proxy_pass` leg cannot emit the PROXY protocol (that
 //! directive exists only in the stream module) — that topology uses the
 //! sibling `forwarded_for` module instead:
 //!
-//! | Source                        | Behavior                                            |
+//! | Source                                    | Behavior                                            |
 //! |---|---|
-//! | trusted proxy + v2 header     | real IP used for limiting / caps / audit / metrics  |
-//! | trusted proxy, no header, `required` | connection rejected                          |
-//! | **untrusted source + PROXY signature** | **hard reject** (anti-spoof)                 |
-//! | untrusted source, plain bytes | direct mode, the TCP peer is the real client        |
+//! | trusted proxy + v2 header                 | real IP used for limiting / caps / audit / metrics  |
+//! | trusted proxy + v1 header (strict form)   | same as v2 — stock nginx emits v1                   |
+//! | trusted proxy, no header, `required`      | connection rejected                                |
+//! | **untrusted source + PROXY signature (either version)** | **hard reject** (anti-spoof)       |
+//! | untrusted source, plain bytes             | direct mode, the TCP peer is the real client        |
 //!
 //! The derived IP is used for **resource governance and audit only** — never
 //! for identity or ACL decisions (identity is exclusively mTLS, RFC
 //! `(internal design notes)` §5.2).
 //!
 //! Parsing is delegated to the `ppp` crate (the ecosystem's de-facto
-//! standard; single dependency `thiserror`). Version 1 (text) headers are
-//! rejected: nginx always emits v2 and accepting v1 would widen the parser
-//! surface for no deployment benefit.
+//! standard; single dependency `thiserror`) for **both** versions — one
+//! audited grammar, not a hand-rolled twin. Version 1 (text) headers are
+//! accepted **only from explicitly trusted proxy sources**: stock nginx
+//! (the stream fragment's `proxy_protocol on;`) emits v1, while an
+//! untrusted emission stays a hard spoofing rejection. Our framing bounds
+//! the v1 parse surface before ppp sees it: one CRLF-terminated line of at
+//! most [`V1_MAX`] bytes, malformed → fail-closed.
 //!
-//! The read is exact (the v2 header self-describes its length), so a proxied
-//! connection never over-reads into payload bytes. A *direct* connection
-//! over-reads at most 12 bytes, returned in [`ProxyOutcome::Direct::read_back`]
-//! for replay (see [`PrefixedStream`]).
+//! The read stops exactly at each version's boundary (v2 self-describes its
+//! length; v1 ends at the CRLF), so a proxied connection never over-reads
+//! into payload bytes. A *direct* connection over-reads at most 12 bytes,
+//! returned in [`ProxyOutcome::Direct::read_back`] for replay (see
+//! [`PrefixedStream`]).
 
 use crate::error::{InterflowError, Result};
 use ipnetwork::IpNetwork;
@@ -44,8 +50,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 pub const V2_SIGNATURE: [u8; 12] = [
     0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a,
 ];
-/// v1 (text) preamble prefix — recognized only to reject it explicitly.
+/// v1 (text) preamble prefix — accepted from trusted proxies only; an
+/// untrusted emission of it is a hard spoofing rejection.
 const V1_PREFIX: &[u8; 6] = b"PROXY ";
+/// Total v1 (text) header cap including the trailing CRLF (spec limit: the
+/// longest well-formed `PROXY TCP6 …` line is 107 bytes). Bounds the text
+/// parse surface; anything longer is not a header we are willing to buffer.
+const V1_MAX: usize = 108;
 /// v2 fixed part: 12-byte signature + ver/cmd + fam/proto + u16 length.
 const V2_FIXED: usize = 16;
 /// Total header cap. A v2 header without TLVs is 16–36 bytes; our nginx sends
@@ -127,7 +138,8 @@ pub enum ProxyError {
     /// A trusted proxy sent a non-PROXY preamble while the mode is required.
     #[error("trusted proxy sent no PROXY header while mode=required")]
     RequiredMissing,
-    /// A trusted proxy sent v1 (not accepted) or a malformed v2 header.
+    /// A trusted proxy sent a malformed v1/v2 header (bad grammar, over the
+    /// size cap, or an address family we refuse — e.g. UNIX over TCP).
     #[error("malformed PROXY header: {0}")]
     Malformed(&'static str),
     /// Peer closed the stream or IO error while reading the preamble.
@@ -171,8 +183,9 @@ impl ProxyProtocolPolicy {
     ///
     /// The caller owns the time budget: wrap the call in a timeout (the edge
     /// reuses its host-peek budget, the hub uses its handshake deadline).
-    /// Exact reads mean a proxied connection over-reads nothing; a direct
-    /// connection over-reads at most 12 bytes (returned for replay).
+    /// The read stops exactly at each version's boundary, so a proxied
+    /// connection over-reads nothing; a direct connection over-reads at
+    /// most 12 bytes (returned for replay).
     pub async fn read<S: AsyncRead + Unpin>(
         &self,
         stream: &mut S,
@@ -185,27 +198,31 @@ impl ProxyProtocolPolicy {
         }
         let trusted = self.is_trusted(peer_ip);
 
-        // Phase 1: accumulate bytes until the preamble is decidable — the
-        // first byte alone rules out both signatures ('\r' for v2, 'P' for
-        // v1); a diverging prefix match short-circuits to Direct.
+        // Phase 1: read one byte at a time until the preamble is decidable
+        // — the first byte alone rules out both signatures ('\r' for v2,
+        // 'P' for v1); a diverging prefix match short-circuits to Direct.
+        // Byte orientation is load-bearing for v1: the text header has no
+        // length field, so a chunked read could swallow the TLS
+        // ClientHello that follows the CRLF (kernel segment coalescing
+        // makes that the common case, not an edge) and `Proxied` has no
+        // replay channel to hand those bytes back.
         let mut buf: Vec<u8> = Vec::with_capacity(V2_FIXED);
-        let mut tmp = [0u8; V2_FIXED];
+        let mut byte = [0u8; 1];
         loop {
-            let n = stream.read(&mut tmp).await?;
+            let n = stream.read(&mut byte).await?;
             if n == 0 {
                 // EOF before any decidable byte: treat as a (degenerate)
                 // direct connection — the subsequent protocol read hits the
                 // same EOF immediately.
                 return Ok(ProxyOutcome::Direct { read_back: buf });
             }
-            buf.extend_from_slice(&tmp[..n]);
+            buf.push(byte[0]);
             let class = classify_prefix(&buf);
             if class == PrefixClass::V1 {
-                return Err(if trusted {
-                    ProxyError::Malformed("PROXY v1 is not accepted (v2 only)")
-                } else {
-                    ProxyError::UntrustedSignature
-                });
+                if !trusted {
+                    return Err(ProxyError::UntrustedSignature);
+                }
+                return read_v1(stream, buf, peer_ip).await;
             }
             if class == PrefixClass::V2 && buf.len() >= V2_FIXED {
                 break;
@@ -222,9 +239,6 @@ impl ProxyProtocolPolicy {
                 } else {
                     Ok(ProxyOutcome::Direct { read_back: buf })
                 };
-            }
-            if buf.len() > V2_MAX {
-                return Err(ProxyError::Malformed("preamble exceeds size cap"));
             }
         }
 
@@ -254,10 +268,54 @@ impl ProxyProtocolPolicy {
         let effective = match header.addresses {
             ppp::v2::Addresses::IPv4(a) => IpAddr::V4(a.source_address),
             ppp::v2::Addresses::IPv6(a) => IpAddr::V6(a.source_address),
-            _ => return Err(ProxyError::Malformed("non-IP address family")),
+            // UNSPEC (UNKNOWN): the trusted front could not determine the
+            // client address — keep the connection, keyed under the front
+            // itself (same fallback as v1 UNKNOWN).
+            ppp::v2::Addresses::Unspecified => peer_ip,
+            // UNIX addressing over a TCP listener is nonsense, not unknown.
+            ppp::v2::Addresses::Unix(_) => {
+                return Err(ProxyError::Malformed("non-IP address family"));
+            }
         };
         Ok(ProxyOutcome::Proxied { effective })
     }
+}
+
+/// Reads a v1 (text) preamble to its CRLF terminator and parses it.
+///
+/// `buf` holds exactly the 6-byte `PROXY ` prefix — byte-at-a-time phase 1
+/// guarantees no more. Byte-oriented reads stop exactly at the CRLF so the
+/// payload that follows (typically a TLS ClientHello) is never consumed;
+/// the line is capped at [`V1_MAX`] bytes before the grammar is applied,
+/// and the grammar itself is the same audited `ppp` parser the v2 path
+/// uses. `UNKNOWN` falls back to the TCP peer, mirroring v2 UNSPEC.
+async fn read_v1<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    mut buf: Vec<u8>,
+    peer_ip: IpAddr,
+) -> std::result::Result<ProxyOutcome, ProxyError> {
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            return Err(ProxyError::Malformed("EOF inside v1 header"));
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n") {
+            break;
+        }
+        if buf.len() >= V1_MAX {
+            return Err(ProxyError::Malformed("v1 header exceeds size cap"));
+        }
+    }
+    let header = ppp::v1::Header::try_from(buf.as_slice())
+        .map_err(|_| ProxyError::Malformed("v1 parse failed"))?;
+    let effective = match header.addresses {
+        ppp::v1::Addresses::Tcp4(a) => IpAddr::V4(a.source_address),
+        ppp::v1::Addresses::Tcp6(a) => IpAddr::V6(a.source_address),
+        ppp::v1::Addresses::Unknown => peer_ip,
+    };
+    Ok(ProxyOutcome::Proxied { effective })
 }
 
 /// Prefix classification of the bytes read so far.
@@ -386,6 +444,15 @@ mod tests {
         h
     }
 
+    /// Builds a valid v2 UNKNOWN (UNSPEC family) header.
+    fn v2_unknown_header() -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&V2_SIGNATURE);
+        h.extend([0x21, 0x00]); // ver2 cmd PROXY, fam UNSPEC/dgram unspecified
+        h.extend([0x00, 0x00]); // len 0
+        h
+    }
+
     #[tokio::test]
     async fn off_mode_returns_direct_without_reading() {
         let mut cursor = std::io::Cursor::new(v2_header());
@@ -435,14 +502,126 @@ mod tests {
         assert!(matches!(err, ProxyError::UntrustedSignature));
     }
 
+    /// A v1 line exactly as stock nginx stream emits it (the front we
+    /// actually deploy).
+    const V1_TCP4: &[u8] = b"PROXY TCP4 198.51.100.7 10.0.0.1 47115 443\r\n";
+
     #[tokio::test]
-    async fn trusted_proxy_v1_is_rejected_as_malformed() {
-        let mut cursor = std::io::Cursor::new(b"PROXY ...".to_vec());
+    async fn trusted_proxy_v1_tcp4_yields_effective_ip() {
+        let mut cursor = std::io::Cursor::new(V1_TCP4.to_vec());
+        let out = policy(ProxyProtocolMode::On, &["127.0.0.1"])
+            .read(&mut cursor, "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, ProxyOutcome::Proxied { effective } if effective.to_string() == "198.51.100.7")
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_v1_tcp6_yields_effective_ip() {
+        let line = b"PROXY TCP6 2001:db8::7 2001:db8::1 47115 443\r\n".to_vec();
+        let mut cursor = std::io::Cursor::new(line.clone());
+        let out = policy(ProxyProtocolMode::Required, &["::1"])
+            .read(&mut cursor, "::1".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, ProxyOutcome::Proxied { effective } if effective.to_string() == "2001:db8::7")
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_v1_unknown_falls_back_to_peer() {
+        let mut cursor = std::io::Cursor::new(b"PROXY UNKNOWN\r\n".to_vec());
+        let out = policy(ProxyProtocolMode::On, &["127.0.0.1"])
+            .read(&mut cursor, "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, ProxyOutcome::Proxied { effective } if effective.to_string() == "127.0.0.1")
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_v2_unknown_falls_back_to_peer() {
+        // v1 and v2 UNKNOWN share one semantic: key the connection under
+        // the trusted front itself.
+        let mut cursor = std::io::Cursor::new(v2_unknown_header());
+        let out = policy(ProxyProtocolMode::On, &["127.0.0.1"])
+            .read(&mut cursor, "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, ProxyOutcome::Proxied { effective } if effective.to_string() == "127.0.0.1")
+        );
+    }
+
+    /// Load-bearing framing property: the v1 read stops exactly at the
+    /// CRLF — the payload that follows (a TLS ClientHello in production)
+    /// must stay in the stream for the protocol layer.
+    #[tokio::test]
+    async fn v1_consumes_exactly_the_header() {
+        let mut bytes = V1_TCP4.to_vec();
+        bytes.extend_from_slice(&[0x16, 0x03, 0x01]); // TLS ClientHello start
+        let mut cursor = std::io::Cursor::new(bytes);
+        policy(ProxyProtocolMode::On, &["127.0.0.1"])
+            .read(&mut cursor, "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            usize::try_from(cursor.position()).unwrap_or(usize::MAX),
+            V1_TCP4.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_missing_crlf_is_malformed() {
+        // Stream ends mid-line: fail-closed, not a silent passthrough.
+        let mut cursor = std::io::Cursor::new(b"PROXY TCP4 198.51.100.7 10.0.0.1 47115".to_vec());
         let err = policy(ProxyProtocolMode::On, &["127.0.0.1"])
             .read(&mut cursor, "127.0.0.1".parse().unwrap())
             .await
             .unwrap_err();
         assert!(matches!(err, ProxyError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn v1_over_size_cap_is_malformed() {
+        let mut line = b"PROXY ".to_vec();
+        line.extend(std::iter::repeat_n(b'a', V1_MAX));
+        let mut cursor = std::io::Cursor::new(line);
+        let err = policy(ProxyProtocolMode::On, &["127.0.0.1"])
+            .read(&mut cursor, "127.0.0.1".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProxyError::Malformed("v1 header exceeds size cap")
+        ));
+    }
+
+    #[tokio::test]
+    async fn v1_bad_tokens_are_malformed() {
+        for line in [
+            // Not a port.
+            &b"PROXY TCP4 198.51.100.7 10.0.0.1 seventeen 443\r\n"[..],
+            // Leading-zero port (ppp grammar rejects).
+            b"PROXY TCP4 198.51.100.7 10.0.0.1 07 443\r\n",
+            // Bad source IP.
+            b"PROXY TCP4 999.51.100.7 10.0.0.1 47115 443\r\n",
+            // Unknown family keyword.
+            b"PROXY TCP5 198.51.100.7 10.0.0.1 47115 443\r\n",
+            // Missing destination port.
+            b"PROXY TCP4 198.51.100.7 10.0.0.1 47115\r\n",
+        ] {
+            let mut cursor = std::io::Cursor::new(line.to_vec());
+            let err = policy(ProxyProtocolMode::On, &["127.0.0.1"])
+                .read(&mut cursor, "127.0.0.1".parse().unwrap())
+                .await
+                .unwrap_err();
+            assert!(matches!(err, ProxyError::Malformed(_)), "line: {line:?}");
+        }
     }
 
     #[tokio::test]
@@ -558,6 +737,64 @@ mod tests {
                     // Only reachable from the trusted proxy with a
                     // structurally valid header.
                     assert_eq!(peer, "127.0.0.1");
+                }
+            }
+        }
+    }
+
+    /// Fuzz-style property, v1-guided: mutations seeded from real v1 lines
+    /// (uniform random bytes essentially never spell "PROXY ", so the
+    /// battery above never reaches the v1 grammar). Same invariant: never a
+    /// panic, `Proxied` only from the trusted proxy.
+    #[tokio::test]
+    async fn hostile_v1_seeded_bytes_never_yield_ip_nor_panic() {
+        let mut seed: u64 = 0xfeed_face;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let seeds: [&[u8]; 4] = [
+            b"PROXY TCP4 198.51.100.7 10.0.0.1 47115 443\r\n",
+            b"PROXY TCP6 2001:db8::7 2001:db8::1 47115 443\r\n",
+            b"PROXY UNKNOWN\r\n",
+            b"PROXY ",
+        ];
+        for round in 0..1000u64 {
+            let base = seeds[usize::try_from(next() % seeds.len() as u64).unwrap()];
+            let mut bytes = base.to_vec();
+            let mutations = usize::try_from(next() % 3).unwrap();
+            for _ in 0..mutations {
+                match next() % 3 {
+                    0 => {
+                        // Flip a random byte.
+                        let idx = usize::try_from(next() % 120).unwrap() % bytes.len().max(1);
+                        if let Some(slot) = bytes.get_mut(idx) {
+                            *slot = (next() & 0xff) as u8;
+                        }
+                    }
+                    1 => {
+                        // Truncate.
+                        let at = usize::try_from(next() % 120).unwrap() % bytes.len().max(1);
+                        bytes.truncate(at);
+                    }
+                    _ => {
+                        // Append random junk (oversize lines included).
+                        let extra = usize::try_from(next() % 40).unwrap();
+                        for _ in 0..extra {
+                            bytes.push((next() & 0xff) as u8);
+                        }
+                    }
+                }
+            }
+            for peer in ["9.9.9.9", "127.0.0.1"] {
+                let mut cursor = std::io::Cursor::new(bytes.clone());
+                let res = policy(ProxyProtocolMode::On, &["127.0.0.1"])
+                    .read(&mut cursor, peer.parse().unwrap())
+                    .await;
+                if let Ok(ProxyOutcome::Proxied { .. }) = res {
+                    assert_eq!(peer, "127.0.0.1", "round {round}: {bytes:?}");
                 }
             }
         }

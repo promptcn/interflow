@@ -9,5 +9,5 @@ pub mod params;
 pub mod paths;
 pub mod secret;
 
-pub use audit::AuditConfig;
+pub use audit::{AuditConfig, AuditRotation};
 pub use logging::LoggingConfig;

@@ -611,6 +611,7 @@ mod tests {
         std::fs::write(dir.join("hub.key"), b"dummy").unwrap();
         std::fs::write(dir.join("tenant-ca.crt"), b"dummy").unwrap();
         HubConfig {
+            policy: Default::default(),
             server: ServerConfig {
                 listen_addr: "127.0.0.1:6666".parse().unwrap(),
                 node_name: None,

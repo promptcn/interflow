@@ -23,7 +23,7 @@
     unused_mut
 )]
 use interflow_mesh::agent::handle::{AgentHandle, AgentState};
-use interflow_testkit::{agent_config, hub_config, pick_ephemeral_port, spawn_hub};
+use interflow_testkit::{agent_config, hub_config, spawn_hub};
 use std::time::Duration;
 
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
@@ -54,8 +54,8 @@ async fn wait_state(handle: &AgentHandle, timeout: Duration) -> AgentState {
 /// into a 409 retry loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_restart_after_graceful_shutdown_reconnects() {
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let _hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let agent_id = "restart-agent";
@@ -99,8 +99,8 @@ async fn poll_drop_returns_rx_for_next_poll() {
     use hyper::Request;
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let _hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let (send_request, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
@@ -181,8 +181,8 @@ async fn stale_rx_return_after_reregister_is_discarded() {
     use hyper::Request;
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let _hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     async fn connect(
@@ -271,8 +271,8 @@ async fn re_registration_rotates_and_invalidates_circuit() {
     use hyper::Request;
     use hyper_util::rt::{TokioExecutor, TokioIo};
 
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let _hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     async fn connect(
         hub_port: u16,
@@ -401,8 +401,8 @@ async fn connect_timeout_recovers_from_black_hole() {
 
     // Restore the link: point at a real hub; the same agent should be
     // Connected normally (timeout → retry → recovery)
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let _hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let handle2 =

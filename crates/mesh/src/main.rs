@@ -46,9 +46,15 @@ async fn main() -> interflow_core::error::Result<()> {
         Commands::Hub { pack } => interflow_mesh::pack::run_hub(&pack).await,
         Commands::Agent { pack } => interflow_mesh::pack::run_agent(&pack).await,
         Commands::Version => {
-            let build_date = env!("INTERFLOW_BUILD_DATE");
-            let git_hash = env!("INTERFLOW_GIT_HASH");
-            println!("{build_date}-{git_hash}");
+            // Full identity: name anchors the binary, the shared const pins
+            // the release line and exact code (`-dirty` = uncommitted
+            // changes) — the same const `interflow --version` prints, so
+            // the two CLIs cannot drift apart.
+            println!(
+                "{} {}",
+                env!("CARGO_PKG_NAME"),
+                interflow_buildinfo::VERSION_WITH_TAG
+            );
             Ok(())
         }
     }

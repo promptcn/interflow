@@ -31,11 +31,10 @@
 use interflow_expose::client::{ExposeArgs, LocalService};
 use interflow_expose::edge::{
     ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, Route,
-    RouteBreakerPolicy, WorkspaceTrust, run,
+    RouteBreakerPolicy, WorkspaceTrust,
 };
 use interflow_mesh::config::TransportKind;
 use interflow_testkit::metrics_harness::{counter_value, metrics_handle, wait_counter_at_least};
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -64,10 +63,6 @@ async fn dead_route_storm_stops_at_the_edge() {
         .try_init();
 
     let dead = dead_port().await;
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
     // Route breaker: trip after 3 failing closes (fast for the test); the
     // agent-side breaker keeps its default threshold of 5, which the edge
@@ -76,8 +71,9 @@ async fn dead_route_storm_stops_at_the_edge() {
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -107,13 +103,9 @@ async fn dead_route_storm_stops_at_the_edge() {
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    let edge_handle = tokio::task::spawn(run(edge_config));
-    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
-        .await
-        .expect("hub should start within 5s");
-    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
-        .await
-        .expect("edge listener should start within 5s");
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    let edge_listen = edge.public_addr();
+    let hub_port = edge.control_addr().port();
 
     let (client_cert, client_key) = certs.named_client_cert("expose-breaker");
     let client_args = ExposeArgs {
@@ -179,6 +171,6 @@ async fn dead_route_storm_stops_at_the_edge() {
         "agent dial work should be bounded by the route threshold, got {dials}"
     );
 
-    edge_handle.abort();
+    edge.shutdown().await.expect("edge shutdown");
     client_handle.abort();
 }

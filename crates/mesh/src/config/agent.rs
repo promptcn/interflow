@@ -377,8 +377,9 @@ impl IngressRule {
 pub struct EgressRule {
     /// Rule name.
     pub name: String,
-    /// Local backend address.
-    pub target_addr: SocketAddr,
+    /// What this rule offers peers: one concrete backend, or an authorized
+    /// range every address inside which the agent will dial on request.
+    pub target: EgressTarget,
     /// Backend protocol: `tcp` (default) or `udp`. Used as the fallback rule
     /// match when there is no dynamic target (ingress without `remote_addr`
     /// configured); when a dynamic target exists, the Open frame's protocol
@@ -391,6 +392,28 @@ pub struct EgressRule {
     /// to close).
     #[serde(default)]
     pub udp_idle_timeout_secs: Option<u64>,
+}
+
+/// The target face of an egress rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EgressTarget {
+    /// One concrete dial target (`host:port`).
+    Addr(SocketAddr),
+    /// An authorization range (`ip/prefix`, any port inside the network).
+    /// Range rules never serve Default/Service selectors — a peer always
+    /// names a concrete address; the range only decides whether the dial is
+    /// permitted (`SecurityConfig::allowed_targets` matching).
+    Cidr(ipnetwork::IpNetwork),
+}
+
+impl std::fmt::Display for EgressTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Addr(addr) => write!(f, "{addr}"),
+            Self::Cidr(net) => write!(f, "{net}"),
+        }
+    }
 }
 
 impl EgressRule {
@@ -783,7 +806,7 @@ hub_url = "http://hub"
 
 [[egress]]
 name = "dns-out"
-target_addr = "10.0.0.1:53"
+target = "10.0.0.1:53"
 target_protocol = "udp"
 udp_idle_timeout_secs = 30
 "#;
@@ -792,10 +815,26 @@ udp_idle_timeout_secs = 30
         assert_eq!(rule.target_protocol, StreamProto::Udp);
         assert_eq!(rule.effective_udp_idle_timeout(), Duration::from_secs(30));
 
+        // A range rule parses the same way — `ip/prefix` instead of
+        // `host:port`.
+        let range_toml = r#"
+
+[agent]
+id = "x"
+hub_url = "http://hub"
+
+[[egress]]
+name = "loopback-any"
+target = "127.0.0.0/8"
+target_protocol = "udp"
+"#;
+        let cfg2: AgentConfig = toml::from_str(range_toml).expect("parse");
+        assert!(matches!(cfg2.egress[0].target, EgressTarget::Cidr(_)));
+
         // Defaults to 60s
         let rule2 = EgressRule {
             name: "d".to_string(),
-            target_addr: "127.0.0.1:1".parse().unwrap(),
+            target: EgressTarget::Addr("127.0.0.1:1".parse().unwrap()),
             target_protocol: StreamProto::Udp,
             udp_idle_timeout_secs: None,
         };

@@ -1,12 +1,12 @@
 [workspace]
- members = ["crates/certs", "crates/cli", "crates/contract", "crates/core", "crates/expose", "crates/identity", "crates/mesh", "crates/registrar", "crates/renewal", "crates/testkit", "crates/util", "src-tauri"]
+ members = ["crates/buildinfo", "crates/certs", "crates/cli", "crates/contract", "crates/core", "crates/expose", "crates/identity", "crates/mesh", "crates/registrar", "crates/renewal", "crates/testkit", "crates/util", "src-tauri"]
 resolver = "2"
 # Continuous-fuzzing crate for the hand-written wire codecs; carries its own
 # lockfile and a nightly toolchain requirement, so it stays out of the workspace.
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -19,6 +19,9 @@ tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7.19"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1"
+# Format-preserving TOML editing (structured manifest appends keep the
+# operator's comments and layout); the same crate `toml` 1.x builds on.
+toml_edit = "0.25"
 thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"

@@ -31,12 +31,20 @@ enum Commands {
         /// JSON config handoff path (serialized `HubConfig`)
         #[arg(long)]
         json: PathBuf,
+        /// Where to write the bound-address handoff once every listener is
+        /// up (`:0` faces materialize there; atomic tmp+rename write)
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
     },
     /// Start the agent
     Agent {
         /// JSON config handoff path (serialized `AgentConfig`)
         #[arg(long)]
         json: PathBuf,
+        /// Where to write the bound ingress-address handoff once every
+        /// ingress listener is bound (atomic tmp+rename write)
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
     },
 }
 
@@ -57,20 +65,27 @@ fn load_json<T: serde::de::DeserializeOwned>(
 async fn main() -> interflow_core::error::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Hub { json } => run_hub(load_json(&json)?).await,
-        Commands::Agent { json } => run_agent(load_json(&json)?).await,
+        Commands::Hub { json, ready_file } => run_hub(load_json(&json)?, ready_file).await,
+        Commands::Agent { json, ready_file } => run_agent(load_json(&json)?, ready_file).await,
     }
 }
 
-async fn run_hub(hub_config: HubConfig) -> interflow_core::error::Result<()> {
+async fn run_hub(
+    hub_config: HubConfig,
+    ready_file: Option<PathBuf>,
+) -> interflow_core::error::Result<()> {
     interflow_core::telemetry::init_logging(&hub_config.logging.level, hub_config.logging.format);
 
-    if hub_config.metrics.enabled {
+    // `:0` faces materialize here; the runner reads the concrete addresses
+    // back from the ready file instead of racing a pick-then-bind window.
+    let metrics_addr = if hub_config.metrics.enabled {
         interflow_core::telemetry::init_metrics(
             hub_config.metrics.listen_addr,
             &hub_config.metrics.path,
-        );
-    }
+        )
+    } else {
+        None
+    };
 
     tracing::info!(
         "Starting hub server, listening on: {}",
@@ -106,12 +121,40 @@ async fn run_hub(hub_config: HubConfig) -> interflow_core::error::Result<()> {
         }
     }
 
-    hub_server.run_until(shutdown).await?;
-    tracing::info!("Hub has exited");
-    Ok(())
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(hub_server.run_until_signalled(shutdown, ready_tx));
+    #[allow(unused_mut)]
+    // Ended before readiness: surface the run's own outcome.
+    let Ok(ready) = ready_rx.await else {
+        return match task.await {
+            Ok(r) => r,
+            Err(e) if e.is_cancelled() => Ok(()),
+            Err(e) => Err(interflow_core::error::InterflowError::JoinError(e)),
+        };
+    };
+    if let Some(path) = ready_file {
+        interflow_testkit::soak::proc::write_hub_ready(
+            &path,
+            interflow_testkit::soak::proc::HubReadyFile {
+                listen: ready.tcp,
+                metrics: metrics_addr,
+            },
+        )
+        .map_err(|e| {
+            interflow_core::error::InterflowError::config(format!("write hub ready file: {e}"))
+        })?;
+    }
+    match task.await {
+        Ok(r) => r,
+        Err(e) if e.is_cancelled() => Ok(()),
+        Err(e) => Err(interflow_core::error::InterflowError::JoinError(e)),
+    }
 }
 
-async fn run_agent(agent_config: AgentConfig) -> interflow_core::error::Result<()> {
+async fn run_agent(
+    agent_config: AgentConfig,
+    ready_file: Option<PathBuf>,
+) -> interflow_core::error::Result<()> {
     interflow_core::telemetry::init_logging(
         &agent_config.logging.level,
         agent_config.logging.format,
@@ -123,7 +166,33 @@ async fn run_agent(agent_config: AgentConfig) -> interflow_core::error::Result<(
 
     tracing::info!("Starting agent: {}", agent_config.agent.id);
 
+    let ingress_rules: Vec<String> = agent_config
+        .ingress
+        .iter()
+        .map(|r| r.name.clone())
+        .collect();
     let mut agent = interflow_mesh::agent::AgentClient::new(agent_config)?.start();
+
+    // `:0` ingress listen ports materialize at bind; the runner reads the
+    // concrete addresses back from the ready file.
+    if let Some(path) = ready_file {
+        let mut ingress = std::collections::HashMap::new();
+        for name in ingress_rules {
+            if let Some(addr) = agent
+                .wait_ingress_addr(&name, std::time::Duration::from_secs(60))
+                .await
+            {
+                ingress.insert(name, addr);
+            }
+        }
+        interflow_testkit::soak::proc::write_agent_ready(
+            &path,
+            interflow_testkit::soak::proc::AgentReadyFile { ingress },
+        )
+        .map_err(|e| {
+            interflow_core::error::InterflowError::config(format!("write agent ready file: {e}"))
+        })?;
+    }
 
     // Event pump: turn structured lifecycle events into log records.
     let mut events = agent.take_events();

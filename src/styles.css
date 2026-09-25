@@ -47,6 +47,31 @@ body {
   opacity: 0.7;
 }
 
+/* Build identity chip (version + compile-time date_hash[−dirty] tag), right
+   of the face toggle — the same string the engine logs print at startup.
+   Click copies the canonical identity; a dirty build turns amber so it is
+   never mistaken for the named commit. */
+.machine-header .machine-version {
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--text-small);
+  opacity: 0.55;
+  white-space: nowrap;
+  align-self: center;
+}
+
+.machine-header .machine-version:hover {
+  opacity: 0.85;
+}
+
+.machine-header .machine-version.dirty {
+  color: #ff9f0a;
+  opacity: 0.9;
+}
+
 /* The one interruption channel: GUI errors show up here, dismissable —
    default-quiet instead of a permanent log pane. */
 .error-banner {
@@ -242,6 +267,18 @@ body {
   border: 1px solid rgba(127, 127, 127, 0.4);
   opacity: 0.8;
   white-space: nowrap;
+}
+
+/* Credential-expiry phases (the dirty-build amber / error red language):
+   warn = less than 20% of the leaf TTL remains, critical = less than 10%
+   (or expired). Applies to node-card chips, detail rows, inspection rows. */
+.leaf-warn {
+  color: #ff9f0a;
+  opacity: 1;
+}
+.leaf-critical {
+  color: #ff453a;
+  opacity: 1;
 }
 
 .node-card-foot button {
@@ -711,6 +748,118 @@ button.danger {
   color: #fff;
 }
 
+/* ------------------------------------------------------------------ */
+/* Manifest form editor (one document, Form/TOML views)                 */
+
+.manifest-toolbar {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.manifest-views {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.manifest-views button {
+  min-width: auto;
+  padding: 2px 12px;
+}
+
+.manifest-views button.selected {
+  background: var(--accent, #0a84ff);
+  color: #fff;
+}
+
+.valid-chip {
+  font-size: var(--text-small);
+  padding: 2px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(127, 127, 127, 0.4);
+  opacity: 0.9;
+}
+
+.valid-chip.valid {
+  border-color: #34c759;
+  color: #34c759;
+}
+
+.valid-chip.invalid {
+  border-color: #ff453a;
+  color: #ff453a;
+}
+
+.manifest-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Summary rows inside form sections: key + value + trailing actions. */
+.summary-key {
+  flex-shrink: 0;
+  min-width: 90px;
+  opacity: 0.85;
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: var(--text-small);
+  word-break: break-all;
+}
+
+.agent-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid rgba(127, 127, 127, 0.3);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.agent-card .rule-row {
+  flex-wrap: wrap;
+}
+
+.kind-badge.role-mesh,
+.kind-badge.role-expose {
+  border-color: var(--accent, #0a84ff);
+}
+
+.kind-badge.role-mixed,
+.kind-badge.role-empty {
+  border-color: #ff453a;
+  color: #ff453a;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.ws-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--text-small);
+  border: 1px solid rgba(127, 127, 127, 0.4);
+  border-radius: 10px;
+  padding: 1px 8px;
+}
+
+.ws-chip button {
+  padding: 0 4px;
+  border: none;
+  background: none;
+  opacity: 0.7;
+}
+
+.form-actions {
+  justify-content: flex-start;
+}
+
 .pack-overview {
   flex: 1;
   display: flex;
@@ -834,4 +983,90 @@ button.link {
 .field-error {
   font-size: var(--text-small);
   color: #ff453a;
+}
+
+/* ------------------------------------------------------------------ */
+/* Issue wizard (IssuePackDialog)                                       */
+
+.issue-kinds {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.issue-kinds button {
+  flex: 0 1 auto;
+}
+
+.issue-kinds button.selected {
+  border-color: var(--accent, #4a9eff);
+  font-weight: 600;
+}
+
+.rule-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border: 1px dashed rgba(128, 128, 128, 0.4);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.rule-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--text-small);
+  opacity: 0.85;
+}
+
+.rule-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.rule-row input {
+  min-width: 0;
+}
+
+.rule-row select {
+  flex-shrink: 0;
+}
+
+.rule-row .rule-remove {
+  flex-shrink: 0;
+  padding: 2px 8px;
+}
+
+.issue-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.issue-preview pre {
+  margin: 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.12);
+  font-size: var(--text-small);
+  overflow-x: auto;
+}
+
+.issue-passphrase {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.issue-passphrase code {
+  flex: 1;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(127, 127, 127, 0.12);
+  font-size: var(--text-base);
+  word-break: break-all;
 }

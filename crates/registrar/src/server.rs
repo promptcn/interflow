@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::crypto::aws_lc_rs;
@@ -104,13 +105,22 @@ pub async fn serve(issuer: PathBuf, options: ServeOptions) -> Result<()> {
             })?;
     tracing::info!("registrar listening on https://{}", options.listen);
     loop {
-        let (stream, _) = listener
-            .accept()
-            .await
-            .map_err(|e| interflow_identity::Error::Io {
-                path: options.listen.to_string(),
-                source: e,
-            })?;
+        let (mut stream, peer) =
+            listener
+                .accept()
+                .await
+                .map_err(|e| interflow_identity::Error::Io {
+                    path: options.listen.to_string(),
+                    source: e,
+                })?;
+        // The nginx stream fragment fronts this listener with PROXY
+        // protocol on every SNI-map target; discard the framing before the
+        // TLS acceptor sees the wire. Loopback-only, so plain direct
+        // connections (the stand-alone deployment) are untouched.
+        if let Err(reason) = consume_proxy_header(&mut stream, peer).await {
+            tracing::warn!("registrar PROXY protocol framing failed ({reason}): peer={peer}");
+            continue;
+        }
         let acceptor = acceptor.read().await.clone();
         let Ok(tls_stream) = acceptor.accept(stream).await else {
             tracing::warn!("registrar TLS handshake failed");
@@ -136,6 +146,136 @@ pub async fn serve(issuer: PathBuf, options: ServeOptions) -> Result<()> {
             }
         });
     }
+}
+
+/// PROXY protocol v2 signature (12 bytes): `\r\n\r\n\0\r\nQUIT\n`. Framing
+/// twin of `interflow-core`'s parser — this crate deliberately does not
+/// depend on interflow-core (registrar keeps its dependency surface
+/// minimal), so the two agree on the wire shape only; policy stays on the
+/// core side and this side makes no trust decisions.
+const PROXY_V2_SIG: [u8; 12] = [
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+];
+/// v1 (text) preamble prefix.
+const PROXY_V1_PREFIX: &[u8; 6] = b"PROXY ";
+/// v1 line cap including the CRLF (spec limit; bounds how far the framing
+/// scan is willing to look).
+const PROXY_V1_MAX: usize = 108;
+/// v2 total cap: fixed header plus declared payload.
+const PROXY_V2_MAX: usize = 1024;
+/// Same budget discipline as the edge/hub pre-TLS sniff stages (slow
+/// loris preamble dribble must not hold an accept slot).
+const PROXY_READ_BUDGET: Duration = Duration::from_secs(10);
+
+/// Peeks until `buf.len()` bytes are visible at the front of the stream
+/// (peek never consumes, and always returns bytes from the front, so the
+/// fill is tracked as the high-water mark, not a cursor).
+async fn peek_exact(
+    stream: &tokio::net::TcpStream,
+    buf: &mut [u8],
+) -> std::result::Result<usize, &'static str> {
+    let mut seen = 0usize;
+    while seen < buf.len() {
+        let n = stream
+            .peek(buf)
+            .await
+            .map_err(|_| "read error while peeking preamble")?;
+        if n == 0 {
+            return Err("EOF while peeking preamble");
+        }
+        seen = seen.max(n);
+    }
+    Ok(seen)
+}
+
+/// Discards a PROXY protocol (v1 or v2) preamble from the front of the
+/// stream when the loopback front (nginx stream SNI dispatch, which emits
+/// the preamble on every map target) sent one. Framing only: the source
+/// address is dropped — the registrar makes no per-IP decisions, so a
+/// `PROXY UNKNOWN` line carries exactly as much information as a real one.
+///
+/// Discrimination is by first byte: `0x0D` starts the v2 signature, `P`
+/// starts the v1 text; a TLS ClientHello (`0x16`) or any other byte is a
+/// direct connection and passes through untouched. A preamble that
+/// announces itself but never completes (timeout / EOF / over the caps) is
+/// dropped fail-closed; a prefix that diverges mid-way is handed to the
+/// TLS layer, which rejects it as garbage anyway.
+async fn consume_proxy_header(
+    stream: &mut tokio::net::TcpStream,
+    peer: SocketAddr,
+) -> std::result::Result<(), &'static str> {
+    if !peer.ip().is_loopback() {
+        // Only the same-host nginx fronts this listener; a remote peer has
+        // no legitimate preamble and gets the plain TLS treatment.
+        return Ok(());
+    }
+    tokio::time::timeout(PROXY_READ_BUDGET, async {
+        let mut first = [0u8; 1];
+        peek_exact(stream, &mut first).await?;
+        match first[0] {
+            // v2: 12-byte signature, then ver/cmd + fam/proto + u16 length
+            // in the 16-byte fixed header; consume exactly the fixed part
+            // plus the declared payload.
+            0x0D => {
+                let mut fixed = [0u8; 16];
+                peek_exact(stream, &mut fixed).await?;
+                if fixed[..12] != PROXY_V2_SIG {
+                    // Started like the signature but diverged: not a
+                    // preamble we recognize.
+                    return Ok(());
+                }
+                let len = u16::from_be_bytes([fixed[14], fixed[15]]) as usize;
+                let total = 16 + len;
+                if total > PROXY_V2_MAX {
+                    return Err("v2 header exceeds size cap");
+                }
+                let mut header = vec![0u8; total];
+                stream
+                    .read_exact(&mut header)
+                    .await
+                    .map_err(|_| "EOF inside v2 header")?;
+                Ok(())
+            }
+            // v1: text line; watch (without consuming) for the CRLF within
+            // the cap, then read exactly through it so the TLS bytes that
+            // follow are never touched.
+            b'P' => {
+                let mut window = [0u8; PROXY_V1_MAX];
+                loop {
+                    let n = stream
+                        .peek(&mut window)
+                        .await
+                        .map_err(|_| "read error while peeking preamble")?;
+                    if n == 0 {
+                        return Err("EOF inside v1 header");
+                    }
+                    if n >= PROXY_V1_PREFIX.len()
+                        && window[..PROXY_V1_PREFIX.len()] != *PROXY_V1_PREFIX
+                    {
+                        // "P..." that is not "PROXY ": plain bytes.
+                        return Ok(());
+                    }
+                    if let Some(pos) = window[..n].windows(2).position(|w| w == b"\r\n") {
+                        let mut line = vec![0u8; pos + 2];
+                        stream
+                            .read_exact(&mut line)
+                            .await
+                            .map_err(|_| "EOF inside v1 header")?;
+                        return Ok(());
+                    }
+                    if n >= PROXY_V1_MAX {
+                        return Err("v1 header exceeds size cap");
+                    }
+                    // Peek blocks until more bytes arrive; the outer
+                    // timeout bounds a preamble that never completes.
+                }
+            }
+            // TLS ClientHello (0x16) or anything else: direct connection.
+            _ => Ok(()),
+        }
+    })
+    .await
+    .map_err(|_| "read budget exceeded while consuming preamble")?
 }
 
 async fn registrar_tls_rotation(

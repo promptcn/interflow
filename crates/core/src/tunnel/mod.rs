@@ -42,4 +42,4 @@ pub use negotiation::{HeartbeatAd, RegisterResponse};
 pub use pump::{PumpConfig, StreamPumpTarget, pump_duplex, pump_tcp_stream};
 pub use selector::{InnerStreamHello, TargetSelector};
 pub use session_tasks::{Beat, SessionExitGuard, SessionTasks, TaskExit, TaskExitReason};
-pub use transport::{IncomingStream, TunnelData, TunnelTransport};
+pub use transport::{IncomingStream, PolicyFetch, TunnelData, TunnelTransport};

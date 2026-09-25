@@ -17,8 +17,8 @@ use interflow_core::tunnel::{AgentTunnel, IncomingStream, TunnelData};
 use interflow_mesh::agent::AgentClient;
 use interflow_mesh::config::AgentConfig;
 use interflow_testkit::{
-    agent_config, hub_config, pick_ephemeral_port, spawn_agent_registered, spawn_hub,
-    udp_ingress_rule, udp_round_trip_once,
+    agent_config, hub_config, spawn_agent_registered, spawn_hub, udp_ingress_rule,
+    udp_round_trip_once,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -146,15 +146,20 @@ async fn read_control(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn udp_inner_quic_hides_target_and_payload_from_hub() {
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let target: SocketAddr = "127.0.0.1:53253".parse().unwrap();
-    let listener_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = interflow_mesh::agent::ingress_udp::bind_udp_socket(listener_bind).unwrap();
-    let ingress_addr = listener.local_addr().unwrap();
-    drop(listener);
-    let _ingress =
-        spawn_agent_registered(ingress_config(hub_port, ingress_addr, "victim", target)).await;
+    let _ingress = spawn_agent_registered(ingress_config(
+        hub_port,
+        "127.0.0.1:0".parse().unwrap(),
+        "victim",
+        target,
+    ))
+    .await;
+    let ingress_addr = _ingress
+        .wait_ingress_addr("udp", Duration::from_secs(10))
+        .await
+        .expect("ingress listener bound");
 
     let raw = connect_tunnel(hub_port, "victim").await;
     let mut incoming = raw.take_incoming_streams().await.unwrap();
@@ -224,8 +229,8 @@ async fn udp_inner_quic_hides_target_and_payload_from_hub() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stripped_udp_e2e_flag_fails_closed_with_zero_dial() {
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (target, dials) = counting_udp_backend().await;
     let _egress = spawn_agent_registered(egress_config(hub_port, target)).await;
     let raw = connect_tunnel(hub_port, "rogue").await;
@@ -249,8 +254,8 @@ async fn stripped_udp_e2e_flag_fails_closed_with_zero_dial() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hub_rejects_udp_e2e_open_with_plaintext_target() {
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let raw = connect_tunnel(hub_port, "rogue").await;
     let sid = interflow_core::protocol::StreamId::random().unwrap();
     let mut response = raw.register_stream(sid).await;
@@ -271,8 +276,8 @@ async fn hub_rejects_udp_e2e_open_with_plaintext_target() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wrong_cn_and_foreign_anchor_fail_before_udp_dial() {
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (target, dials) = counting_udp_backend().await;
     let _egress = spawn_agent_registered(egress_config(hub_port, target)).await;
 
@@ -335,8 +340,8 @@ async fn wrong_cn_and_foreign_anchor_fail_before_udp_dial() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revoked_inner_quic_client_fails_before_udp_dial() {
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (target, dials) = counting_udp_backend().await;
     let mut cfg = egress_config(hub_port, target);
     let (cert, key, crl) = certs().revoked_client_material("rogue");
@@ -376,8 +381,8 @@ async fn revoked_inner_quic_client_fails_before_udp_dial() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn silent_and_garbled_udp_quic_handshakes_time_out_without_dial() {
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (target, dials) = counting_udp_backend().await;
     let _egress = spawn_agent_registered(egress_config(hub_port, target)).await;
     let raw = connect_tunnel(hub_port, "rogue").await;

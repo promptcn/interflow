@@ -36,7 +36,7 @@ use interflow_mesh::config::{AgentConfig, InnerTlsConfig};
 use interflow_testkit::{
     agent_config, hub_config,
     metrics_harness::{init_tracing, metrics_handle, wait_counter_at_least},
-    pick_ephemeral_port, spawn_agent_registered, spawn_hub,
+    spawn_agent_registered, spawn_hub,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -323,8 +323,8 @@ async fn p1_required_full_chain_round_trip() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = interflow_testkit::echo_server().await;
 
     let eg = spawn_agent_registered(egress_agent_config(
@@ -335,18 +335,18 @@ async fn p1_required_full_chain_round_trip() {
     ))
     .await;
 
-    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = TcpListener::bind(listen).await.unwrap();
-    let ingress_addr = listener.local_addr().unwrap();
-    drop(listener);
     let in_handle = spawn_agent_registered(ingress_agent_config(
         "in",
         hub_port,
-        ingress_addr,
+        "127.0.0.1:0".parse().unwrap(),
         "eg",
         e2e_config(5),
     ))
     .await;
+    let ingress_addr = in_handle
+        .wait_ingress_addr("r", Duration::from_secs(10))
+        .await
+        .expect("ingress listener bound");
 
     let mut sock = dial_listener(ingress_addr).await;
     let marker = b"TOPSECRET-MARKER-plaintext";
@@ -371,13 +371,8 @@ async fn p2_quic_plane_smoke() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(interflow_testkit::hub_quic_config(
-        hub_port,
-        certs(),
-        vec![],
-    ))
-    .await;
+    let hub = spawn_hub(interflow_testkit::hub_quic_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = interflow_testkit::echo_server().await;
 
     let mut eg_cfg = egress_agent_config("eg", hub_port, echo_addr, e2e_config(5));
@@ -385,13 +380,20 @@ async fn p2_quic_plane_smoke() {
     eg_cfg.agent.hub_quic_addr = Some(format!("127.0.0.1:{hub_port}"));
     let eg = spawn_agent_registered(eg_cfg).await;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ingress_addr = listener.local_addr().unwrap();
-    drop(listener);
-    let mut in_cfg = ingress_agent_config("in", hub_port, ingress_addr, "eg", e2e_config(5));
+    let mut in_cfg = ingress_agent_config(
+        "in",
+        hub_port,
+        "127.0.0.1:0".parse().unwrap(),
+        "eg",
+        e2e_config(5),
+    );
     in_cfg.agent.transport = interflow_mesh::config::TransportKind::Quic;
     in_cfg.agent.hub_quic_addr = Some(format!("127.0.0.1:{hub_port}"));
     let in_handle = spawn_agent_registered(in_cfg).await;
+    let ingress_addr = in_handle
+        .wait_ingress_addr("r", Duration::from_secs(10))
+        .await
+        .expect("ingress listener bound");
 
     let mut sock = dial_listener(ingress_addr).await;
     sock.write_all(b"quic-plane").await.unwrap();
@@ -413,19 +415,20 @@ async fn p2_quic_plane_smoke() {
 /// Common scaffolding: hub + a `required` ingress agent targeting the
 /// attacker-controlled agent id `victim`. Returns (hub_port, ingress addr).
 async fn required_ingress_against(victim: &str, timeout_secs: u64) -> (u16, SocketAddr) {
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ingress_addr = listener.local_addr().unwrap();
-    drop(listener);
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let in_handle = spawn_agent_registered(ingress_agent_config(
         "in",
         hub_port,
-        ingress_addr,
+        "127.0.0.1:0".parse().unwrap(),
         victim,
         e2e_config(timeout_secs),
     ))
     .await;
+    let ingress_addr = in_handle
+        .wait_ingress_addr("r", Duration::from_secs(10))
+        .await
+        .expect("ingress listener bound");
     std::mem::forget(in_handle); // lives for the test; cleaned with the process
     (hub_port, ingress_addr)
 }
@@ -543,8 +546,8 @@ async fn a4a_same_tenant_wrong_cn_fails_and_real_egress_zero_dial() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (backend, total, _active) = counting_backend().await;
 
     // The real egress: required, would dial the backend if a stream landed.
@@ -554,17 +557,18 @@ async fn a4a_same_tenant_wrong_cn_fails_and_real_egress_zero_dial() {
 
     // The ingress targets `victim`; the hub (honestly) routes there — the
     // "redirect" is that the stream never reaches the intended `eg`.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ingress_addr = listener.local_addr().unwrap();
-    drop(listener);
     let in_handle = spawn_agent_registered(ingress_agent_config(
         "in",
         hub_port,
-        ingress_addr,
+        "127.0.0.1:0".parse().unwrap(),
         "victim",
         e2e_config(5),
     ))
     .await;
+    let ingress_addr = in_handle
+        .wait_ingress_addr("r", Duration::from_secs(10))
+        .await
+        .expect("ingress listener bound");
     std::mem::forget(in_handle);
 
     let (attacker, _h) = connect_tunnel(hub_port, "victim").await;
@@ -621,8 +625,8 @@ async fn a4c_forged_src_agent_rejected_zero_dial() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (backend, total, _active) = counting_backend().await;
     let eg =
         spawn_agent_registered(egress_agent_config("eg", hub_port, backend, e2e_config(5))).await;
@@ -685,8 +689,8 @@ async fn a5_stripped_flag_is_rejected_not_plaintext() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (backend, total, _active) = counting_backend().await;
     let eg =
         spawn_agent_registered(egress_agent_config("eg", hub_port, backend, e2e_config(5))).await;
@@ -725,8 +729,8 @@ async fn a5b_legacy_plaintext_is_always_rejected() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let (echo_addr, _echo) = interflow_testkit::echo_server().await;
     let eg = spawn_agent_registered(egress_agent_config(
         "eg",
@@ -813,19 +817,20 @@ async fn a6b_plaintext_banner_peer_never_falls_back() {
     let _serial = serial_lock().await;
     let _ = metrics_handle();
     init_tracing();
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ingress_addr = listener.local_addr().unwrap();
-    drop(listener);
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     let in_handle = spawn_agent_registered(ingress_agent_config(
         "in",
         hub_port,
-        ingress_addr,
+        "127.0.0.1:0".parse().unwrap(),
         "victim",
         e2e_config(2),
     ))
     .await;
+    let ingress_addr = in_handle
+        .wait_ingress_addr("r", Duration::from_secs(10))
+        .await
+        .expect("ingress listener bound");
     std::mem::forget(in_handle);
 
     let (attacker, _h) = connect_tunnel(hub_port, "victim").await;
@@ -955,8 +960,7 @@ async fn a7_gateway_anchor_full_chain_and_missing_anchor() {
     let gw_key = gw_dir.path().join("gateway/edge.key").display().to_string();
 
     // Hub: the test tenant + the `_edge` gateway principal (trusted).
-    let hub_port = pick_ephemeral_port();
-    let mut hub_cfg = hub_config(hub_port, certs(), vec![]);
+    let mut hub_cfg = hub_config(0, certs(), vec![]);
     hub_cfg
         .auth
         .tenants
@@ -966,7 +970,8 @@ async fn a7_gateway_anchor_full_chain_and_missing_anchor() {
             crl_path: None,
             trusted_gateway: true,
         });
-    spawn_hub(hub_cfg).await;
+    let hub = spawn_hub(hub_cfg).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
 
     let (echo_addr, _echo) = interflow_testkit::echo_server().await;
     // Egress WITH the anchor.

@@ -19,7 +19,6 @@
 use interflow_expose::edge::{
     ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, Route, WorkspaceTrust,
 };
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -32,16 +31,13 @@ async fn readiness_signal_fires_once_both_listener_faces_accept() {
         )
         .try_init();
 
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
-
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "readiness-test");
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; the readiness signal carries the bound
+        // addresses.
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -75,10 +71,11 @@ async fn readiness_signal_fires_once_both_listener_faces_accept() {
     ));
 
     // The signal itself — the whole point of the change.
-    tokio::time::timeout(Duration::from_secs(10), ready_rx)
+    let ready = tokio::time::timeout(Duration::from_secs(10), ready_rx)
         .await
         .expect("readiness signal within 10s")
         .expect("edge run must not end before signalling readiness");
+    let (edge_listen, hub_listen) = (ready.public, ready.control);
 
     // Honesty check: by ready-time both faces accept a TCP connection
     // (short budgets — they must already be up, not merely soon).

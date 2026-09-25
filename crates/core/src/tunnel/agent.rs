@@ -149,6 +149,13 @@ impl AgentTunnel {
         self.inner.unregister_incoming_stream(stream_id).await;
     }
 
+    /// Pulls the hub's current signed policy bundle over this session's
+    /// control plane as a conditional request (`seen` = the generation the
+    /// caller already holds; see [`TunnelTransport::pull_policy`]).
+    pub async fn pull_policy(&self, seen: u64) -> Result<Option<crate::tunnel::PolicyFetch>> {
+        self.inner.pull_policy(seen).await
+    }
+
     /// Session-termination contract: releases all stream resources of this tunnel (idempotent).
     ///
     /// Calling it declares this tunnel's session terminated. The
@@ -370,6 +377,15 @@ impl TunnelTransport for SlotBackend {
         if let Some(backend) = self.withdraw_backend() {
             backend.shutdown().await;
         }
+    }
+
+    /// Policy pull rides whatever backend the current session installed
+    /// (an empty slot retries on the next tick).
+    async fn pull_policy(&self, seen: u64) -> Result<Option<crate::tunnel::PolicyFetch>> {
+        let Some(backend) = self.backend() else {
+            return Err(slot_empty_error());
+        };
+        backend.pull_policy(seen).await
     }
 }
 

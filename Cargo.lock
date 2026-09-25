@@ -2815,8 +2815,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "interflow-buildinfo"
+version = "0.5.0"
+
+[[package]]
 name = "interflow-certs"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rcgen 0.14.8",
  "rustls",
@@ -2829,10 +2833,11 @@ dependencies = [
 
 [[package]]
 name = "interflow-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "hex",
+ "interflow-buildinfo",
  "interflow-core",
  "interflow-expose",
  "interflow-identity",
@@ -2847,22 +2852,25 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "toml_edit 0.25.13+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "interflow-contract"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "interflow-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "bytes",
  "criterion",
  "dirs",
+ "flate2",
  "futures",
  "getrandom 0.4.3",
  "governor",
@@ -2886,6 +2894,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -2899,12 +2908,12 @@ dependencies = [
 
 [[package]]
 name = "interflow-expose"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
- "chrono",
  "criterion",
  "futures",
+ "interflow-buildinfo",
  "interflow-certs",
  "interflow-core",
  "interflow-mesh",
@@ -2928,10 +2937,11 @@ dependencies = [
 
 [[package]]
 name = "interflow-gui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dirs",
  "gethostname",
+ "interflow-buildinfo",
  "interflow-cli",
  "interflow-core",
  "interflow-expose",
@@ -2948,6 +2958,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-dialog",
+ "tauri-plugin-notification",
  "tauri-plugin-single-instance",
  "tauri-specta",
  "tempfile",
@@ -2961,7 +2972,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-identity"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "age",
  "ed25519-dalek",
@@ -2970,6 +2981,7 @@ dependencies = [
  "humantime",
  "interflow-contract",
  "interflow-util",
+ "ipnetwork",
  "rcgen 0.14.8",
  "rustls-pemfile",
  "serde",
@@ -2980,22 +2992,24 @@ dependencies = [
  "time",
  "tokio-rustls",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
  "x509-parser",
 ]
 
 [[package]]
 name = "interflow-mesh"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
- "chrono",
  "clap",
  "criterion",
  "futures",
+ "hex",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "interflow-buildinfo",
  "interflow-certs",
  "interflow-contract",
  "interflow-core",
@@ -3028,7 +3042,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-registrar"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "clap",
@@ -3055,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-renewal"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "interflow-core",
  "interflow-identity",
@@ -3070,12 +3084,15 @@ dependencies = [
 
 [[package]]
 name = "interflow-testkit"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "clap",
+ "http-body-util",
+ "hyper",
  "interflow-certs",
  "interflow-core",
+ "interflow-expose",
  "interflow-mesh",
  "metrics",
  "metrics-exporter-prometheus",
@@ -3094,7 +3111,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-util"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "hex",
  "http",
@@ -3139,6 +3156,9 @@ name = "ipnetwork"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -3487,6 +3507,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "mac-notification-sys"
+version = "0.6.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd604973958ddcc11b561193c0fb96ba146506ef2f231ef2e7c35fd2cbc9beca"
+dependencies = [
+ "cc",
+ "log",
+ "objc2",
+ "objc2-foundation",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3697,6 +3731,20 @@ name = "nonzero_ext"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
+
+[[package]]
+name = "notify-rust"
+version = "4.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5b4c1b4f2aa9f25f63a7a49d3dd0ed567b3670da15330a66b29434be899b891"
+dependencies = [
+ "futures-lite",
+ "log",
+ "mac-notification-sys",
+ "serde",
+ "tauri-winrt-notification",
+ "zbus",
+]
 
 [[package]]
 name = "nu-ansi-term"
@@ -6038,6 +6086,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-notification"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad2fd40946aef810c4be9fd33a2d1b9b397cb79042b2d21c81a0a8f204354fd1"
+dependencies = [
+ "log",
+ "notify-rust",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.18",
+ "time",
+ "url",
+]
+
+[[package]]
 name = "tauri-plugin-single-instance"
 version = "2.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6182,6 +6249,17 @@ dependencies = [
  "dunce",
  "embed-resource",
  "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
+name = "tauri-winrt-notification"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed071c670382e85fc2f48ae706492d8c338f4f89bf72520d32f8abfe880aade"
+dependencies = [
+ "thiserror 2.0.18",
+ "windows",
+ "windows-version",
 ]
 
 [[package]]
@@ -6500,6 +6578,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.3",
 ]
 

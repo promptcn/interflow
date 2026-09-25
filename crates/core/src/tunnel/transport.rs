@@ -36,7 +36,7 @@
 //!   frames of established streams are still never silently dropped on any
 //!   path.
 
-use crate::error::Result;
+use crate::error::{InterflowError, Result};
 use crate::protocol::{CloseReason, FrameOrigin, FrameType, StreamId, StreamProto};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -157,6 +157,32 @@ pub trait TunnelTransport: Send + Sync + 'static {
     /// internally — two paths, so cleanup does not depend on any single call
     /// site remembering it.
     async fn shutdown(&self);
+
+    /// Pulls the hub's current signed policy bundle over this session's
+    /// control plane (`GET /policy`), as a conditional request: `seen` is
+    /// the generation the caller already holds, and a hub at or below it
+    /// answers `304 Not Modified`. `Ok(None)` = no newer bundle (304, or an
+    /// older hub without a policy face). Transports without a
+    /// request/response control plane (QUIC) keep the default: an
+    /// unsupported error the caller treats as "this deployment distributes
+    /// policy through the node-local file channel".
+    async fn pull_policy(&self, _seen: u64) -> Result<Option<PolicyFetch>> {
+        Err(InterflowError::protocol(
+            "this transport has no policy control plane".to_string(),
+        ))
+    }
+}
+
+/// One signed policy bundle served by the hub's `GET /policy`.
+///
+/// The opaque canonical bytes, their detached signature, and the serving
+/// generation — the caller verifies the signature against its own trust
+/// anchor; the hub is a distributor, never an authority.
+#[derive(Debug, Clone)]
+pub struct PolicyFetch {
+    pub body: Bytes,
+    pub signature: Vec<u8>,
+    pub generation: u64,
 }
 
 /// Capacity (in frames) of the per-stream dedicated channel. A healthy

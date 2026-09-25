@@ -32,7 +32,7 @@ use interflow_core::fault::FaultPoint;
 use interflow_expose::edge::{wait_initial_registration, watch_agent_health};
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::fault::{self, FaultPlan};
-use interflow_testkit::{agent_config, pick_ephemeral_port, spawn_agent_registered, spawn_hub};
+use interflow_testkit::{agent_config, refused_addr, spawn_agent_registered, spawn_hub};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -129,8 +129,9 @@ async fn wedged_first_registration_fails_startup_boundedly() {
 async fn struggling_but_alive_supervisor_never_trips_the_watch() {
     let certs = interflow_testkit::certs::TestCerts::generate("health", "healthy");
     let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    // A port with nothing listening: every attempt fails fast.
-    let dead_port = pick_ephemeral_port();
+    // Guaranteed-refused by construction (port 1 is below every ephemeral
+    // range) — no pick-then-release race against parallel tests.
+    let dead_port = refused_addr().port();
     let mut cfg = agent_config("struggling", dead_port, &certs);
     cfg.agent.hub_url = format!("http://127.0.0.1:{dead_port}");
     cfg.agent.connect_timeout_secs = 2;
@@ -158,8 +159,8 @@ async fn healthy_agent_never_trips_the_watch() {
     let _certs = interflow_testkit::certs::TestCerts::generate("health", "healthy");
     let certs = interflow_testkit::certs::TestCerts::generate("health", "healthy");
     let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(interflow_testkit::hub_config(hub_port, &certs, vec![])).await;
+    let _hub = spawn_hub(interflow_testkit::hub_config(0, &certs, vec![])).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
     let agent = spawn_agent_registered(agent_config("healthy", hub_port, &certs)).await;
 
     let outcome = tokio::time::timeout(
@@ -186,8 +187,8 @@ async fn dead_supervisor_trips_the_watch_via_stream_end() {
     let _serial = FAULT_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
 
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(interflow_testkit::hub_config(hub_port, &certs, vec![])).await;
+    let _hub = spawn_hub(interflow_testkit::hub_config(0, &certs, vec![])).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::AgentSuperviseLoopTick));
     let mut cfg = agent_config("doomed-supervisor", hub_port, &certs);

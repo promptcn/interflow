@@ -213,16 +213,74 @@ async fn run_heartbeat_supervisor(h: std::sync::Arc<HubState>, shutdown: Cancell
         let mut pings = 0u64;
         let mut full = 0u64;
         let mut evicted = 0u64;
+        let now_unix = interflow_identity::expiry::now_unix();
         for (agent_id, state) in &snapshot {
-            let (alive, tx, is_quic, circuit) = {
+            let (alive, tx, is_quic, circuit, leaf_validity) = {
                 let st = state.read().await;
                 (
                     !pong_expired(&st, &cadence),
                     st.tx.clone(),
                     st.quic.is_some(),
                     st.circuit,
+                    st.leaf_validity_unix,
                 )
             };
+            // Credential-expiry phasing — both planes, ahead of the h2-only
+            // heartbeat path below. Symmetric state-transfer accounting (see
+            // [`crate::hub::state::SharedExpiryLedger`]): a phase crossing
+            // logs + audits once; an agent sitting in a phase is silence.
+            if let Some(t) = crate::hub::state::expiry_transition(
+                &h.expiry_ledger,
+                agent_id,
+                leaf_validity,
+                now_unix,
+            ) {
+                // A transition implies the validity window was Some (the
+                // check returns None otherwise).
+                let (not_before, not_after) =
+                    leaf_validity.expect("a transition implies the validity window was Some");
+                h.audit.record(
+                    AuditKind::CredentialExpiry {
+                        agent: t.agent.clone(),
+                        phase: t.health.phase.as_str().to_string(),
+                        remaining_secs: t.health.remaining_secs,
+                        not_after_unix: not_after,
+                    },
+                    Some(t.agent.clone()),
+                    None,
+                );
+                let remaining =
+                    interflow_identity::expiry::format_remaining(t.health.remaining_secs);
+                match t.health.phase {
+                    interflow_identity::expiry::LeafPhase::Critical => {
+                        warn!(
+                            agent = %t.agent,
+                            remaining = %remaining,
+                            not_after_unix = not_after,
+                            "credential_expiry: less than 10% of the agent's leaf lifetime \
+                             remains (or expired) — the node will stop serving at expiry; \
+                             rotate before then"
+                        );
+                    }
+                    interflow_identity::expiry::LeafPhase::Warn => {
+                        info!(
+                            agent = %t.agent,
+                            remaining = %remaining,
+                            not_after_unix = not_after,
+                            "credential_expiry: less than 20% of the agent's leaf lifetime \
+                             remains — rotate with `interflow rotate`"
+                        );
+                    }
+                    interflow_identity::expiry::LeafPhase::Healthy => {
+                        info!(
+                            agent = %t.agent,
+                            not_before_unix = not_before,
+                            "credential_expiry: back to healthy (rotation landed, hub-side \
+                             evidence)"
+                        );
+                    }
+                }
+            }
             if is_quic {
                 continue;
             }

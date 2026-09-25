@@ -13,9 +13,11 @@ The example is self-contained and uses neutral names:
 - local listeners and services on loopback
 
 The scenario README contains material generation, a single-machine smoke
-test, and a real multi-host deployment checklist. Generated `certs/` and
-`dist/` directories are intentionally ignored by Git; never commit private
-keys, issuer stores, or Credential Packs.
+test, and a real multi-host deployment checklist — including the
+no-TOML-editing paths (`interflow node add` to append agents,
+`pack seal --generate-passphrase` for encrypted distribution). Generated
+`certs/` and `dist/` directories are intentionally ignored by Git; never
+commit private keys, issuer stores, or Credential Packs.
 
 Engine-level scenarios (site-to-site with hand-managed X.509 material) are
 expert examples and live beside the engine in `crates/mesh/dev-examples/`.

@@ -8,8 +8,9 @@ use interflow_core::protocol::StreamProto;
 use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
     AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, ControlConfig,
-    EgressRule, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig, HubTlsConfig,
-    IngressRule, LoggingConfig, MetricsConfig, ServerConfig, TenantConfig, TransportKind,
+    EgressRule, EgressTarget, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig,
+    HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig, ServerConfig, TenantConfig,
+    TransportKind,
 };
 use std::net::SocketAddr;
 
@@ -76,6 +77,7 @@ pub fn hub_config_tuned(
         security,
         heartbeat,
         metrics: MetricsConfig::default(),
+        policy: Default::default(),
         audit: Default::default(),
         logging: LoggingConfig::default(),
         transport: Default::default(),
@@ -151,7 +153,7 @@ pub fn agent_quic_config(id: &str, hub_port: u16, certs: &TestCerts) -> AgentCon
 pub fn tcp_egress_rule(name: &str, target: SocketAddr) -> EgressRule {
     EgressRule {
         name: name.to_string(),
-        target_addr: target,
+        target: EgressTarget::Addr(target),
         target_protocol: StreamProto::Tcp,
         udp_idle_timeout_secs: None,
     }
@@ -181,7 +183,7 @@ pub fn tcp_ingress_rule(
 pub fn udp_egress_rule(name: &str, target: SocketAddr) -> EgressRule {
     EgressRule {
         name: name.to_string(),
-        target_addr: target,
+        target: EgressTarget::Addr(target),
         target_protocol: StreamProto::Udp,
         udp_idle_timeout_secs: None,
     }

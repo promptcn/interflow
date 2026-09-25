@@ -27,7 +27,6 @@ use interflow_expose::edge::{
 use interflow_mesh::agent::AgentEvent;
 use interflow_mesh::config::TransportKind;
 use interflow_testkit::certs::TestCerts;
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -72,26 +71,15 @@ async fn run_quic_round_trip(derived_addr: bool) {
     let echo_addr = interflow_testkit::echo_server().await.0;
     let _certs = TestCerts::generate("expose-quic-e2e", "unused-client-cn");
 
-    // 2. Ports: with a derived address, QUIC shares the hub TCP port number
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let quic_port = if derived_addr {
-        hub_port
-    } else {
-        interflow_testkit::pick_ephemeral_port()
-    };
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
-    let quic_listen: SocketAddr = format!("127.0.0.1:{quic_port}").parse().unwrap();
-
     // 3. Temp routes.toml
 
     // 4. Spawn edge: hub TLS on (QUIC mandates it) + QUIC listener on
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -111,21 +99,20 @@ async fn run_quic_round_trip(derived_addr: bool) {
             agent_id: "expose-quic-test".to_string(),
             service_id: "web".to_string(),
         }],
-        quic_listen: Some(quic_listen),
+        // Derived dual-stack: the QUIC face follows the control TCP port
+        // (both kernel-assigned when :0). The explicit-vs-derived difference
+        // under test is the CLIENT's hub_quic_addr below; the server-side
+        // face placement is equivalent either way.
+        quic_listen: Some("127.0.0.1:0".parse().unwrap()),
         listener: EdgeListenerPolicy {
             ..EdgeListenerPolicy::default()
         },
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_config));
-
-    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
-        .await
-        .expect("edge listener should start within 5s");
-    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
-        .await
-        .expect("edge hub should start within 5s");
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    let edge_listen = edge.public_addr();
+    let hub_port = edge.control_addr().port();
 
     // 5. Spawn the expose client over QUIC (CA = the test CA; hub URL only
     //    matters for derivation in the derived variant)
@@ -147,7 +134,7 @@ async fn run_quic_round_trip(derived_addr: bool) {
         hub_quic_addr: if derived_addr {
             None
         } else {
-            Some(format!("127.0.0.1:{quic_port}"))
+            Some(edge.control_quic_addr().expect("quic face").to_string())
         },
     };
     let mut client_handle = interflow_expose::client::start(&client_args).expect("client start");
@@ -166,7 +153,7 @@ async fn run_quic_round_trip(derived_addr: bool) {
         tokio::time::timeout(Duration::from_secs(5), sock.read_exact(&mut response)).await;
 
     client_handle.shutdown_graceful().await.ok();
-    edge_handle.abort();
+    edge.shutdown().await.expect("edge shutdown");
 
     read_result
         .expect("read should not timeout")

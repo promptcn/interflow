@@ -12,6 +12,7 @@
 //! - [`stack`]: in-process hub / agent assembly + graceful shutdown + readiness probes
 //! - [`backend`]: echo / UDP echo / SSE timestamped-chunk backends (phased, with silence/burst support)
 //! - [`impair`]: impairment proxies (TCP byte withholding to simulate lost-segment HOL / real UDP drops + delay)
+//! - [`hub_http`]: consumer-side mirrors of the hub's operator HTTP contracts + the shared `GET /agents` e2e client
 //! - [`metrics`]: quantiles and scenario result types (bench artifact schema)
 //! - [`soak`]: long-running regression gate (real process topology + eight assertions; CLI in `bin/soak.rs`)
 
@@ -33,6 +34,7 @@ pub use certs::{tls_client_connect, tls_client_connect_with};
 pub mod config;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
+pub mod hub_http;
 pub mod impair;
 pub mod metrics;
 pub mod metrics_harness;
@@ -44,6 +46,7 @@ pub mod stack;
 // avoid name collisions with config types).
 pub use backend::*;
 pub use config::*;
+pub use hub_http::*;
 pub use stack::*;
 
 /// Deterministic canonical opaque stream id for bare-wire tests.

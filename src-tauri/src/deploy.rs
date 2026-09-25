@@ -117,7 +117,7 @@ mod tests {
         let issuer = dir.path().join("issuer").display().to_string();
         let out = dir.path().join("dist").display().to_string();
         let apply_lines =
-            interflow_cli::plan::apply(&manifest, Path::new(&issuer), Path::new(&out))
+            interflow_cli::plan::apply(&manifest, Path::new(&issuer), Path::new(&out), false)
                 .expect("applies");
         assert!(
             apply_lines.iter().any(|l| l.contains("✔ applied")),
@@ -150,7 +150,7 @@ mod tests {
         .expect("write manifest");
         let issuer = dir.path().join("issuer");
         let out = dir.path().join("dist");
-        interflow_cli::plan::apply(&manifest, &issuer, &out).expect("apply");
+        interflow_cli::plan::apply(&manifest, &issuer, &out, false).expect("apply");
 
         let sealed = dir.path().join("agent.iflowpack");
         seal_pack(&out.join("packs/agent-desktop"), &sealed, "open sesame").expect("seals");

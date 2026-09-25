@@ -87,8 +87,22 @@ back to plaintext.
    - `[[agent.lan-b.mesh_egress]].target_addr` → the same address (the
      authorization pair must match; the manifest validator enforces it)
    - `[registrar].endpoint` → your registrar
+
+   A fresh scenario can skip hand-editing entirely — the structured
+   commands build the same manifest non-destructively (existing comments
+   kept; the edited file must pass the full validation funnel before
+   anything is written):
+
+   ```bash
+   interflow setup --face mesh --realm example --hub-name central --hub-endpoint hub.example.com:6666
+   interflow node add agent/lan-b --mesh-egress web:192.0.2.10:80        # serve side first
+   interflow node add agent/lan-a --mesh-ingress to-lan-b:127.0.0.1:3001:192.0.2.10:80@lan-b
+   ```
+
 2. `./apply.sh`, then distribute each pack to its node (`.iflowpack`
-   sealed archives via `interflow pack seal` work here too).
+   sealed archives via
+   `interflow pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
+   work here too — output beside the pack, passphrase printed once).
 3. Open the hub's TCP port on the firewall and start the three nodes with
    `interflow-mesh hub --pack …` / `interflow-mesh agent --pack …`
    (or install the rendered systemd units).

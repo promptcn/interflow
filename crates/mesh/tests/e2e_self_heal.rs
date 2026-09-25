@@ -41,7 +41,7 @@ use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
 use interflow_testkit::fault::{self, FaultPlan};
 use interflow_testkit::{
     agent_config, agent_quic_config, echo_server, hub_config, hub_config_tuned, hub_quic_config,
-    pick_ephemeral_port, spawn_agent, spawn_agent_registered, spawn_hub, tcp_egress_rule,
+    refused_addr, spawn_agent, spawn_agent_registered, spawn_hub, tcp_egress_rule,
     wait_agent_connected,
 };
 use std::net::SocketAddr;
@@ -224,8 +224,8 @@ async fn supervisor_died(handle: &AgentHandle, within: Duration) -> bool {
 /// egress agent. Returns (echo_addr, hub_port, egress).
 async fn h2_stack_with_egress() -> (SocketAddr, u16, AgentHandle) {
     let (echo_addr, _echo_handle) = echo_server().await;
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config(hub_port, certs(), Vec::new())).await;
+    let _hub = spawn_hub(hub_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent_registered(egress_cfg).await;
@@ -429,8 +429,8 @@ async fn wedged_upload_rebuilds_via_stall_watchdog() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
     let (echo_addr, _echo_handle) = echo_server().await;
-    let hub_port = pick_ephemeral_port();
-    let _hub = spawn_hub(fast_heartbeat_h2_config(hub_port)).await;
+    let _hub = spawn_hub(fast_heartbeat_h2_config(0)).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent_registered(egress_cfg).await;
@@ -488,7 +488,9 @@ async fn supervisor_panic_is_observable_to_embedders() {
     fault::clear();
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::AgentSuperviseLoopTick));
 
-    let closed_port = pick_ephemeral_port();
+    // Guaranteed-refused by construction (port 1 is below every ephemeral
+    // range) — no pick-then-release race against parallel tests.
+    let closed_port = refused_addr().port();
     let mut cfg = agent_config("doomed", closed_port, certs());
     cfg.agent.connect_timeout_secs = 1;
     let handle = spawn_agent(cfg);
@@ -546,14 +548,14 @@ async fn quic_control_read_panic_rebuilds_session() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
     let (echo_addr, _echo_handle) = echo_server().await;
-    let hub_port = pick_ephemeral_port();
-    let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
+    let mut hub_cfg = hub_quic_config(0, certs(), Vec::new());
     hub_cfg.heartbeat = HeartbeatConfig {
         enabled: false,
         interval_secs: 15,
         max_missed: 4,
     };
     let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
@@ -599,14 +601,14 @@ async fn quic_accept_loop_panic_rebuilds_session() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
     let (echo_addr, _echo_handle) = echo_server().await;
-    let hub_port = pick_ephemeral_port();
-    let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
+    let mut hub_cfg = hub_quic_config(0, certs(), Vec::new());
     hub_cfg.heartbeat = HeartbeatConfig {
         enabled: true,
         interval_secs: 1,
         max_missed: 1,
     };
     let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     // Ordering discipline: front first (its accept-loop consult precedes the
     // plan), then arm, then the targeted egress agent.
@@ -647,9 +649,11 @@ async fn quic_closed_watcher_panic_survives_hub_restart() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
     let (echo_addr, _echo_handle) = echo_server().await;
-    let hub_port = pick_ephemeral_port();
-    let hub_cfg = || {
-        let mut c = hub_quic_config(hub_port, certs(), Vec::new());
+    // First bind :0 (kernel-assigned = owned at bind), then pin the
+    // materialized port for the restart — the agents' hub address is baked
+    // before hub 1 even exists.
+    let hub_cfg = |port: u16| {
+        let mut c = hub_quic_config(port, certs(), Vec::new());
         c.heartbeat = HeartbeatConfig {
             enabled: true,
             interval_secs: 1,
@@ -658,7 +662,8 @@ async fn quic_closed_watcher_panic_survives_hub_restart() {
         c
     };
 
-    let _hub1 = spawn_hub(hub_cfg()).await;
+    let _hub1 = spawn_hub(hub_cfg(0)).await;
+    let hub_port = _hub1.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
@@ -685,7 +690,7 @@ async fn quic_closed_watcher_panic_survives_hub_restart() {
         wait_port_rebindable(hub_port, Duration::from_secs(10)).await,
         "hub port must become rebindable after graceful shutdown"
     );
-    let _hub2 = spawn_hub(hub_cfg()).await;
+    let _hub2 = spawn_hub(hub_cfg(hub_port)).await;
     assert!(
         wait_agent_connected(&front, REBUILD_BUDGET).await,
         "agent must re-register after the hub restarts despite the dead closed-watcher (state: {:?})",
@@ -712,14 +717,14 @@ async fn quic_control_write_stall_rebuilds_session() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     fault::clear();
     let (echo_addr, _echo_handle) = echo_server().await;
-    let hub_port = pick_ephemeral_port();
-    let mut hub_cfg = hub_quic_config(hub_port, certs(), Vec::new());
+    let mut hub_cfg = hub_quic_config(0, certs(), Vec::new());
     hub_cfg.heartbeat = HeartbeatConfig {
         enabled: true,
         interval_secs: 1,
         max_missed: 1,
     };
     let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];

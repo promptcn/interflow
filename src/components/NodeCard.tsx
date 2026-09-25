@@ -1,4 +1,4 @@
-import { isRunning, stateText, type NodeInfo } from "../api";
+import { formatRemainingSecs, isRunning, leafPhaseClass, stateText, type NodeInfo } from "../api";
 import { KindBadge, StateDot } from "./ui";
 
 /// Short state label for the card footer — `stateText` in full (Failed
@@ -85,6 +85,14 @@ export default function NodeCard({
         </span>
         {node.desired_running && <span className="node-card-tag">auto-start</span>}
         {node.generation > 0 && <span className="node-card-tag">gen {node.generation}</span>}
+        {node.credential && (
+          <span
+            className={`node-card-tag ${leafPhaseClass(node.credential)}`}
+            title={`Credentials expire ${node.credential.not_after}`}
+          >
+            leaf {formatRemainingSecs(node.credential.remaining_secs)}
+          </span>
+        )}
         <button
           className={running ? "" : "primary"}
           disabled={node.state === "Starting" || node.state === "Stopping"}

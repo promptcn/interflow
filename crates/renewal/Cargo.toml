@@ -11,10 +11,10 @@ name = "interflow_renewal"
 path = "src/lib.rs"
 
 [dependencies]
-interflow-identity = { path = "../identity", version = "0.4" }
-interflow-core = { path = "../core", version = "0.4" }
+interflow-identity = { path = "../identity", version = "0.5" }
+interflow-core = { path = "../core", version = "0.5" }
 # Shared atomic writes (CRL refresh)
-interflow-util = { path = "../util", version = "0.4" }
+interflow-util = { path = "../util", version = "0.5" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"

@@ -13,7 +13,6 @@ use interflow_expose::edge::{
     ControlEndpointTls, EdgeConfig, IngressPrincipal, Route, WorkspaceTrust,
 };
 use interflow_mesh::config::TransportKind;
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -33,10 +32,6 @@ async fn routes_select_their_own_workspace_session() {
     let certs_b = interflow_testkit::certs::TestCerts::generate("ws-b", "agent-b");
     let (echo_a, _echo_a_task) = interflow_testkit::echo_server().await;
     let (echo_b, _echo_b_task) = interflow_testkit::echo_server().await;
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
     // Workspace-scoped ingress principals (CN `edge`, each signed by its
     // own workspace's issuer).
@@ -51,8 +46,9 @@ async fn routes_select_their_own_workspace_session() {
     }
 
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs_a.server_cert_path(),
             key: certs_a.server_key_path(),
@@ -85,14 +81,9 @@ async fn routes_select_their_own_workspace_session() {
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    tokio::task::spawn(interflow_expose::edge::run(edge_config));
-
-    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
-        .await
-        .expect("control endpoint should start within 5s");
-    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
-        .await
-        .expect("edge listener should start within 5s");
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    let edge_listen = edge.public_addr();
+    let hub_port = edge.control_addr().port();
 
     // One egress agent per workspace. Both verify the control endpoint via
     // workspace A's CA (the control cert is issued by it) and anchor their

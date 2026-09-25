@@ -1,12 +1,5 @@
 import { useEffect, useState } from "react";
-import {
-  api,
-  isRunning,
-  stateText,
-  type LogLine,
-  type NodeInfo,
-  type Transport,
-} from "../api";
+import { api, formatRemainingSecs, isRunning, leafPhaseClass, stateText, type LogLine, type NodeInfo, type Transport } from "../api";
 import LogView from "./LogView";
 import { KindBadge, SectionPanel, StateDot } from "./ui";
 
@@ -214,6 +207,18 @@ export default function NodeDetail({
               <span className="hint">{node.generation}</span>
             </div>
           )}
+          {node.credential && (
+            <div className="row">
+              <label>Credentials expire</label>
+              <span
+                className={`hint ${leafPhaseClass(node.credential)}`}
+                title="When this node's leaf credentials stop working — rotate before then"
+              >
+                {node.credential.not_after} ·{" "}
+                {formatRemainingSecs(node.credential.remaining_secs)} left
+              </span>
+            </div>
+          )}
         </SectionPanel>
 
         {hasMeshRules && (
@@ -240,7 +245,7 @@ export default function NodeDetail({
                 {node.mesh_egress_rules.map((rule) => (
                   <div className="mesh-rule" key={rule.name}>
                     <span className="mesh-rule-proto">{rule.protocol}</span>
-                    <span>{rule.target_addr}</span>
+                    <span>{rule.target}</span>
                     <span className="mesh-rule-name hint" title={rule.name}>
                       {rule.name}
                     </span>

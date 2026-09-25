@@ -12,8 +12,8 @@
 //! process exit, so the supervisor restarts the node onto the new material.
 
 use crate::config::{
-    AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, EgressRule, HubConfig,
-    HubTlsConfig, IngressRule, InnerTlsConfig, ServerConfig, TenantConfig,
+    AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, EgressRule,
+    EgressTarget, HubConfig, HubTlsConfig, IngressRule, InnerTlsConfig, ServerConfig, TenantConfig,
 };
 use crate::hub::HubServer;
 use interflow_core::config::AuditConfig;
@@ -23,6 +23,7 @@ use interflow_core::tls::TlsMinVersion;
 use interflow_identity::credentials::ActiveCredentialSet;
 use interflow_identity::manifest::MeshProtocol;
 use interflow_identity::pack::{CredentialPack, PackKind};
+use interflow_identity::policy::RuntimePolicy;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -84,7 +85,9 @@ pub fn build_hub_config(
     }
     let trust_dir = pack_dir.join("trust");
 
-    // Tenant trust table: one entry per workspace issuer in the bundle.
+    // Tenant trust table: one entry per workspace issuer in the bundle, plus
+    // the reserved `control` tenant (the realm issuer's control principals —
+    // the policy publication face; data-plane endpoints reject it).
     // CRLs: live refresh first, the rotate-embedded snapshot otherwise.
     let mut tenants = Vec::new();
     for name in pack.trust.metadata.issuers.keys() {
@@ -106,6 +109,13 @@ pub fn build_hub_config(
              agent and re-apply",
         ));
     }
+    let control_crl = interflow_identity::pack::crl_path_for(pack_dir, "control");
+    tenants.push(TenantConfig {
+        name: crate::hub::state::CONTROL_TENANT.to_owned(),
+        ca_path: trust_dir.join("control.crt").display().to_string(),
+        crl_path: control_crl.as_ref().map(|p| p.display().to_string()),
+        trusted_gateway: false,
+    });
 
     // Server credential: the control-endpoint identity (renewed sequences
     // materialize under the pack's active state).
@@ -129,17 +139,7 @@ pub fn build_hub_config(
     // Cross-workspace admission derives from the signed policy (same-
     // workspace streams are allowed by the engine's default; the empty rule
     // set means full inter-workspace isolation).
-    let mut acl = AclConfig::default();
-    for stream in &pack.policy.mesh {
-        if stream.source_workspace != stream.target_workspace {
-            acl.rules.insert(AclRule {
-                source_tenant: stream.source_workspace.clone(),
-                source: stream.source_agent.clone(),
-                target_tenant: stream.target_workspace.clone(),
-                target: stream.target_agent.clone(),
-            });
-        }
-    }
+    let acl = policy_acl(&pack.policy);
 
     let config = HubConfig {
         server: ServerConfig {
@@ -167,6 +167,19 @@ pub fn build_hub_config(
         audit: AuditConfig {
             enabled: true,
             path: Some(pack_dir.join("audit.jsonl").display().to_string()),
+            // Rotation defaults (64 MiB / keep 32 / gzip) apply — a
+            // long-lived hub ledger must never grow unbounded.
+            rotation: Default::default(),
+        },
+        // The policy publication face: the trust bundle's policy key + the
+        // node-local update channel (the same files the reload watcher
+        // polls). The floor starts at the authoritative policy generation
+        // this hub loaded (state/policy override included).
+        policy: crate::config::PolicyAdminConfig {
+            verifier_key_hex: Some(pack.trust.metadata.policy_key.clone()),
+            state_policy_dir: Some(pack_dir.join("state").join("policy")),
+            embedded_policy_dir: Some(pack_dir.join("policy")),
+            generation: pack.policy.generation,
         },
         logging: Default::default(),
     };
@@ -229,45 +242,11 @@ pub fn build_agent_config(
         }
     }
 
-    let mut ingress = Vec::with_capacity(mesh.ingress.len());
-    for rule in &mesh.ingress {
-        // Cross-workspace targets travel tenant-qualified on the wire (a
-        // bare id resolves into the source's own tenant at the hub); the
-        // workspace pairing comes from the signed policy, not local guess.
-        let target_qualified = pack
-            .policy
-            .mesh
-            .iter()
-            .find(|s| s.source_agent == pack.metadata.node && s.target_agent == rule.target_agent)
-            .and_then(|s| {
-                (s.target_workspace != workspace)
-                    .then(|| format!("{}/{}", s.target_workspace, rule.target_agent))
-            })
-            .unwrap_or_else(|| rule.target_agent.clone());
-        ingress.push(IngressRule {
-            name: rule.name.clone(),
-            listen_addr: parse_addr(&rule.listen, "listen address")?,
-            listen_protocol: stream_proto(rule.protocol),
-            target_agent: target_qualified,
-            remote_addr: Some(rule.remote_addr.clone()),
-            idle_timeout_secs: None,
-            udp_per_ip_pps: Default::default(),
-            udp_per_ip_bytes_per_sec: Default::default(),
-            udp_egress_bytes_per_sec: Default::default(),
-        });
+    let mut ingress = Vec::new();
+    for rule in policy_ingress_rules(&pack.policy, &pack.metadata.node, workspace)? {
+        ingress.push(rule);
     }
-    let mut egress = Vec::with_capacity(mesh.egress.len());
-    for rule in &mesh.egress {
-        egress.push(EgressRule {
-            name: rule.name.clone(),
-            target_addr: parse_addr(&rule.target_addr, "target address")?,
-            target_protocol: stream_proto(rule.protocol),
-            udp_idle_timeout_secs: None,
-        });
-    }
-    // Egress allowlist (SSRF bound): exactly what this agent offered to
-    // peers in the manifest.
-    let allowed_targets: Vec<String> = mesh.egress.iter().map(|r| r.target_addr.clone()).collect();
+    let (egress, allowed_targets) = policy_egress_rules(&pack.policy, &pack.metadata.node)?;
 
     let config = AgentConfig {
         agent: AgentInfo {
@@ -312,6 +291,345 @@ fn normalize_endpoint(endpoint: &str) -> String {
     }
 }
 
+/// The hub's cross-workspace admission table, derived from the signed
+/// policy's stream face.
+///
+/// Same-workspace streams need no rule (the engine's default allows them);
+/// an empty rule set means full inter-workspace isolation. Shared by
+/// startup assembly and the signed-policy reload — the hub consults the
+/// live table on every Open.
+pub fn policy_acl(policy: &RuntimePolicy) -> AclConfig {
+    let mut acl = AclConfig::default();
+    for stream in &policy.mesh {
+        if stream.source_workspace != stream.target_workspace {
+            acl.rules.insert(AclRule {
+                source_tenant: stream.source_workspace.clone(),
+                source: stream.source_agent.clone(),
+                target_tenant: stream.target_workspace.clone(),
+                target: stream.target_agent.clone(),
+            });
+        }
+    }
+    acl
+}
+
+/// How often the node-local policy update channel (`state/policy`) is
+/// polled — the renewal scheduler's polling discipline (no platform watch
+/// dependencies); one interval of latency is well inside the product goal
+/// for policy changes ("minutes, not days").
+const POLICY_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Fingerprint of a policy channel directory: both files' mtime + length.
+/// `None` when the channel is absent. Shared by the reload watchers and
+/// the hub's serve cache (fingerprint unchanged → the verified bytes are
+/// unchanged).
+pub(crate) fn policy_channel_fingerprint(
+    policy_dir: &Path,
+) -> Option<(std::time::SystemTime, u64, std::time::SystemTime, u64)> {
+    let toml_meta = std::fs::metadata(policy_dir.join("policy.toml")).ok()?;
+    let sig_meta = std::fs::metadata(policy_dir.join("policy.sig")).ok()?;
+    Some((
+        toml_meta.modified().ok()?,
+        toml_meta.len(),
+        sig_meta.modified().ok()?,
+        sig_meta.len(),
+    ))
+}
+
+/// Spawns the signed-policy reload watcher for a running mesh agent.
+///
+/// Two distribution channels, one applying path: the node-local file
+/// channel (`state/policy`) and — when a tunnel facade is supplied — the
+/// hub's control-plane pull (`GET /policy`), which is how an update
+/// published at the hub reaches every agent with zero physical touches (an
+/// offline agent catches up on its first connected tick). Each tick
+/// verifies candidates against the pack's trust bundle and the
+/// anti-rollback floor, then hands the derived rules to
+/// [`AgentClient::apply_policy`]. Rejection is fail-keep: a tampered
+/// signature, a rollback, or an undervivable rule face is logged (with its
+/// category) while the current policy keeps serving.
+pub fn spawn_policy_reload(
+    pack_dir: &Path,
+    client: crate::agent::AgentClient,
+    tunnel: Option<interflow_core::tunnel::AgentTunnel>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
+    let node = pack.metadata.node.clone();
+    let workspace = pack.metadata.workspace.clone().unwrap_or_default();
+    let verifier_key = pack.trust.metadata.policy_key.clone();
+    let mut seen = pack.policy.generation;
+    let dir = pack_dir.to_owned();
+    Ok(tokio::spawn(async move {
+        let policy_dir = dir.join("state/policy");
+        let mut fingerprint = policy_channel_fingerprint(&policy_dir);
+        loop {
+            tokio::time::sleep(POLICY_WATCH_INTERVAL).await;
+
+            // Channel 1: the node-local file drop.
+            let current = policy_channel_fingerprint(&policy_dir);
+            if current != fingerprint {
+                fingerprint = current;
+                try_reload(&dir, &node, &workspace, &client, &mut seen).await;
+            }
+
+            // Channel 2: the hub's control plane, as a conditional request:
+            // the hub answers 304 (mapped to None here) while the caller
+            // already holds the serving generation. A pull that fails
+            // (older hub, QUIC transport, session mid-rebuild) is skipped
+            // for this tick — the next tick retries.
+            if let Some(tunnel) = &tunnel
+                && let Ok(Some(fetch)) = tunnel.pull_policy(seen).await
+                && fetch.generation > seen
+            {
+                match RuntimePolicy::verify_with_hex_key(
+                    &fetch.body,
+                    &fetch.signature,
+                    &verifier_key,
+                ) {
+                    Ok(policy) => {
+                        if let Err(e) = policy.check_not_rollback(seen) {
+                            tracing::warn!(
+                                "policy pull: rejecting hub-served generation {} (keeping \
+                                 current): {e}",
+                                fetch.generation
+                            );
+                        } else {
+                            // Persist into the node-local channel first: the
+                            // applying path (and any restart) reads exactly
+                            // these files.
+                            let channel_dir = dir.join("state/policy");
+                            if let Err(e) = std::fs::create_dir_all(&channel_dir) {
+                                tracing::warn!("policy pull: cannot persist update: {e}");
+                            } else {
+                                let write = |name: &str, bytes: &[u8]| {
+                                    let path = channel_dir.join(name);
+                                    let tmp = channel_dir.join(format!("{name}.tmp"));
+                                    std::fs::write(&tmp, bytes)
+                                        .and_then(|()| std::fs::rename(&tmp, &path))
+                                };
+                                if let Err(e) = write("policy.toml", &fetch.body)
+                                    .and_then(|()| write("policy.sig", &fetch.signature))
+                                {
+                                    tracing::warn!("policy pull: persisting update failed: {e}");
+                                } else {
+                                    fingerprint = policy_channel_fingerprint(&policy_dir);
+                                    tracing::info!(
+                                        target: "audit",
+                                        generation = fetch.generation,
+                                        "policy pull: accepted hub-served update into the \
+                                         node-local channel"
+                                    );
+                                    try_reload(&dir, &node, &workspace, &client, &mut seen).await;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "policy pull: rejecting hub-served bytes (keeping current): {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }))
+}
+
+/// One apply attempt from the node-local channel: reload the pack (trust
+/// bundle + update channel), verify + anti-rollback check, derive, apply.
+/// `seen` advances only on a successful application.
+async fn try_reload(
+    dir: &Path,
+    node: &str,
+    workspace: &str,
+    client: &crate::agent::AgentClient,
+    seen: &mut u64,
+) {
+    // Re-load the pack for the trust bundle + update channel; a torn copy
+    // mid-write fails here and is retried next tick.
+    let Ok(pack) = CredentialPack::load_runtime(dir) else {
+        tracing::warn!("policy reload: pack reload failed (torn update?), keeping current policy");
+        return;
+    };
+    match pack.policy_update(*seen) {
+        Ok(Some(update)) => {
+            let generation = update.policy.generation;
+            match (
+                policy_ingress_rules(&update.policy, node, workspace),
+                policy_egress_rules(&update.policy, node),
+            ) {
+                (Ok(ingress), Ok((egress, allowed))) => {
+                    let signature = interflow_util::sha256_hex(&update.signature);
+                    tracing::info!(
+                        target: "audit",
+                        generation,
+                        signature_fingerprint = %signature,
+                        ingress_rules = ingress.len(),
+                        egress_rules = egress.len(),
+                        "policy reload: applying signed policy update"
+                    );
+                    client.apply_policy(ingress, egress, allowed).await;
+                    *seen = generation;
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    // The signed face is unusable on this node — keep the
+                    // current policy; a corrected re-drop (new fingerprint)
+                    // retries cleanly.
+                    tracing::error!(
+                        "policy reload: update does not derive valid rules, keeping current \
+                         policy: {e}"
+                    );
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!("policy reload: rejecting update (keeping current policy): {e}");
+        }
+    }
+}
+
+/// Spawns the signed-policy reload watcher for a running hub.
+///
+/// Swaps the cross-workspace admission table under the shared-config lock
+/// (effective on the next Open — never a listener rebuild). Same fail-keep
+/// contract as the agent watcher.
+pub fn spawn_hub_policy_reload(
+    pack_dir: &Path,
+    hub: &HubServer,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
+    let mut seen = pack.policy.generation;
+    let shared = hub.shared_config();
+    let dir = pack_dir.to_owned();
+    Ok(tokio::spawn(async move {
+        let policy_dir = dir.join("state/policy");
+        let mut fingerprint = policy_channel_fingerprint(&policy_dir);
+        loop {
+            tokio::time::sleep(POLICY_WATCH_INTERVAL).await;
+            let current = policy_channel_fingerprint(&policy_dir);
+            if current == fingerprint {
+                continue;
+            }
+            fingerprint = current;
+            let Ok(pack) = CredentialPack::load_runtime(&dir) else {
+                tracing::warn!(
+                    "policy reload: pack reload failed (torn update?), keeping current policy"
+                );
+                continue;
+            };
+            match pack.policy_update(seen) {
+                Ok(Some(update)) => {
+                    let generation = update.policy.generation;
+                    let acl = policy_acl(&update.policy);
+                    let rules = acl.rules.len();
+                    let mut config = shared.write().await;
+                    config.acl = acl;
+                    drop(config);
+                    tracing::info!(
+                        target: "audit",
+                        generation,
+                        acl_rules = rules,
+                        "hub policy reload: cross-workspace admission table swapped"
+                    );
+                    seen = generation;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "hub policy reload: rejecting update (keeping current policy): {e}"
+                    );
+                }
+            }
+        }
+    }))
+}
+
+/// Derives one agent's engine ingress rules from the signed policy's stream
+/// face — its own listen-side rows (`source_agent == node`).
+///
+/// The single derivation for both startup assembly and the hot-reload path;
+/// cross-workspace targets travel tenant-qualified on the wire (a bare id
+/// resolves into the source's own tenant at the hub), with the workspace
+/// pairing taken from the signed row itself, never local guess.
+pub fn policy_ingress_rules(
+    policy: &RuntimePolicy,
+    node: &str,
+    workspace: &str,
+) -> Result<Vec<IngressRule>> {
+    let mut ingress = Vec::new();
+    for stream in &policy.mesh {
+        if stream.source_agent != node {
+            continue;
+        }
+        let target_agent = if stream.target_workspace == workspace {
+            stream.target_agent.clone()
+        } else {
+            format!("{}/{}", stream.target_workspace, stream.target_agent)
+        };
+        ingress.push(IngressRule {
+            name: stream.name.clone(),
+            listen_addr: parse_addr(&stream.listen, "listen address")?,
+            listen_protocol: stream_proto(stream.protocol),
+            target_agent,
+            remote_addr: Some(stream.remote_addr.clone()),
+            idle_timeout_secs: stream.idle_timeout_secs,
+            udp_per_ip_pps: Default::default(),
+            udp_per_ip_bytes_per_sec: Default::default(),
+            udp_egress_bytes_per_sec: Default::default(),
+        });
+    }
+    Ok(ingress)
+}
+
+/// Derives one agent's engine egress rules and its egress allowlist from the
+/// signed policy's egress face (`agent == node`).
+///
+/// The allowlist entry is the offer itself — one concrete address, or a
+/// range that widens the offer to every address (any port) inside it.
+/// Single derivation for startup and hot reload, so the two can never
+/// drift.
+pub fn policy_egress_rules(
+    policy: &RuntimePolicy,
+    node: &str,
+) -> Result<(Vec<EgressRule>, Vec<String>)> {
+    let mut egress = Vec::new();
+    let mut allowed_targets = Vec::new();
+    for offer in &policy.mesh_egress {
+        if offer.agent != node {
+            continue;
+        }
+        let target = match (&offer.target_addr, &offer.target_cidr) {
+            (Some(addr), None) => EgressTarget::Addr(parse_addr(addr, "target address")?),
+            (None, Some(cidr)) => EgressTarget::Cidr(cidr.parse().map_err(|e| {
+                config_error(format!(
+                    "mesh egress offer {:?}: target_cidr {cidr:?}",
+                    offer.name
+                ))
+                .with_source(e)
+            })?),
+            // The signer-side validator rejects both-empty / both-present;
+            // a signed policy carrying one is foreign or tampered — refuse
+            // rather than guess.
+            _ => {
+                return Err(config_error(format!(
+                    "mesh egress offer {:?}: exactly one of target_addr / target_cidr is \
+                     required",
+                    offer.name
+                )));
+            }
+        };
+        allowed_targets.push(offer.authorization().to_owned());
+        egress.push(EgressRule {
+            name: offer.name.clone(),
+            target,
+            target_protocol: stream_proto(offer.protocol),
+            udp_idle_timeout_secs: offer.udp_idle_timeout_secs,
+        });
+    }
+    Ok((egress, allowed_targets))
+}
+
 /// `interflow-mesh hub --pack <dir>`: engine + renewal scheduler, whichever
 /// finishes first wins (renewal/CRL updates exit gracefully so the
 /// supervisor restarts onto the new material).
@@ -328,6 +646,7 @@ pub async fn run_hub(pack_dir: &Path) -> Result<()> {
     );
     let plane = crate::hub::server::build_runtime_tls_plane(&config)?;
     let hub = HubServer::with_tls_plane(config, plane)?;
+    let mut policy_watcher = spawn_hub_policy_reload(pack_dir, &hub)?;
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     {
@@ -373,6 +692,17 @@ pub async fn run_hub(pack_dir: &Path) -> Result<()> {
     tokio::select! {
         result = &mut hub_run => result,
         result = interflow_renewal::renewal_scheduler(pack_dir) => result,
+        // The watcher only ever returns by panic — that is a structural
+        // defect worth failing the process over rather than silently
+        // freezing the policy channel.
+        joined = &mut policy_watcher => {
+            joined.map_err(|e| {
+                InterflowError::config("hub policy watcher task failed").with_source(e)
+            })?;
+            Err(InterflowError::config(
+                "hub policy watcher exited unexpectedly (no update loop exit exists)",
+            ))
+        }
     }
 }
 
@@ -392,7 +722,9 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
     let hub_url = config.agent.hub_url.clone();
     let rules = config.ingress.len() + config.egress.len();
     let has_ingress_listeners = !config.ingress.is_empty();
-    let mut agent = crate::agent::AgentClient::new(config)?.start();
+    let client = crate::agent::AgentClient::new(config)?;
+    let mut agent = client.clone().start();
+    let mut policy_watcher = spawn_policy_reload(pack_dir, client, Some(agent.tunnel()))?;
     println!(
         "mesh agent {} started: {} rule(s) → {}",
         pack.metadata.node, rules, hub_url
@@ -439,6 +771,7 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
         );
     tokio::select! {
         () = wait_for_shutdown_signal() => {
+            policy_watcher.abort();
             pump.abort();
             if let Err(e) = agent.shutdown_graceful().await {
                 tracing::error!("graceful shutdown failed: {e}");
@@ -447,12 +780,25 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
             std::process::exit(130)
         }
         joined = &mut scheduler => {
+            policy_watcher.abort();
             pump.abort();
             agent.shutdown_graceful().await?;
             joined.map_err(|e| {
                 InterflowError::config("renewal scheduler task failed").with_source(e)
             })??;
             Ok(())
+        }
+        // The watcher only ever returns by panic — fail the process rather
+        // than silently freezing the policy channel.
+        joined = &mut policy_watcher => {
+            pump.abort();
+            agent.shutdown_graceful().await?;
+            joined.map_err(|e| {
+                InterflowError::config("policy watcher task failed").with_source(e)
+            })?;
+            Err(InterflowError::config(
+                "policy watcher exited unexpectedly (no update loop exit exists)",
+            ))
         }
     }
 }
@@ -538,8 +884,8 @@ target_addr = "127.0.0.1:3000"
             config.server.listen_addr,
             "0.0.0.0:6666".parse::<SocketAddr>().unwrap()
         );
-        // Tenant table: one issuer-anchored entry per workspace, paths
-        // inside the pack.
+        // Tenant table: one issuer-anchored entry per workspace (plus the
+        // reserved control tenant), paths inside the pack.
         let mut names: Vec<&str> = config
             .auth
             .tenants
@@ -547,9 +893,14 @@ target_addr = "127.0.0.1:3000"
             .map(|t| t.name.as_str())
             .collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["alpha", "beta"]);
+        assert_eq!(names, vec!["alpha", "beta", "control"]);
         for tenant in &config.auth.tenants {
-            assert!(tenant.ca_path.contains("trust/workspace-"));
+            assert!(
+                tenant.ca_path.contains("trust/workspace-")
+                    || tenant.ca_path.contains("trust/control.crt"),
+                "unexpected tenant anchor: {}",
+                tenant.ca_path
+            );
             assert!(!tenant.trusted_gateway);
         }
         // Cross-workspace stream → one ACL rule; same-workspace needs none.
@@ -563,6 +914,8 @@ target_addr = "127.0.0.1:3000"
         assert!(tls.cert_path.contains("state/credentials"));
         assert_eq!(tls.min_version, TlsMinVersion::V1_3);
 
+        assert_eq!(config.policy.generation, 1);
+        assert!(config.policy.verifier_key_hex.is_some());
         // Same-workspace deployments stay isolated with an empty rule set.
         let same = Manifest::parse(
             r#"
@@ -594,7 +947,7 @@ target_addr = "127.0.0.1:3000"
         let active2 = ActiveCredentialSet::load_or_bootstrap(&pack2).unwrap();
         let config2 = build_hub_config(&pack2, &active2, &out2).unwrap();
         assert!(config2.acl.rules.is_empty());
-        assert_eq!(config2.auth.tenants.len(), 1);
+        assert_eq!(config2.auth.tenants.len(), 2, "alpha + control");
     }
 
     #[test]

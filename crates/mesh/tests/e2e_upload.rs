@@ -36,7 +36,7 @@ use interflow_core::tunnel::H2RequestBody;
 use interflow_core::tunnel::negotiation::{RegisterResponse, RouteResponse};
 use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
 use interflow_mesh::hub::qualified_agent_id;
-use interflow_testkit::{hub_config_tuned, pick_ephemeral_port, spawn_hub};
+use interflow_testkit::{has_agent, hub_config_tuned, list_agents, spawn_hub};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -162,18 +162,6 @@ async fn poll(
     snd.send_request(req).await.expect("poll")
 }
 
-async fn list_agents(snd: &mut SendRequest<H2RequestBody>) -> Vec<String> {
-    snd.ready().await.expect("ready");
-    let req = Request::builder()
-        .method("GET")
-        .uri("/agents")
-        .body(interflow_core::tunnel::empty_request_body())
-        .unwrap();
-    let resp = snd.send_request(req).await.expect("agents");
-    let body = resp.into_body().collect().await.expect("body").to_bytes();
-    serde_json::from_slice(&body).expect("agents json")
-}
-
 fn encode_up(ft: FrameType, sid: StreamId, src: CircuitToken, payload: &[u8]) -> Bytes {
     let mut buf = BytesMut::new();
     encode_frame(ft, 0, sid, src, payload, &mut buf).expect("encode");
@@ -214,15 +202,17 @@ async fn wait_close_note(body: &mut hyper::body::Incoming, sid: StreamId) -> Str
 /// first is dropped, it can be rebuilt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn second_upload_same_agent_gets_409() {
-    let port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config_tuned(
-        port,
+    let port = spawn_hub(hub_config_tuned(
+        0,
         certs(),
         vec![],
         security(),
         HeartbeatConfig::default(),
     ))
-    .await;
+    .await
+    .local_addr()
+    .expect("hub bound")
+    .port();
 
     let mut a = connect(port, "dup").await;
     let dup_circuit = register(&mut a, "dup").await;
@@ -254,15 +244,17 @@ async fn second_upload_same_agent_gets_409() {
 /// old upload's response ends (the death signal yields its place).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn register_preempts_active_upload() {
-    let port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config_tuned(
-        port,
+    let port = spawn_hub(hub_config_tuned(
+        0,
         certs(),
         vec![],
         security(),
         HeartbeatConfig::default(),
     ))
-    .await;
+    .await
+    .local_addr()
+    .expect("hub bound")
+    .port();
 
     // Connection A: register + active upload
     let mut a = connect(port, "agent-x").await;
@@ -304,15 +296,17 @@ async fn register_preempts_active_upload() {
 /// connection identity → rejected with `_close_` and the upload survives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forged_source_frame_rejected_upload_survives() {
-    let port = pick_ephemeral_port();
-    let _hub = spawn_hub(hub_config_tuned(
-        port,
+    let port = spawn_hub(hub_config_tuned(
+        0,
         certs(),
         vec![],
         security(),
         HeartbeatConfig::default(),
     ))
-    .await;
+    .await
+    .local_addr()
+    .expect("hub bound")
+    .port();
 
     let mut a = connect(port, "real").await;
     let real_circuit = register(&mut a, "real").await;
@@ -387,13 +381,16 @@ async fn forged_source_frame_rejected_upload_survives() {
 /// upload response ends; a rebuild self-heals via implicit re-registration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
-    let port = pick_ephemeral_port();
     let hb = HeartbeatConfig {
         enabled: true,
         interval_secs: 1,
         max_missed: 1,
     };
-    let _hub = spawn_hub(hub_config_tuned(port, certs(), vec![], security(), hb)).await;
+    let port = spawn_hub(hub_config_tuned(0, certs(), vec![], security(), hb))
+        .await
+        .local_addr()
+        .expect("hub bound")
+        .port();
 
     let mut a = connect(port, "wedge").await;
     let wedge_circuit = register(&mut a, "wedge").await;
@@ -420,7 +417,7 @@ async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
-        if !list_agents(&mut a).await.contains(&wedge_key) {
+        if !has_agent(&list_agents(&mut a).await, &wedge_key) {
             break;
         }
         assert!(
@@ -455,7 +452,7 @@ async fn evict_ends_upload_and_reupload_implicitly_reregisters() {
         "rebuilding the upload should implicitly re-register successfully"
     );
     assert!(
-        list_agents(&mut a).await.contains(&wedge_key),
+        has_agent(&list_agents(&mut a).await, &wedge_key),
         "should be back in the registry after implicit re-registration"
     );
 }

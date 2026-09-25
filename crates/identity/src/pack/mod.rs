@@ -163,9 +163,18 @@ pub struct NodeEdgeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeMeshConfig {
-    /// The mesh hub this agent dials (`https://host:port`).
+    /// The mesh hub this agent dials (`https://host:port`). The site-to-site
+    /// rules themselves live in the signed policy (`policy/policy.toml`) —
+    /// node-local dial info is all `node.toml` carries for the mesh face.
     pub hub_endpoint: String,
+    /// Legacy pre-policy-face fields (rules carried here before the
+    /// policy-identity separation). Parsed so an old pack gets a precise
+    /// migration error instead of a bare unknown-field parse failure;
+    /// a non-empty value is rejected at load and the renderer never
+    /// writes these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ingress: Vec<crate::manifest::MeshIngressRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<crate::manifest::MeshEgressRule>,
 }
 
@@ -599,10 +608,16 @@ target_addr = "127.0.0.1:3000"
             pack.primary_identity().unwrap().principal.to_string(),
             "spiffe://promptcn/alpha/agent/lan-a"
         );
+        // node.toml carries node-local dial info only — the rules ride the
+        // signed policy.
         let mesh = pack.node_config.mesh.as_ref().expect("mesh role");
         assert_eq!(mesh.hub_endpoint, "hub.example.com:6666");
-        assert_eq!(mesh.ingress.len(), 1);
-        assert_eq!(mesh.ingress[0].target_agent, "lan-b");
+        assert!(mesh.ingress.is_empty() && mesh.egress.is_empty());
+        let stream = &pack.policy.mesh[0];
+        assert_eq!(stream.source_agent, "lan-a");
+        assert_eq!(stream.target_agent, "lan-b");
+        assert_eq!(stream.listen, "127.0.0.1:3001");
+        assert_eq!(stream.name, "svc");
         // The agent dials the hub, not an expose control endpoint.
         assert_eq!(pack.metadata.control_endpoint, "hub.example.com:6666");
         // Cross-workspace peer anchors ride in the trust bundle.
@@ -610,12 +625,14 @@ target_addr = "127.0.0.1:3000"
         assert!(pack.trust.issuers.contains_key("workspace/beta"));
 
         // The egress side needs the source's anchor for inner peer
-        // verification — mutual inner TLS.
+        // verification — mutual inner TLS. Its offer lives in the signed
+        // policy's egress face.
         let out_b = tmp.path().join("packs/agent-lan-b");
         AgentCredentialPack::render(&issuer, &manifest, "lan-b", 1, &out_b).unwrap();
         let pack_b = CredentialPack::load(&out_b).unwrap();
-        let mesh_b = pack_b.node_config.mesh.as_ref().expect("mesh role");
-        assert_eq!(mesh_b.egress.len(), 1);
+        let offer = &pack_b.policy.mesh_egress[0];
+        assert_eq!(offer.agent, "lan-b");
+        assert_eq!(offer.target_addr.as_deref(), Some("127.0.0.1:3000"));
         assert!(pack_b.trust.issuers.contains_key("workspace/alpha"));
 
         // Expose manifests (no mesh face) render packs without the mesh
@@ -627,6 +644,138 @@ target_addr = "127.0.0.1:3000"
         let expose_pack = CredentialPack::load(&expose_out).unwrap();
         assert!(expose_pack.node_config.mesh.is_none());
         assert!(expose_pack.policy.mesh.is_empty());
+    }
+
+    /// Renders a signed policy update into `state/policy` — the node-local
+    /// update channel.
+    fn write_policy_update(
+        issuer: &IssuerStore,
+        out: &std::path::Path,
+        policy: &crate::policy::RuntimePolicy,
+    ) {
+        let signer = issuer.policy_signer().unwrap();
+        let (bytes, signature) = policy.signed(&signer).unwrap();
+        let dir = out.join("state/policy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("policy.toml"), &bytes).unwrap();
+        std::fs::write(dir.join("policy.sig"), &signature).unwrap();
+    }
+
+    fn update_policy_face(generation: u64, remote_port: u16) -> crate::policy::RuntimePolicy {
+        use crate::policy::*;
+        RuntimePolicy {
+            generation,
+            routes: vec![],
+            services: vec![],
+            ingress_authorizations: vec![],
+            mesh: vec![PolicyMeshStream {
+                source_workspace: "alpha".to_owned(),
+                source_agent: "lan-a".to_owned(),
+                target_workspace: "beta".to_owned(),
+                target_agent: "lan-b".to_owned(),
+                name: "svc".to_owned(),
+                listen: "127.0.0.1:3001".to_owned(),
+                remote_addr: format!("127.0.0.1:{remote_port}"),
+                protocol: crate::manifest::MeshProtocol::Tcp,
+                idle_timeout_secs: None,
+            }],
+            mesh_egress: vec![PolicyMeshEgress {
+                workspace: "beta".to_owned(),
+                agent: "lan-b".to_owned(),
+                name: "svc".to_owned(),
+                protocol: crate::manifest::MeshProtocol::Tcp,
+                target_addr: Some(format!("127.0.0.1:{remote_port}")),
+                target_cidr: None,
+                udp_idle_timeout_secs: None,
+            }],
+        }
+    }
+
+    /// A newer signed bundle in `state/policy` supersedes the embedded
+    /// snapshot at load — the policy evolves without re-signing any identity.
+    #[test]
+    fn state_policy_update_supersedes_embedded_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issuer = mesh_issuer(&tmp);
+        let manifest = Manifest::parse(&mesh_manifest_text()).unwrap();
+        let out = tmp.path().join("packs/agent-lan-a");
+        AgentCredentialPack::render(&issuer, &manifest, "lan-a", 1, &out).unwrap();
+        let embedded = CredentialPack::load_runtime(&out).unwrap();
+        assert_eq!(embedded.policy.generation, 1);
+        assert_eq!(embedded.policy.mesh[0].remote_addr, "127.0.0.1:3000");
+
+        write_policy_update(&issuer, &out, &update_policy_face(2, 9443));
+        let updated = CredentialPack::load_runtime(&out).unwrap();
+        assert_eq!(updated.policy.generation, 2);
+        assert_eq!(updated.policy.mesh[0].remote_addr, "127.0.0.1:9443");
+        // The running node's watcher API accepts it against the embedded
+        // floor and rejects a replay afterwards.
+        assert!(updated.policy_update(1).unwrap().is_some());
+    }
+
+    /// Rollback and tampering are rejected by category — the embedded
+    /// snapshot keeps serving (fail-keep), and the watcher-facing API names
+    /// the failure.
+    #[test]
+    fn state_policy_rollback_and_tamper_are_rejected_fail_keep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issuer = mesh_issuer(&tmp);
+        let manifest = Manifest::parse(&mesh_manifest_text()).unwrap();
+        let out = tmp.path().join("packs/agent-lan-a");
+        AgentCredentialPack::render(&issuer, &manifest, "lan-a", 3, &out).unwrap();
+
+        // A bundle older than the embedded generation.
+        write_policy_update(&issuer, &out, &update_policy_face(2, 9443));
+        let pack = CredentialPack::load_runtime(&out).unwrap();
+        assert_eq!(
+            pack.policy.generation, 3,
+            "a rolled-back update must not supersede the embedded snapshot"
+        );
+        let err = pack.policy_update(3).unwrap_err().to_string();
+        assert!(err.contains("rollback"), "category must be named: {err}");
+
+        // A tampered signature (bytes edited after signing).
+        write_policy_update(&issuer, &out, &update_policy_face(9, 9443));
+        let dir = out.join("state/policy");
+        let bytes = std::fs::read(dir.join("policy.toml")).unwrap();
+        let mut tampered = bytes.clone();
+        tampered[0] ^= 0xff;
+        std::fs::write(dir.join("policy.toml"), tampered).unwrap();
+        let pack = CredentialPack::load_runtime(&out).unwrap();
+        assert_eq!(pack.policy.generation, 3);
+        let err = pack.policy_update(3).unwrap_err().to_string();
+        assert!(
+            err.contains("signature") || err.contains("parse"),
+            "category must be named: {err}"
+        );
+    }
+
+    /// Packs from before the policy-identity separation (rules in
+    /// node.toml) fail with the migration instruction, not a bare parse
+    /// error.
+    #[test]
+    fn pre_separation_pack_is_rejected_with_migration_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issuer = mesh_issuer(&tmp);
+        let manifest = Manifest::parse(&mesh_manifest_text()).unwrap();
+        let out = tmp.path().join("packs/agent-lan-a");
+        AgentCredentialPack::render(&issuer, &manifest, "lan-a", 1, &out).unwrap();
+
+        // Rewrite node.toml in the pre-separation shape (rules inline) and
+        // re-fold the digest manifest so only the layout differs.
+        let rendered = std::fs::read_to_string(out.join("node.toml")).unwrap();
+        let legacy = format!(
+            "{rendered}\n[[mesh.ingress]]\nname = \"svc\"\nlisten = \"127.0.0.1:3001\"\n\
+             target_agent = \"lan-b\"\nremote_addr = \"127.0.0.1:3000\"\n"
+        );
+        std::fs::write(out.join("node.toml"), legacy).unwrap();
+        write_digests(&out).unwrap();
+
+        let err = CredentialPack::load_runtime(&out).unwrap_err().to_string();
+        assert!(
+            err.contains("predates the signed-policy rule face"),
+            "migration hint must be present: {err}"
+        );
     }
 
     #[test]

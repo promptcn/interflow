@@ -33,9 +33,7 @@
 )]
 use interflow_expose::edge::{
     ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, Route, WorkspaceTrust,
-    run,
 };
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -47,17 +45,14 @@ use tokio::net::TcpStream;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_offline_closes_fast_without_panic() {
     // 1. Grab ports + a temp routes.toml (route points at a never-registered agent)
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
     // 2. Start only the edge (hub server + edge agent + listener); do not start the expose client
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -83,14 +78,9 @@ async fn agent_offline_closes_fast_without_panic() {
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    let edge_handle = tokio::task::spawn(run(edge_config));
-
-    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
-        .await
-        .expect("hub should start within 5s");
-    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
-        .await
-        .expect("edge listener should start within 5s");
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    let edge_listen = edge.public_addr();
+    let _hub_port = edge.control_addr().port();
 
     // 3. Recording panic hook: capture the payload and forward to the previous hook (keep stderr output)
     let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -122,7 +112,7 @@ async fn agent_offline_closes_fast_without_panic() {
 
     // 6. Wait for the hook to settle (any panic would fire before the socket drop), then wrap up
     tokio::time::sleep(Duration::from_millis(300)).await;
-    edge_handle.abort();
+    edge.shutdown().await.expect("edge shutdown");
 
     match read_result {
         // Server-side close → EOF / connection reset both count as a fast close-out

@@ -21,16 +21,18 @@ path = "src/main.rs"
 fault-injection = ["interflow-core/fault-injection"]
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.4" }
-interflow-contract = { path = "../contract", version = "0.4" }
+interflow-core = { path = "../core", version = "0.5" }
+interflow-contract = { path = "../contract", version = "0.5" }
 # Shared endpoint/authority parsing (QUIC SNI, SSRF host extraction)
-interflow-util = { path = "../util", version = "0.4" }
+interflow-util = { path = "../util", version = "0.5" }
 # Shared rcgen issuance + name validation (single implementation behind the
 # identity issuer and the test kit; mesh config validation checks names)
-interflow-certs = { path = "../certs", version = "0.4" }
+interflow-certs = { path = "../certs", version = "0.5" }
 # Credential Pack bootstrap + renewal (product site-to-site path)
-interflow-identity = { path = "../identity", version = "0.4" }
-interflow-renewal = { path = "../renewal", version = "0.4" }
+interflow-identity = { path = "../identity", version = "0.5" }
+interflow-renewal = { path = "../renewal", version = "0.5" }
+# Compile-time build identity (`version` output + engine logs)
+interflow-buildinfo = { path = "../buildinfo", version = "0.5" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -61,11 +63,13 @@ metrics = "0.24.6"
 
 # Security
 sha2 = "0.11"
-ipnetwork = "0.21.1"
+ipnetwork = { version = "0.21.1", features = ["serde"] }
 subtle = "2.6"
 
 # Error handling
 thiserror = "2"
+# policy signature transport (hex) for the publication endpoint
+hex = { workspace = true }
 
 # Utility libraries
 bytes = "1.12"
@@ -77,14 +81,11 @@ rand = "0.9"
 # Command-line arguments
 clap = { version = "4.6", features = ["derive"] }
 
-[build-dependencies]
-chrono = "0.4"
-
 [dev-dependencies]
 # Shared test/bench harness (dev-dependency cycle: testkit depends on mesh,
 # supported by cargo, same pattern as tokio/tokio-test; testkit stays out of the
 # production dependency graph)
-interflow-testkit = { path = "../testkit", version = "0.4", features = ["fault-injection"] }
+interflow-testkit = { path = "../testkit", version = "0.5", features = ["fault-injection"] }
 # paused-clock unit tests (egress send-path health)
 tokio = { workspace = true, features = ["test-util"] }
 # bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion

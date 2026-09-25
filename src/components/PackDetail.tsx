@@ -112,6 +112,7 @@ export default function PackDetail({
           title={`Seal ${pack.dir_name}`}
           description="The recipient enters it on import."
           confirmLabel="Seal"
+          generate
           onClose={() => setSealTarget(null)}
           onConfirm={async (passphrase) => {
             const target = sealTarget;

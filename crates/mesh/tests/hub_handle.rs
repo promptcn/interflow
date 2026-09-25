@@ -9,7 +9,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use interflow_mesh::hub::{HubHandle, HubLifecycle};
-use interflow_testkit::{hub_config, pick_ephemeral_port};
+use interflow_testkit::hub_config;
 use std::time::{Duration, Instant};
 
 /// Wait until the hub reaches a state satisfying `pred`, panicking on
@@ -43,9 +43,8 @@ async fn wait_state(hub: &HubHandle, what: &str) -> HubLifecycle {
 /// Spawn → Starting → Running → shutdown → Stopped, against a real listener.
 #[tokio::test]
 async fn spawn_run_stop_round_trip() {
-    let port = pick_ephemeral_port();
     let certs = interflow_testkit::certs::TestCerts::generate("hub-handle", "hub-agent");
-    let hub = HubHandle::spawn(hub_config(port, &certs, Vec::new())).expect("hub spawn");
+    let hub = HubHandle::spawn(hub_config(0, &certs, Vec::new())).expect("hub spawn");
     assert_eq!(hub.state(), HubLifecycle::Starting);
     wait_state(&hub, "Running").await;
 
@@ -61,9 +60,11 @@ async fn spawn_run_stop_round_trip() {
 /// the embedder's restart decision needs the cause.
 #[tokio::test]
 async fn busy_port_surfaces_as_failed() {
-    let port = pick_ephemeral_port();
-    // Hold the port so the hub's bind fails.
-    let holder = std::net::TcpListener::bind(("127.0.0.1", port)).expect("hold port");
+    // Hold a concrete port the moment it is chosen (bind :0 = kernel-assigned,
+    // owned until dropped) so the hub's bind of the same address fails
+    // deterministically — no pick-then-hold race window.
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold port");
+    let port = holder.local_addr().expect("held addr").port();
     let certs = interflow_testkit::certs::TestCerts::generate("hub-busy", "hub-agent");
     let hub = HubHandle::spawn(hub_config(port, &certs, Vec::new())).expect("hub spawn");
     let state = wait_state(&hub, "Failed").await;

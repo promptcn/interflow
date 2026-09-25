@@ -22,6 +22,32 @@ pub enum SealKey {
     Recipient(String),
 }
 
+/// A freshly generated sealing passphrase: 18 random bytes as 24 base64url
+/// characters (144 bits) — at or above the strength of a human-chosen one,
+/// with none of the reuse habits. CLI `pack seal --generate-passphrase` and
+/// the GUI issue wizard share this one source, so both surfaces seal with
+/// the same entropy.
+pub fn generate_passphrase() -> Result<String> {
+    let mut bytes = [0u8; 18];
+    // `getrandom::Error` does not implement `std::error::Error`, so the
+    // message is the only place the cause can surface.
+    getrandom::fill(&mut bytes).map_err(|e| Error::pack(format!("passphrase entropy: {e}")))?;
+    // 18 bytes = 6 × 3-byte groups → exactly 24 chars, no padding.
+    const URL_SAFE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(24);
+    for group in 0..6 {
+        let base = group * 3;
+        let n = (u32::from(bytes[base]) << 16)
+            | (u32::from(bytes[base + 1]) << 8)
+            | u32::from(bytes[base + 2]);
+        out.push(URL_SAFE[(n >> 18 & 0x3f) as usize] as char);
+        out.push(URL_SAFE[(n >> 12 & 0x3f) as usize] as char);
+        out.push(URL_SAFE[(n >> 6 & 0x3f) as usize] as char);
+        out.push(URL_SAFE[(n & 0x3f) as usize] as char);
+    }
+    Ok(out)
+}
+
 /// Seals a pack directory into `.iflowpack`.
 pub fn seal(pack_dir: &Path, out_file: &Path, key: &SealKey) -> Result<()> {
     let mut tar_bytes = Vec::new();
@@ -160,4 +186,25 @@ fn tighten_dir(dir: &Path) -> Result<()> {
         Ok(())
     }
     walk(dir)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::generate_passphrase;
+
+    /// 24 base64url characters, twice-generated values differ (fresh OS
+    /// entropy, not a fixed seed).
+    #[test]
+    fn generated_passphrases_are_24_url_safe_chars() {
+        let a = generate_passphrase().unwrap();
+        let b = generate_passphrase().unwrap();
+        assert_eq!(a.len(), 24, "18 bytes → 24 base64url chars, no padding");
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "url-safe alphabet only: {a}"
+        );
+        assert_ne!(a, b, "two draws must not collide");
+    }
 }

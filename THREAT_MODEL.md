@@ -295,20 +295,32 @@ may carry multiple tenants, each with its own client CA:
 - **Real client IPs** are restored per topology and key rate limits,
   connection caps, audit and metrics **only** — never identity or ACL
   decisions (identity is exclusively mTLS). The mechanisms are mutually
-  exclusive and share one trusted-proxy set (loopback by default):
-  **PROXY protocol v2**
-  (`ppp` crate, v1 rejected; LB / nginx-stream fronts, `[server]
-  proxy_protocol` on the hub; preamble read
-  pre-peek; an untrusted source sending a PROXY signature is hard-rejected)
-  and **X-Forwarded-For** on the edge's standard nginx HTTP `proxy_pass`
-  leg (stock nginx cannot emit PROXY there; the mode is derived from the
-  deployment — `required` in the fronted topology, `off` with ACME
-  direct): only the right-most chain
+  exclusive **per listener** (the control stream leg and the public HTTP
+  leg of one fronted deployment legitimately use one each) and share one
+  trusted-proxy set (loopback by default): **PROXY protocol v1/v2**
+  (`ppp` crate for both grammars; v1 is accepted **only from explicitly
+  trusted proxy sources** — stock nginx stream emits v1 — with our framing
+  bounding the text parse to one CRLF-terminated line of ≤108 bytes before
+  ppp sees it, and malformed → fail-closed) and **X-Forwarded-For** on the
+  edge's standard nginx HTTP `proxy_pass` leg (stock nginx cannot emit
+  PROXY there; the mode is derived from the deployment — `required` in the
+  fronted topology, `off` with ACME direct): only the right-most chain
   entry appended by a trusted proxy is used, left-side (client-forged)
   entries are ignored, and `required` rejects a trusted proxy that sends no
   parseable header. With XFF active, per-IP gating for a trusted proxy is
   deferred until the request head is buffered; the fronting nginx's own
   `limit_req`/`limit_conn` cover that leg in the meantime.
+- **Three PROXY protocol consumers** in the fronted topology, one trust
+  rule: an untrusted source emitting a PROXY signature (either version) is
+  hard-rejected everywhere. The **hub control endpoint** consumes the
+  preamble pre-mTLS and keys its per-IP admission, connection caps and
+  audit records on the restored IP — never an identity decision; UNKNOWN
+  headers (either version) fall back to the TCP peer rather than fail. The
+  **registrar** consumes the framing only (loopback-only listener, peek-
+  based, address discarded, zero per-IP decisions). The **nginx internal
+  https listener** terminates it via `listen … proxy_protocol` + realip
+  (`set_real_ip_from` loopback), restoring `$remote_addr` for its own
+  per-IP `limit_req`/`limit_conn` and for the XFF right entry it appends.
 - Residual: the §6 relay-host content exposure is closed for TCP and
   UDP data planes by agent↔agent inner TLS / inner QUIC. Availability and
   traffic-analysis exposure remain as stated above.
@@ -318,9 +330,12 @@ may carry multiple tenants, each with its own client CA:
 `ppp` 2.3.0 is the first parser-class third-party dependency on a
 pre-authentication path (PROXY preamble). Rationale and the audit surface:
 single transitive dependency (`thiserror`), ecosystem de-facto standard
-since 2019; parsed input restricted to v2 (nginx always emits v2); the
-integration boundary carries property tests plus a fuzz-style
-arbitrary-bytes battery (no panic, no IP from untrusted sources), aligned
+since 2019; both wire versions parse through the same crate (one audited
+grammar, no hand-rolled twin) with our framing restricting input to a
+bounded preamble (v2 ≤1024 bytes exact-length; v1 one CRLF-terminated line
+≤108 bytes) before parsing; the integration boundary carries property
+tests plus fuzz-style arbitrary-bytes batteries — uniform-random and
+v1-seeded mutations (no panic, no IP from untrusted sources) — aligned
 with the §8.2 fuzzing roadmap.
 
 ## 7. Attacker position: local actor on an agent host — the control API surface

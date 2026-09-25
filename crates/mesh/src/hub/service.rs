@@ -24,7 +24,7 @@ use interflow_core::error::InterflowError;
 use interflow_core::protocol::CircuitToken;
 use interflow_core::security::AuditKind;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -39,8 +39,6 @@ use tokio::sync::RwLock;
 pub struct HubService {
     /// Long-lived shared hub state (registry/stream tables, limits, audit).
     pub(crate) state: Arc<HubState>,
-    /// Peer TCP address.
-    pub(crate) peer_addr: SocketAddr,
     /// Effective client IP (the PROXY-protocol address when fronted by a
     /// trusted proxy, else the TCP peer). Rate limiting, connection caps and
     /// audit key on this — never identity or ACL decisions.
@@ -59,14 +57,12 @@ impl HubService {
     /// (connection identity is bound per connection).
     pub(crate) const fn new(
         state: Arc<crate::hub::state::HubState>,
-        peer_addr: SocketAddr,
         effective_ip: IpAddr,
         connection_identity: Arc<RwLock<Option<PeerIdentity>>>,
         connection_circuit: Arc<RwLock<Option<CircuitToken>>>,
     ) -> Self {
         Self {
             state,
-            peer_addr,
             effective_ip,
             connection_identity,
             connection_circuit,
@@ -83,9 +79,13 @@ impl HubService {
             .map_or_else(String::new, PeerIdentity::qualified)
     }
 
-    /// Takes the peer address as a string (for auditing).
+    /// Takes the audited peer as a string: the effective client IP (the
+    /// PROXY-protocol address when fronted by a trusted proxy), so audit
+    /// records carry the real client — fronted legs would otherwise all
+    /// log 127.0.0.1. The raw TCP address stays available in accept-path
+    /// log lines; identity never reads either (mTLS only).
     pub(crate) fn peer_str(&self) -> String {
-        self.peer_addr.to_string()
+        self.effective_ip.to_string()
     }
 
     /// The connection's derived identity, if any (fail-closed gate).
@@ -145,7 +145,7 @@ impl Service<Request<Incoming>> for HubService {
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         // All fields are Arc / Copy: a single clone transfers every handle
         let svc = self.clone();
-        let peer_str = self.peer_addr.to_string();
+        let peer_str = self.peer_str();
 
         Box::pin(async move {
             let path = req.uri().path().to_string();
@@ -195,6 +195,8 @@ impl Service<Request<Incoming>> for HubService {
                 (&Method::POST, "/stream/up") => svc.handle_stream_up(req).await,
                 (&Method::GET, "/poll") => svc.handle_poll(req).await,
                 (&Method::GET, "/agents") => svc.handle_list_agents().await,
+                (&Method::PUT, "/policy") => svc.handle_policy_publish(req).await,
+                (&Method::GET, "/policy") => svc.handle_policy_pull(req).await,
                 _ => Ok(text_response(StatusCode::NOT_FOUND, "Not Found")),
             }
         })

@@ -62,7 +62,7 @@ use crate::agent::control::{ControlOpError, EgressCommand};
 use crate::agent::ingress_udp::UDP_RECV_BUF;
 use crate::agent::rules::RuleStore;
 use crate::agent::target_breaker::{BreakerDecision, BreakerKind, TargetBreakers};
-use crate::config::{AgentConfig, EgressRule, SecurityConfig};
+use crate::config::{AgentConfig, EgressRule, EgressTarget, SecurityConfig};
 use bytes::Bytes;
 use interflow_core::config::params::BreakerPolicy;
 use interflow_core::error::{InterflowError, Result};
@@ -202,7 +202,13 @@ type UdpControlStreams = Arc<std::sync::Mutex<HashMap<SessionId, quinn::StreamId
 /// tasks.
 pub(crate) struct EgressSession {
     pub(crate) tunnel: AgentTunnel,
-    pub(crate) security: SecurityConfig,
+    /// Live egress allowlist: a watch receiver over the agent-scoped
+    /// [`SecurityConfig`], so a signed-policy reload (widening or narrowing
+    /// the offer) takes effect on the very next Open without a session
+    /// rebuild. Established streams are never torn down mid-flight — a
+    /// narrower allowlist rejects new flows and lets old ones drain (the
+    /// reload contract).
+    pub(crate) security: tokio::sync::watch::Receiver<SecurityConfig>,
     /// Session resource policy (timeout parameters).
     pub(crate) policy: EgressPolicy,
     /// Agent-level flood-line defenses (shared across sessions).
@@ -599,18 +605,27 @@ impl EgressHandler {
             interflow_core::tunnel::TargetSelector::Default => rules
                 .iter()
                 .find(|rule| rule.target_protocol == StreamProto::Udp)
-                .map(|rule| rule.target_addr.to_string()),
+                .and_then(|rule| match rule.target {
+                    EgressTarget::Addr(addr) => Some(addr.to_string()),
+                    // A range authorizes; it never names a concrete dial.
+                    EgressTarget::Cidr(_) => None,
+                }),
             interflow_core::tunnel::TargetSelector::Address(address) => Some(address),
             interflow_core::tunnel::TargetSelector::Service(service) => rules
                 .iter()
                 .find(|rule| rule.target_protocol == StreamProto::Udp && rule.name == service)
-                .map(|rule| rule.target_addr.to_string()),
+                .and_then(|rule| match rule.target {
+                    EgressTarget::Addr(addr) => Some(addr.to_string()),
+                    EgressTarget::Cidr(_) => None,
+                }),
         }
         .unwrap_or_default();
 
+        // Snapshot the live allowlist for this Open (see the TCP path note).
+        let security_now = security.borrow().clone();
         let reject = if target.is_empty() {
             Some(SessionReject::NoTarget)
-        } else if !Self::is_target_allowed(&target, security)
+        } else if !Self::is_target_allowed(&target, &security_now)
             || runtime
                 .breakers
                 .as_ref()
@@ -908,10 +923,7 @@ impl EgressHandler {
         let sess = self.sess;
 
         for rule in &rules {
-            info!(
-                "Configured egress rule: {} -> {}",
-                rule.name, rule.target_addr
-            );
+            info!("Configured egress rule: {} -> {}", rule.name, rule.target);
         }
 
         let mut command_rx = self.command_rx;
@@ -945,6 +957,19 @@ impl EgressHandler {
                         Some(EgressCommand::List(resp_tx)) => {
                             let views = store.egress_views().await;
                             let _ = resp_tx.send(views);
+                        }
+                        // Signed-policy reload: the store (rule truth) was
+                        // already replaced by the reloader; refresh this
+                        // session's matching snapshot. Selector resolution
+                        // and UDP idle budgets pick up the new rules on the
+                        // very next Open.
+                        Some(EgressCommand::Sync(desired)) => {
+                            info!(
+                                "Policy reload reconciled egress rules: {} -> {}",
+                                rules.len(),
+                                desired.len()
+                            );
+                            rules = desired;
                         }
                         None => {
                             info!("Egress command channel closed");
@@ -1258,16 +1283,27 @@ impl EgressHandler {
                     interflow_core::tunnel::TargetSelector::Default => rules
                         .iter()
                         .find(|r| r.target_protocol == StreamProto::Tcp)
-                        .map(|r| r.target_addr.to_string()),
+                        .and_then(|r| match r.target {
+                            EgressTarget::Addr(addr) => Some(addr.to_string()),
+                            // A range authorizes; it never names a concrete dial.
+                            EgressTarget::Cidr(_) => None,
+                        }),
                     interflow_core::tunnel::TargetSelector::Address(addr) => Some(addr),
                     interflow_core::tunnel::TargetSelector::Service(service) => rules
                         .iter()
                         .find(|r| r.target_protocol == StreamProto::Tcp && r.name == service)
-                        .map(|r| r.target_addr.to_string()),
+                        .and_then(|r| match r.target {
+                            EgressTarget::Addr(addr) => Some(addr.to_string()),
+                            EgressTarget::Cidr(_) => None,
+                        }),
                 }
                 .unwrap_or_default();
+                // Snapshot the live allowlist for this Open: a policy reload
+                // between two Opens is picked up here (established streams
+                // keep their fate — new flows judge by the current policy).
+                let security_now = security.borrow().clone();
                 if target_addr_selected.is_empty()
-                    || !Self::is_target_allowed(&target_addr_selected, &security)
+                    || !Self::is_target_allowed(&target_addr_selected, &security_now)
                     || runtime
                         .breakers
                         .as_ref()
@@ -1275,7 +1311,7 @@ impl EgressHandler {
                 {
                     let close_reason = if target_addr_selected.is_empty() {
                         CloseReason::NoTarget
-                    } else if !Self::is_target_allowed(&target_addr_selected, &security) {
+                    } else if !Self::is_target_allowed(&target_addr_selected, &security_now) {
                         CloseReason::SecurityDenied
                     } else {
                         CloseReason::TargetCircuitOpen

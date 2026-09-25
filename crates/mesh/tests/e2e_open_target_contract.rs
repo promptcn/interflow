@@ -38,9 +38,7 @@ use interflow_core::tunnel::quic::{QUIC_ALPN, QuicSessionParams, QuicTunnel};
 use interflow_core::tunnel::session_tasks::SessionTasks;
 use interflow_core::tunnel::{AgentTunnel, H2Liveness};
 use interflow_mesh::agent::AgentClient;
-use interflow_testkit::{
-    agent_config, hub_config, hub_quic_config, pick_ephemeral_port, spawn_hub,
-};
+use interflow_testkit::{agent_config, hub_config, hub_quic_config, spawn_hub};
 use tokio_util::sync::CancellationToken;
 
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
@@ -51,8 +49,11 @@ fn certs() -> &'static interflow_testkit::certs::TestCerts {
 /// h2 plane: an empty target is rejected by `POST /route`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h2_empty_target_route_lease_rejected() {
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub_port = spawn_hub(hub_config(0, certs(), vec![]))
+        .await
+        .local_addr()
+        .expect("hub bound")
+        .port();
 
     let client = AgentClient::new(agent_config("src", hub_port, certs())).expect("agent build");
     let conn = client
@@ -86,8 +87,11 @@ async fn h2_empty_target_route_lease_rejected() {
 /// QUIC plane: an empty target fails closed during RouteRequest negotiation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_empty_target_route_lease_rejected() {
-    let hub_port = pick_ephemeral_port();
-    spawn_hub(hub_quic_config(hub_port, certs(), vec![])).await;
+    let hub_port = spawn_hub(hub_quic_config(0, certs(), vec![]))
+        .await
+        .local_addr()
+        .expect("hub bound")
+        .port();
 
     let (cert, key) = certs().named_client_cert("quic-src");
     let tls = build_client_config(

@@ -197,10 +197,31 @@ pub enum PublicTls {
     Acme(AcmeOptions),
 }
 
+/// The actually-bound listener addresses of a running edge.
+///
+/// Delivered by [`run_until_signalled`]'s readiness signal: every `:0` face
+/// materializes here instead of racing a pick-then-bind window. `control`
+/// is the embedded hub (TCP+QUIC dual-stack on one port).
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeReady {
+    /// Public listener (`EdgeListener`).
+    pub public: SocketAddr,
+    /// Control endpoint (embedded hub server).
+    pub control: SocketAddr,
+    /// Control endpoint's dedicated QUIC face, when configured on its own
+    /// port (a `Some(:0)` materializes here); `None` when QUIC is off or
+    /// derived dual-stack (same port as `control`).
+    pub control_quic: Option<SocketAddr>,
+    /// ACME HTTP-01/redirect face, when enabled and successfully bound
+    /// (`None` when the :80 bind failed non-fatally or ACME is off).
+    pub acme_http: Option<SocketAddr>,
+}
+
 /// Edge startup configuration — typed, pack-native. Paths are filesystem
 /// paths (not display strings); routes arrive resolved from the signed
 /// runtime policy, never via an intermediate file.
 #[derive(Debug, Clone)]
+
 pub struct EdgeConfig {
     /// Public listen address (the front proxy passes traffic here; in ACME
     /// mode this is the TLS-terminating listener itself).
@@ -210,6 +231,21 @@ pub struct EdgeConfig {
     /// Control endpoint server identity. Mandatory: the embedded hub
     /// verifies client certificates at the TLS handshake.
     pub control_tls: ControlEndpointTls,
+    /// PROXY protocol negotiation on the control listener. Fronted
+    /// topologies sit behind the nginx stream fragment which emits PROXY
+    /// protocol (v1 on stock nginx, v2 where available) on the
+    /// mTLS-passthrough control leg; mode `On` (optional-accept, loopback
+    /// trusted) keeps the edge's own headerless loopback self-dials working.
+    /// Independent of `listener.proxy_protocol` (public leg uses XFF by
+    /// design).
+    ///
+    /// Known and accepted: with pp active the hub's
+    /// `AuthConfig.rate_limit_per_minute` and ConnTracker key on the real
+    /// client IP, so the edge's internal self-dials share one
+    /// 127.0.0.1 bucket — equivalent to the pp-off status quo (they also
+    /// keyed 127.0.0.1); workspace counts are small and reconnects are
+    /// backoff-supervised.
+    pub control_proxy_protocol: ProxyProtocolConfig,
     /// One trust anchor per authorized workspace (its issuer CA).
     pub workspace_trust: Vec<WorkspaceTrust>,
     /// One workspace-scoped ingress principal per authorized workspace.
@@ -271,6 +307,7 @@ impl Default for EdgeConfig {
                 cert: PathBuf::new(),
                 key: PathBuf::new(),
             },
+            control_proxy_protocol: ProxyProtocolConfig::default(),
             workspace_trust: Vec::new(),
             principals: Vec::new(),
             routes: Vec::new(),
@@ -342,7 +379,7 @@ pub async fn run_until(
 pub async fn run_until_signalled(
     config: EdgeConfig,
     shutdown: tokio_util::sync::CancellationToken,
-    ready: tokio::sync::oneshot::Sender<()>,
+    ready: tokio::sync::oneshot::Sender<EdgeReady>,
 ) -> Result<()> {
     run_until_inner(config, shutdown, Some(ready)).await
 }
@@ -350,7 +387,7 @@ pub async fn run_until_signalled(
 async fn run_until_inner(
     config: EdgeConfig,
     shutdown: tokio_util::sync::CancellationToken,
-    ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ready: Option<tokio::sync::oneshot::Sender<EdgeReady>>,
 ) -> Result<()> {
     // Attribution for every edge-side log line (display only): the GUI's
     // "This node" filter matches on this value, the standalone CLI falls
@@ -438,6 +475,9 @@ async fn run_until_inner(
     let audit_cfg = AuditConfig {
         enabled: config.audit_path.is_some(),
         path: config.audit_path.as_ref().map(|p| p.display().to_string()),
+        // Rotation defaults (64 MiB / keep 32 / gzip) apply — a
+        // long-lived edge ledger must never grow unbounded.
+        rotation: Default::default(),
     };
     let audit = AuditSink::spawn(&audit_cfg);
     if audit_cfg.enabled {
@@ -478,12 +518,6 @@ async fn run_until_inner(
         interflow_core::tls::TlsMinVersion::V1_2,
     )?;
     let hub_plane_config = plane.config.clone();
-    let control_port = config.control_listen_addr.port();
-    // The edge self-dial uses cert pinning (see
-    // build_workspace_agent_config), so the ServerName takes no part in
-    // verification; the URL uses the 127.0.0.1 IP literal to avoid the
-    // localhost→::1 IPv6/IPv4 mismatch risk.
-    let hub_url = format!("https://127.0.0.1:{control_port}");
 
     let hub_server = interflow_mesh::hub::HubServer::with_tls_plane(hub_cfg, plane)?;
     // Single-public-port mode: remember the hub's TLS configuration and a
@@ -527,11 +561,21 @@ async fn run_until_inner(
             Err(e) => format!("join failed: {e}"),
         }),
     };
-    if let Err(reason) = hub_start {
-        return Err(InterflowError::connection(format!(
-            "internal control endpoint failed to start: {reason}"
-        )));
-    }
+    let hub_ready = match hub_start {
+        Ok(ready) => ready,
+        Err(reason) => {
+            return Err(InterflowError::connection(format!(
+                "internal control endpoint failed to start: {reason}"
+            )));
+        }
+    };
+    let control_addr = hub_ready.tcp;
+    // The edge self-dial uses cert pinning (see
+    // build_workspace_agent_config), so the ServerName takes no part in
+    // verification; the URL uses the hub's actually-bound IP literal (a :0
+    // control port materializes above), avoiding the localhost→::1
+    // IPv6/IPv4 mismatch risk.
+    let hub_url = format!("https://{control_addr}");
 
     // 6. Start one internal agent session per workspace (supervised
     //    auto-reconnect): each dials the local control endpoint with its
@@ -687,9 +731,34 @@ async fn run_until_inner(
             // `Err` = the listener future ended before binding — its
             // error surfaces through the steady-state select below, and
             // ready must not fire.
-            if listener_ready_rx.await.is_ok() {
+            if let Ok(public) = listener_ready_rx.await {
                 interflow_util::systemd::notify_ready();
-                let _ = outer_ready.send(());
+                // The ACME :80 bind attempt completes (or fails) within
+                // microseconds of the runtime spawn — give it a bounded
+                // window here so the ready snapshot carries the address
+                // deterministically, while keeping the face best-effort
+                // (bind failure stays None, non-fatal by design).
+                let acme_http = match acme_runtime.as_ref() {
+                    Some(runtime) => {
+                        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                        loop {
+                            if let Some(addr) = runtime.http_local_addr() {
+                                break Some(addr);
+                            }
+                            if tokio::time::Instant::now() >= deadline {
+                                break None;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                    None => None,
+                };
+                let _ = outer_ready.send(EdgeReady {
+                    public,
+                    control: control_addr,
+                    control_quic: hub_ready.quic,
+                    acme_http,
+                });
             }
         };
         tokio::pin!(barrier);
@@ -879,7 +948,11 @@ fn build_hub_config(config: &EdgeConfig, audit_cfg: &AuditConfig) -> HubConfig {
             // attribution (the hub engine's own `node_name` mechanism), so
             // its lines land in the hosting node's log view too.
             node_name: Some(config.effective_log_name()),
-            proxy_protocol: ProxyProtocolConfig::default(), // behind the front proxy
+            // Fronted topologies: the nginx stream fragment fronts the
+            // control leg with PROXY protocol (see `control_proxy_protocol`);
+            // direct topologies keep the default (off) — the TCP peer is
+            // the agent.
+            proxy_protocol: config.control_proxy_protocol.clone(),
         },
         // The trust table is injected via `with_tls_plane` (in-memory roots);
         // this config section carries only the rate limit.
@@ -898,11 +971,20 @@ fn build_hub_config(config: &EdgeConfig, audit_cfg: &AuditConfig) -> HubConfig {
         heartbeat: Default::default(),
         metrics: Default::default(),
         audit: audit_cfg.clone(),
+        // No policy publication face on the embedded expose edge — that is
+        // the mesh hub's control plane.
+        policy: Default::default(),
         logging: LoggingConfig::default(),
         transport: HubTransportConfig {
             quic: HubQuicConfig {
+                // Three states: None = QUIC off for the control endpoint.
+                // Some(:0) = derived dual-stack — the QUIC listener follows
+                // the control TCP port (when control is also :0, the hub's
+                // TCP write-back lands before the QUIC spawn reads it, so
+                // both faces share one kernel-assigned port). Some(concrete)
+                // = an explicit QUIC face on its own port.
                 enabled: config.quic_listen.is_some(),
-                listen_addr: config.quic_listen,
+                listen_addr: config.quic_listen.filter(|a| a.port() != 0),
                 ..HubQuicConfig::default()
             },
             ..HubTransportConfig::default()

@@ -23,19 +23,24 @@ path = "src/bin/export_bindings.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-interflow-core = { path = "../crates/core", version = "0.4" }
-interflow-cli = { path = "../crates/cli", version = "0.4" }
-interflow-expose = { path = "../crates/expose", version = "0.4" }
-interflow-identity = { path = "../crates/identity", version = "0.4" }
-interflow-mesh = { path = "../crates/mesh", version = "0.4" }
+interflow-core = { path = "../crates/core", version = "0.5" }
+interflow-cli = { path = "../crates/cli", version = "0.5" }
+interflow-expose = { path = "../crates/expose", version = "0.5" }
+interflow-identity = { path = "../crates/identity", version = "0.5" }
+interflow-mesh = { path = "../crates/mesh", version = "0.5" }
 # Credential renewal scheduler (one per running node — GUI/binary parity)
-interflow-renewal = { path = "../crates/renewal", version = "0.4" }
+interflow-renewal = { path = "../crates/renewal", version = "0.5" }
 # Atomic profile writes
-interflow-util = { path = "../crates/util", version = "0.4" }
+interflow-util = { path = "../crates/util", version = "0.5" }
+# Compile-time build identity (machine header, tray tooltip, startup log)
+interflow-buildinfo = { path = "../crates/buildinfo", version = "0.5" }
 
 tauri = { version = "2", features = ["tray-icon", "image-png", "specta"] }
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
+# One-time "still running in the tray" toast on first hide-to-tray
+# (Windows); Rust-side only — no JS module registration, no ACL surface.
+tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 # Machine anchor: the GUI is machine-scoped, and the header/tray show which
 # machine the nodes run on (a node is an identity, not a machine).
@@ -65,7 +70,7 @@ uuid = { version = "1.23", features = ["v4"] }
 [dev-dependencies]
 # In-process hub + self-signed certs for the Start/Stop round-trip regression
 # tests (tunnel.rs) — the 2026-09-18 deadlock acceptance gate.
-interflow-testkit = { path = "../crates/testkit", version = "0.4" }
+interflow-testkit = { path = "../crates/testkit", version = "0.5" }
 # Bindings-freshness drift guard test (contract.rs)
 tempfile = "3"
 

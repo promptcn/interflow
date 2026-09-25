@@ -73,19 +73,36 @@ pub fn set_log_level(level: &str) {
     init_logging(level, LogFormat::Plain);
 }
 
-/// Starts the Prometheus exporter on the given address. Failures only log, never abort.
+/// Starts the Prometheus exporter on the given address.
 ///
-/// Note: in the current version of metrics-exporter-prometheus 0.17 the path
-/// is fixed at `/metrics`; the `path` parameter is only used for log display.
-pub fn init_metrics(listen_addr: std::net::SocketAddr, path: &str) {
+/// Failures only log, never abort. Returns the address the exporter is
+/// reachable on — a `:0` (kernel-assigned) port materializes here, so
+/// callers hosting the exporter on an ephemeral port read it from this
+/// instead of racing a pick-then-bind window.
+///
+/// Note: in the current version of metrics-exporter-prometheus (0.18) the
+/// path is fixed at `/metrics`, and the builder accepts only a `SocketAddr`
+/// (no pre-bound listener, no address report). The port is therefore
+/// materialized by a synchronous bind→read→release→hand-off sequence inside
+/// this function — the release-to-rebind gap is a few microseconds on one
+/// thread, the tightest the upstream API allows.
+pub fn init_metrics(listen_addr: std::net::SocketAddr, path: &str) -> Option<std::net::SocketAddr> {
+    let actual = {
+        let probe = std::net::TcpListener::bind(listen_addr).ok()?;
+        probe.local_addr().ok()?
+    };
     match metrics_exporter_prometheus::PrometheusBuilder::new()
-        .with_http_listener(listen_addr)
+        .with_http_listener(actual)
         .install()
     {
         Ok(()) => {
-            tracing::info!("Prometheus metrics enabled: http://{listen_addr}{path}");
+            tracing::info!("Prometheus metrics enabled: http://{actual}{path}");
+            Some(actual)
         }
-        Err(e) => tracing::warn!("failed to enable Prometheus metrics: {e}"),
+        Err(e) => {
+            tracing::warn!("failed to enable Prometheus metrics: {e}");
+            None
+        }
     }
 }
 

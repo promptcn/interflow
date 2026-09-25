@@ -75,19 +75,14 @@ async fn full_edge_expose_round_trip() {
     // 1. echo backend
     let echo_addr = interflow_testkit::echo_server().await.0;
 
-    // 2. Grab ports
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
-
     // 3. Temp routes.toml
     // 4. Spawn edge (hub server + edge agent + listener)
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -113,16 +108,9 @@ async fn full_edge_expose_round_trip() {
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_config));
-
-    // 5. Wait for the hub listener to be ready
-    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
-        .await
-        .expect("hub should start within 5s");
-    // Wait for the edge listener to be ready
-    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
-        .await
-        .expect("edge listener should start within 5s");
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    let edge_listen = edge.public_addr();
+    let hub_port = edge.control_addr().port();
 
     // 6. Spawn the expose client (connects to the edge's hub, agent_id=expose-test, egress to echo)
     let (client_cert, client_key) = certs.client_paths();
@@ -162,7 +150,7 @@ async fn full_edge_expose_round_trip() {
     let mut response = vec![0u8; request.len()];
     let read_result =
         tokio::time::timeout(Duration::from_secs(3), sock.read_exact(&mut response)).await;
-    edge_handle.abort();
+    edge.shutdown().await.expect("edge shutdown");
     client_handle.abort();
 
     read_result
@@ -213,18 +201,14 @@ async fn two_services_route_by_id_not_position() {
     let alpha_addr = marker_backend("BACKEND-ALPHA\n").await;
     let beta_addr = marker_backend("BACKEND-BETA\n").await;
 
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
-
     // Routes deliberately in the OPPOSITE order of the agent's rules: any
     // positional pairing would cross-wire the hosts.
     let certs = interflow_testkit::certs::TestCerts::generate("e2e2", "expose-test");
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -256,13 +240,9 @@ async fn two_services_route_by_id_not_position() {
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    let edge_handle = tokio::task::spawn(interflow_expose::edge::run(edge_config));
-    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
-        .await
-        .expect("hub should start within 5s");
-    interflow_testkit::wait_for_tcp(edge_listen, Duration::from_secs(5))
-        .await
-        .expect("edge listener should start within 5s");
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    let edge_listen = edge.public_addr();
+    let hub_port = edge.control_addr().port();
 
     // Agent rules declared alpha-first; the routes above are beta-first.
     let (client_cert, client_key) = certs.client_paths();
@@ -312,7 +292,7 @@ async fn two_services_route_by_id_not_position() {
 
     let alpha_response = fetch("alpha.local").await;
     let beta_response = fetch("beta.local").await;
-    edge_handle.abort();
+    edge.shutdown().await.expect("edge shutdown");
     client_handle.abort();
 
     assert!(

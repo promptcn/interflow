@@ -8,7 +8,8 @@
 use interflow_core::protocol::StreamProto;
 use interflow_mesh::agent::{AgentClient, AgentHandle};
 use interflow_mesh::config::{
-    AgentConfig, AgentInfo, AgentTlsConfig as TlsConfig, ControlConfig, EgressRule, TransportKind,
+    AgentConfig, AgentInfo, AgentTlsConfig as TlsConfig, ControlConfig, EgressRule, EgressTarget,
+    TransportKind,
 };
 
 /// One local service an expose agent dials for (id + effective address).
@@ -103,15 +104,6 @@ impl ExposeArgs {
     }
 }
 
-/// Build tag (date + git hash injected at compile time by build.rs; also effective
-/// when a GUI links this crate — no more guessing from file mtimes whether a binary
-/// contains a fix).
-const BUILD_TAG: &str = concat!(
-    env!("INTERFLOW_BUILD_DATE"),
-    "_",
-    env!("INTERFLOW_GIT_HASH")
-);
-
 /// fd soft-limit raise (unix): baseline headroom for a long-running network proxy,
 /// **not** a substitute for fixing leaks.
 ///
@@ -167,7 +159,7 @@ pub fn start(args: &ExposeArgs) -> Result<AgentHandle, interflow_core::error::In
         node = %args.effective_log_name(),
         "expose client starting (build {}): local services [{}] → hub {} (transport={}, \
          agent_id={})",
-        BUILD_TAG,
+        interflow_buildinfo::BUILD_TAG,
         service_log_summary(&args.services),
         args.hub_url,
         match args.transport {
@@ -224,7 +216,7 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
     for service in &args.services {
         egress.push(EgressRule {
             name: service.id.clone(),
-            target_addr: service.target_addr,
+            target: EgressTarget::Addr(service.target_addr),
             target_protocol: StreamProto::Tcp,
             udp_idle_timeout_secs: None,
         });

@@ -22,7 +22,7 @@ use interflow_core::security::AuditKind;
 use interflow_core::security::proxy_protocol::{
     PrefixedStream, ProxyError, ProxyOutcome, ProxyProtocolPolicy,
 };
-use interflow_core::tls::extract_cn_from_chain;
+use interflow_core::tls::{extract_cn_from_chain, extract_leaf_validity_from_chain};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -206,6 +206,7 @@ where
                 tenant: tenant_ident.tenant,
                 agent: cn,
                 trusted_gateway: tenant_ident.trusted_gateway,
+                leaf_validity_unix: extract_leaf_validity_from_chain(certs),
             });
         } else {
             warn!("client certificate carries no CN — rejecting (peer={addr})");
@@ -223,13 +224,7 @@ where
 
     let conn = h2_builder(&h2_transport).serve_connection(
         TokioIo::new(tls_stream),
-        HubService::new(
-            state,
-            addr,
-            effective_ip,
-            connection_identity,
-            connection_circuit,
-        ),
+        HubService::new(state, effective_ip, connection_identity, connection_circuit),
     );
     serve_h2(conn, shutdown, addr, true).await;
     let finished_circuit = *cleanup_circuit.read().await;

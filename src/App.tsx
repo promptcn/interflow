@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   api,
   onLogLine,
@@ -6,6 +7,7 @@ import {
   type LogLine,
   type NodeInfo,
   type NodeStateDto,
+  type VersionInfo,
 } from "./api";
 import DeployFace, { type DeployView } from "./components/DeployFace";
 import NodeDetail from "./components/NodeDetail";
@@ -26,6 +28,10 @@ export default function App() {
   const [allLogs, setAllLogs] = useState(false);
   const [nodesLoaded, setNodesLoaded] = useState(false);
   const [hostName, setHostName] = useState<string | null>(null);
+  // Compile-time build identity — fetched once; never changes at runtime.
+  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
+  // Transient "copied ✓" feedback on the header identity chip.
+  const [versionCopied, setVersionCopied] = useState(false);
   // Operator face: deploy (issue packs) vs nodes (run them). Both faces
   // stay mounted and merely hide — switching faces preserves editor and
   // navigation state.
@@ -65,6 +71,11 @@ export default function App() {
       } catch (e) {
         console.error("Failed to get hostname:", e);
       }
+      try {
+        setVersionInfo(await api.getVersionInfo());
+      } catch (e) {
+        console.error("Failed to get version info:", e);
+      }
     })();
 
     const unsubs = [
@@ -86,6 +97,19 @@ export default function App() {
       unsubs.forEach((u) => u.then((f) => f()));
     };
   }, []);
+
+  // "Which build is that machine running" rounds end in a pasted string:
+  // one click copies the canonical identity (same form the CLI prints).
+  const copyVersion = async () => {
+    if (!versionInfo) return;
+    try {
+      await writeText(`Interflow v${versionInfo.version} (${versionInfo.build_tag})`);
+      setVersionCopied(true);
+      setTimeout(() => setVersionCopied(false), 1500);
+    } catch {
+      // Clipboard denied — the chip text stays selectable for manual copy.
+    }
+  };
 
   // Esc climbs one level (detail → overview, pack detail → grid, manifest →
   // packs) — but never steals the key from a text field.
@@ -139,6 +163,21 @@ export default function App() {
             Deploy
           </button>
         </span>
+        {versionInfo && (
+          <button
+            className={`machine-version${versionInfo.dirty ? " dirty" : ""}`}
+            title={
+              versionInfo.dirty
+                ? "Built from uncommitted local changes — treat as the builder's, not the commit's. Click to copy the build identity"
+                : "Click to copy the build identity"
+            }
+            onClick={copyVersion}
+          >
+            {versionCopied
+              ? "copied ✓"
+              : `v${versionInfo.version} · ${versionInfo.build_tag}`}
+          </button>
+        )}
       </header>
 
       {guiError && (

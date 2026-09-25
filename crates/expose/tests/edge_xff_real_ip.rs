@@ -47,10 +47,6 @@ struct StackOpts {
 /// audit_path). Certificates reuse the production test kit (real mTLS).
 async fn spawn_stack(opts: StackOpts) -> (SocketAddr, std::path::PathBuf) {
     let echo_addr = interflow_testkit::echo_server().await.0;
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
     let audit_path = std::env::temp_dir().join(format!(
         "interflow_test_edge_xff_{}.jsonl",
@@ -60,8 +56,9 @@ async fn spawn_stack(opts: StackOpts) -> (SocketAddr, std::path::PathBuf) {
     let certs = interflow_testkit::certs::TestCerts::generate("e2e", "expose-test");
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -94,22 +91,9 @@ async fn spawn_stack(opts: StackOpts) -> (SocketAddr, std::path::PathBuf) {
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    tokio::task::spawn(interflow_expose::edge::run(edge_config));
-
-    // Wait for the hub listener, then let the edge listener come up without
-    // consuming any of its rate-limit tokens.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if TcpStream::connect(hub_listen).await.is_ok() {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "hub should start within 5s"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    let edge_listen = edge.public_addr();
+    let hub_port = edge.control_addr().port();
 
     let (client_cert, client_key) = certs.client_paths();
     let client_args = ExposeArgs {

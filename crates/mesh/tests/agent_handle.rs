@@ -8,7 +8,7 @@
 #![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::panic)]
 
 use interflow_mesh::agent::{AgentClient, AgentState};
-use interflow_testkit::{agent_config, hub_config, pick_ephemeral_port, spawn_hub};
+use interflow_testkit::{agent_config, hub_config, spawn_hub};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -44,8 +44,8 @@ async fn wait_state(
 
 #[tokio::test]
 async fn start_connect_and_graceful_shutdown() {
-    let hub_port = pick_ephemeral_port();
-    let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut handle = AgentClient::new(agent_config("handle-test", hub_port, certs()))
@@ -89,9 +89,12 @@ async fn start_connect_and_graceful_shutdown() {
 
 #[tokio::test]
 async fn no_hub_then_reconnect() {
-    // Do not start the hub yet: connection refused → the supervisor should
-    // enter Reconnecting (with backoff) rather than exit
-    let hub_port = pick_ephemeral_port();
+    // Hold the port with a wrong-CA hub: the agent's mTLS handshake is
+    // rejected deterministically (vs. a picked-but-dead port, which can be
+    // stolen by a parallel test) — same supervisor path: Reconnecting.
+    let wrong_certs = interflow_testkit::certs::TestCerts::generate("wrong-ca", "hub-agent");
+    let holder = spawn_hub(hub_config(0, &wrong_certs, vec![])).await;
+    let hub_port = holder.local_addr().expect("holder bound").port();
     let handle = AgentClient::new(agent_config("reconnect-test", hub_port, certs()))
         .expect("agent build")
         .start();
@@ -111,8 +114,9 @@ async fn no_hub_then_reconnect() {
     .await
     .expect("timed out waiting for Reconnecting");
 
-    // Once the hub comes up, the agent should reconnect automatically within
-    // the backoff window
+    // Once the trusted hub takes over the same port, the agent should
+    // reconnect automatically within the backoff window
+    holder.shutdown_graceful().await.expect("release holder");
     let hub = spawn_hub(hub_config(hub_port, certs(), vec![])).await;
     wait_state(
         handle.subscribe_state(),
@@ -127,7 +131,7 @@ async fn no_hub_then_reconnect() {
 
 #[tokio::test]
 async fn config_error_fails_fast() {
-    let mut cfg = agent_config("bad-cfg", pick_ephemeral_port(), certs());
+    let mut cfg = agent_config("bad-cfg", 0, certs());
     // Invalid URL: a config-class error; the supervisor should become Failed
     // instead of retrying forever
     cfg.agent.hub_url = "not a url".to_string();

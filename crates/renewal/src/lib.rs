@@ -461,12 +461,21 @@ async fn offline_watch(pack_dir: &Path, log_name: Option<String>) -> Result<()> 
                  `interflow rotate`",
             ));
         }
-        let ttl = pack.metadata.leaf_ttl_secs;
-        let remaining = (expiry - now).whole_seconds().max(0);
-        if !warned && ttl > 0 && u64::try_from(remaining).unwrap_or(u64::MAX) <= ttl * 8 / 10 {
+        // The phase math is the workspace-wide single source (identity's
+        // expiry module): warn once when less than WARN_RATIO (20%) of the
+        // leaf lifetime remains. (This also fixes the pre-2026-09-25
+        // mismatch where the trigger fired at 80% remaining while the
+        // message claimed 20%.)
+        let health = interflow_identity::expiry::leaf_phase_from_ttl(
+            expiry.unix_timestamp(),
+            pack.metadata.leaf_ttl_secs,
+            now.unix_timestamp(),
+        );
+        if !warned && health.phase != interflow_identity::expiry::LeafPhase::Healthy {
             warned = true;
             tracing::warn!(
                 node,
+                remaining = %interflow_identity::expiry::format_remaining(health.remaining_secs),
                 "credential_expiry_warning: less than 20% of the leaf lifetime remains — \
                  rotate with `interflow rotate` before {}",
                 expiry

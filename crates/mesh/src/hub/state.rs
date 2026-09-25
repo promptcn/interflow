@@ -68,12 +68,24 @@ pub struct PeerIdentity {
     /// Whether the owning tenant is a trusted gateway (may open streams
     /// across tenant boundaries).
     pub trusted_gateway: bool,
+    /// The connection certificate's validity window as unix seconds
+    /// `(not_before, not_after)`. The hub reads it (never judges it —
+    /// webpki already rejected expired certificates at the handshake) to
+    /// phase the agent's credential expiry; `None` only if the leaf
+    /// failed to parse, in which case expiry phasing simply has no input.
+    pub leaf_validity_unix: Option<(i64, i64)>,
 }
 
 impl PeerIdentity {
     /// The registry key form `"{tenant}/{agent}"`.
     pub fn qualified(&self) -> String {
         qualified_agent_id(&self.tenant, &self.agent)
+    }
+
+    /// The connection certificate's `notAfter` (unix seconds), when the
+    /// leaf parsed.
+    pub fn leaf_not_after_unix(&self) -> Option<i64> {
+        self.leaf_validity_unix.map(|(_, not_after)| not_after)
     }
 
     /// Splits a qualified key `"{tenant}/{agent}"` back into its parts.
@@ -180,6 +192,155 @@ pub(crate) fn release_stream_slot(counts: &SharedStreamCounts, agent: &str) {
     }
 }
 
+/// Reserved tenant name for the realm issuer's control principals (the
+/// policy publication face).
+///
+/// The TLS plane anchors the realm root under this name; data-plane
+/// endpoints reject it, `PUT /policy` requires it.
+pub const CONTROL_TENANT: &str = "control";
+
+/// Qualified agent -> the latest policy generation whose **serving** has
+/// already been recorded in the audit ledger for that agent.
+///
+/// `policy_pulled` is a state-transition event (a generation reaching an
+/// agent), not a heartbeat: steady-state pulls (the watcher ticks where
+/// nothing changed — 304s) are authentication activity, not ledger
+/// material. The table dedupes the remaining repeats the conditional
+/// request cannot: a 200 re-serve of the same generation (e.g. the agent's
+/// apply failed and it pulls again) is one arrival per generation, not one
+/// per delivery.
+///
+/// In-memory by design: the authoritative "which generation does this
+/// agent hold" state lives agent-side (`x-policy-seen`) — after a hub
+/// restart every online agent answers 304 against its current generation,
+/// so no catch-up bookkeeping is owed. Entries are bounded by the set of
+/// agents that ever registered in this process (a few dozen bytes each).
+pub type SharedPolicyPullLedger = Arc<std::sync::Mutex<HashMap<String, u64>>>;
+
+/// Check-and-set for one `policy_pulled` ledger entry: returns `true`
+/// (and advances the table) only when this agent has not already been
+/// recorded at `generation`; `false` when the serving is a repeat. The
+/// `std::sync::Mutex` is held only for the compare-and-swap (nanosecond
+/// scale), never across an await.
+pub(crate) fn should_record_policy_pull(
+    ledger: &SharedPolicyPullLedger,
+    agent: &str,
+    generation: u64,
+) -> bool {
+    let mut map = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map.get(agent).is_some_and(|&g| g == generation) {
+        false
+    } else {
+        map.insert(agent.to_owned(), generation);
+        true
+    }
+}
+
+/// Qualified agent -> the credential-expiry phase already recorded for
+/// that agent (`credential_expiry` audit events).
+///
+/// The SAME state-transfer accounting discipline as
+/// [`SharedPolicyPullLedger`]: an agent's leaf crossing a phase boundary
+/// (healthy → warn → critical, or back to healthy after a rotation) is
+/// one event per crossing; an agent sitting in a phase is not news, no
+/// matter how many heartbeat ticks observe it. In-memory: after a hub
+/// restart the first observation of a non-healthy agent re-fires once
+/// (a fresh process attesting to what it sees — bounded, not noise).
+pub type SharedExpiryLedger =
+    Arc<std::sync::Mutex<HashMap<String, interflow_identity::expiry::LeafPhase>>>;
+
+/// One observed phase crossing (the heartbeat tick's expiry check output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpiryTransition {
+    /// The qualified agent whose leaf crossed a phase boundary.
+    pub agent: String,
+    /// The phase before the crossing (an unobserved agent starts at
+    /// `Healthy`: a first sighting already inside `warn` counts as a
+    /// crossing — the hub has never attested otherwise).
+    pub from: interflow_identity::expiry::LeafPhase,
+    /// The leaf health at the crossing.
+    pub health: interflow_identity::expiry::LeafHealth,
+}
+
+/// Check-and-advance one agent's recorded expiry phase: returns the
+/// crossing when the observed phase differs from the recorded one (or the
+/// agent was never recorded), `None` while it is unchanged. `None` is
+/// also returned when the certificate window is unknown (leaf failed to
+/// parse — no input, no attestation, ledger untouched).
+pub(crate) fn expiry_transition(
+    ledger: &SharedExpiryLedger,
+    agent: &str,
+    leaf_validity_unix: Option<(i64, i64)>,
+    now_unix: i64,
+) -> Option<ExpiryTransition> {
+    let (not_before, not_after) = leaf_validity_unix?;
+    let health =
+        interflow_identity::expiry::leaf_phase_from_validity(not_before, not_after, now_unix);
+    let mut map = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let from = map
+        .get(agent)
+        .copied()
+        .unwrap_or(interflow_identity::expiry::LeafPhase::Healthy);
+    if from == health.phase {
+        return None;
+    }
+    map.insert(agent.to_owned(), health.phase);
+    Some(ExpiryTransition {
+        agent: agent.to_owned(),
+        from,
+        health,
+    })
+}
+
+/// A verified policy bundle cached for serving.
+///
+/// Carries the fingerprint of the channel directory it was loaded from
+/// (mtime+len of both files — [`crate::pack::policy_channel_fingerprint`])
+/// plus the verified bytes. An atomic publish changes the fingerprint, so
+/// a stale cache can never serve: fingerprint hit ⇒ the verified bytes are
+/// exactly what is on disk. Turns the steady-state pull path (one request
+/// per agent per watch interval) into two `stat` calls instead of a file
+/// read + ed25519 verification.
+pub struct CachedPolicy {
+    /// The channel directory the bytes were loaded from (`dir` or
+    /// `embedded_dir`).
+    pub dir: std::path::PathBuf,
+    /// Fingerprint of `dir` at load time.
+    pub fingerprint: Option<(std::time::SystemTime, u64, std::time::SystemTime, u64)>,
+    /// The canonical policy TOML bytes.
+    pub body: Bytes,
+    /// The detached signature.
+    pub signature: Vec<u8>,
+    /// The serving generation.
+    pub generation: u64,
+}
+
+/// Runtime face of the signed-policy publication channel.
+///
+/// What `PUT /policy` verifies against, where accepted updates persist
+/// (the reload watcher polls the same files), the anti-rollback floor
+/// that only ever advances, and the serve cache that keeps steady-state
+/// pulls off the disk.
+pub struct PolicyChannel {
+    /// The trust bundle's policy verifying key (hex).
+    pub verifier_key_hex: String,
+    /// Persistence dir (`<pack>/state/policy`).
+    pub dir: std::path::PathBuf,
+    /// The pack's embedded policy snapshot dir (`<pack>/policy`) — served
+    /// to pullers when no update has been published.
+    pub embedded_dir: std::path::PathBuf,
+    /// Highest policy generation this hub has accepted.
+    pub floor: std::sync::atomic::AtomicU64,
+    /// Verified bundle cache, keyed by the channel fingerprint (see
+    /// [`CachedPolicy`]). `std::sync::RwLock`: both sides only clone/copy
+    /// under the lock, never await.
+    pub cached: std::sync::RwLock<Option<CachedPolicy>>,
+}
+
 /// Long-lived shared hub state.
 ///
 /// One aggregate carried verbatim by the h2 plane, the QUIC plane, and the
@@ -207,6 +368,16 @@ pub struct HubState {
     pub stream_counts: SharedStreamCounts,
     /// Audit log sink (no-op in disabled mode).
     pub audit: AuditSink,
+    /// The signed-policy publication channel (`PUT /policy`): verifier +
+    /// persistence dir + the anti-rollback floor. `None` on non-pack hubs.
+    pub policy_channel: Option<Arc<PolicyChannel>>,
+    /// Audit dedup table for policy servings (see
+    /// [`SharedPolicyPullLedger`]).
+    pub policy_pull_ledger: SharedPolicyPullLedger,
+    /// Per-agent credential-expiry phase already recorded (see
+    /// [`SharedExpiryLedger`]) — the symmetric-transfer accounting state
+    /// for `credential_expiry` events.
+    pub expiry_ledger: SharedExpiryLedger,
     /// Connection tracker (per-IP + global caps).
     pub conn_tracker: Arc<ConnTracker>,
     /// Background task group: connection-level tasks attach here so the
@@ -296,12 +467,26 @@ pub struct AgentSession {
     /// (traffic streams go through the relay rather than /poll). Set back
     /// to `None` when an h2 re-registration replaces the channel in place.
     pub quic: Option<Arc<QuicAgentConn>>,
+    /// The registration certificate's validity window `(not_before,
+    /// not_after)` in unix seconds — the hub-side input to credential
+    /// expiry phasing (see [`SharedExpiryLedger`]). Refreshed at every
+    /// registration (a reconnected agent presents its current leaf;
+    /// `install_channels` keeps the previous value, the register sites
+    /// overwrite it).
+    pub leaf_validity_unix: Option<(i64, i64)>,
 }
 
 impl AgentSession {
     /// Creates a fresh session with new channels (generation 0). `quic`
-    /// carries the relay connection when registration arrives over QUIC.
-    pub fn new(circuit: CircuitToken, quic: Option<Arc<QuicAgentConn>>) -> Self {
+    /// carries the relay connection when registration arrives over QUIC;
+    /// `leaf_validity_unix` carries the registration certificate's
+    /// validity window (None when the leaf did not parse — expiry phasing
+    /// then simply has no input for this session).
+    pub fn new(
+        circuit: CircuitToken,
+        quic: Option<Arc<QuicAgentConn>>,
+        leaf_validity_unix: Option<(i64, i64)>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(HUB_CHANNEL_CAP);
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         Self {
@@ -316,6 +501,7 @@ impl AgentSession {
             poll_waker: Arc::new(std::sync::Mutex::new(None)),
             up_lease: None,
             quic,
+            leaf_validity_unix,
         }
     }
 
@@ -696,5 +882,79 @@ impl RxStream {
         }
         self.pending_payload = Some(df.data);
         Poll::Ready(Some(Ok(Frame::data(header.freeze()))))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_pull_ledger_dedups_by_agent_and_generation() {
+        let ledger: SharedPolicyPullLedger = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // First sighting of a generation at an agent: a state transition.
+        assert!(should_record_policy_pull(&ledger, "main/lan-a", 2));
+        // Same agent, same generation (a re-serve after a failed apply): a
+        // repeat, not a transition.
+        assert!(!should_record_policy_pull(&ledger, "main/lan-a", 2));
+        // A newer generation reaching the same agent: a transition again.
+        assert!(should_record_policy_pull(&ledger, "main/lan-a", 3));
+        // Agents are independent — lan-b reaching a generation lan-a already
+        // holds is still a transition for lan-b.
+        assert!(should_record_policy_pull(&ledger, "main/lan-b", 2));
+        assert!(!should_record_policy_pull(&ledger, "main/lan-b", 2));
+    }
+
+    #[test]
+    fn expiry_ledger_fires_once_per_phase_crossing() {
+        use interflow_identity::expiry::LeafPhase;
+        let ledger: SharedExpiryLedger = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ttl = 90 * 86_400;
+        let now = 80 * 86_400; // 10d left → warn (11%)
+        // First sighting inside warn: a crossing from the implicit
+        // healthy baseline (the hub has never attested otherwise).
+        let t = expiry_transition(&ledger, "main/lan-a", Some((0, ttl)), now).unwrap();
+        assert_eq!(t.from, LeafPhase::Healthy);
+        assert_eq!(t.health.phase, LeafPhase::Warn);
+        // Every subsequent tick in the same phase: silence.
+        assert!(expiry_transition(&ledger, "main/lan-a", Some((0, ttl)), now).is_none());
+        assert!(expiry_transition(&ledger, "main/lan-a", Some((0, ttl)), now + 3600).is_none());
+        // Crossing into critical: exactly one event.
+        let later = 82 * 86_400; // 8d left → critical
+        let t = expiry_transition(&ledger, "main/lan-a", Some((0, ttl)), later).unwrap();
+        assert_eq!(
+            (t.from, t.health.phase),
+            (LeafPhase::Warn, LeafPhase::Critical)
+        );
+        assert!(expiry_transition(&ledger, "main/lan-a", Some((0, ttl)), later + 60).is_none());
+        // Rotation: a fresh leaf lands back in healthy — a symmetric
+        // crossing (the hub-side "problem solved" attestation).
+        let rotated_not_after = later + ttl;
+        let t = expiry_transition(
+            &ledger,
+            "main/lan-a",
+            Some((later, rotated_not_after)),
+            later,
+        )
+        .unwrap();
+        assert_eq!(
+            (t.from, t.health.phase),
+            (LeafPhase::Critical, LeafPhase::Healthy)
+        );
+        // And it can degrade again after recovery.
+        let t = expiry_transition(
+            &ledger,
+            "main/lan-a",
+            Some((later, rotated_not_after)),
+            rotated_not_after - 5 * 86_400,
+        )
+        .unwrap();
+        assert_eq!(t.health.phase, LeafPhase::Critical);
+        // No validity window (unparseable leaf): no input, no attestation,
+        // ledger untouched.
+        assert!(expiry_transition(&ledger, "main/lan-x", None, now).is_none());
+        // Agents are independent.
+        assert!(expiry_transition(&ledger, "main/lan-b", Some((0, ttl)), now).is_some());
     }
 }

@@ -146,6 +146,58 @@ fn offline_apply_marks_metadata_and_skips_registrar() {
 }
 
 #[test]
+fn offline_leaf_ttl_180d_is_legal_and_renders_the_horizon() {
+    // The unattended-node tier (2026-09-24 deployment review §4): a
+    // physically distant, rarely-touched node may carry a 180d leaf so the
+    // rotate calendar halves. The validator's offline bounds (7d–365d)
+    // admit it, and the rendered packs carry the full horizon.
+    let dir = tempfile::tempdir().expect("tempdir").keep();
+    let raised = OFFLINE_MANIFEST.replace("leaf_ttl = \"90d\"", "leaf_ttl = \"180d\"");
+    let manifest = write_manifest(&dir, &raised);
+    run_ok(&["plan", "validate", "--manifest", &manifest]);
+    run_ok(&[
+        "plan",
+        "apply",
+        "--manifest",
+        &manifest,
+        "--issuer",
+        &dir.join("issuer").display().to_string(),
+        "--out",
+        &dir.join("dist").display().to_string(),
+    ]);
+    let pack_toml = std::fs::read_to_string(dir.join("dist/packs/ingress-edge/pack.toml")).unwrap();
+    assert!(
+        pack_toml.contains("leaf_ttl_secs = 15552000"),
+        "180d leaf: {pack_toml}"
+    );
+    // The signed certificate itself must carry the horizon, not just the
+    // metadata (the review's open question: does issuance honor the raise?).
+    run_ok(&[
+        "identity",
+        "inspect",
+        "--pack",
+        &dir.join("dist/packs/ingress-edge").display().to_string(),
+    ]);
+
+    // The ceiling is real, not absent — the review's original "no upper
+    // bound" reading was wrong.
+    let dir2 = tempfile::tempdir().expect("tempdir").keep();
+    let beyond = OFFLINE_MANIFEST.replace("leaf_ttl = \"90d\"", "leaf_ttl = \"366d\"");
+    let out = run(&[
+        "plan",
+        "validate",
+        "--manifest",
+        &write_manifest(&dir2, &beyond),
+    ]);
+    assert!(!out.success);
+    assert!(
+        out.stderr.contains("7d and 365d"),
+        "the offline tier bounds must be named: {}",
+        out.stderr
+    );
+}
+
+#[test]
 fn offline_tier_rejects_registrar_section_and_short_leaves() {
     let dir = tempfile::tempdir().expect("tempdir").keep();
     let both = OFFLINE_MANIFEST.replacen(

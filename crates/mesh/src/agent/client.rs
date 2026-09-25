@@ -2,6 +2,7 @@ use crate::agent::control::ControlServer;
 use crate::agent::egress::EgressHandler;
 use crate::agent::handle::{AgentHandle, AgentState, EventSink, backoff_duration};
 use crate::agent::ingress::IngressHandler;
+use crate::agent::ingress_addrs::IngressAddrs;
 use crate::agent::rules::RuleStore;
 use crate::config::{AgentConfig, TransportKind};
 use http::Uri;
@@ -66,8 +67,20 @@ pub struct AgentClient {
     config: AgentConfig,
     /// Cross-session rule truth: control-API adds/removes flow through this;
     /// after a tunnel reconnect the handlers take rules from here rather
-    /// than the startup snapshot.
+    /// than the startup snapshot. A signed-policy reload replaces the whole
+    /// table (origin `Policy`) — the signed policy is the durable truth,
+    /// runtime additions live exactly as long as the process.
     rule_store: Arc<RuleStore>,
+    /// Live egress allowlist (watch): every session's egress handler
+    /// subscribes, so a policy reload widens/narrows the offer on the next
+    /// Open without a session rebuild.
+    security_tx: tokio::sync::watch::Sender<crate::config::SecurityConfig>,
+    /// Senders into the CURRENT session's rule command channels (always
+    /// created, not only when the control API is enabled — the signed-policy
+    /// reload path uses them too). Re-installed by every session rebuild;
+    /// `None` between sessions (a reload then only updates the store + the
+    /// security watch, and the next session seeds from them).
+    session_commands: Arc<tokio::sync::RwLock<Option<SessionRuleSenders>>>,
     /// Egress flood-line runtime (agent-scoped): concurrency counters and
     /// rate buckets are shared across sessions and not reset on session
     /// rebuild — residual flows from the previous session keep consuming
@@ -80,6 +93,18 @@ pub struct AgentClient {
     /// `Type=notify` units gate on). Carried on the client so every session
     /// rebuild can fire it idempotently.
     ingress_ready: tokio::sync::watch::Sender<bool>,
+    /// Actually-bound ingress listener addresses, shared across sessions so
+    /// a `:0` listen port pins across session rebuilds and stays observable
+    /// from the [`AgentHandle`](crate::agent::AgentHandle).
+    ingress_addrs: std::sync::Arc<IngressAddrs>,
+}
+
+/// The current session's rule command senders (ingress listeners + egress
+/// snapshot reconciliation).
+#[derive(Clone)]
+struct SessionRuleSenders {
+    ingress: mpsc::Sender<crate::agent::control::IngressCommand>,
+    egress: mpsc::Sender<crate::agent::control::EgressCommand>,
 }
 
 /// How one session ended (the supervisor decides reconnect or exit from this).
@@ -141,12 +166,52 @@ impl AgentClient {
         // set fails the agent here instead of per-stream at runtime.
         let e2e_runtime = crate::agent::e2e::E2eRuntime::from_config(&config)?;
         Ok(Self {
+            security_tx: tokio::sync::watch::channel(config.security.clone()).0,
+            session_commands: Arc::new(tokio::sync::RwLock::new(None)),
             config,
             rule_store,
             egress_runtime,
             e2e_runtime,
             ingress_ready: tokio::sync::watch::channel(false).0,
+            ingress_addrs: std::sync::Arc::new(IngressAddrs::new()),
         })
+    }
+
+    /// Applies a verified signed-policy reload atomically: the live egress
+    /// allowlist, the cross-session rule store, and — when a session is
+    /// alive — its listeners and matching snapshots all move to the new
+    /// face. Established streams are never torn down; a narrower allowlist
+    /// rejects new flows and lets old ones drain.
+    ///
+    /// The caller has already verified the policy's signature and
+    /// generation; this method only moves the derived rules in.
+    pub async fn apply_policy(
+        &self,
+        ingress: Vec<crate::config::IngressRule>,
+        egress: Vec<crate::config::EgressRule>,
+        allowed_targets: Vec<String>,
+    ) {
+        // Allowlist first: narrowing takes effect on the very next Open.
+        self.security_tx.send_modify(|security| {
+            security.allowed_targets = allowed_targets;
+        });
+        self.rule_store.replace_ingress(ingress).await;
+        self.rule_store.replace_egress(egress).await;
+        let senders = self.session_commands.read().await.clone();
+        if let Some(SessionRuleSenders { ingress, egress }) = senders {
+            let ingress_rules = self.rule_store.ingress_snapshot().await;
+            let egress_rules = self.rule_store.egress_snapshot().await;
+            // Best-effort: a full channel (32 pending commands) means the
+            // session is mid-teardown or wedged — the store is already the
+            // truth and the next session reconciles from it.
+            let _ = ingress
+                .send(crate::agent::control::IngressCommand::Sync(ingress_rules))
+                .await;
+            let _ = egress
+                .send(crate::agent::control::EgressCommand::Sync(egress_rules))
+                .await;
+        }
+        metrics::counter!("interflow_agent_config_reload_total").increment(1);
     }
 
     /// Startup pre-validation of the identity binding (design
@@ -207,6 +272,7 @@ impl AgentClient {
         };
 
         let ingress_ready_rx = self.ingress_ready.subscribe();
+        let ingress_addrs = std::sync::Arc::clone(&self.ingress_addrs);
         let join = {
             let shutdown = shutdown.clone();
             let tracker = tracker.clone();
@@ -226,6 +292,7 @@ impl AgentClient {
             join,
             established,
             ingress_ready_rx,
+            ingress_addrs,
         )
     }
 
@@ -402,27 +469,21 @@ impl AgentClient {
         // Owned by SessionTasks (shared with the critical-task wrappers).
         let session_tracker = tasks.tracker().clone();
 
-        // Initialize control channels
-        let (ingress_tx, ingress_rx) = if self.config.control.enabled {
-            let (tx, rx) = mpsc::channel(32);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-
-        let (egress_tx, egress_rx) = if self.config.control.enabled {
-            let (tx, rx) = mpsc::channel(32);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+        // Rule command channels exist for EVERY session — the control API
+        // (when enabled) and the signed-policy reload path both ride them.
+        let (ingress_tx, ingress_rx) = mpsc::channel(32);
+        let (egress_tx, egress_rx) = mpsc::channel(32);
+        *self.session_commands.write().await = Some(SessionRuleSenders {
+            ingress: ingress_tx.clone(),
+            egress: egress_tx.clone(),
+        });
 
         // Start Control Server (in QUIC mode the hub-proxy feature has no h2
         // sender for now; pass None to degrade)
         let mut control_handle = if self.config.control.enabled {
             let control_addr = self.config.control.listen_addr;
-            let ingress_tx_clone = ingress_tx.clone();
-            let egress_tx_clone = egress_tx.clone();
+            let ingress_tx_clone = Some(ingress_tx.clone());
+            let egress_tx_clone = Some(egress_tx.clone());
             let hub_client = hub_client_for_control.take();
             let auth_token = self.config.control.auth_token.clone();
             let token = session_token.clone();
@@ -450,7 +511,7 @@ impl AgentClient {
 
         // Start ingress + egress mode
         let rule_store = self.rule_store.clone();
-        let security_config = self.config.security.clone();
+        let security_config = self.security_tx.subscribe();
         let egress_policy = crate::agent::egress::EgressPolicy::from(&self.config);
         let egress_runtime = Arc::clone(&self.egress_runtime);
         let e2e_runtime = Arc::clone(&self.e2e_runtime);
@@ -459,6 +520,7 @@ impl AgentClient {
         let teardown_tunnel = tunnel.clone();
         let handler_node = node.clone();
         let handler_ingress_ready = self.ingress_ready.clone();
+        let handler_ingress_addrs = std::sync::Arc::clone(&self.ingress_addrs);
         let mut handler_task = session_tracker.spawn(async move {
             info!(node = %handler_node, "Starting agent services (ingress & egress)");
 
@@ -477,7 +539,8 @@ impl AgentClient {
                 rule_store.clone(),
                 handler_token.clone(),
                 handler_tracker.clone(),
-                ingress_rx,
+                Some(ingress_rx),
+                handler_ingress_addrs,
                 Arc::clone(&e2e_runtime),
                 handler_ingress_ready,
             );
@@ -487,7 +550,7 @@ impl AgentClient {
             let egress = EgressHandler::new(
                 agent_id,
                 rule_store,
-                egress_rx,
+                Some(egress_rx),
                 incoming,
                 crate::agent::egress::EgressSession {
                     tunnel,
@@ -563,6 +626,10 @@ impl AgentClient {
         // that is about to be torn down. The bounded termination contract
         // below still runs on the concrete per-session tunnel.
         slot.withdraw();
+        // Drop this session's rule command senders so a policy reload during
+        // the reconnect gap only updates the store + security watch (the
+        // next session seeds from them).
+        *self.session_commands.write().await = None;
         if tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, teardown_tunnel.shutdown())
             .await
             .is_err()

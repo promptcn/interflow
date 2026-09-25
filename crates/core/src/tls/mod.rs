@@ -15,6 +15,6 @@ pub use inner::{
 };
 pub use server::{
     TlsMinVersion, build_mtls_acceptor, build_rustls_server_config_with_roots,
-    extract_cn_from_chain, extract_cn_from_pem_file, load_crl,
+    extract_cn_from_chain, extract_cn_from_pem_file, extract_leaf_validity_from_chain, load_crl,
 };
 pub use tenant::{TenantIdentity, TenantTrustRoot, TenantVerifier, TlsPlane, build_tls_plane};

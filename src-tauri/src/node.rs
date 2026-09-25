@@ -44,6 +44,7 @@
 //! pack name in the same field so the GUI log view can filter per node.
 
 use interflow_identity::credentials::ActiveCredentialSet;
+use interflow_identity::manifest::{MeshEgressRule, MeshIngressRule};
 use interflow_identity::pack::{CredentialPack, NodeMeshConfig, PackKind};
 use interflow_mesh::agent::{
     AgentClient, AgentHandle, AgentState, RestartDecision, SupervisorRestartPolicy,
@@ -133,6 +134,55 @@ pub struct PackInfo {
     pub mesh: Option<NodeMeshConfig>,
     /// Listen address (hub/ingress).
     pub listen: Option<String>,
+    /// Leaf-credential health (earliest active expiry, phased). `None`
+    /// when the pack has no active credential set yet.
+    pub credential: Option<CredentialHealth>,
+}
+
+/// Leaf-credential health of one pack — the GUI/tray/doctor surface of
+/// "how long until this node's credentials stop working". Phase math and
+/// text come from identity's `expiry` module (the workspace-wide single
+/// source, shared with the hub's per-agent observations).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialHealth {
+    /// Earliest active leaf `notAfter` (RFC 3339, UTC).
+    pub not_after: String,
+    /// Remaining seconds of that leaf (negative once expired).
+    pub remaining_secs: i64,
+    /// Phase: healthy / warn (<20% of the TTL) / critical (<10%).
+    pub phase: interflow_identity::expiry::LeafPhase,
+}
+
+/// Computes a pack's credential health: from its ACTIVE credential set
+/// when one exists (the renewal plane's output — `load_existing`, never
+/// bootstrap: a view must not mint credential state), falling back to the
+/// pack's bootstrap identities for a never-started node (the credentials
+/// its first start will actually use). `None` when neither carries any
+/// expiry.
+pub fn pack_credential_health(pack: &CredentialPack) -> Option<CredentialHealth> {
+    let not_after_unix =
+        match interflow_identity::credentials::ActiveCredentialSet::load_existing(pack)
+            .ok()
+            .flatten()
+        {
+            Some(active) => active.earliest_expiry().ok()?.unix_timestamp(),
+            None => pack
+                .identities
+                .values()
+                .flat_map(|buckets| buckets.values())
+                .map(|entry| entry.not_after_unix)
+                .min()?,
+        };
+    let health = interflow_identity::expiry::leaf_phase_from_ttl(
+        not_after_unix,
+        pack.metadata.leaf_ttl_secs,
+        interflow_identity::expiry::now_unix(),
+    );
+    Some(CredentialHealth {
+        not_after: interflow_identity::expiry::format_rfc3339(not_after_unix),
+        remaining_secs: health.remaining_secs,
+        phase: health.phase,
+    })
 }
 
 /// Inspects a pack directory through the shared validation funnel — the same
@@ -142,6 +192,39 @@ pub struct PackInfo {
 pub fn inspect_pack(pack_dir: &Path) -> Result<PackInfo, String> {
     let pack = CredentialPack::load_runtime(pack_dir)
         .map_err(|e| format!("Credential Pack rejected: {e}"))?;
+    // Mesh rules display from the AUTHORITATIVE policy face (state/policy
+    // override included — what the engine actually runs), same as
+    // `build_agent_config`; node.toml carries only the dial target.
+    let mesh = pack.node_config.mesh.as_ref().map(|mesh| NodeMeshConfig {
+        hub_endpoint: mesh.hub_endpoint.clone(),
+        ingress: pack
+            .policy
+            .mesh
+            .iter()
+            .filter(|s| s.source_agent == pack.metadata.node)
+            .map(|s| MeshIngressRule {
+                name: s.name.clone(),
+                listen: s.listen.clone(),
+                protocol: s.protocol,
+                target_agent: s.target_agent.clone(),
+                remote_addr: s.remote_addr.clone(),
+                idle_timeout_secs: s.idle_timeout_secs,
+            })
+            .collect(),
+        egress: pack
+            .policy
+            .mesh_egress
+            .iter()
+            .filter(|o| o.agent == pack.metadata.node)
+            .map(|o| MeshEgressRule {
+                name: o.name.clone(),
+                protocol: o.protocol,
+                target_addr: o.target_addr.clone(),
+                target_cidr: o.target_cidr.clone(),
+                udp_idle_timeout_secs: o.udp_idle_timeout_secs,
+            })
+            .collect(),
+    });
     Ok(PackInfo {
         kind: NodeKind::classify(&pack),
         name: pack.metadata.node.clone(),
@@ -157,8 +240,9 @@ pub fn inspect_pack(pack_dir: &Path) -> Result<PackInfo, String> {
                 default_address: s.address.clone(),
             })
             .collect(),
-        mesh: pack.node_config.mesh.clone(),
+        mesh,
         listen: pack.node_config.listen.clone(),
+        credential: pack_credential_health(&pack),
     })
 }
 
@@ -284,7 +368,12 @@ impl From<HubLifecycle> for NodeState {
 #[allow(clippy::large_enum_variant)]
 enum Prepared {
     Expose(interflow_expose::client::ExposeArgs),
-    Mesh(AgentConfig),
+    /// The mesh agent config plus its pack dir — the signed-policy reload
+    /// watcher polls the pack's `state/policy` update channel from the dir.
+    Mesh {
+        config: AgentConfig,
+        pack_dir: std::path::PathBuf,
+    },
     Hub(HubConfig),
     Ingress(interflow_expose::edge::EdgeConfig),
 }
@@ -349,7 +438,10 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
                 .or_else(|| derive_quic_addr(&config.agent.hub_url));
             config.agent.hub_quic_addr = quic_addr;
             config.agent.log_name = Some(log_attribution(spec));
-            Ok(Prepared::Mesh(config))
+            Ok(Prepared::Mesh {
+                config,
+                pack_dir: dir,
+            })
         }
         NodeKind::Hub => {
             if pack.metadata.kind != PackKind::Hub {
@@ -405,7 +497,12 @@ fn derive_quic_addr(hub_url: &str) -> Option<String> {
 
 /// A running engine, normalized.
 enum Engine {
-    Agent(AgentHandle),
+    Agent {
+        handle: AgentHandle,
+        /// The signed-policy reload watcher (mesh agents only); aborted
+        /// together with the engine on stop.
+        policy_watcher: Option<tokio::task::JoinHandle<()>>,
+    },
     Hub(HubHandle),
     Ingress(FutureEngine),
 }
@@ -413,9 +510,11 @@ enum Engine {
 impl Engine {
     fn is_alive(&self) -> bool {
         match self {
-            Self::Agent(h) => {
-                !matches!(h.state(), AgentState::Stopped | AgentState::Failed { .. })
-                    && !h.is_finished()
+            Self::Agent { handle, .. } => {
+                !matches!(
+                    handle.state(),
+                    AgentState::Stopped | AgentState::Failed { .. }
+                ) && !handle.is_finished()
             }
             // The hub monitor reaches a terminal lifecycle when (and only
             // when) the run future ended.
@@ -426,7 +525,15 @@ impl Engine {
 
     async fn shutdown_graceful(self) -> Result<(), String> {
         match self {
-            Self::Agent(h) => h.shutdown_graceful().await.map_err(|e| e.to_string()),
+            Self::Agent {
+                handle,
+                policy_watcher,
+            } => {
+                if let Some(watcher) = policy_watcher {
+                    watcher.abort();
+                }
+                handle.shutdown_graceful().await.map_err(|e| e.to_string())
+            }
             Self::Hub(h) => h.shutdown_graceful().await.map_err(|e| e.to_string()),
             Self::Ingress(e) => e.shutdown_graceful().await,
         }
@@ -468,7 +575,9 @@ impl FutureEngine {
             rt.spawn(async move {
                 let readied = tokio::select! {
                     ready = ready_rx => match ready {
-                        Ok(()) => true,
+                    // EdgeReady carries the bound addresses; the GUI only
+                    // gates on readiness itself.
+                    Ok(_edge_ready) => true,
                         // The run ended before signalling readiness (its
                         // sender is gone): the real error surfaces through
                         // the monitor — don't race it with a generic
@@ -681,6 +790,42 @@ pub struct NodeManager {
     rt: tokio::runtime::Handle,
     events: tokio::sync::mpsc::UnboundedSender<ManagerEvent>,
     renewal: RenewalFactory,
+    /// Per-node leaf-credential health cache (node id -> health). Fed by
+    /// the 5-minute refresher and the add/update paths; `list_nodes`
+    /// lazily computes missing entries (first sighting). Credential
+    /// expiry is a slow variable — a 5-minute granularity is far finer
+    /// than the decision it feeds (rotate within days).
+    credential_health: Arc<Mutex<HashMap<String, CredentialHealth>>>,
+}
+
+/// How often the credential-health cache is recomputed from the packs.
+const CREDENTIAL_HEALTH_REFRESH: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Recomputes the whole credential-health cache: snapshot (id, pack_dir)
+/// under the manager lock, then read + phase OUTSIDE it (pack loads are
+/// file IO; the lock must not wait on disks). Nodes whose pack no longer
+/// loads simply drop out of the cache.
+fn refresh_health_cache(
+    inner: &Arc<Mutex<Inner>>,
+    cache: &Arc<Mutex<HashMap<String, CredentialHealth>>>,
+) {
+    let dirs: Vec<(String, std::path::PathBuf)> = {
+        let guard = inner.lock().unwrap_or_else(PoisonError::into_inner);
+        guard
+            .nodes
+            .iter()
+            .map(|(id, e)| (id.clone(), e.spec.pack_dir.clone()))
+            .collect()
+    };
+    let mut fresh = HashMap::new();
+    for (id, dir) in dirs {
+        if let Some(pack) = CredentialPack::load_runtime(&dir).ok()
+            && let Some(health) = pack_credential_health(&pack)
+        {
+            fresh.insert(id, health);
+        }
+    }
+    *cache.lock().unwrap_or_else(PoisonError::into_inner) = fresh;
 }
 
 /// Snapshot for `list_nodes` (commands layer maps it to the IPC DTO).
@@ -734,13 +879,33 @@ impl NodeManager {
                 }
             }
         });
+        let inner: Arc<Mutex<Inner>> = Arc::new(Mutex::new(Inner {
+            nodes: HashMap::new(),
+        }));
+        let credential_health: Arc<Mutex<HashMap<String, CredentialHealth>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // Low-frequency refresher: expiry is a slow variable (days), the
+        // recompute is a handful of pack reads (ms-scale) — a plain tick on
+        // the shared runtime, blocked-worker cost is one blink per 5 min.
+        {
+            let inner = Arc::clone(&inner);
+            let cache = Arc::clone(&credential_health);
+            rt.spawn(async move {
+                let mut ticker = tokio::time::interval(CREDENTIAL_HEALTH_REFRESH);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticker.tick().await; // the interval's immediate first tick
+                loop {
+                    ticker.tick().await;
+                    refresh_health_cache(&inner, &cache);
+                }
+            });
+        }
         Self {
-            inner: Arc::new(Mutex::new(Inner {
-                nodes: HashMap::new(),
-            })),
+            inner,
             rt,
             events,
             renewal,
+            credential_health,
         }
     }
 
@@ -1052,6 +1217,9 @@ impl NodeManager {
         if desired_running {
             self.start(id)?;
         }
+        // The pack's leaf changed under the update — refresh the health
+        // cache so the next view shows the new expiry, not the old one.
+        self.refresh_credential_health();
         Ok(UpdateReport {
             generation_from,
             generation_to,
@@ -1074,6 +1242,35 @@ impl NodeManager {
             .collect();
         nodes.sort_by(|a, b| a.spec.name.cmp(&b.spec.name));
         nodes
+    }
+
+    /// The node's credential health, from the cache when present (the
+    /// 5-minute refresher / add-update paths feed it), computed on first
+    /// sighting otherwise. `None` = no node, or no active credential set.
+    pub fn credential_health(&self, id: &str) -> Option<CredentialHealth> {
+        {
+            let cache = self
+                .credential_health
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(h) = cache.get(id) {
+                return Some(h.clone());
+            }
+        }
+        let pack_dir = self.lock().nodes.get(id)?.spec.pack_dir.clone();
+        let pack = CredentialPack::load_runtime(&pack_dir).ok()?;
+        let health = pack_credential_health(&pack)?;
+        self.credential_health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_string(), health.clone());
+        Some(health)
+    }
+
+    /// Drops and recomputes every cached credential health (add / update /
+    /// rotate paths call this so the next view reads the fresh pack).
+    pub fn refresh_credential_health(&self) {
+        refresh_health_cache(&self.inner, &self.credential_health);
     }
 
     pub fn state(&self, id: &str) -> Option<NodeState> {
@@ -1161,16 +1358,36 @@ impl NodeManager {
                 self.clone()
                     .spawn_agent_listener(id, generation, handle.subscribe_state());
                 entry.state = handle.state().into();
-                entry.engine = Some(Engine::Agent(handle));
+                entry.engine = Some(Engine::Agent {
+                    handle,
+                    policy_watcher: None,
+                });
             }
-            Prepared::Mesh(config) => {
-                let handle = AgentClient::new(config)
-                    .map_err(|e| format!("cannot start: {e}"))?
-                    .start();
+            Prepared::Mesh { config, pack_dir } => {
+                let client = AgentClient::new(config).map_err(|e| format!("cannot start: {e}"))?;
+                let handle = client.clone().start();
+                // Hot reload rides the same watcher the CLI binary uses
+                // (file channel + hub pull); a watcher that fails to start
+                // degrades to restart-on-update (warned) instead of
+                // blocking the node.
+                let policy_watcher = match interflow_mesh::pack::spawn_policy_reload(
+                    &pack_dir,
+                    client,
+                    Some(handle.tunnel()),
+                ) {
+                    Ok(watcher) => Some(watcher),
+                    Err(e) => {
+                        tracing::warn!("signed-policy hot reload unavailable for this node: {e}");
+                        None
+                    }
+                };
                 self.clone()
                     .spawn_agent_listener(id, generation, handle.subscribe_state());
                 entry.state = handle.state().into();
-                entry.engine = Some(Engine::Agent(handle));
+                entry.engine = Some(Engine::Agent {
+                    handle,
+                    policy_watcher,
+                });
             }
             Prepared::Hub(config) => {
                 let handle = HubHandle::spawn(config).map_err(|e| format!("cannot start: {e}"))?;
@@ -1836,6 +2053,59 @@ mod tests {
     // rendered packs — the same funnel as crates/mesh's
     // pack_site_to_site.rs acceptance test, driven through the manager).
     // ------------------------------------------------------------------
+
+    /// A never-started pack reports its bootstrap identities' health (the
+    /// credentials its first start will use): healthy, essentially the
+    /// full leaf TTL remaining, RFC 3339 not_after. (The phase MATH —
+    /// 20%/10% boundaries, expired, both entries agreeing — is unit-locked
+    /// in identity's expiry module; this locks the GUI plumbing.)
+    #[test]
+    fn fresh_pack_reports_bootstrap_leaf_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = IssuerStore::open(dir.path().join("issuer"));
+        issuer.ensure_realm().unwrap();
+        issuer.ensure_workspace("alpha").unwrap();
+        issuer.ensure_policy_key().unwrap();
+        let manifest = Manifest::parse(
+            r#"
+[realm]
+id = "gui-test"
+[registrar]
+endpoint = "https://registrar.example.com"
+[mesh.hub.central]
+listen = "127.0.0.1:1"
+endpoint = "127.0.0.1:1"
+[workspace.alpha]
+[agent.lan-a]
+workspace = "alpha"
+[[agent.lan-a.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:1"
+"#,
+        )
+        .unwrap();
+        let pack_dir = dir.path().join("packs/agent-lan-a");
+        AgentCredentialPack::render(&issuer, &manifest, "lan-a", 1, &pack_dir).unwrap();
+        let pack = CredentialPack::load_runtime(&pack_dir).unwrap();
+        let health = pack_credential_health(&pack)
+            .expect("a rendered pack carries bootstrap identities with expiries");
+        assert_eq!(
+            health.phase,
+            interflow_identity::expiry::LeafPhase::Healthy,
+            "a freshly rendered pack is inside its window with room"
+        );
+        // Registrar tier: 24h leaf, rendered moments ago.
+        assert!(
+            health.remaining_secs > 23 * 3600,
+            "remaining: {}",
+            health.remaining_secs
+        );
+        assert!(
+            health.not_after.ends_with('Z'),
+            "RFC 3339 UTC: {}",
+            health.not_after
+        );
+    }
 
     use interflow_identity::issuance::IssuerStore;
     use interflow_identity::manifest::Manifest;

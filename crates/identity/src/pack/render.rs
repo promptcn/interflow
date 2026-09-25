@@ -183,10 +183,12 @@ impl AgentCredentialPack {
                 })
                 .collect(),
             mesh: match mesh_role {
+                // node.toml carries node-local dial info only; the rules
+                // ride the signed policy (RuntimePolicy mesh faces).
                 true => Some(NodeMeshConfig {
                     hub_endpoint: hub_endpoint()?,
-                    ingress: agent_cfg.mesh_ingress.clone(),
-                    egress: agent_cfg.mesh_egress.clone(),
+                    ingress: Vec::new(),
+                    egress: Vec::new(),
                 }),
                 false => None,
             },

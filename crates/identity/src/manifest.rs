@@ -218,17 +218,140 @@ pub struct MeshIngressRule {
     /// The peer agent that dials `remote_addr` on its own network.
     pub target_agent: String,
     pub remote_addr: String,
+    /// Stream idle timeout (seconds): the stream closes when no data flows in
+    /// either direction. Defaults per protocol (tcp 300 / udp 60) — raise it
+    /// for long silent requests such as a non-streaming LLM call whose first
+    /// byte arrives minutes later. Bounded 1..=86400 at validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
 }
 
-/// A serve-side mesh rule on an agent: an address this agent is willing to
-/// dial for peers (also its egress allowlist entry).
+/// A serve-side mesh rule on an agent: what this agent is willing to dial
+/// for peers (also its egress authorization). Exactly one of `target_addr`
+/// (one concrete service) or `target_cidr` (a whole authorized range, any
+/// port) — the engine's `is_target_allowed` matches both shapes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshEgressRule {
     pub name: String,
     #[serde(default)]
     pub protocol: MeshProtocol,
-    pub target_addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_addr: Option<String>,
+    /// Range authorization (`ip/prefix`, e.g. `127.0.0.0/8` for "every
+    /// loopback service"): a peer's ingress rule pairs with this rule when
+    /// its `remote_addr` IP falls inside the network — port is not
+    /// constrained, mirroring the engine's CIDR branch. Widening a pack from
+    /// one address to a range grows the blast radius of that pack's leak —
+    /// declare the narrowest range that covers the services you actually
+    /// serve. Catch-alls (`0.0.0.0/0`, `::/0`) and CIDRs that lie entirely
+    /// inside the engine's hard SSRF blocklist (link-local, cloud metadata)
+    /// are rejected at validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_cidr: Option<String>,
+    /// UDP session idle timeout (seconds), default 60. TCP backends have no
+    /// idle budget — they close on EOF — so the knob is UDP-only by name and
+    /// by effect. Bounded 1..=86400 at validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_idle_timeout_secs: Option<u64>,
+}
+
+impl MeshEgressRule {
+    /// The allowlist entry this rule contributes (`host:port` or `ip/prefix`)
+    /// — exactly what lands in the engine's `SecurityConfig.allowed_targets`.
+    pub fn authorization(&self) -> &str {
+        self.target_cidr
+            .as_deref()
+            .or(self.target_addr.as_deref())
+            .unwrap_or("")
+    }
+
+    /// Whether this rule authorizes an ingress rule under `protocol` at
+    /// `remote_addr`: exact address pairing, or the address IP inside the
+    /// rule's CIDR (port unconstrained, mirroring the engine's CIDR branch).
+    /// Only called on validated rules, where exactly one target is present
+    /// and parses; a malformed CIDR simply fails to contain anything.
+    pub fn offers(&self, protocol: MeshProtocol, remote_addr: &SocketAddr) -> bool {
+        if self.protocol != protocol {
+            return false;
+        }
+        if let Some(addr) = &self.target_addr {
+            return addr == &remote_addr.to_string();
+        }
+        self.target_cidr
+            .as_deref()
+            .and_then(|cidr| cidr.parse::<ipnetwork::IpNetwork>().ok())
+            .is_some_and(|net| net.contains(remote_addr.ip()))
+    }
+}
+
+/// Rejects CIDRs that would authorize the entire address space, and CIDRs
+/// that lie entirely inside the engine's hard SSRF blocklist
+/// (`mesh/src/agent/ssrf_deny.rs`: link-local + cloud metadata). The first
+/// is an over-grant footgun; the second authorizes nothing at all — the
+/// engine denies that space per-connect — so both are dead config caught at
+/// plan time. A wider CIDR that merely *overlaps* the reserved space stays
+/// declarable: the engine still denies the reserved slice on every dial.
+fn validate_egress_cidr(agent_id: &str, rule_name: &str, cidr: &str) -> Result<()> {
+    let net: ipnetwork::IpNetwork = cidr.parse().map_err(|_| {
+        Error::manifest(format!(
+            "agent '{agent_id}' mesh rule {rule_name:?}: target_cidr {cidr:?} is not a \
+             valid network (expected ip/prefix, e.g. \"127.0.0.0/8\")"
+        ))
+    })?;
+    if net.prefix() == 0 {
+        return Err(Error::manifest(format!(
+            "agent '{agent_id}' mesh rule {rule_name:?}: target_cidr {cidr:?} authorizes the \
+             entire address space — declare the narrowest range that covers the services you \
+             actually serve"
+        )));
+    }
+    let reserved = match net {
+        ipnetwork::IpNetwork::V4(v4) => {
+            // Subnet-of 169.254.0.0/16 (same bits ssrf_deny's is_link_local
+            // matches), or a /32 on a metadata address outside that space.
+            (v4.prefix() >= 16 && (u32::from(v4.ip()) & 0xffff_0000) == 0xa9fe_0000)
+                || (v4.prefix() == 32
+                    && (v4.ip() == std::net::Ipv4Addr::new(169, 254, 169, 254)
+                        || v4.ip() == std::net::Ipv4Addr::new(100, 100, 100, 200)))
+        }
+        ipnetwork::IpNetwork::V6(v6) => {
+            // Subnet-of fe80::/10, or the unspecified /128.
+            (v6.prefix() >= 10 && (v6.ip().segments()[0] & 0xffc0) == 0xfe80)
+                || (v6.prefix() == 128 && v6.ip().is_unspecified())
+        }
+    };
+    if reserved {
+        return Err(Error::manifest(format!(
+            "agent '{agent_id}' mesh rule {rule_name:?}: target_cidr {cidr:?} lies entirely \
+             inside the hard SSRF blocklist (link-local / cloud metadata) — the engine denies \
+             that space on every dial, so the rule would authorize nothing"
+        )));
+    }
+    Ok(())
+}
+
+/// Mesh idle-timeout bounds (seconds): one day is the ceiling — an
+/// unconfigured-much-longer value would read as "forever" and defeat the
+/// resource hygiene the budget exists for.
+pub const MESH_IDLE_TIMEOUT_MAX_SECS: u64 = 86_400;
+
+fn validate_mesh_idle_timeout(
+    agent_id: &str,
+    rule_name: &str,
+    field: &str,
+    value: Option<u64>,
+) -> Result<()> {
+    let Some(secs) = value else {
+        return Ok(());
+    };
+    if !(1..=MESH_IDLE_TIMEOUT_MAX_SECS).contains(&secs) {
+        return Err(Error::manifest(format!(
+            "agent '{agent_id}' mesh rule {rule_name:?}: {field} must be between 1 and \
+             {MESH_IDLE_TIMEOUT_MAX_SECS} seconds (found {secs})"
+        )));
+    }
+    Ok(())
 }
 
 /// The desired-state manifest.
@@ -604,10 +727,65 @@ impl Manifest {
                 }
             }
         }
+        // Egress targets first, across every agent: a malformed target must
+        // surface as its own error, not as a downstream pairing miss.
+        for (agent_id, agent) in &self.agent {
+            let mut egress_names = BTreeSet::new();
+            for rule in &agent.mesh_egress {
+                validate_name("mesh rule", &rule.name)?;
+                validate_mesh_idle_timeout(
+                    agent_id,
+                    &rule.name,
+                    "udp_idle_timeout_secs",
+                    rule.udp_idle_timeout_secs,
+                )?;
+                if !egress_names.insert(rule.name.clone()) {
+                    return Err(Error::manifest(format!(
+                        "agent '{agent_id}' declares mesh rule {:?} twice",
+                        rule.name
+                    )));
+                }
+                match (&rule.target_addr, &rule.target_cidr) {
+                    (Some(addr), None) => {
+                        if addr.parse::<SocketAddr>().is_err() {
+                            return Err(Error::manifest(format!(
+                                "agent '{agent_id}' mesh rule {:?}: target_addr {addr:?} is \
+                                 not a valid address",
+                                rule.name
+                            )));
+                        }
+                    }
+                    (None, Some(cidr)) => {
+                        validate_egress_cidr(agent_id, &rule.name, cidr)?;
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(Error::manifest(format!(
+                            "agent '{agent_id}' mesh rule {:?}: declare exactly one of \
+                             target_addr or target_cidr — a rule is either one concrete \
+                             service or one authorized range",
+                            rule.name
+                        )));
+                    }
+                    (None, None) => {
+                        return Err(Error::manifest(format!(
+                            "agent '{agent_id}' mesh rule {:?}: requires target_addr \
+                             (one service) or target_cidr (an authorized range)",
+                            rule.name
+                        )));
+                    }
+                }
+            }
+        }
         for (agent_id, agent) in &self.agent {
             let mut ingress_names = BTreeSet::new();
             for rule in &agent.mesh_ingress {
                 validate_name("mesh rule", &rule.name)?;
+                validate_mesh_idle_timeout(
+                    agent_id,
+                    &rule.name,
+                    "idle_timeout_secs",
+                    rule.idle_timeout_secs,
+                )?;
                 if !ingress_names.insert(rule.name.clone()) {
                     return Err(Error::manifest(format!(
                         "agent '{agent_id}' declares mesh rule {:?} twice",
@@ -628,7 +806,7 @@ impl Manifest {
                         rule.name
                     )));
                 }
-                rule.remote_addr.parse::<SocketAddr>().map_err(|e| {
+                let remote: SocketAddr = rule.remote_addr.parse().map_err(|e| {
                     Error::manifest(format!(
                         "agent '{agent_id}' mesh rule {:?}: remote_addr {:?} is not a valid \
                          address: {e}",
@@ -641,32 +819,17 @@ impl Manifest {
                         rule.name, rule.target_agent
                     )));
                 };
-                let offered = target.mesh_egress.iter().any(|egress| {
-                    egress.target_addr == rule.remote_addr && egress.protocol == rule.protocol
-                });
+                let offered = target
+                    .mesh_egress
+                    .iter()
+                    .any(|egress| egress.offers(rule.protocol, &remote));
                 if !offered {
                     return Err(Error::manifest(format!(
                         "agent '{agent_id}' mesh rule {:?} targets agent {:?} at {}, but that \
-                         agent does not offer it — declare a matching \
-                         [[agent.{}.mesh_egress]] entry",
+                         agent does not offer it — declare a matching [[agent.{}.mesh_egress]] \
+                         entry (a target_addr equal to the remote address, or a target_cidr \
+                         containing it)",
                         rule.name, rule.target_agent, rule.remote_addr, rule.target_agent
-                    )));
-                }
-            }
-            let mut egress_names = BTreeSet::new();
-            for rule in &agent.mesh_egress {
-                validate_name("mesh rule", &rule.name)?;
-                if !egress_names.insert(rule.name.clone()) {
-                    return Err(Error::manifest(format!(
-                        "agent '{agent_id}' declares mesh rule {:?} twice",
-                        rule.name
-                    )));
-                }
-                if rule.target_addr.parse::<SocketAddr>().is_err() {
-                    return Err(Error::manifest(format!(
-                        "agent '{agent_id}' mesh rule {:?}: target_addr {:?} is not a valid \
-                         address",
-                        rule.name, rule.target_addr
                     )));
                 }
             }
@@ -932,11 +1095,175 @@ target_addr = "127.0.0.1:3000"
         );
     }
 
+    /// Range egress: one `target_cidr` rule pairs with every ingress whose
+    /// `remote_addr` IP falls inside the network — port unconstrained, the
+    /// loopback recipe for "serve every local service without re-signing".
+    #[test]
+    fn mesh_egress_range_authorizes_any_port_inside_it() {
+        let text = MESH_VALID
+            .replace(
+                "remote_addr = \"127.0.0.1:3000\"",
+                "remote_addr = \"127.0.0.1:8055\"",
+            )
+            .replace(
+                "target_addr = \"127.0.0.1:3000\"",
+                "target_cidr = \"127.0.0.0/8\"",
+            );
+        let m = Manifest::parse(&text).unwrap();
+        let rule = &m.agent["lan-b"].mesh_egress[0];
+        assert_eq!(rule.authorization(), "127.0.0.0/8");
+        // Canonical round trip keeps the range face.
+        let rendered = m.to_toml().unwrap();
+        assert_eq!(Manifest::parse(&rendered).unwrap(), m);
+    }
+
+    #[test]
+    fn mesh_egress_range_does_not_authorize_outside_addresses() {
+        let text = MESH_VALID
+            .replace(
+                "remote_addr = \"127.0.0.1:3000\"",
+                "remote_addr = \"192.168.1.5:80\"",
+            )
+            .replace(
+                "target_addr = \"127.0.0.1:3000\"",
+                "target_cidr = \"127.0.0.0/8\"",
+            );
+        let err = Manifest::parse(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("does not offer it"),
+            "an address outside the range must not pair: {err}"
+        );
+    }
+
+    #[test]
+    fn mesh_egress_rejects_catch_all_cidrs() {
+        for cidr in ["0.0.0.0/0", "::/0"] {
+            let text = MESH_VALID.replace(
+                "target_addr = \"127.0.0.1:3000\"",
+                format!("target_cidr = \"{cidr}\"").as_str(),
+            );
+            let err = Manifest::parse(&text).unwrap_err();
+            assert!(
+                err.to_string().contains("entire address space"),
+                "{cidr} must be rejected as an over-grant: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_egress_rejects_cidrs_inside_the_ssrf_blocklist() {
+        for cidr in ["169.254.0.0/16", "169.254.169.254/32", "fe80::/10", "::"] {
+            let text = MESH_VALID.replace(
+                "target_addr = \"127.0.0.1:3000\"",
+                format!("target_cidr = \"{cidr}\"").as_str(),
+            );
+            let err = Manifest::parse(&text).unwrap_err();
+            assert!(
+                err.to_string().contains("SSRF blocklist"),
+                "{cidr} authorizes nothing the engine would dial: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_egress_requires_exactly_one_target() {
+        let both = MESH_VALID.replace(
+            "target_addr = \"127.0.0.1:3000\"",
+            "target_addr = \"127.0.0.1:3000\"\ntarget_cidr = \"127.0.0.0/8\"",
+        );
+        let err = Manifest::parse(&both).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("exactly one of target_addr or target_cidr"),
+            "{err}"
+        );
+        let neither = MESH_VALID.replace("\ntarget_addr = \"127.0.0.1:3000\"", "");
+        let err = Manifest::parse(&neither).unwrap_err();
+        assert!(err.to_string().contains("requires target_addr"), "{err}");
+    }
+
+    #[test]
+    fn mesh_egress_rejects_malformed_cidr() {
+        let text = MESH_VALID.replace(
+            "target_addr = \"127.0.0.1:3000\"",
+            "target_cidr = \"127.0.0.1/99\"",
+        );
+        let err = Manifest::parse(&text).unwrap_err();
+        assert!(err.to_string().contains("not a valid network"), "{err}");
+    }
+
     #[test]
     fn mesh_listener_is_loopback_only() {
         let text = MESH_VALID.replace("127.0.0.1:3001", "0.0.0.0:3001");
         let err = Manifest::parse(&text).unwrap_err();
         assert!(err.to_string().contains("loopback-only"));
+    }
+
+    #[test]
+    fn mesh_idle_timeouts_parse_and_round_trip() {
+        let text = MESH_VALID
+            .replace(
+                "remote_addr = \"127.0.0.1:3000\"",
+                "remote_addr = \"127.0.0.1:3000\"\nidle_timeout_secs = 1800",
+            )
+            .replace(
+                "target_addr = \"127.0.0.1:3000\"",
+                "target_addr = \"127.0.0.1:3000\"\nudp_idle_timeout_secs = 120",
+            );
+        let m = Manifest::parse(&text).unwrap();
+        assert_eq!(
+            m.agent["lan-a"].mesh_ingress[0].idle_timeout_secs,
+            Some(1800)
+        );
+        assert_eq!(
+            m.agent["lan-b"].mesh_egress[0].udp_idle_timeout_secs,
+            Some(120)
+        );
+        // Canonical round trip keeps the values (and omits them when absent).
+        let text = m.to_toml().unwrap();
+        assert_eq!(Manifest::parse(&text).unwrap(), m);
+        let bare = Manifest::parse(MESH_VALID).unwrap();
+        assert_eq!(bare.agent["lan-a"].mesh_ingress[0].idle_timeout_secs, None);
+        assert_eq!(
+            bare.agent["lan-b"].mesh_egress[0].udp_idle_timeout_secs,
+            None
+        );
+        assert!(!text.contains("idle_timeout_secs = \n"));
+    }
+
+    #[test]
+    fn mesh_idle_timeouts_are_bounded() {
+        for (field, value) in [
+            ("idle_timeout_secs", "0"),
+            ("idle_timeout_secs", "86401"),
+            ("udp_idle_timeout_secs", "0"),
+            ("udp_idle_timeout_secs", "999999999"),
+        ] {
+            let text = match field {
+                "idle_timeout_secs" => MESH_VALID.replace(
+                    "target_agent = \"lan-b\"",
+                    &format!("target_agent = \"lan-b\"\n{field} = {value}"),
+                ),
+                _ => MESH_VALID.replace(
+                    "name = \"web\"",
+                    &format!("name = \"web\"\n{field} = {value}"),
+                ),
+            };
+            let err = Manifest::parse(&text)
+                .expect_err("expected the out-of-bounds mesh idle timeout to be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains(field), "{field} must be named: {msg}");
+            assert!(
+                msg.contains("between 1 and"),
+                "bounds must be stated: {msg}"
+            );
+        }
+        // The ceiling itself is legal.
+        let text = MESH_VALID.replace(
+            "target_agent = \"lan-b\"",
+            "target_agent = \"lan-b\"\nidle_timeout_secs = 86400",
+        );
+        assert!(Manifest::parse(&text).is_ok());
     }
 
     #[test]

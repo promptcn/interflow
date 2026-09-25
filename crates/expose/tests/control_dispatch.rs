@@ -31,8 +31,6 @@ async fn public_port_dispatches_control_sni_to_the_hub_plane() {
         )
         .try_init();
     let certs = interflow_testkit::certs::TestCerts::generate("dispatch", "agent-dispatch");
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().expect("addr");
 
     // The embedded control plane: hub state + the mTLS plane built from the
     // test CA (same assembly as the edge, minus its own listener — only the
@@ -71,7 +69,7 @@ async fn public_port_dispatches_control_sni_to_the_hub_plane() {
     let business_config = Arc::new(business_plain);
 
     let listener = EdgeListener {
-        listen_addr: listen,
+        listen_addr: "127.0.0.1:0".parse().expect("addr"),
         node: "test-edge".to_string(),
         tls: Some(PublicTlsPlanes {
             challenge: Arc::clone(&business_config),
@@ -99,10 +97,9 @@ async fn public_port_dispatches_control_sni_to_the_hub_plane() {
         ),
         identity: Arc::new(IngressIdentity::new(vec![], vec![]).expect("identity")),
     };
-    tokio::spawn(listener.run());
-    interflow_testkit::wait_for_tcp(listen, Duration::from_secs(5))
-        .await
-        .expect("listener up");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(listener.run_signalled(ready_tx));
+    let listen = ready_rx.await.expect("listener bound");
 
     let (client_cert, client_key) = certs.client_paths();
     let client = Some((client_cert, client_key));

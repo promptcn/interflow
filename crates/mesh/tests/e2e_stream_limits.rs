@@ -25,7 +25,7 @@ use interflow_core::protocol::{FrameType, StreamProto};
 use interflow_core::tunnel::AgentTunnel;
 use interflow_mesh::agent::AgentClient;
 use interflow_mesh::config::HubSecurityConfig;
-use interflow_testkit::{agent_config, hub_config, pick_ephemeral_port, spawn_hub};
+use interflow_testkit::{agent_config, hub_config, spawn_hub};
 use tokio::sync::mpsc;
 
 fn certs() -> &'static interflow_testkit::certs::TestCerts {
@@ -42,13 +42,13 @@ fn sid(n: u16) -> interflow_core::protocol::StreamId {
     interflow_core::protocol::StreamId::from_bytes(bytes)
 }
 
-/// Build and start a hub with the given security config; returns hub_port.
+/// Build and start a hub with the given security config; returns the actual
+/// bound port (kernel-assigned at bind — no pick-then-bind race).
 async fn start_hub(security: HubSecurityConfig) -> u16 {
-    let hub_port = pick_ephemeral_port();
-    let mut cfg = hub_config(hub_port, certs(), vec![]);
+    let mut cfg = hub_config(0, certs(), vec![]);
     cfg.security = security;
-    spawn_hub(cfg).await;
-    hub_port
+    let hub = spawn_hub(cfg).await;
+    hub.local_addr().expect("hub bound").port()
 }
 
 /// Connect to the hub + register + return an AgentTunnel (the caller holds

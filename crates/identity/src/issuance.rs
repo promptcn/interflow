@@ -15,6 +15,8 @@
 
 use crate::{Error, PrincipalKind, PrincipalPath, Result, validate_name};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use interflow_contract::Generation;
+use serde::{Deserialize, Serialize};
 
 use interflow_util::sha256_hex;
 use std::path::{Path, PathBuf};
@@ -308,12 +310,83 @@ fn err(context: &'static str) -> impl Fn(rcgen::Error) -> Error {
 // Issuer store (operator machine layout)
 // ---------------------------------------------------------------------------
 
+/// The file the store's manifest binding lives in (see [`StoreBinding`]).
+const BINDING_FILE: &str = "binding.json";
+const APPLIED_FILE: &str = "applied.json";
+
+/// What `plan apply` last put into the world — the diff base that lets the
+/// next apply distinguish "the manifest's identity face changed" (re-render
+/// packs) from "only the mesh rule face changed" (sign + publish a policy
+/// update; no identity is re-signed). Stored in the issuer store next to
+/// the binding contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppliedState {
+    /// sha256 of the manifest with every agent's mesh rule lists emptied —
+    /// the identity/trust/dial face. Unchanged + policy changed = the
+    /// policy-only fast path.
+    pub stripped_manifest_digest: String,
+    /// The live policy generation (embedded at full render, incremented per
+    /// policy-only update).
+    pub policy_generation: Generation,
+    /// sha256 of the live policy's canonical bytes (at `policy_generation`).
+    pub policy_digest: String,
+    /// node → sha256 of its rendered pack directory (SHA256SUMS content).
+    #[serde(default)]
+    pub packs: std::collections::BTreeMap<String, String>,
+}
+
+/// The issuer store's binding to one manifest lineage — the persisted half
+/// of the trust-root isolation contract ((internal design notes), 「一个
+/// realm 一个 manifest」): one store signs exactly one realm, driven by
+/// exactly one manifest file. A second deployment scenario gets its own
+/// realm id and its own `--issuer` directory, so a leaked pack's blast
+/// radius stays inside the scenario that issued it.
+///
+/// `manifest_path` (canonical, absolute) is the lineage key: editing the
+/// same file rebinds silently, while a *different* manifest file claiming
+/// the same realm trips the guard in `plan apply`/`rotate`. The digest is
+/// human context for that error message, not a second key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreBinding {
+    /// The realm this store was created for.
+    pub realm: String,
+    /// Canonical absolute path of the manifest that bound the store.
+    pub manifest_path: String,
+    /// sha256 of the manifest bytes at bind time (short context, not a key).
+    pub manifest_digest: String,
+    /// RFC 3339 timestamp of the (re)bind.
+    pub bound_at: String,
+}
+
+impl StoreBinding {
+    /// Captures the binding facts for `manifest` at `manifest_path` now.
+    pub fn capture(manifest: &crate::manifest::Manifest, manifest_path: &Path) -> Result<Self> {
+        let canonical = manifest_path
+            .canonicalize()
+            .unwrap_or_else(|_| manifest_path.to_owned());
+        let bytes = std::fs::read(&canonical).map_err(|e| Error::Io {
+            path: canonical.display().to_string(),
+            source: e,
+        })?;
+        let bound_at = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Error::issuance("binding timestamp".to_string()).with_source(e))?;
+        Ok(Self {
+            realm: manifest.realm.id.clone(),
+            manifest_path: canonical.display().to_string(),
+            manifest_digest: sha256_hex(&bytes),
+            bound_at,
+        })
+    }
+}
+
 /// The on-disk issuer store:
 ///
 /// ```text
 /// <root>/
 ///   realm-issuer.crt|.key      # signs control endpoint identities
 ///   policy-signing.key|.pub    # ed25519 runtime-policy signer
+///   binding.json               # the one-realm / one-manifest contract
 ///   workspaces/<ws>-issuer.crt|.key
 /// ```
 ///
@@ -475,6 +548,97 @@ impl IssuerStore {
             &self.root.join("realm-issuer.crt"),
             &self.root.join("realm-issuer.key"),
         )
+    }
+
+    /// Reads the store's manifest binding, if any. Stores created before
+    /// bindings existed have none — the next `plan apply`/`rotate` records
+    /// one.
+    pub fn binding(&self) -> Result<Option<StoreBinding>> {
+        let path = self.root.join(BINDING_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Error::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                });
+            }
+        };
+        serde_json::from_str(&text).map(Some).map_err(|e| {
+            Error::issuance(format!(
+                "issuer store {} has a malformed {BINDING_FILE} — inspect it, or rebind \
+                 deliberately by re-running with the allow-shared override",
+                self.root.display()
+            ))
+            .with_source(e)
+        })
+    }
+
+    /// Records (or refreshes) the store's manifest binding, atomically:
+    /// the write lands via a temp file + rename, so a crash never leaves a
+    /// half-written contract behind.
+    pub fn record_binding(&self, binding: &StoreBinding) -> Result<()> {
+        std::fs::create_dir_all(&self.root).map_err(|e| Error::Io {
+            path: self.root.display().to_string(),
+            source: e,
+        })?;
+        let text = serde_json::to_string_pretty(binding)
+            .map_err(|e| Error::issuance("binding serialization".to_string()).with_source(e))?;
+        let final_path = self.root.join(BINDING_FILE);
+        let tmp = self.root.join(format!(".{BINDING_FILE}.tmp"));
+        std::fs::write(&tmp, text).map_err(|e| Error::Io {
+            path: tmp.display().to_string(),
+            source: e,
+        })?;
+        std::fs::rename(&tmp, &final_path).map_err(|e| Error::Io {
+            path: final_path.display().to_string(),
+            source: e,
+        })
+    }
+
+    /// What `plan apply` last put into the world (the diff base for the
+    /// policy-only fast path). `None` before the first apply.
+    pub fn applied_state(&self) -> Result<Option<AppliedState>> {
+        let path = self.root.join(APPLIED_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Error::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                });
+            }
+        };
+        serde_json::from_str(&text).map(Some).map_err(|e| {
+            Error::issuance(format!(
+                "issuer store {} has a malformed {APPLIED_FILE} — delete it and re-run apply",
+                self.root.display()
+            ))
+            .with_source(e)
+        })
+    }
+
+    /// Records the applied state, atomically (temp + rename).
+    pub fn record_applied(&self, state: &AppliedState) -> Result<()> {
+        std::fs::create_dir_all(&self.root).map_err(|e| Error::Io {
+            path: self.root.display().to_string(),
+            source: e,
+        })?;
+        let text = serde_json::to_string_pretty(state).map_err(|e| {
+            Error::issuance("applied-state serialization".to_string()).with_source(e)
+        })?;
+        let final_path = self.root.join(APPLIED_FILE);
+        let tmp = self.root.join(format!(".{APPLIED_FILE}.tmp"));
+        std::fs::write(&tmp, text).map_err(|e| Error::Io {
+            path: tmp.display().to_string(),
+            source: e,
+        })?;
+        std::fs::rename(&tmp, &final_path).map_err(|e| Error::Io {
+            path: final_path.display().to_string(),
+            source: e,
+        })
     }
 
     /// Loads one workspace's issuer.

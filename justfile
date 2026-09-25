@@ -22,7 +22,7 @@ test:
 
 # Run integration tests only
 test-e2e:
-    cargo test --workspace --test '*' -- --test-threads=1
+    cargo test --workspace --test '*'
 
 # QUIC vs h2 concurrent-stream loss comparison (scenario benchmark; see --help for options)
 bench-loss:
@@ -96,6 +96,10 @@ example-public-domain-agent:
 # GUI DMG packaging (equivalent to ./scripts/build-dmg.sh, incl. fallback cleanup of create-dmg leaks)
 dmg:
     bash scripts/build-dmg.sh
+
+# Windows GUI NSIS installer, cross-compiled from this host (msvc ABI via cargo-xwin; no MSI off-Windows)
+nsis:
+    bash scripts/build-windows-gui.sh
 
 # Clean build artifacts
 clean:

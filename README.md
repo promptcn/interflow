@@ -26,18 +26,28 @@ transports — HTTP/2 and QUIC.
 ## Site-to-site (private network ↔ private network)
 
 The same manifest model drives the mesh engine: declare a `[mesh.hub.*]`
-node and per-agent mesh rules, `interflow plan apply` renders hub and agent
-Credential Packs, and the nodes run on the `interflow-mesh` binary (a node
-is an identity — a machine can run any number of them, each in its own
-mesh):
+node and per-agent mesh rules — by hand, or structurally with
+`setup --face mesh` + `node add` (no TOML to write: the append is
+non-destructive, and the edited manifest must pass the full validation
+funnel before anything is written) — then `interflow plan apply` renders
+hub and agent Credential Packs, and the nodes run on the `interflow-mesh`
+binary (a node is an identity — a machine can run any number of them, each
+in its own mesh):
 
 ```bash
-interflow plan apply --manifest interflow.toml --issuer issuer --out dist
+interflow setup --face mesh --realm example --hub-name central --hub-endpoint hub.example.com:6666
+interflow node add agent/lan-b --mesh-egress web:10.1.0.5:80     # serve side first
+interflow node add agent/lan-a --mesh-ingress to-lan-b:127.0.0.1:3001:10.1.0.5:80@lan-b
+interflow plan apply                          # all flags default: interflow.toml / issuer / dist
 
 interflow-mesh hub   --pack dist/packs/hub-central   # public relay
 interflow-mesh agent --pack dist/packs/agent-lan-a    # LAN A side
 interflow-mesh agent --pack dist/packs/agent-lan-b    # LAN B side
 ```
+
+Distribute a pack as an encrypted `.iflowpack` with
+`interflow pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
+(the output lands beside the pack; the 144-bit passphrase prints once).
 
 Hub and agent credentials are issued offline (never enrolled), renew
 automatically against the registrar, and respond to the same `rotate` /
@@ -120,13 +130,15 @@ interflow-registrar serve --issuer issuer --listen 0.0.0.0:18666 \
   --tls-key registrar.key --leaf-ttl 24h \
   --control-endpoint relay.example.com:16666
 
-# 3. Issue every identity + Credential Pack
+# 3. Issue every identity + Credential Pack (append more agents any time:
+#    interflow node add agent/<name> --service id:address, then re-apply)
 interflow plan apply --manifest interflow.toml --issuer issuer --out dist
 
 # 4. Public server: start the ingress from its pack
 interflow ingress run --pack dist/packs/ingress-edge
 
-# 5. Local machine: start the agent from its pack
+# 5. Local machine: start the agent from its pack (transfer it encrypted:
+#    interflow pack seal --pack dist/packs/agent-myagent --generate-passphrase)
 interflow agent run --pack dist/packs/agent-myagent
 ```
 

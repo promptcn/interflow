@@ -58,19 +58,43 @@ impl CredentialPack {
             })?,
         )
         .map_err(|e| Error::pack("node.toml parse".to_string()).with_source(e))?;
+        // Pre-separation packs carry the mesh rules in node.toml. Parsed
+        // (serde-known) only so this fails with the migration instruction
+        // instead of a bare unknown-field error.
+        if let Some(mesh) = &node_config.mesh
+            && (!mesh.ingress.is_empty() || !mesh.egress.is_empty())
+        {
+            return Err(Error::pack(
+                "this pack carries its mesh rules in node.toml — it predates the \
+                 signed-policy rule face; re-render it with `plan apply` and reinstall"
+                    .to_owned(),
+            ));
+        }
         let trust = TrustBundle::load(&dir.join("trust"))?;
 
         // Policy signature against the trust bundle's policy key — a pack
         // without a verifiable signature is rejected outright.
-        let policy_key_bytes = hex::decode(trust.metadata.policy_key.trim())
-            .map_err(|e| Error::trust("policy verifying key".to_string()).with_source(e))?;
-        let mut key_arr = [0u8; 32];
-        key_arr.copy_from_slice(&policy_key_bytes);
-        let verifier = VerifyingKey::from_bytes(&key_arr)
-            .map_err(|e| Error::trust("policy verifying key".to_string()).with_source(e))?;
+        let verifier = policy_verifier(&trust)?;
         let signed = SignedPolicyFiles::load(&dir.join("policy"), &verifier)?;
-        let (policy, policy_signature) = (signed.policy, signed.signature);
-        validate_generation(metadata.generation, &trust, &policy)?;
+        validate_generation(metadata.generation, &trust, &signed.policy)?;
+        // Authoritative policy: a newer signed bundle in `state/policy`
+        // (the node-local update channel — state/ is outside SHA256SUMS on
+        // purpose, the ed25519 signature is its integrity) supersedes the
+        // embedded snapshot. The embedded generation is the rollback floor;
+        // a bundle that fails verification or rolls back is rejected with a
+        // warning and the embedded snapshot keeps serving (fail-keep).
+        let (policy, policy_signature) =
+            match Self::load_policy_override(dir, &verifier, signed.policy.generation) {
+                Ok(Some(update)) => (update.policy, update.signature),
+                Ok(None) => (signed.policy, signed.signature),
+                Err(e) => {
+                    tracing::warn!(
+                        "rejecting policy update in state/policy (keeping the embedded \
+                         snapshot): {e}"
+                    );
+                    (signed.policy, signed.signature)
+                }
+            };
 
         // Identity entries.
         let identity_dir = dir.join("identity");
@@ -378,8 +402,56 @@ impl CredentialPack {
             pack_digest: self.pack_digest.clone(),
         }
     }
+
+    /// Loads the node-local policy update from `state/policy`, if one is
+    /// present. Verification + anti-rollback against `floor` (the highest
+    /// generation this node has accepted); errors name their category
+    /// (missing files / bad signature / parse failure / rollback) for the
+    /// caller's rejection log.
+    fn load_policy_override(
+        dir: &Path,
+        verifier: &VerifyingKey,
+        floor: Generation,
+    ) -> Result<Option<SignedPolicyFiles>> {
+        let state_policy = dir.join("state").join("policy");
+        if !state_policy.join("policy.toml").is_file() {
+            return Ok(None);
+        }
+        let signed = SignedPolicyFiles::load(&state_policy, verifier)?;
+        signed.policy.check_not_rollback(floor)?;
+        Ok(Some(signed))
+    }
+
+    /// The node-local policy update channel, for a running node's reload
+    /// watcher: loads + verifies `state/policy` against this pack's trust
+    /// bundle and enforces anti-rollback against `floor` (the highest
+    /// generation the node has ever applied — at minimum the embedded
+    /// snapshot's). `Ok(None)` means no update is present. A tampered or
+    /// rolled-back bundle is an `Err` the watcher logs while the current
+    /// policy keeps serving.
+    pub fn policy_update(&self, floor: Generation) -> Result<Option<SignedPolicyFiles>> {
+        let verifier = policy_verifier(&self.trust)?;
+        Self::load_policy_override(&self.dir, &verifier, floor)
+    }
 }
 
+/// The policy verifying key from the trust bundle (the anchor every policy
+/// signature is checked against).
+fn policy_verifier(trust: &TrustBundle) -> Result<VerifyingKey> {
+    let key_bytes = hex::decode(trust.metadata.policy_key.trim())
+        .map_err(|e| Error::trust("policy verifying key".to_string()).with_source(e))?;
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&key_bytes);
+    VerifyingKey::from_bytes(&key_arr)
+        .map_err(|e| Error::trust("policy verifying key".to_string()).with_source(e))
+}
+
+/// Generation coherence of the pack's **embedded** signed objects: pack
+/// metadata, trust bundle, and the embedded policy snapshot all carry the
+/// render-time generation. A `state/policy` update supersedes the embedded
+/// policy on its own generation track (≥ the embedded generation — see
+/// `load_policy_override`), which is why this check runs before the override
+/// is considered.
 pub(crate) fn validate_generation(
     generation: Generation,
     trust: &TrustBundle,

@@ -66,17 +66,39 @@ impl HubService {
             }
         };
         let agent_key = identity.qualified();
+        // Control-plane principals (the realm root's `control` tenant) never
+        // register as data-plane agents — their only authority is policy
+        // publication, and registering would hand them a routable circuit.
+        if identity.tenant.as_ref() == crate::hub::state::CONTROL_TENANT {
+            metrics::counter!("interflow_hub_auth_failures", "reason" => "control_principal_on_data_plane")
+                .increment(1);
+            self.state.audit.record(
+                AuditKind::AgentRegisterDenied {
+                    reason: "control_principal_on_data_plane".to_string(),
+                },
+                None,
+                Some(self.peer_str()),
+            );
+            return Ok(text_response(
+                StatusCode::FORBIDDEN,
+                "control-plane principals cannot register as agents",
+            ));
+        }
         let circuit = CircuitToken::random()?;
         *self.connection_circuit.write().await = Some(circuit);
         info!(
             "Agent registered: circuit={circuit} from {}",
-            self.peer_addr
+            self.effective_ip
         );
         self.state
             .route_leases
             .write()
             .await
             .retain(|_, (_, source, _)| source != &agent_key);
+
+        // The registration certificate's validity window rides the session
+        // (refreshed here — a reconnected agent presents its current leaf).
+        let leaf_validity = identity.leaf_validity_unix;
 
         // Single write lock: atomically insert or replace the channel in
         // place (see [`AgentSession::install_channels`] for why in place).
@@ -89,12 +111,14 @@ impl HubService {
                     // h2 registration overwrites a QUIC session: the old
                     // relay connection closes itself out via its
                     // connection-lost watcher
-                    existing.write().await.install_channels(circuit, None);
+                    let mut session = existing.write().await;
+                    session.install_channels(circuit, None);
+                    session.leaf_validity_unix = leaf_validity;
                 }
                 None => {
                     agents.insert(
                         agent_key.clone(),
-                        Arc::new(RwLock::new(AgentSession::new(circuit, None))),
+                        Arc::new(RwLock::new(AgentSession::new(circuit, None, leaf_validity))),
                     );
                 }
             }
@@ -167,7 +191,9 @@ impl HubService {
             unreachable!("implicit re-registration requires a connection circuit");
         };
         info!("Agent circuit={circuit} not registered, implicitly re-registering");
-        let arc = Arc::new(RwLock::new(AgentSession::new(circuit, None)));
+        // The connection certificate's window rides the fresh session.
+        let leaf_validity = self.identity().await.and_then(|i| i.leaf_validity_unix);
+        let arc = Arc::new(RwLock::new(AgentSession::new(circuit, None, leaf_validity)));
         {
             let mut agents = self.state.agents.write().await;
             agents.insert(agent_id.to_string(), arc.clone());

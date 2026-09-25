@@ -196,6 +196,20 @@ pub async fn tls_client_connect_with(
     server_name: &str,
     addr: std::net::SocketAddr,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let connector = tls_connector(ca_path, client_cert_path, client_key_path)?;
+    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    let server_name =
+        rustls::pki_types::ServerName::try_from(server_name.to_string()).expect("server name");
+    connector.connect(server_name, tcp).await
+}
+
+/// Builds the mTLS client connector from a certificate triple (the shared
+/// body of the TLS connect helpers).
+fn tls_connector(
+    ca_path: &Path,
+    client_cert_path: &Path,
+    client_key_path: &Path,
+) -> std::io::Result<tokio_rustls::TlsConnector> {
     let cert_pem = std::fs::read(client_cert_path)?;
     let key_pem = std::fs::read(client_key_path)?;
     let ca_pem = std::fs::read(ca_path)?;
@@ -215,9 +229,80 @@ pub async fn tls_client_connect_with(
         .with_root_certificates(roots)
         .with_client_auth_cert(client_cert, key)
         .expect("client auth");
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
-    let tcp = tokio::net::TcpStream::connect(addr).await?;
+    Ok(tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+        config,
+    )))
+}
+
+/// Which PROXY protocol preamble [`tls_client_connect_pp`] writes before
+/// the TLS ClientHello.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PpVersion {
+    /// Text line — what stock nginx stream (`proxy_protocol on;`) emits.
+    V1,
+    /// Binary header — signature + fixed header + address payload, for
+    /// fronts that speak v2.
+    V2,
+}
+
+/// Protocol-level test helper with a PROXY protocol preamble: connects to
+/// `addr`, writes the preamble for `source_ip` (the "real client" the
+/// front vouches for), then runs the same mTLS handshake as
+/// [`tls_client_connect`]. Exercises the pre-TLS sniff stages of
+/// pp-fronted listeners (hub control endpoint, edge public listener).
+pub async fn tls_client_connect_pp(
+    certs: &TestCerts,
+    cn: &str,
+    addr: std::net::SocketAddr,
+    source_ip: std::net::IpAddr,
+    version: PpVersion,
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let (cert_path, key_path) = certs.named_client_cert(cn);
+    let connector = tls_connector(&certs.ca_path(), &cert_path, &key_path)?;
+    let mut tcp = tokio::net::TcpStream::connect(addr).await?;
+    tokio::io::AsyncWriteExt::write_all(&mut tcp, &pp_preamble(source_ip, version)).await?;
     let server_name =
-        rustls::pki_types::ServerName::try_from(server_name.to_string()).expect("server name");
+        rustls::pki_types::ServerName::try_from("localhost".to_string()).expect("server name");
     connector.connect(server_name, tcp).await
+}
+
+/// Hand-built preamble bytes (testkit keeps the ppp crate out of its
+/// dependency graph; both versions are tiny fixed layouts).
+fn pp_preamble(source: std::net::IpAddr, version: PpVersion) -> Vec<u8> {
+    match version {
+        PpVersion::V1 => match source {
+            std::net::IpAddr::V4(ip) => {
+                format!("PROXY TCP4 {ip} 10.0.0.1 47115 443\r\n").into_bytes()
+            }
+            std::net::IpAddr::V6(ip) => {
+                format!("PROXY TCP6 {ip} 2001:db8::1 47115 443\r\n").into_bytes()
+            }
+        },
+        PpVersion::V2 => {
+            let mut h = Vec::new();
+            h.extend_from_slice(&[
+                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+            ]);
+            h.push(0x21); // ver2 cmd PROXY
+            match source {
+                std::net::IpAddr::V4(ip) => {
+                    h.push(0x11); // fam TCP4
+                    h.extend_from_slice(&12u16.to_be_bytes()); // payload length
+                    h.extend_from_slice(&ip.octets());
+                    h.extend_from_slice(&[10, 0, 0, 1]); // destination
+                }
+                std::net::IpAddr::V6(ip) => {
+                    h.push(0x21); // fam TCP6
+                    h.extend_from_slice(&36u16.to_be_bytes()); // payload length
+                    h.extend_from_slice(&ip.octets());
+                    h.extend_from_slice(&[
+                        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                    ]); // 2001:db8::1
+                }
+            }
+            h.extend_from_slice(&47115u16.to_be_bytes()); // source port
+            h.extend_from_slice(&443u16.to_be_bytes()); // destination port
+            h
+        }
+    }
 }

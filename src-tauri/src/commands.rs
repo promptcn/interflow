@@ -11,8 +11,10 @@
 
 use crate::SharedState;
 use crate::contract::{
-    AddNodeParams, DeployPackDto, ImportedPackDto, LocalNodeRefDto, ManifestTemplateParams,
-    NodeInfo, NodePrefs, PackInspection, UpdatedNodeDto,
+    AddNodeParams, AddedNodeDto, DeployContextDto, DeployPackDto, DeployPrefsDto, EditActionDto,
+    EditedManifestDto, ImportedPackDto, IssueNodeParams, LocalNodeRefDto, ManifestSummaryDto,
+    ManifestTemplateParams, MeshTemplateParams, NodeInfo, NodePrefs, PackInspection, SealedPackDto,
+    UpdatedNodeDto, VersionInfo,
 };
 use crate::deploy;
 use crate::node::{self, NodeKind, NodeSpec};
@@ -52,10 +54,16 @@ fn expanded_existing(field: &mut String, label: &str) -> Result<(), String> {
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
 pub fn list_nodes(state: State<'_, SharedState>) -> Result<Vec<NodeInfo>, String> {
-    Ok(manager(&state)?
+    let manager = manager(&state)?;
+    Ok(manager
         .snapshots()
         .into_iter()
-        .map(Into::into)
+        .map(|snapshot| {
+            let id = snapshot.spec.id.clone();
+            let mut info: NodeInfo = snapshot.into();
+            info.credential = manager.credential_health(&id).map(Into::into);
+            info
+        })
         .collect())
 }
 
@@ -209,6 +217,19 @@ pub fn get_host_name() -> Result<String, String> {
         .map_err(|e| format!("hostname unavailable: {}", e.to_string_lossy()))
 }
 
+/// This build's identity (machine header): crate version + the compile-time
+/// build tag the engine binaries also log at startup.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::unnecessary_wraps)] // Tauri command shape
+pub fn get_version_info() -> Result<VersionInfo, String> {
+    Ok(VersionInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_tag: interflow_buildinfo::BUILD_TAG.to_string(),
+        dirty: interflow_buildinfo::DIRTY,
+    })
+}
+
 // -------------------------------------------------------------------------
 // Deploy (operator) surface — the GUI twin of the `interflow` plan/rotate/
 // revoke/pack commands, sharing the exact same library code paths.
@@ -239,16 +260,64 @@ pub fn deploy_read_text(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
 }
 
-/// Saves the deploy pane's manifest text back to its path (atomic enough for
-/// an editor pane: write-to-temp + rename).
+/// Saves the deploy pane's manifest text back to its path — the editor's
+/// single write path, with the same discipline a structured append has:
+/// one silent `.bak` generation, then the atomic replace.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
 pub fn deploy_write_text(path: String, text: String) -> Result<(), String> {
     let path = expanded(&path);
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("replace {}: {e}", path.display()))
+    interflow_cli::manifest_edit::save_manifest(&path, &text)
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Parses manifest text into the Form view's read model — shape-level, so
+/// an under-construction document (a fresh mesh skeleton) still renders,
+/// with its validation issues attached. A parse failure carries the source
+/// chain (TOML position) for the TOML view to point at.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)] // Tauri command shape
+pub fn deploy_parse_manifest(text: String) -> Result<ManifestSummaryDto, String> {
+    match interflow_cli::manifest_edit::summarize(&text) {
+        Ok(summary) => Ok(summary.into()),
+        Err(e) => Err(interflow_cli::manifest_edit::error_chain(&e)),
+    }
+}
+
+/// Applies one structured manifest edit — pure: `text → validated text`,
+/// comments and layout preserved (the document model's one funnel). The
+/// editor keeps owning the file write; this never touches the disk.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
+pub fn deploy_edit_manifest(
+    text: String,
+    action: EditActionDto,
+) -> Result<EditedManifestDto, String> {
+    let action = interflow_cli::manifest_edit::ManifestEdit::from(action);
+    let edited = interflow_cli::manifest_edit::apply_edit(&text, &action)
+        .map_err(|e| interflow_cli::manifest_edit::error_chain(&e))?;
+    let summary = interflow_cli::manifest_edit::summarize(&edited)
+        .map_err(|e| interflow_cli::manifest_edit::error_chain(&e))?;
+    Ok(EditedManifestDto {
+        text: edited,
+        summary: summary.into(),
+    })
+}
+
+/// Renders the site-to-site (mesh) starter skeleton (the builder form's
+/// second template).
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)] // Tauri command shape
+pub fn deploy_mesh_template(params: MeshTemplateParams) -> Result<String, String> {
+    Ok(interflow_cli::plan::setup_mesh_template(
+        &params.realm,
+        &params.hub_name,
+        &params.hub_endpoint,
+    ))
 }
 
 /// Validates a manifest; returns the human-readable report lines.
@@ -273,7 +342,7 @@ pub async fn deploy_apply(
 ) -> Result<Vec<String>, String> {
     let (manifest, issuer, out) = (expanded(&manifest), expanded(&issuer), expanded(&out));
     tauri::async_runtime::spawn_blocking(move || {
-        interflow_cli::plan::apply(&manifest, &issuer, &out).map_err(|e| e.to_string())
+        interflow_cli::plan::apply(&manifest, &issuer, &out, false).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -395,7 +464,7 @@ pub async fn deploy_rotate(
     let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
     let pack = pack.map(|p| expanded(&p));
     tauri::async_runtime::spawn_blocking(move || {
-        interflow_cli::plan::rotate(&manifest, &issuer, &node, pack.as_deref(), None)
+        interflow_cli::plan::rotate(&manifest, &issuer, &node, pack.as_deref(), None, false)
             .map_err(|e| e.to_string())
     })
     .await
@@ -416,6 +485,181 @@ pub async fn deploy_revoke(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Appends a node to the manifest — the issue wizard's core step, the GUI
+/// twin of `interflow node add`. Structured and non-destructive (comments
+/// and layout stay); the edited manifest must pass the full validation
+/// funnel before anything is written.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be deserialized by value
+pub async fn deploy_add_node(params: IssueNodeParams) -> Result<AddedNodeDto, String> {
+    let manifest = expanded(&params.manifest);
+    let spec = issue_spec(&params);
+    tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::plan::add_node(&manifest, &spec)
+            .map(|outcome| AddedNodeDto {
+                manifest_text: outcome.manifest_text,
+                pack_dir_name: outcome.pack_dir_name,
+            })
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Converts the wizard's parameters into the shared `node add` spec. The
+/// role split is enforced here, not just suggested by the form: an expose
+/// agent never carries mesh rows and vice versa (one pack, one role — a
+/// stray row from a mid-form kind switch is dropped, not signed).
+fn issue_spec(params: &IssueNodeParams) -> interflow_cli::plan::AddNodeSpec {
+    use crate::contract::IssueNodeKindDto;
+    use interflow_cli::plan::{
+        AddMeshEgressSpec, AddMeshIngressSpec, AddNodeKind, AddNodeSpec, AddServiceSpec,
+    };
+    let udp = |protocol: crate::contract::MeshProtocolDto| {
+        matches!(protocol, crate::contract::MeshProtocolDto::Udp)
+    };
+    let services = || {
+        params
+            .services
+            .iter()
+            .map(|s| AddServiceSpec {
+                id: s.id.clone(),
+                address: s.address.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let mesh_ingress = || {
+        params
+            .mesh_ingress
+            .iter()
+            .map(|r| AddMeshIngressSpec {
+                name: r.name.clone(),
+                listen: r.listen.clone(),
+                udp: udp(r.protocol),
+                target_agent: r.target_agent.clone(),
+                remote_addr: r.remote_addr.clone(),
+                idle_timeout_secs: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let mesh_egress = || {
+        params
+            .mesh_egress
+            .iter()
+            .map(|r| AddMeshEgressSpec {
+                name: r.name.clone(),
+                udp: udp(r.protocol),
+                target_addr: r.target.clone().filter(|s| !s.trim().is_empty()),
+                target_cidr: r.target_cidr.clone().filter(|s| !s.trim().is_empty()),
+            })
+            .collect::<Vec<_>>()
+    };
+    let (kind, services, mesh_ingress, mesh_egress) = match params.kind {
+        IssueNodeKindDto::AgentExpose => (AddNodeKind::Agent, services(), Vec::new(), Vec::new()),
+        IssueNodeKindDto::AgentMesh => (
+            AddNodeKind::Agent,
+            Vec::new(),
+            mesh_ingress(),
+            mesh_egress(),
+        ),
+        IssueNodeKindDto::Hub => (AddNodeKind::Hub, Vec::new(), Vec::new(), Vec::new()),
+        IssueNodeKindDto::Ingress => (AddNodeKind::Ingress, Vec::new(), Vec::new(), Vec::new()),
+    };
+    AddNodeSpec {
+        kind,
+        node: params.node.clone(),
+        workspace: params.workspace.clone().filter(|s| !s.trim().is_empty()),
+        services,
+        mesh_ingress,
+        mesh_egress,
+        ingress_workspaces: params.ingress_workspaces.clone(),
+        hub_endpoint: params.hub_endpoint.clone().filter(|s| !s.trim().is_empty()),
+    }
+}
+
+/// Generates a 144-bit sealing passphrase — the same source the CLI's
+/// `pack seal --generate-passphrase` uses, so both surfaces seal with the
+/// same entropy.
+#[tauri::command]
+#[specta::specta]
+pub fn deploy_generate_passphrase() -> Result<String, String> {
+    interflow_identity::pack::sealed::generate_passphrase().map_err(|e| e.to_string())
+}
+
+/// Seals a pack straight into the user's Downloads directory — the issue
+/// wizard's one-click export. Collisions get a numeric suffix (a re-issue
+/// never clobbers a file that may not have been transferred yet).
+#[tauri::command]
+#[specta::specta]
+pub async fn deploy_seal_to_downloads(
+    pack_dir: String,
+    passphrase: String,
+) -> Result<SealedPackDto, String> {
+    let pack_dir = expanded(&pack_dir);
+    let downloads =
+        dirs::download_dir().ok_or_else(|| "cannot resolve the Downloads directory".to_string())?;
+    let name = pack_dir
+        .file_name()
+        .map_or_else(|| "pack".to_owned(), |n| n.to_string_lossy().into_owned());
+    let mut target = downloads.join(format!("{name}.iflowpack"));
+    let mut counter = 2u32;
+    while target.exists() {
+        target = downloads.join(format!("{name}-{counter}.iflowpack"));
+        counter += 1;
+    }
+    let out_file = target.display().to_string();
+    let pack_for_task = pack_dir.clone();
+    let out_for_task = target.clone();
+    let pass_for_task = passphrase.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        deploy::seal_pack(&pack_for_task, &out_for_task, &pass_for_task)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(SealedPackDto {
+        path: out_file,
+        passphrase,
+    })
+}
+
+/// Loads the remembered deployment contexts (most recent first).
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::unnecessary_wraps)] // Tauri command shape (load never fails)
+pub fn deploy_prefs_load() -> Result<DeployPrefsDto, String> {
+    let prefs = crate::deploy_prefs::load();
+    Ok(DeployPrefsDto {
+        recent: prefs
+            .recent
+            .into_iter()
+            .map(|c| DeployContextDto {
+                manifest: c.manifest,
+                issuer: c.issuer,
+                out: c.out,
+            })
+            .collect(),
+    })
+}
+
+/// Persists the remembered deployment contexts (full-list replacement —
+/// the frontend owns dedupe/promotion).
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be deserialized by value
+pub fn deploy_prefs_save(recent: Vec<DeployContextDto>) -> Result<(), String> {
+    crate::deploy_prefs::save(&crate::deploy_prefs::DeployPrefs {
+        recent: recent
+            .into_iter()
+            .map(|c| crate::deploy_prefs::DeployContext {
+                manifest: c.manifest,
+                issuer: c.issuer,
+                out: c.out,
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -446,5 +690,80 @@ mod tests {
         expanded_existing(&mut field, "Credential Pack directory")
             .expect("existing directory passes");
         assert_eq!(field, dir.path().display().to_string());
+    }
+
+    /// The wizard's kind split maps onto the CLI core correctly: both agent
+    /// roles → one Agent kind (services vs mesh rules is one-pack-one-role,
+    /// enforced downstream), and blank optionals are filtered to None so
+    /// the core's defaults apply.
+    #[test]
+    fn issue_spec_splits_roles_and_filters_blanks() {
+        use crate::contract::{
+            IssueMeshEgressDto, IssueMeshIngressDto, IssueNodeKindDto, IssueNodeParams,
+            IssueServiceSpecDto, MeshProtocolDto,
+        };
+        let expose = IssueNodeParams {
+            kind: IssueNodeKindDto::AgentExpose,
+            node: "desktop2".into(),
+            manifest: "~/interflow.toml".into(),
+            workspace: Some("  ".into()),
+            services: vec![IssueServiceSpecDto {
+                id: "asr".into(),
+                address: "127.0.0.1:8080".into(),
+            }],
+            mesh_ingress: vec![IssueMeshIngressDto {
+                name: "stale".into(),
+                listen: "127.0.0.1:1".into(),
+                protocol: MeshProtocolDto::Tcp,
+                target_agent: "x".into(),
+                remote_addr: "127.0.0.1:1".into(),
+            }],
+            mesh_egress: vec![],
+            ingress_workspaces: vec![],
+            hub_endpoint: Some(String::new()),
+        };
+        let spec = super::issue_spec(&expose);
+        assert!(matches!(spec.kind, interflow_cli::plan::AddNodeKind::Agent));
+        assert_eq!(spec.workspace, None, "blank workspace → core default");
+        assert_eq!(spec.hub_endpoint, None);
+        assert_eq!(spec.services.len(), 1);
+        // A stray mesh row (e.g. left over from a mid-form kind switch)
+        // must be dropped here — never signed into a mixed-role pack.
+        assert!(
+            spec.mesh_ingress.is_empty() && spec.mesh_egress.is_empty(),
+            "the expose role carries no mesh rows"
+        );
+
+        let mesh = IssueNodeParams {
+            kind: IssueNodeKindDto::AgentMesh,
+            node: "home-win".into(),
+            manifest: "~/interflow.toml".into(),
+            workspace: Some("main".into()),
+            services: vec![],
+            mesh_ingress: vec![IssueMeshIngressDto {
+                name: "ollama".into(),
+                listen: "127.0.0.1:11434".into(),
+                protocol: MeshProtocolDto::Udp,
+                target_agent: "peer".into(),
+                remote_addr: "127.0.0.1:11434".into(),
+            }],
+            mesh_egress: vec![IssueMeshEgressDto {
+                name: "loop".into(),
+                protocol: MeshProtocolDto::Tcp,
+                target: None,
+                target_cidr: Some("127.0.0.0/8".into()),
+            }],
+            ingress_workspaces: vec![],
+            hub_endpoint: None,
+        };
+        let spec = super::issue_spec(&mesh);
+        assert!(spec.services.is_empty());
+        assert!(spec.mesh_ingress[0].udp, "Udp maps to the udp flag");
+        assert_eq!(
+            spec.mesh_egress[0].target_cidr.as_deref(),
+            Some("127.0.0.0/8")
+        );
+        assert_eq!(spec.mesh_egress[0].target_addr, None);
+        assert_eq!(spec.workspace.as_deref(), Some("main"));
     }
 }

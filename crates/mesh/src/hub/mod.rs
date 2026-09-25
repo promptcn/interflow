@@ -12,6 +12,7 @@
 //! - [`poll`]      — `/poll` handling (streamed download + RxStream adapter)
 //! - [`heartbeat`] — agent lifecycle (eviction primitive + Ping/Pong heartbeat + `/pong`)
 //! - [`handlers`]  — administrative endpoints such as `/agents`
+//! - [`http`]      — wire contracts of the operator HTTP surface (typed `/agents` response)
 //! - [`state`]     — shared state: `TunnelData`, `AgentSession`, `ActiveStream`, aliases
 //! - TLS certificate/private key loading and file permission checks: `interflow_core::tls`
 
@@ -20,6 +21,8 @@ pub mod control;
 pub mod handle;
 pub mod handlers;
 pub mod heartbeat;
+pub mod http;
+pub mod policy;
 pub mod poll;
 pub mod quic;
 pub mod registration;
@@ -32,6 +35,7 @@ pub mod state;
 pub mod upload;
 
 pub use handle::{HubHandle, HubLifecycle};
+pub use http::{AgentListEntry, LeafExpiry};
 pub use server::HubServer;
 pub use state::{
     ActiveStream, AgentSession, HubLimits, HubState, QuicAgentConn, SharedActiveStreams,

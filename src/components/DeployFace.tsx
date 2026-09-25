@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { api, type DeployPackDto } from "../api";
+import { api, type DeployContextDto, type DeployPackDto } from "../api";
+import IssuePackDialog from "./IssuePackDialog";
 import ManifestEditor from "./ManifestEditor";
 import PackDetail from "./PackDetail";
 import PackOverview from "./PackOverview";
@@ -35,17 +36,80 @@ export default function DeployFace({
   onError,
   onNodesChanged,
 }: Props) {
-  // Paths (hand-typing `~` works; the backend expands it).
+  // Paths (hand-typing `~` works; the backend expands it). Restored from
+  // the remembered deployment contexts on mount — switching between the
+  // expose and mesh faces is a pick, never retyped paths.
   const [manifest, setManifest] = useState("~/interflow.toml");
   const [issuer, setIssuer] = useState("~/interflow-issuer");
   const [out, setOut] = useState("~/interflow-dist");
+  const [recentContexts, setRecentContexts] = useState<DeployContextDto[]>([]);
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const [issueOpen, setIssueOpen] = useState(false);
   // The manifest text being edited (loaded/saved by path; the template
-  // builder seeds it).
+  // builder seeds it). `savedText` is what was last on disk — the gap
+  // between the two is the editor's dirty state (Save or discard closes
+  // it; Apply closes it by saving first: Apply means "make the saved
+  // manifest live").
   const [text, setText] = useState<string | null>(null);
+  const [savedText, setSavedText] = useState<string | null>(null);
   const [output, setOutput] = useState<string[]>([]);
   const [outputOpen, setOutputOpen] = useState(false);
   const [packs, setPacks] = useState<DeployPackDto[]>([]);
   const [busy, setBusy] = useState(false);
+
+  // Restore the last-used deployment context on mount (convenience only —
+  // a failure keeps the defaults).
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const prefs = await api.deployPrefsLoad();
+        if (!cancelled && prefs.recent.length > 0) {
+          setRecentContexts(prefs.recent);
+          setManifest(prefs.recent[0].manifest);
+          setIssuer(prefs.recent[0].issuer);
+          setOut(prefs.recent[0].out);
+        }
+      } catch {
+        // Defaults stand.
+      } finally {
+        if (!cancelled) setPrefsLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Debounced persistence: the current triple goes to the front of the
+  // remembered list (deduped, capped by the backend's remember policy).
+  useEffect(() => {
+    if (!prefsLoaded) return;
+    const timer = setTimeout(() => {
+      const current = { manifest: manifest.trim(), issuer: issuer.trim(), out: out.trim() };
+      if (current.manifest === "" || current.issuer === "" || current.out === "") return;
+      const rest = recentContexts.filter(
+        (c) =>
+          c.manifest !== current.manifest ||
+          c.issuer !== current.issuer ||
+          c.out !== current.out,
+      );
+      const next = [current, ...rest].slice(0, 5);
+      setRecentContexts(next);
+      api.deployPrefsSave(next).catch(() => {});
+    }, 800);
+    return () => clearTimeout(timer);
+    // recentContexts is intentionally excluded: the list update below runs
+    // through this effect's own output, and every real change to it arrives
+    // via a paths change anyway.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manifest, issuer, out, prefsLoaded]);
+
+  const pickContext = (ctx: DeployContextDto) => {
+    setManifest(ctx.manifest);
+    setIssuer(ctx.issuer);
+    setOut(ctx.out);
+  };
 
   const say = (lines: string[]) => {
     setOutput((prev) => [...prev, ...lines]);
@@ -61,7 +125,9 @@ export default function DeployFace({
   const loadManifest = async () => {
     setBusy(true);
     try {
-      setText(await api.deployReadText(manifest.trim()));
+      const loaded = await api.deployReadText(manifest.trim());
+      setText(loaded);
+      setSavedText(loaded);
     } catch (e) {
       onError(String(e));
     } finally {
@@ -74,6 +140,7 @@ export default function DeployFace({
     setBusy(true);
     try {
       await api.deployWriteText(manifest.trim(), text);
+      setSavedText(text);
       say([`saved ${manifest.trim()}`]);
     } catch (e) {
       onError(String(e));
@@ -96,6 +163,13 @@ export default function DeployFace({
   const apply = async () => {
     setBusy(true);
     try {
+      // Apply reads the file — unsaved editor state would silently miss the
+      // very changes being applied for, so save first (a no-op when clean).
+      if (text !== null && text !== savedText) {
+        await api.deployWriteText(manifest.trim(), text);
+        setSavedText(text);
+        say([`saved ${manifest.trim()}`]);
+      }
       say(await api.deployApply(manifest.trim(), issuer.trim(), out.trim()));
       setPacks(await api.deployListPacks(out.trim()));
       // Packs were just (re)issued — the grid is where the user continues.
@@ -216,9 +290,12 @@ export default function DeployFace({
           out={out}
           text={text}
           busy={busy}
+          dirty={text !== null && text !== savedText}
+          recentContexts={recentContexts}
           onManifestChange={setManifest}
           onIssuerChange={setIssuer}
           onOutChange={setOut}
+          onPickContext={pickContext}
           onTextChange={setText}
           onPickFile={pickFile}
           onLoad={loadManifest}
@@ -248,6 +325,27 @@ export default function DeployFace({
           onRefresh={() => void refreshPacks()}
           onOpenPack={onSelectPack}
           onUpdateLocal={(pack) => void updateLocalNode(pack)}
+          onIssuePack={() => setIssueOpen(true)}
+        />
+      )}
+
+      {issueOpen && (
+        <IssuePackDialog
+          manifest={manifest}
+          issuer={issuer}
+          out={out}
+          busy={busy}
+          recentContexts={recentContexts}
+          onPickContext={pickContext}
+          onSay={say}
+          // `node add` writes the file itself; the editor mirrors the
+          // outcome, so the on-disk and on-screen states stay one.
+          onIssued={(t) => {
+            setText(t);
+            setSavedText(t);
+          }}
+          onComplete={() => void refreshPacks()}
+          onClose={() => setIssueOpen(false)}
         />
       )}
 

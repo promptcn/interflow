@@ -36,17 +36,14 @@ async fn acme_issues_serves_and_routes() {
 
     let certs = interflow_testkit::certs::TestCerts::generate("acme", "agent-acme");
     let (echo_addr, _echo_task) = interflow_testkit::echo_server().await;
-    let edge_port = interflow_testkit::pick_ephemeral_port();
-    let hub_port = interflow_testkit::pick_ephemeral_port();
-    let edge_listen: SocketAddr = format!("127.0.0.1:{edge_port}").parse().unwrap();
-    let hub_listen: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
     let (principal_cert, principal_key) = certs.named_client_cert("edge");
     let cache_dir =
         std::env::temp_dir().join(format!("interflow-acme-cache-{}", uuid::Uuid::new_v4()));
 
     let edge_config = EdgeConfig {
-        listen_addr: edge_listen,
-        control_listen_addr: hub_listen,
+        // :0 = kernel-assigned; spawn_edge hands back the bound addresses
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        control_listen_addr: "127.0.0.1:0".parse().unwrap(),
         control_tls: ControlEndpointTls {
             cert: certs.server_cert_path(),
             key: certs.server_key_path(),
@@ -72,19 +69,15 @@ async fn acme_issues_serves_and_routes() {
             directory: Some(directory.clone()),
             directory_ca: std::env::var("INTERFLOW_PEBBLE_CA").ok().map(PathBuf::from),
             cache_dir: cache_dir.clone(),
-            http_listen: format!("127.0.0.1:{}", interflow_testkit::pick_ephemeral_port())
-                .parse()
-                .unwrap(),
+            http_listen: "127.0.0.1:0".parse().unwrap(),
         }),
         listener: EdgeListenerPolicy::default(),
         agent_recovery_timeout: Duration::from_secs(120),
         ..EdgeConfig::default()
     };
-    tokio::task::spawn(interflow_expose::edge::run(edge_config));
-
-    interflow_testkit::wait_for_tcp(hub_listen, Duration::from_secs(5))
-        .await
-        .expect("control endpoint should start within 5s");
+    let edge = interflow_testkit::spawn_edge(edge_config).await;
+    let edge_listen = edge.public_addr();
+    let hub_port = edge.control_addr().port();
 
     // Egress agent behind the route.
     let (client_cert, client_key) = certs.client_paths();

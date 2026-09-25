@@ -44,15 +44,39 @@ export const commands = {
 	 *  can run any number of them).
 	 */
 	getHostName: () => typedError<string, string>(__TAURI_INVOKE("get_host_name")),
+	/**
+	 *  This build's identity (machine header): crate version + the compile-time
+	 *  build tag the engine binaries also log at startup.
+	 */
+	getVersionInfo: () => typedError<VersionInfo, string>(__TAURI_INVOKE("get_version_info")),
 	/**  Renders the starter manifest template (the builder form's output). */
 	deployManifestTemplate: (params: ManifestTemplateParams) => typedError<string, string>(__TAURI_INVOKE("deploy_manifest_template", { params })),
+	/**
+	 *  Renders the site-to-site (mesh) starter skeleton (the builder form's
+	 *  second template).
+	 */
+	deployMeshTemplate: (params: MeshTemplateParams) => typedError<string, string>(__TAURI_INVOKE("deploy_mesh_template", { params })),
 	/**  Reads a manifest (or any text file the deploy pane edits). */
 	deployReadText: (path: string) => typedError<string, string>(__TAURI_INVOKE("deploy_read_text", { path })),
 	/**
-	 *  Saves the deploy pane's manifest text back to its path (atomic enough for
-	 *  an editor pane: write-to-temp + rename).
+	 *  Saves the deploy pane's manifest text back to its path — the editor's
+	 *  single write path, with the same discipline a structured append has:
+	 *  one silent `.bak` generation, then the atomic replace.
 	 */
 	deployWriteText: (path: string, text: string) => typedError<null, string>(__TAURI_INVOKE("deploy_write_text", { path, text })),
+	/**
+	 *  Parses manifest text into the Form view's read model — shape-level, so
+	 *  an under-construction document (a fresh mesh skeleton) still renders,
+	 *  with its validation issues attached. A parse failure carries the source
+	 *  chain (TOML position) for the TOML view to point at.
+	 */
+	deployParseManifest: (text: string) => typedError<ManifestSummaryDto, string>(__TAURI_INVOKE("deploy_parse_manifest", { text })),
+	/**
+	 *  Applies one structured manifest edit — pure: `text → validated text`,
+	 *  comments and layout preserved (the document model's one funnel). The
+	 *  editor keeps owning the file write; this never touches the disk.
+	 */
+	deployEditManifest: (text: string, action: EditActionDto) => typedError<EditedManifestDto, string>(__TAURI_INVOKE("deploy_edit_manifest", { text, action })),
 	/**  Validates a manifest; returns the human-readable report lines. */
 	deployValidate: (manifest: string) => typedError<string[], string>(__TAURI_INVOKE("deploy_validate", { manifest })),
 	/**  Issues identities + packs from the manifest (the deploy page's Apply). */
@@ -80,6 +104,32 @@ export const commands = {
 	deployRotate: (manifest: string, issuer: string, node: string, pack: string | null) => typedError<string[], string>(__TAURI_INVOKE("deploy_rotate", { manifest, issuer, node, pack })),
 	/**  Revokes a pack (deny list + CRL). */
 	deployRevoke: (issuer: string, pack: string, reason: string) => typedError<string[], string>(__TAURI_INVOKE("deploy_revoke", { issuer, pack, reason })),
+	/**
+	 *  Appends a node to the manifest — the issue wizard's core step, the GUI
+	 *  twin of `interflow node add`. Structured and non-destructive (comments
+	 *  and layout stay); the edited manifest must pass the full validation
+	 *  funnel before anything is written.
+	 */
+	deployAddNode: (params: IssueNodeParams) => typedError<AddedNodeDto, string>(__TAURI_INVOKE("deploy_add_node", { params })),
+	/**
+	 *  Generates a 144-bit sealing passphrase — the same source the CLI's
+	 *  `pack seal --generate-passphrase` uses, so both surfaces seal with the
+	 *  same entropy.
+	 */
+	deployGeneratePassphrase: () => typedError<string, string>(__TAURI_INVOKE("deploy_generate_passphrase")),
+	/**
+	 *  Seals a pack straight into the user's Downloads directory — the issue
+	 *  wizard's one-click export. Collisions get a numeric suffix (a re-issue
+	 *  never clobbers a file that may not have been transferred yet).
+	 */
+	deploySealToDownloads: (packDir: string, passphrase: string) => typedError<SealedPackDto, string>(__TAURI_INVOKE("deploy_seal_to_downloads", { packDir, passphrase })),
+	/**  Loads the remembered deployment contexts (most recent first). */
+	deployPrefsLoad: () => typedError<DeployPrefsDto, string>(__TAURI_INVOKE("deploy_prefs_load")),
+	/**
+	 *  Persists the remembered deployment contexts (full-list replacement —
+	 *  the frontend owns dedupe/promotion).
+	 */
+	deployPrefsSave: (recent: DeployContextDto[]) => typedError<null, string>(__TAURI_INVOKE("deploy_prefs_save", { recent })),
 };
 
 /** Events */
@@ -99,6 +149,82 @@ export type AddNodeParams = {
 	hub_quic_addr: string | null,
 };
 
+/**
+ *  `deploy_add_node` result: the rewritten manifest text (feeds the editor
+ *  so both surfaces stay on the same file) and the pack directory name
+ *  `plan apply` will render.
+ */
+export type AddedNodeDto = {
+	manifest_text: string,
+	pack_dir_name: string,
+};
+
+/**
+ *  Which pack role an agent plays (`Mixed`/`Empty` occur only in documents
+ *  the validation funnel rejects).
+ */
+export type AgentRoleDto = "expose" | "mesh" | "mixed" | "empty";
+
+/**
+ *  One agent node as the form sees it — identity (name, workspace), role,
+ *  and the role's content.
+ */
+export type AgentSummaryDto = {
+	node: string,
+	workspace: string,
+	role: AgentRoleDto,
+	services: ManifestServiceDto[],
+	mesh_ingress: ManifestIngressRuleDto[],
+	mesh_egress: ManifestEgressRuleDto[],
+};
+
+/**
+ *  Whole-node creation with role content — the same append the issue
+ *  wizard performs, minus the wizard's paths (the document being edited is
+ *  the target). Shape mirrors [`IssueNodeParams`].
+ */
+export type CreateNodeDto = {
+	kind: IssueNodeKindDto,
+	node: string,
+	workspace: string | null,
+	services: IssueServiceSpecDto[],
+	mesh_ingress: IssueMeshIngressDto[],
+	mesh_egress: IssueMeshEgressDto[],
+	ingress_workspaces: string[],
+	hub_endpoint: string | null,
+};
+
+/**
+ *  Leaf-credential health of one pack (the "when do this node's
+ *  credentials stop working" surface). Phase thresholds are the
+ *  workspace-wide 20% / 10% of the leaf TTL (identity's `expiry` module).
+ */
+export type CredentialHealthDto = {
+	/**  Earliest active leaf `notAfter` (RFC 3339, UTC). */
+	not_after: string,
+	/**
+	 *  Remaining seconds of that leaf (negative once expired; i32 on the
+	 *  wire — specta forbids BigInt-style types, and ±68 years of
+	 *  remaining-seconds headroom is beyond generous).
+	 */
+	remaining_secs: number,
+	/**
+	 *  `healthy` / `warn` (<20% of the TTL remains, amber) / `critical`
+	 *  (<10%, red). Surfaces color-code on this string.
+	 */
+	phase: string,
+};
+
+/**
+ *  One remembered deployment context (manifest/issuer/out travel as a
+ *  triple — mixing faces' paths is the confusion this kills).
+ */
+export type DeployContextDto = {
+	manifest: string,
+	issuer: string,
+	out: string,
+};
+
 /**  One rendered pack in a `plan apply` output tree (deploy page cards). */
 export type DeployPackDto = {
 	/**  Directory name under `<out>/packs/` (e.g. `ingress-edge`). */
@@ -116,10 +242,172 @@ export type DeployPackDto = {
 	local_node: LocalNodeRefDto | null,
 };
 
+/**
+ *  `deploy_prefs_load/save` payload: the recent deployment contexts, most
+ *  recent first.
+ */
+export type DeployPrefsDto = {
+	recent: DeployContextDto[],
+};
+
+/**
+ *  One structured manifest edit — the Form view's whole submission
+ *  vocabulary (wire form of `manifest_edit::ManifestEdit`).
+ */
+export type EditActionDto = ({ SetRealm: RealmEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ SetPublicTls: PublicTlsEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ SetIdentity: IdentityEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertWorkspace: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never } | ({ RemoveWorkspace: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertHub: HubEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveHub: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertIngress: IngressEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveIngress: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ CreateNode: CreateNodeDto }) & { RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ SetAgentWorkspace: {
+	agent: string,
+	workspace: string,
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveAgent: string }) & { CreateNode?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertService: ServiceEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertWorkspace?: never } | ({ RemoveService: {
+	agent: string,
+	id: string,
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertMeshIngress: MeshIngressEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveMeshIngress: {
+	agent: string,
+	name: string,
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertMeshEgress: MeshEgressEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveMeshEgress: {
+	agent: string,
+	name: string,
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertRoute: RouteEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveRoute: {
+	host: string,
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never };
+
+/**
+ *  `deploy_edit_manifest` result: the rewritten document text (the editor's
+ *  new state) and its read model in one round trip — the form re-renders
+ *  from what the edit actually produced, never from a client-side guess.
+ */
+export type EditedManifestDto = {
+	text: string,
+	summary: ManifestSummaryDto,
+};
+
+/**  One `[mesh.hub.<name>]`. */
+export type HubDto = {
+	name: string,
+	listen: string,
+	endpoint: string,
+};
+
+/**  `[mesh.hub.<name>]`. */
+export type HubEditDto = {
+	name: string,
+	endpoint: string,
+	/**  Empty/`None` = the default listen (`0.0.0.0:6666`). */
+	listen: string | null,
+};
+
+/**
+ *  The identity tier as the form sees it — mode, leaf TTL, and the tier's
+ *  bounds in one place (the bounds re-derive with the mode).
+ */
+export type IdentityDto = {
+	mode: IdentityModeDto,
+	leaf_ttl: string | null,
+	leaf_ttl_bounds: LeafTtlBoundsDto,
+	/**  The registrar endpoint when the tier has one (registrar mode). */
+	registrar_endpoint: string,
+};
+
+/**
+ *  The identity tier — one atomic decision (mode + leaf TTL + the
+ *  registrar endpoint that registrar mode demands and offline mode
+ *  forbids).
+ */
+export type IdentityEditDto = {
+	mode: IdentityModeDto,
+	leaf_ttl: string | null,
+	registrar_endpoint: string | null,
+};
+
+/**
+ *  Which identity tier a deployment runs (wire form of manifest
+ *  `IdentityMode`).
+ */
+export type IdentityModeDto = "registrar" | "offline";
+
 /**  `deploy_install_sealed` result: ready to "add as node". */
 export type ImportedPackDto = {
 	pack_dir: string,
 	inspection: PackInspection,
+};
+
+/**  `[ingress.<node>]`. */
+export type IngressEditDto = {
+	node: string,
+	workspaces: string[],
+	listen: string | null,
+	control_listen: string | null,
+	edge_rate_per_ip_per_minute: number | null,
+};
+
+/**
+ *  One `[ingress.<node>]` (public entry point); `edge_rate` `None` = no
+ *  `[edge]` overrides.
+ */
+export type IngressNodeDto = {
+	node: string,
+	workspaces: string[],
+	listen: string,
+	control_listen: string,
+	edge_rate_per_ip_per_minute: number | null,
+};
+
+/**
+ *  A serve-side mesh rule (issue wizard): exactly one of `target` /
+ *  `target_cidr`.
+ */
+export type IssueMeshEgressDto = {
+	name: string,
+	protocol: MeshProtocolDto,
+	target: string | null,
+	target_cidr: string | null,
+};
+
+/**  A listen-side mesh rule (issue wizard). */
+export type IssueMeshIngressDto = {
+	name: string,
+	listen: string,
+	protocol: MeshProtocolDto,
+	target_agent: string,
+	remote_addr: string,
+};
+
+/**
+ *  Which node kind the issue wizard appends (the agent role split is the
+ *  wizard's concern; the CLI core only knows agent/ingress/hub).
+ */
+export type IssueNodeKindDto = "agent_expose" | "agent_mesh" | "hub" | "ingress";
+
+/**
+ *  `deploy_add_node` parameters — the GUI twin of `interflow node add`
+ *  (structured, non-destructive manifest append).
+ */
+export type IssueNodeParams = {
+	kind: IssueNodeKindDto,
+	node: string,
+	manifest: string,
+	workspace: string | null,
+	services: IssueServiceSpecDto[],
+	mesh_ingress: IssueMeshIngressDto[],
+	mesh_egress: IssueMeshEgressDto[],
+	ingress_workspaces: string[],
+	hub_endpoint: string | null,
+};
+
+/**  One service an expose agent dials locally (issue wizard). */
+export type IssueServiceSpecDto = {
+	id: string,
+	address: string,
+};
+
+/**
+ *  The identity tier's `leaf_ttl` bounds and default as display text —
+ *  computed from the issuance constants, so the form's hint and the
+ *  validator's裁决 can never disagree.
+ */
+export type LeafTtlBoundsDto = {
+	min: string,
+	max: string,
+	default: string,
 };
 
 /**  A local node matching a dist pack's identity (Deploy page cards). */
@@ -148,6 +436,54 @@ export type LogLine = {
 	node: string | null,
 };
 
+/**
+ *  One `[[agent.<node>.mesh_egress]]` rule; exactly one of `target_addr` /
+ *  `target_cidr` is set.
+ */
+export type ManifestEgressRuleDto = {
+	name: string,
+	protocol: MeshProtocolDto,
+	target_addr: string | null,
+	target_cidr: string | null,
+	udp_idle_timeout_secs: number | null,
+};
+
+/**
+ *  One `[[agent.<node>.mesh_ingress]]` rule with every field (u32 on the
+ *  wire — specta forbids BigInt, and the timeout ceiling is 86400).
+ */
+export type ManifestIngressRuleDto = {
+	name: string,
+	listen: string,
+	protocol: MeshProtocolDto,
+	target_agent: string,
+	remote_addr: string,
+	idle_timeout_secs: number | null,
+};
+
+/**  One `[[agent.<node>.services]]` entry. */
+export type ManifestServiceDto = {
+	id: string,
+	address: string,
+};
+
+/**
+ *  The whole manifest as the Form view renders it — a projection of the
+ *  parsed document (every schema field, by construction), with validation
+ *  issues attached. `issues` empty ⇔ applyable.
+ */
+export type ManifestSummaryDto = {
+	realm: RealmDto,
+	public_tls: PublicTlsDto,
+	identity: IdentityDto,
+	workspaces: string[],
+	agents: AgentSummaryDto[],
+	ingress: IngressNodeDto[],
+	routes: RouteDto[],
+	hubs: HubDto[],
+	issues: string[],
+};
+
 /**  Parameters of the manifest template builder (mirrors `interflow setup`). */
 export type ManifestTemplateParams = {
 	realm: string,
@@ -159,11 +495,35 @@ export type ManifestTemplateParams = {
 	service_address: string,
 };
 
-/**  A serve-side mesh rule (pack-signed; the GUI shows it read-only). */
+/**  One serve-side mesh rule. */
+export type MeshEgressEditDto = {
+	agent: string,
+	name: string,
+	protocol: MeshProtocolDto,
+	target_addr: string | null,
+	target_cidr: string | null,
+	udp_idle_timeout_secs: number | null,
+};
+
+/**
+ *  A serve-side mesh rule (pack-signed; the GUI shows it read-only). `target`
+ *  is one concrete `host:port`, or an authorized `ip/prefix` range.
+ */
 export type MeshEgressRuleDto = {
 	name: string,
 	protocol: MeshProtocolDto,
-	target_addr: string,
+	target: string,
+};
+
+/**  One listen-side mesh rule. */
+export type MeshIngressEditDto = {
+	agent: string,
+	name: string,
+	listen: string,
+	protocol: MeshProtocolDto,
+	target_agent: string,
+	remote_addr: string,
+	idle_timeout_secs: number | null,
 };
 
 /**  A listen-side mesh rule (pack-signed; the GUI shows it read-only). */
@@ -179,6 +539,16 @@ export type MeshIngressRuleDto = {
 
 /**  Wire protocol of a mesh rule (wire form of manifest `MeshProtocol`). */
 export type MeshProtocolDto = "tcp" | "udp";
+
+/**
+ *  Parameters of the site-to-site (mesh) starter template (mirrors
+ *  `interflow setup --face mesh`).
+ */
+export type MeshTemplateParams = {
+	realm: string,
+	hub_name: string,
+	hub_endpoint: string,
+};
 
 /**  One managed node (list rows, detail panes). */
 export type NodeInfo = {
@@ -222,6 +592,12 @@ export type NodeInfo = {
 	listen: string | null,
 	/**  Rotation generation of the pack (display cache for update hints). */
 	generation: number,
+	/**
+	 *  Leaf-credential health (earliest active expiry, phased). `None`
+	 *  when the pack has no active credential set. Color-code `phase`:
+	 *  warn = amber, critical = red (the dirty-build visual language).
+	 */
+	credential: CredentialHealthDto | null,
 };
 
 /**
@@ -290,6 +666,65 @@ export type PackInspection = {
 	mesh_egress: number,
 	/**  Listen address (hub/ingress). */
 	listen: string | null,
+	/**  Leaf-credential health (earliest active expiry, phased). */
+	credential: CredentialHealthDto | null,
+};
+
+/**  `[public_tls]` as the form sees it. */
+export type PublicTlsDto = {
+	mode: PublicTlsModeDto,
+	email: string | null,
+	directory: string | null,
+};
+
+/**  `[public_tls]`. */
+export type PublicTlsEditDto = {
+	mode: PublicTlsModeDto,
+	email: string | null,
+	directory: string | null,
+};
+
+/**
+ *  How the ingress terminates public HTTPS (wire form of manifest
+ *  `PublicTlsMode`).
+ */
+export type PublicTlsModeDto = "acme" | "frontend-proxy" | "manual";
+
+/**
+ *  `[realm]` as the form sees it (empty `control_endpoint` = site-to-site
+ *  only).
+ */
+export type RealmDto = {
+	id: string,
+	control_endpoint: string,
+};
+
+/**  `[realm]`. */
+export type RealmEditDto = {
+	id: string,
+	/**  Empty = absent (site-to-site-only realm). */
+	control_endpoint: string,
+};
+
+/**  One `[[route]]`: public host → service identity. */
+export type RouteDto = {
+	host: string,
+	service: string,
+};
+
+/**  One public route. */
+export type RouteEditDto = {
+	host: string,
+	service: string,
+};
+
+/**
+ *  `deploy_seal_to_downloads` result: where the sealed pack landed plus the
+ *  passphrase it was sealed with (the wizard shows it exactly once).
+ */
+export type SealedPackDto = {
+	path: string,
+	passphrase: string,
 };
 
 /**
@@ -313,6 +748,13 @@ export type ServiceAddressPrefDto = {
 	address: string,
 };
 
+/**  One service entry on an agent. */
+export type ServiceEditDto = {
+	agent: string,
+	id: string,
+	address: string,
+};
+
 /**
  *  Transport toward the hub/control endpoint (wire form mirrors mesh
  *  `TransportKind`).
@@ -326,6 +768,29 @@ export type UpdatedNodeDto = {
 	generation_to: number,
 	/**  The node had a running intent and was restarted onto the new pack. */
 	restarted: boolean,
+};
+
+/**
+ *  This build's identity (machine header): crate version plus the
+ *  compile-time build tag the engine binaries also log at startup —
+ *  what the GUI shows is what a log line prints, so the two name the
+ *  same build without translation.
+ */
+export type VersionInfo = {
+	/**  Workspace crate version (e.g. `0.4.0`). */
+	version: string,
+	/**
+	 *  `<commit-date>_<git-short-hash>[-dirty]` — the one build tag every
+	 *  Interflow surface prints.
+	 */
+	build_tag: string,
+	/**
+	 *  The working tree had uncommitted changes when this binary was
+	 *  built: the tag names a commit the binary only partially matches.
+	 *  Surfaced visually (amber), not just as a suffix — a dirty build on
+	 *  a remote machine must not be mistaken for the named commit.
+	 */
+	dirty: boolean,
 };
 
 /* Tauri Specta runtime */

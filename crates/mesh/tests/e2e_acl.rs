@@ -18,9 +18,7 @@ use interflow_mesh::config::{
     AclConfig, AclRule, AgentConfig, HubConfig, HubTlsConfig, IngressRule, TenantConfig,
 };
 use interflow_testkit::certs::TestCerts;
-use interflow_testkit::{
-    agent_config, hub_config, pick_ephemeral_port, spawn_agent, spawn_hub, wait_for_tcp,
-};
+use interflow_testkit::{agent_config, hub_config, spawn_agent, spawn_hub};
 use std::time::Duration;
 
 fn tenant_a() -> &'static TestCerts {
@@ -73,10 +71,10 @@ fn tenant_agent(id: &str, hub_port: u16, certs: &TestCerts) -> AgentConfig {
     agent_config(id, hub_port, certs)
 }
 
-fn ingress_to(listen_port: u16, target: &str) -> Vec<IngressRule> {
+fn ingress_to(target: &str) -> Vec<IngressRule> {
     vec![IngressRule {
         name: "rule".to_string(),
-        listen_addr: format!("127.0.0.1:{listen_port}").parse().unwrap(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
         target_agent: target.to_string(),
         remote_addr: Some("127.0.0.1:1".to_string()), // placeholder (denied before dial)
         listen_protocol: StreamProto::Tcp,
@@ -88,11 +86,11 @@ fn ingress_to(listen_port: u16, target: &str) -> Vec<IngressRule> {
 }
 
 /// Asserts the ingress listener yields no echo within 2s (denied).
-async fn assert_denied(listen_port: u16) {
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{listen_port}").parse().unwrap();
-    wait_for_tcp(addr, Duration::from_secs(15))
+async fn assert_denied(agent: &interflow_mesh::agent::AgentHandle) {
+    let addr = agent
+        .wait_ingress_addr("rule", Duration::from_secs(15))
         .await
-        .expect("listener ready");
+        .expect("listener bound");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut sock = tokio::net::TcpStream::connect(addr).await.expect("connect");
     sock.write_all(b"hi").await.expect("write");
@@ -108,16 +106,15 @@ async fn assert_denied(listen_port: u16) {
 /// Cross-tenant Open (a/in-a → b/eg-b) with no exception rule: denied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_tenant_stream_denied_without_rule() {
-    let hub_port = pick_ephemeral_port();
-    let listen_port = pick_ephemeral_port();
-    let _hub = spawn_hub(two_tenant_hub(hub_port, false)).await;
+    let _hub = spawn_hub(two_tenant_hub(0, false)).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let _eg_b = spawn_agent(tenant_agent("eg-b", hub_port, tenant_b()));
     let mut in_a = tenant_agent("in-a", hub_port, tenant_a());
-    in_a.ingress = ingress_to(listen_port, "b/eg-b"); // explicit cross-tenant target
+    in_a.ingress = ingress_to("b/eg-b"); // explicit cross-tenant target
     let _in_a = spawn_agent(in_a);
 
-    assert_denied(listen_port).await;
+    assert_denied(&_in_a).await;
 }
 
 /// Same-tenant Open (a/in-a2 → a/eg-a2) with no rules: allowed by default.
@@ -126,9 +123,8 @@ async fn cross_tenant_stream_denied_without_rule() {
 /// same pairing; here the deny-side assertion is the contract under test).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_tenant_stream_allowed_by_default() {
-    let hub_port = pick_ephemeral_port();
-    let listen_port = pick_ephemeral_port();
-    let _hub = spawn_hub(two_tenant_hub(hub_port, false)).await;
+    let _hub = spawn_hub(two_tenant_hub(0, false)).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut eg_a = tenant_agent("eg-a2", hub_port, tenant_a());
     eg_a.egress = vec![interflow_testkit::tcp_egress_rule(
@@ -137,18 +133,17 @@ async fn same_tenant_stream_allowed_by_default() {
     )];
     let _eg = spawn_agent(eg_a);
     let mut in_a = tenant_agent("in-a2", hub_port, tenant_a());
-    in_a.ingress = ingress_to(listen_port, "eg-a2"); // bare target → source's own tenant
+    in_a.ingress = ingress_to("eg-a2"); // bare target → source's own tenant
     let handle = spawn_agent(in_a);
 
     // The same-tenant Open is not policy-denied: the stream reaches the
     // target (which fails to dial 127.0.0.1:1 — a fast Close comes back, so
     // the connection is torn down promptly rather than hanging in denial).
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{listen_port}").parse().unwrap();
-    wait_for_tcp(addr, Duration::from_secs(15))
+    handle
+        .wait_ingress_addr("rule", Duration::from_secs(15))
         .await
-        .expect("listener ready");
+        .expect("listener bound");
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let _ = handle;
 }
 
 /// Cross-tenant Open with an explicit `[[acl.rules]]` exception: allowed.
@@ -157,9 +152,8 @@ async fn same_tenant_stream_allowed_by_default() {
 /// placeholder — the stream establishment itself must not be denied.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_tenant_stream_allowed_with_explicit_rule() {
-    let hub_port = pick_ephemeral_port();
-    let listen_port = pick_ephemeral_port();
-    let _hub = spawn_hub(two_tenant_hub(hub_port, true)).await;
+    let _hub = spawn_hub(two_tenant_hub(0, true)).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
 
     let mut eg_b = tenant_agent("eg-b", hub_port, tenant_b());
     eg_b.egress = vec![interflow_testkit::tcp_egress_rule(
@@ -168,23 +162,22 @@ async fn cross_tenant_stream_allowed_with_explicit_rule() {
     )];
     let _eg = spawn_agent(eg_b);
     let mut in_a = tenant_agent("in-a", hub_port, tenant_a());
-    in_a.ingress = ingress_to(listen_port, "b/eg-b");
+    in_a.ingress = ingress_to("b/eg-b");
     let _in = spawn_agent(in_a);
 
     // With the exception rule the Open is NOT policy-denied: the connection
     // is established and torn down by the failed dial (fast close) instead of
     // a deny — assert the listener answered at all within a short window.
-    let addr: std::net::SocketAddr = format!("127.0.0.1:{listen_port}").parse().unwrap();
-    wait_for_tcp(addr, Duration::from_secs(15))
+    _in.wait_ingress_addr("rule", Duration::from_secs(15))
         .await
-        .expect("listener ready");
+        .expect("listener bound");
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
 /// Guards the fixture wiring itself: both tenant CAs land in the trust table.
 #[test]
 fn two_tenant_hub_trusts_both_cas() {
-    let cfg = two_tenant_hub(pick_ephemeral_port(), false);
+    let cfg = two_tenant_hub(0, false);
     assert_eq!(cfg.auth.tenants.len(), 2);
     assert!(matches!(cfg.tls, Some(HubTlsConfig { enabled: true, .. })));
 }

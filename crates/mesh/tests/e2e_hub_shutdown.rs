@@ -21,7 +21,7 @@
 
 use interflow_core::protocol::StreamProto;
 use interflow_mesh::agent::{AgentClient, AgentState};
-use interflow_mesh::config::{EgressRule, TransportKind};
+use interflow_mesh::config::{EgressRule, EgressTarget, TransportKind};
 use interflow_mesh::hub::HubServer;
 use interflow_testkit::{
     agent_config, agent_quic_config, echo_server, hub_config, hub_quic_config, wait_agent_connected,
@@ -51,7 +51,7 @@ async fn hub_run_until_returns_and_releases_port() {
     };
     // The signal IS the readiness contract (TCP bound + QUIC up) — no port
     // probing needed.
-    let hub_port = ready_rx.await.expect("hub listeners ready").port();
+    let hub_port = ready_rx.await.expect("hub listeners ready").tcp.port();
 
     token.cancel();
     let result = tokio::time::timeout(Duration::from_secs(15), hub_task)
@@ -84,14 +84,14 @@ async fn hub_shutdown_drains_registered_agent() {
         let token = token.clone();
         tokio::spawn(async move { server.run_until_signalled(token, ready_tx).await })
     };
-    let hub_port = ready_rx.await.expect("hub listeners ready").port();
+    let hub_port = ready_rx.await.expect("hub listeners ready").tcp.port();
 
     // egress agent connects directly to the hub
     let mut agent_cfg = agent_config("egress", hub_port, certs());
     agent_cfg.agent.transport = TransportKind::H2;
     agent_cfg.egress = vec![EgressRule {
         name: "echo".into(),
-        target_addr: echo_addr,
+        target: EgressTarget::Addr(echo_addr),
         target_protocol: StreamProto::Tcp,
         udp_idle_timeout_secs: None,
     }];
@@ -158,13 +158,13 @@ async fn hub_shutdown_closes_quic_endpoint() {
         let token = token.clone();
         tokio::spawn(async move { server.run_until_signalled(token, ready_tx).await })
     };
-    let hub_port = ready_rx.await.expect("hub listeners ready").port();
+    let hub_port = ready_rx.await.expect("hub listeners ready").tcp.port();
 
     // QUIC egress agent
     let mut agent_cfg = agent_quic_config("shutdown-egress", hub_port, certs());
     agent_cfg.egress = vec![EgressRule {
         name: "echo".into(),
-        target_addr: echo_addr,
+        target: EgressTarget::Addr(echo_addr),
         target_protocol: StreamProto::Tcp,
         udp_idle_timeout_secs: None,
     }];

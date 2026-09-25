@@ -113,16 +113,45 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
     if let Ok(active) =
         interflow_identity::credentials::ActiveCredentialSet::load_or_bootstrap(&pack)
     {
-        println!(
-            "  active credentials expire {}",
-            active
-                .earliest_expiry()
-                .map_err(interflow_cli::runtime::pack_error)?
-                .format(&time::format_description::well_known::Rfc3339)
-                .map_err(
-                    |e| interflow_core::error::InterflowError::config("timestamp").with_source(e)
-                )?
+        let expiry = active
+            .earliest_expiry()
+            .map_err(interflow_cli::runtime::pack_error)?;
+        let expiry_text = expiry
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| {
+                interflow_core::error::InterflowError::config("timestamp").with_source(e)
+            })?;
+        // Phase + action line: the same 20%/10% thresholds every surface
+        // shows (identity's expiry module is the single source).
+        let health = interflow_identity::expiry::leaf_phase_from_ttl(
+            expiry.unix_timestamp(),
+            pack.metadata.leaf_ttl_secs,
+            interflow_identity::expiry::now_unix(),
         );
+        let remaining = interflow_identity::expiry::format_remaining(health.remaining_secs);
+        use interflow_identity::expiry::LeafPhase;
+        let (glyph, action) = match (health.phase, pack.metadata.registrar_endpoint.as_deref()) {
+            (LeafPhase::Healthy, _) => ("✔", String::new()),
+            (LeafPhase::Warn, Some(endpoint)) => (
+                "·",
+                format!(" — renewal keeps retrying; check the registrar at {endpoint}"),
+            ),
+            (LeafPhase::Warn, None) => (
+                "·",
+                " — offline tier: rotate manually with `interflow rotate`".to_string(),
+            ),
+            (LeafPhase::Critical, Some(_)) => (
+                "✘",
+                " — renewal has not landed; the node stops serving at expiry".to_string(),
+            ),
+            (LeafPhase::Critical, None) => (
+                "✘",
+                " — offline tier: rotate NOW with `interflow rotate`; the node stops \
+                 serving at expiry"
+                    .to_string(),
+            ),
+        };
+        println!("{glyph} Active credentials expire {expiry_text} ({remaining} left{action})");
         match pack.metadata.registrar_endpoint.as_deref() {
             Some(endpoint) => println!("  registrar: {endpoint}"),
             None => println!("  registrar: none (offline tier — rotate manually before expiry)"),
@@ -182,7 +211,8 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
                 for rule in &mesh.egress {
                     println!(
                         "✔ Mesh serve {} at {} (offered to peers)",
-                        rule.name, rule.target_addr
+                        rule.name,
+                        rule.authorization()
                     );
                 }
             }
@@ -620,15 +650,23 @@ pub fn identity_inspect(
     println!("Bootstrap expires: {}", summary.expires);
     let active = interflow_identity::credentials::ActiveCredentialSet::load_or_bootstrap(&pack)
         .map_err(interflow_cli::runtime::pack_error)?;
+    let expiry = active
+        .earliest_expiry()
+        .map_err(interflow_cli::runtime::pack_error)?;
+    let health = interflow_identity::expiry::leaf_phase_from_ttl(
+        expiry.unix_timestamp(),
+        pack.metadata.leaf_ttl_secs,
+        interflow_identity::expiry::now_unix(),
+    );
     println!(
-        "Active credentials expire: {}",
-        active
-            .earliest_expiry()
-            .map_err(interflow_cli::runtime::pack_error)?
+        "Active credentials expire: {} ({} left, {})",
+        expiry,
+        interflow_identity::expiry::format_remaining(health.remaining_secs),
+        health.phase.as_str()
     );
     match pack.metadata.registrar_endpoint.as_deref() {
         Some(endpoint) => println!("Registrar: {endpoint}"),
-        None => println!("Registrar: none (offline tier)"),
+        None => println!("Registrar: none (offline tier — rotate with `interflow rotate`)"),
     }
     println!("Pack digest: {}", summary.pack_digest);
     if expert {

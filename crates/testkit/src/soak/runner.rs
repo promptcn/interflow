@@ -66,7 +66,7 @@ use crate::soak::proc::{
     spawn_mesh, write_json,
 };
 use crate::soak::{rss, scrape};
-use crate::stack::{pick_ephemeral_port, wait_for_tcp};
+use crate::stack::wait_for_tcp;
 use clap::Parser;
 use interflow_mesh::config::TransportKind;
 use serde::Serialize;
@@ -717,6 +717,7 @@ async fn churn_eviction_waves(
                 &log_path,
                 "churn",
                 &fault_env_ref,
+                None,
             ) else {
                 continue;
             };
@@ -939,22 +940,80 @@ async fn run_scenario(
         );
     }
 
-    // ---- Ports and infrastructure (load/observation side, stays in this process) ----
-    let hub_port = pick_ephemeral_port();
-    let hub_addr: SocketAddr = format!("127.0.0.1:{hub_port}").parse().expect("hub addr");
-    let metrics_port = pick_ephemeral_port();
-    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}")
-        .parse()
-        .expect("metrics");
-    let ingress_port = pick_ephemeral_port();
-    let ingress_addr: SocketAddr = format!("127.0.0.1:{ingress_port}")
-        .parse()
-        .expect("ingress");
-
+    // ---- Ports: everything binds :0 and materializes in the children /
+    // ready handoffs (no pick-then-bind windows). ----
     let interval = Duration::from_millis(args.chunk_interval_ms);
     let (backend_addr, backend, backend_task) = sse_backend(args.chunk_bytes, interval).await;
     backend.set_burst_chunks(args.burst_chunks);
     let certs = crate::certs::TestCerts::generate("soak", "soak-egress");
+
+    let mut procs: Vec<Arc<Mutex<MeshProcess>>> = Vec::new();
+    let fault_env: Vec<(String, String)> = args
+        .fault_plan
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(|p| vec![("INTERFLOW_FAULT_PLAN".to_string(), p.to_string())])
+        .unwrap_or_default();
+    let fault_env_ref: Vec<(&str, &str)> = fault_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let spawn_one = |subcmd: &'static str,
+                     cfg_file: &'static str,
+                     log_file: &'static str,
+                     pname: &'static str,
+                     extra_env: &[(&str, &str)]| {
+        spawn_mesh(
+            mesh_bin,
+            subcmd,
+            &scenario_dir.join(cfg_file),
+            &logs_dir.join(log_file),
+            pname,
+            extra_env,
+            None,
+        )
+    };
+
+    // ---- Hub process first: a `:0` config hands the concrete listen +
+    // metrics addresses back via the ready file — everything downstream
+    // (proxies, agent configs, scrapers) points at them. ----
+    let hub_ready_path = scenario_dir.join("hub.ready.json");
+    let _ = std::fs::remove_file(&hub_ready_path);
+    let hub_cfg = hub_config(
+        "127.0.0.1:0".parse().expect("hub :0"),
+        "127.0.0.1:0".parse().expect("metrics :0"),
+        &certs,
+    );
+    if let Err(e) = write_json(&scenario_dir.join("hub.json"), &hub_cfg) {
+        return failed_result(name, args, e);
+    }
+    let hub_startup: SoakResult<super::proc::HubReadyFile> = async {
+        let hub = spawn_mesh(
+            mesh_bin,
+            "hub",
+            &scenario_dir.join("hub.json"),
+            &logs_dir.join("hub.log"),
+            "hub",
+            &[],
+            Some(&hub_ready_path),
+        )?;
+        procs.push(Arc::new(Mutex::new(hub)));
+        super::proc::wait_ready_file(&hub_ready_path, Duration::from_secs(30)).await
+    }
+    .await;
+    let hub_ready = match hub_startup {
+        Ok(r) => r,
+        Err(e) => {
+            let tails = log_tails(&procs).await;
+            teardown_procs(&procs).await;
+            backend_task.abort();
+            return failed_result(name, args, format!("hub process not ready: {e}\n{tails}"));
+        }
+    };
+    let hub_addr = hub_ready.listen;
+    let metrics_addr = hub_ready
+        .metrics
+        .expect("hub metrics exporter bound (metrics.enabled)");
 
     let impair_cfg = ImpairConfig {
         one_way_delay: Duration::from_millis(args.rtt_ms / 2),
@@ -994,81 +1053,60 @@ async fn run_scenario(
         _ => hub_addr,
     };
 
-    // ---- Processes under test: real config files + spawn + readiness ----
-    let hub_cfg = hub_config(hub_addr, metrics_addr, &certs);
+    // ---- Agents: configs point at the hub's concrete address; the ingress
+    // rule listens on `:0` and its bound address hands back via the ready
+    // file. ----
+    let ingress_ready_path = scenario_dir.join("ingress.ready.json");
+    let _ = std::fs::remove_file(&ingress_ready_path);
     let egress_cfg = egress_agent_config(hub_endpoint_via_proxy, transport, &certs, backend_addr);
     let ingress_cfg = ingress_agent_config(
         hub_addr,
         transport,
         &certs,
-        ingress_addr,
+        "127.0.0.1:0".parse().expect("ingress :0"),
         backend_addr,
         args.idle_timeout_secs,
     );
-    if let Err(e) = write_json(&scenario_dir.join("hub.json"), &hub_cfg)
-        .and_then(|()| write_json(&scenario_dir.join("egress.json"), &egress_cfg))
+    if let Err(e) = write_json(&scenario_dir.join("egress.json"), &egress_cfg)
         .and_then(|()| write_json(&scenario_dir.join("ingress.json"), &ingress_cfg))
     {
         return failed_result(name, args, e);
     }
-
-    let mut procs: Vec<Arc<Mutex<MeshProcess>>> = Vec::new();
-    let fault_env: Vec<(String, String)> = args
-        .fault_plan
-        .as_deref()
-        .filter(|p| !p.is_empty())
-        .map(|p| vec![("INTERFLOW_FAULT_PLAN".to_string(), p.to_string())])
-        .unwrap_or_default();
-    let fault_env_ref: Vec<(&str, &str)> = fault_env
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let spawn_one = |subcmd: &'static str,
-                     cfg_file: &'static str,
-                     log_file: &'static str,
-                     pname: &'static str,
-                     extra_env: &[(&str, &str)]| {
-        spawn_mesh(
-            mesh_bin,
-            subcmd,
-            &scenario_dir.join(cfg_file),
-            &logs_dir.join(log_file),
-            pname,
-            extra_env,
-        )
-    };
-    let startup: SoakResult<()> = async {
-        let hub = spawn_one("hub", "hub.json", "hub.log", "hub", &[])?;
-        procs.push(Arc::new(Mutex::new(hub)));
-        wait_for_tcp(hub_addr, Duration::from_secs(30))
-            .await
-            .map_err(|e| SoakError::msg(format!("hub listener not ready: {e}")))?;
-        wait_for_tcp(metrics_addr, Duration::from_secs(20))
-            .await
-            .map_err(|e| SoakError::msg(format!("hub metrics not ready: {e}")))?;
+    let agents_startup: SoakResult<super::proc::AgentReadyFile> = async {
         let egress = spawn_one("agent", "egress.json", "egress.log", "egress", &[])?;
         procs.push(Arc::new(Mutex::new(egress)));
-        let ingress = spawn_one("agent", "ingress.json", "ingress.log", "ingress", &[])?;
+        let ingress = spawn_mesh(
+            mesh_bin,
+            "agent",
+            &scenario_dir.join("ingress.json"),
+            &logs_dir.join("ingress.log"),
+            "ingress",
+            &[],
+            Some(&ingress_ready_path),
+        )?;
         procs.push(Arc::new(Mutex::new(ingress)));
-        wait_for_tcp(ingress_addr, Duration::from_secs(60))
-            .await
-            .map_err(|e| SoakError::msg(format!("ingress local listener not ready: {e}")))?;
-        Ok(())
+        super::proc::wait_ready_file(&ingress_ready_path, Duration::from_secs(60)).await
     }
     .await;
-
-    if let Err(e) = startup {
-        let tails = log_tails(&procs).await;
-        teardown_procs(&procs).await;
-        backend_task.abort();
-        if let Some(p) = tcp_proxy {
-            p.shutdown().await;
+    let ingress_addr = match agents_startup {
+        Ok(r) => r
+            .ingress
+            .get("sse")
+            .copied()
+            .expect("ingress rule sse bound"),
+        Err(e) => {
+            let tails = log_tails(&procs).await;
+            teardown_procs(&procs).await;
+            backend_task.abort();
+            if let Some(p) = tcp_proxy {
+                p.shutdown().await;
+            }
+            if let Some(p) = udp_proxy {
+                p.shutdown().await;
+            }
+            return failed_result(name, args, format!("{e}\n{tails}"));
         }
-        if let Some(p) = udp_proxy {
-            p.shutdown().await;
-        }
-        return failed_result(name, args, format!("{e}\n{tails}"));
-    }
+    };
 
     // Data-path readiness probe (egress registered + full tunnel path). With retries:
     // the egress TLS handshake through the impairment proxy is occasionally slower
@@ -1115,12 +1153,16 @@ async fn run_scenario(
     // Separated from the main ingress: the eviction waves (SIGKILL + restart) never touch the
     // persistent consumer streams; also not added to `procs` (liveness supervision would
     // misjudge the "planned death" as a process exit).
-    let churn_port = pick_ephemeral_port();
-    let churn_addr: SocketAddr = format!("127.0.0.1:{churn_port}")
-        .parse()
-        .expect("churn addr");
-    let churn_cfg = churn_agent_config(hub_addr, transport, &certs, churn_addr, backend_addr);
     let churn_config_path = scenario_dir.join("churn.json");
+    let churn_ready_path = scenario_dir.join("churn.ready.json");
+    let _ = std::fs::remove_file(&churn_ready_path);
+    let mut churn_cfg = churn_agent_config(
+        hub_addr,
+        transport,
+        &certs,
+        "127.0.0.1:0".parse().expect("churn :0"),
+        backend_addr,
+    );
     if let Err(e) = write_json(&churn_config_path, &churn_cfg) {
         teardown_procs(&procs).await;
         backend_task.abort();
@@ -1139,6 +1181,7 @@ async fn run_scenario(
         &logs_dir.join("churn.log"),
         "churn",
         &fault_env_ref,
+        Some(&churn_ready_path),
     ) {
         Ok(c) => Arc::new(Mutex::new(c)),
         Err(e) => {
@@ -1161,13 +1204,41 @@ async fn run_scenario(
             );
         }
     };
-    if let Err(e) = wait_for_tcp(churn_addr, Duration::from_secs(60)).await {
-        let tails = log_tails(&procs).await;
-        teardown_procs(&procs).await;
-        {
-            let mut g = churn_proc.lock().await;
-            let _ = g.terminate_graceful(Duration::from_secs(5)).await;
+    let churn_addr = match super::proc::wait_ready_file::<super::proc::AgentReadyFile>(
+        &churn_ready_path,
+        Duration::from_secs(60),
+    )
+    .await
+    {
+        Ok(r) => r.ingress.get("churn").copied().expect("churn rule bound"),
+        Err(e) => {
+            let tails = log_tails(&procs).await;
+            teardown_procs(&procs).await;
+            {
+                let mut g = churn_proc.lock().await;
+                let _ = g.terminate_graceful(Duration::from_secs(5)).await;
+            }
+            backend_task.abort();
+            if let Some(p) = tcp_proxy {
+                p.shutdown().await;
+            }
+            if let Some(p) = udp_proxy {
+                p.shutdown().await;
+            }
+            return failed_result(
+                name,
+                args,
+                format!("churn listener not ready: {e}\n{tails}"),
+            );
         }
+    };
+    // Pin the materialized port into the config: the SIGKILL+restart waves
+    // respawn from this same file, so the churn address stays stable for the
+    // clients (the kill-to-rebind gap is the documented physical constraint
+    // of the same-port-restart shape; a stolen port fails loud on rebind).
+    churn_cfg.ingress[0].listen_addr = churn_addr;
+    if let Err(e) = write_json(&churn_config_path, &churn_cfg) {
+        teardown_procs(&procs).await;
         backend_task.abort();
         if let Some(p) = tcp_proxy {
             p.shutdown().await;
@@ -1175,14 +1246,7 @@ async fn run_scenario(
         if let Some(p) = udp_proxy {
             p.shutdown().await;
         }
-        return failed_result(
-            name,
-            args,
-            format!(
-                "churn listener not ready: {e}
-{tails}"
-            ),
-        );
+        return failed_result(name, args, e);
     }
 
     // ---- Main run: phase scheduling + N consumer streams + sampling + liveness supervision ----

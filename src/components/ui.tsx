@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { kindLabel, stateColor, type NodeKindDto, type NodeStateDto } from "../api";
+import { api, kindLabel, stateColor, type NodeKindDto, type NodeStateDto } from "../api";
 
 /// Shared visual primitives — the one vocabulary every face speaks (cards,
 /// sections, badges, dots, dialogs). New surfaces reuse these instead of
@@ -103,16 +103,23 @@ export function PassphraseDialog({
   title,
   description,
   confirmLabel,
+  generate = false,
   onConfirm,
   onClose,
 }: {
   title: string;
   description: string;
   confirmLabel: string;
+  /// Offer a Generate button (sealing flows): a 144-bit passphrase from
+  /// the same source the CLI uses, revealed in the clear because its whole
+  /// job is to travel to the target machine. Import flows must NOT offer
+  /// it — the passphrase has to match the existing file.
+  generate?: boolean;
   onConfirm: (passphrase: string) => void;
   onClose: () => void;
 }) {
   const [passphrase, setPassphrase] = useState("");
+  const [revealed, setRevealed] = useState(false);
   return (
     <Modal onClose={onClose}>
       <h2>{title}</h2>
@@ -120,7 +127,7 @@ export function PassphraseDialog({
       <div className="row">
         <label>Passphrase</label>
         <input
-          type="password"
+          type={revealed ? "text" : "password"}
           autoFocus
           value={passphrase}
           onChange={(e) => setPassphrase(e.target.value)}
@@ -129,6 +136,21 @@ export function PassphraseDialog({
           }}
           autoComplete="off"
         />
+        {generate && (
+          <button
+            title="generate a 144-bit passphrase"
+            onClick={async () => {
+              try {
+                setPassphrase(await api.deployGeneratePassphrase());
+                setRevealed(true);
+              } catch {
+                // Generation is best-effort convenience; typing still works.
+              }
+            }}
+          >
+            Generate
+          </button>
+        )}
       </div>
       <div className="dialog-actions">
         <button onClick={onClose}>Cancel</button>
