@@ -11,10 +11,10 @@ name = "interflow_identity"
 path = "src/lib.rs"
 
 [dependencies]
-interflow-contract = { path = "../contract", version = "0.5" }
+interflow-contract = { path = "../contract", version = "0.6" }
 # Shared endpoint/authority parsing (SAN extraction, manifest endpoint
 # validation); deliberately NOT interflow-core — identity stays light
-interflow-util = { path = "../util", version = "0.5" }
+interflow-util = { path = "../util", version = "0.6" }
 
 # X.509 issuance with URI SAN support (SPIFFE-like principal paths).
 rcgen = { version = "0.14", features = ["x509-parser"] }

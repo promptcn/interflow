@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, type DeployContextDto, type EditActionDto, type ManifestSummaryDto, type ManifestTemplateParams } from "../api";
 import ManifestForm from "./ManifestForm";
+import { SegmentedControl } from "./ui";
 
 /// The manifest page — one document, two views.
 ///
@@ -222,22 +223,15 @@ export default function ManifestEditor({
       </div>
 
       <div className="row manifest-toolbar">
-        <span className="manifest-views">
-          <button
-            className={view === "form" ? "selected" : ""}
-            disabled={text === null}
-            onClick={() => setView("form")}
-          >
-            Form
-          </button>
-          <button
-            className={view === "toml" ? "selected" : ""}
-            disabled={text === null}
-            onClick={() => setView("toml")}
-          >
-            TOML
-          </button>
-        </span>
+        <SegmentedControl
+          value={view}
+          options={[
+            { value: "form", label: "Form" },
+            { value: "toml", label: "TOML" },
+          ]}
+          onChange={setView}
+          disabled={text === null}
+        />
         {statusChip()}
         {dirty && <span className="hint">unsaved — Save writes the file (with a .bak)</span>}
         <span style={{ flex: 1 }} />

@@ -21,11 +21,16 @@ endpoint = "https://registrar.example.com"
 workspaces = ["demo"]
 listen = "0.0.0.0:8443"
 control_listen = "0.0.0.0:16666"
+# Optional QUIC (UDP) face for the control endpoint — same port number as
+# control_listen by convention; expose the UDP port directly (it cannot ride
+# the front proxy). Agents opt in per node with `transport = "quic"`.
+# quic_listen = "0.0.0.0:16666"
 
 [workspace.demo]
 
 [agent.lan-agent]
 workspace = "demo"
+# transport = "quic"  # dial the control endpoint over QUIC instead of h2
 
 [[agent.lan-agent.services]]
 id = "web"

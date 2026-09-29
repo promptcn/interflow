@@ -12,6 +12,7 @@ import {
 import DeployFace, { type DeployView } from "./components/DeployFace";
 import NodeDetail from "./components/NodeDetail";
 import NodeOverview from "./components/NodeOverview";
+import { SegmentedControl } from "./components/ui";
 
 const MAX_LOG_LINES = 2000;
 
@@ -149,20 +150,15 @@ export default function App() {
       <header className="machine-header">
         <span className="machine-title">Interflow</span>
         {hostName && <span className="machine-host">— {hostName}</span>}
-        <span className="face-toggle">
-          <button
-            className={face === "nodes" ? "selected" : ""}
-            onClick={() => setFace("nodes")}
-          >
-            Nodes
-          </button>
-          <button
-            className={face === "deploy" ? "selected" : ""}
-            onClick={() => setFace("deploy")}
-          >
-            Deploy
-          </button>
-        </span>
+        <SegmentedControl
+          className="face-toggle"
+          value={face}
+          options={[
+            { value: "nodes", label: "Nodes" },
+            { value: "deploy", label: "Deploy" },
+          ]}
+          onChange={setFace}
+        />
         {versionInfo && (
           <button
             className={`machine-version${versionInfo.dirty ? " dirty" : ""}`}

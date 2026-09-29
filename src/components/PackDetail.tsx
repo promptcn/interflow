@@ -46,7 +46,7 @@ export default function PackDetail({
   return (
     <div className="detail-page">
       <div className="detail-topbar">
-        <button className="back" onClick={onBack} title="Esc">
+        <button onClick={onBack} title="Esc">
           ← Packs
         </button>
         <h2>{pack.dir_name}</h2>

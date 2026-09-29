@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { api, type DeployContextDto, type IssueNodeParams } from "../api";
-import { Modal } from "./ui";
+import { Modal, SegmentedControl } from "./ui";
 
 /// The issue wizard: one modal from "a new machine needs a pack" to a
 /// sealed `.iflowpack` in Downloads. The user supplies exactly the two
@@ -278,19 +278,12 @@ export default function IssuePackDialog({
             </div>
           )}
 
-          <div className="issue-kinds">
-            {KINDS.map((k) => (
-              <button
-                key={k.value}
-                className={kind === k.value ? "selected" : ""}
-                disabled={active}
-                title={k.blurb}
-                onClick={() => setKind(k.value)}
-              >
-                {k.label}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl
+            value={kind}
+            options={KINDS.map((k) => ({ value: k.value, label: k.label, title: k.blurb }))}
+            onChange={setKind}
+            disabled={active}
+          />
           <p className="hint">{KINDS.find((k) => k.value === kind)?.blurb}</p>
 
           <div className="row">
@@ -321,7 +314,7 @@ export default function IssuePackDialog({
             <div className="rule-editor">
               <div className="rule-editor-head">
                 <span>Services</span>
-                <button disabled={active} onClick={() => setServices([...services, { id: "", address: "" }])}>
+                <button className="sm" disabled={active} onClick={() => setServices([...services, { id: "", address: "" }])}>
                   + service
                 </button>
               </div>
@@ -330,7 +323,7 @@ export default function IssuePackDialog({
                   {field(s.id, (v) => setServices(services.map((r, j) => (j === i ? { ...r, id: v } : r))), "asr", "120px")}
                   {field(s.address, (v) => setServices(services.map((r, j) => (j === i ? { ...r, address: v } : r))), "127.0.0.1:8080")}
                   <button
-                    className="rule-remove"
+                    className="rule-remove sm"
                     disabled={active}
                     onClick={() => setServices(services.filter((_, j) => j !== i))}
                   >
@@ -345,7 +338,7 @@ export default function IssuePackDialog({
             <div className="rule-editor">
               <div className="rule-editor-head">
                 <span>Mesh ingress — forward a local listener to a peer</span>
-                <button
+                <button className="sm"
                   disabled={active}
                   onClick={() =>
                     setMeshIngress([...meshIngress, { name: "", listen: "", protocol: "tcp", target_agent: "", remote_addr: "" }])
@@ -368,7 +361,7 @@ export default function IssuePackDialog({
                     {field(r.target_agent, (v) => patch({ target_agent: v }), "peer agent", "110px")}
                     {field(r.remote_addr, (v) => patch({ remote_addr: v }), "127.0.0.1:11434", "170px")}
                     <button
-                      className="rule-remove"
+                      className="rule-remove sm"
                       disabled={active}
                       onClick={() => setMeshIngress(meshIngress.filter((_, j) => j !== i))}
                     >
@@ -379,7 +372,7 @@ export default function IssuePackDialog({
               })}
               <div className="rule-editor-head">
                 <span>Mesh egress — what this agent dials for peers</span>
-                <button
+                <button className="sm"
                   disabled={active}
                   onClick={() => setMeshEgress([...meshEgress, { name: "", protocol: "tcp", target: "" }])}
                 >
@@ -398,7 +391,7 @@ export default function IssuePackDialog({
                     </select>
                     {field(r.target, (v) => patch({ target: v }), "127.0.0.1:11434 or 127.0.0.0/8")}
                     <button
-                      className="rule-remove"
+                      className="rule-remove sm"
                       disabled={active}
                       onClick={() => setMeshEgress(meshEgress.filter((_, j) => j !== i))}
                     >

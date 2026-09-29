@@ -21,6 +21,43 @@ export function KindBadge({ kind }: { kind: NodeKindDto }) {
   return <span className={`kind-badge kind-${kind}`}>{kindLabel(kind)}</span>;
 }
 
+/// One mutually-exclusive picker — the single widget behind the face
+/// switch, deploy nav, manifest views, log scope, transport and kind
+/// pickers (it replaced eight hand-rolled copies whose selected styles
+/// disagreed). `className` carries placement-only shells (e.g.
+/// face-toggle's margin-left: auto); sizing and the selected language
+/// live in .segmented.
+export function SegmentedControl<T extends string>({
+  value,
+  options,
+  onChange,
+  disabled = false,
+  className = "",
+}: {
+  value: T;
+  options: { value: T; label: string; title?: string }[];
+  onChange: (value: T) => void;
+  disabled?: boolean;
+  className?: string;
+}) {
+  return (
+    <div className={`segmented ${className}`.trim()}>
+      {options.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          className={option.value === value ? "selected" : ""}
+          disabled={disabled}
+          title={option.title}
+          onClick={() => onChange(option.value)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /// One titled block of a detail page: the unit that replaced the old
 /// everything-in-one-form pane. `hint` carries the one-line rule of the
 /// section (what is editable when, what is pack-signed); `grow` lets a

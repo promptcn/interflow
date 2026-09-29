@@ -381,6 +381,7 @@ endpoint = "{registrar_endpoint}"
 workspaces = ["default"]
 # listen = "0.0.0.0:443"
 # control_listen = "127.0.0.1:16666"
+# quic_listen = "0.0.0.0:16666"  # optional QUIC (UDP) face for the control endpoint
 
 [workspace.default]
 

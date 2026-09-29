@@ -5,6 +5,7 @@ import IssuePackDialog from "./IssuePackDialog";
 import ManifestEditor from "./ManifestEditor";
 import PackDetail from "./PackDetail";
 import PackOverview from "./PackOverview";
+import { SegmentedControl } from "./ui";
 
 /// The deploy (operator) face: manifest → validate/apply → packs →
 /// distribute/rotate/revoke. Two levels like the nodes face — the Packs
@@ -267,20 +268,14 @@ export default function DeployFace({
   return (
     <div className="deploy-face">
       <div className="deploy-nav">
-        <span className="deploy-nav-toggle">
-          <button
-            className={view === "packs" ? "selected" : ""}
-            onClick={() => onViewChange("packs")}
-          >
-            Packs
-          </button>
-          <button
-            className={view === "manifest" ? "selected" : ""}
-            onClick={() => onViewChange("manifest")}
-          >
-            Manifest
-          </button>
-        </span>
+        <SegmentedControl
+          value={view}
+          options={[
+            { value: "packs", label: "Packs" },
+            { value: "manifest", label: "Manifest" },
+          ]}
+          onChange={onViewChange}
+        />
       </div>
 
       {view === "manifest" ? (
@@ -350,7 +345,7 @@ export default function DeployFace({
       )}
 
       <div className="output-strip">
-        <button className="output-strip-toggle" onClick={() => setOutputOpen((v) => !v)}>
+        <button className="output-strip-toggle sm" onClick={() => setOutputOpen((v) => !v)}>
           {outputOpen ? "▾" : "▸"} Output{output.length > 0 ? ` (${output.length})` : ""}
         </button>
         {outputOpen && (

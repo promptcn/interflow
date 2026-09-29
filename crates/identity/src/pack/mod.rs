@@ -115,6 +115,12 @@ pub struct NodeConfig {
     pub listen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_listen: Option<String>,
+    /// Control endpoint's QUIC (UDP) listen address, rendered from the
+    /// manifest's `[ingress.<node>] quic_listen`. `None` keeps the QUIC
+    /// transport off; the address is already validation-checked (public,
+    /// concrete port) and parsed into `EdgeConfig.quic_listen` at boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_listen: Option<String>,
     /// Single-public-port mode (ACME topologies): connections with this
     /// SNI on the public listener are dispatched to the control plane, so
     /// the deployment needs only 443. `None` on fronted topologies (the
@@ -132,6 +138,12 @@ pub struct NodeConfig {
     /// machine-local preference may override each one at run time; the
     /// signed policy carries the ids only).
     pub services: Vec<NodeService>,
+    /// The manifest-issued **default** dial transport for an agent pack
+    /// (`"h2"` / `"quic"`; present on agent packs only when the manifest
+    /// sets it). A machine-local preference overrides it at run time;
+    /// headless nodes dial exactly this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
     /// Site-to-site runtime rules — present on mesh-role agent packs (the
     /// hub dial target plus this agent's local rules). Absent on expose
     /// packs.
@@ -870,6 +882,10 @@ target_addr = "127.0.0.1:3000"
             parsed.edge.is_none(),
             "a node.toml without [edge] must parse"
         );
+        assert!(
+            parsed.quic_listen.is_none() && parsed.transport.is_none(),
+            "absent QUIC fields default to off/h2 (old packs parse unchanged)"
+        );
 
         // 0 = unlimited is a legitimate explicit override and must survive.
         let with_edge = format!("{base}\n[edge]\nnew_conn_rate_per_ip_per_minute = 0\n");
@@ -893,6 +909,74 @@ target_addr = "127.0.0.1:3000"
         assert!(
             toml::from_str::<NodeConfig>(&garbage).is_err(),
             "unknown [edge] fields must be rejected (deny_unknown_fields)"
+        );
+    }
+
+    /// The QUIC face and the agent dial transport ride the manifest →
+    /// node.toml leg: absent fields render nothing (old packs unchanged,
+    /// engine defaults apply); explicit ones land verbatim and survive the
+    /// digest-verified load.
+    #[test]
+    fn quic_fields_render_into_node_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issuer = IssuerStore::open(tmp.path().join("issuer"));
+        issuer.ensure_realm().unwrap();
+        issuer.ensure_workspace("main").unwrap();
+        issuer.ensure_policy_key().unwrap();
+
+        // Absent: neither field renders, and the loaded pack reports both
+        // as None (the h2-only status quo, byte-identical node.toml).
+        let manifest = Manifest::parse(&manifest_text()).unwrap();
+        let out = tmp.path().join("packs/ingress-edge");
+        IngressCredentialPack::render(&issuer, &manifest, "edge", 1, &out).unwrap();
+        let node_toml = std::fs::read_to_string(out.join("node.toml")).unwrap();
+        assert!(
+            !node_toml.contains("quic_listen"),
+            "absent quic_listen must not render: {node_toml}"
+        );
+        let agent_out = tmp.path().join("packs/agent-desktop");
+        AgentCredentialPack::render(&issuer, &manifest, "desktop", 1, &agent_out).unwrap();
+        let agent_toml = std::fs::read_to_string(agent_out.join("node.toml")).unwrap();
+        assert!(
+            !agent_toml.contains("transport"),
+            "absent transport must not render: {agent_toml}"
+        );
+
+        // Explicit: the fixture's control endpoint carries an explicit
+        // port, so the quic cross-check is satisfiable.
+        let tuned_text = manifest_text()
+            .replacen(
+                "[ingress.edge]\nworkspaces = [\"main\"]",
+                "[ingress.edge]\nworkspaces = [\"main\"]\nquic_listen = \"0.0.0.0:16666\"",
+                1,
+            )
+            .replacen(
+                "[agent.desktop]\nworkspace = \"main\"",
+                "[agent.desktop]\nworkspace = \"main\"\ntransport = \"quic\"",
+                1,
+            );
+        let tuned = Manifest::parse(&tuned_text).unwrap();
+        let out2 = tmp.path().join("packs/ingress-edge-quic");
+        IngressCredentialPack::render(&issuer, &tuned, "edge", 1, &out2).unwrap();
+        let pack = CredentialPack::load(&out2).unwrap();
+        assert_eq!(
+            pack.node_config.quic_listen.as_deref(),
+            Some("0.0.0.0:16666"),
+            "quic_listen must survive the digest-verified load"
+        );
+        let node_toml2 = std::fs::read_to_string(out2.join("node.toml")).unwrap();
+        assert!(
+            node_toml2.contains("quic_listen = \"0.0.0.0:16666\""),
+            "quic_listen renders as readable TOML: {node_toml2}"
+        );
+
+        let agent_out2 = tmp.path().join("packs/agent-desktop-quic");
+        AgentCredentialPack::render(&issuer, &tuned, "desktop", 1, &agent_out2).unwrap();
+        let agent_pack = CredentialPack::load(&agent_out2).unwrap();
+        assert_eq!(
+            agent_pack.node_config.transport.as_deref(),
+            Some("quic"),
+            "the signed transport default must survive the digest-verified load"
         );
     }
 }

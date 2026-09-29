@@ -34,10 +34,10 @@ export default function LogView({
   return (
     <div className="log-section">
       <div className="log-toolbar">
-        <button disabled={logs.length === 0} onClick={onClear}>
+        <button className="sm" disabled={logs.length === 0} onClick={onClear}>
           Clear logs
         </button>
-        <button disabled={logs.length === 0} onClick={copy}>
+        <button className="sm" disabled={logs.length === 0} onClick={copy}>
           {copied ? "Copied" : "Copy logs"}
         </button>
       </div>

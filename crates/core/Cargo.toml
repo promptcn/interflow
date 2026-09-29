@@ -20,7 +20,7 @@ fault-injection = []
 workspace = true
 
 [dependencies]
-interflow-contract = { path = "../contract", version = "0.5" }
+interflow-contract = { path = "../contract", version = "0.6" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -102,7 +102,7 @@ criterion = { version = "0.8", default-features = false, features = ["async_toki
 proptest = "1.7"
 # Self-signed certificates for the TLS min-version handshake test (the single
 # rcgen implementation; core keeps issuance out of its production graph)
-interflow-certs = { path = "../certs", version = "0.5" }
+interflow-certs = { path = "../certs", version = "0.6" }
 # Paused clock (start_paused) for unit tests to deterministically verify the INCOMING_SEND_TIMEOUT path
 tokio = { workspace = true, features = ["test-util"] }
 # Audit rotation/persistence unit tests: isolated segment directories

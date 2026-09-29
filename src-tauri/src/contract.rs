@@ -16,7 +16,7 @@
 //! incrementally).
 
 use crate::node::{NodeKind, NodeSnapshot, NodeState, PackInfo};
-use interflow_identity::manifest::{MeshEgressRule, MeshIngressRule, MeshProtocol};
+use interflow_identity::manifest::{AgentTransport, MeshEgressRule, MeshIngressRule, MeshProtocol};
 use interflow_mesh::config::TransportKind;
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,15 @@ impl From<TransportKind> for Transport {
         match kind {
             TransportKind::H2 => Self::H2,
             TransportKind::Quic => Self::Quic,
+        }
+    }
+}
+
+impl From<AgentTransport> for Transport {
+    fn from(transport: AgentTransport) -> Self {
+        match transport {
+            AgentTransport::H2 => Self::H2,
+            AgentTransport::Quic => Self::Quic,
         }
     }
 }
@@ -227,6 +236,12 @@ pub struct NodeInfo {
     pub desired_running: bool,
     /// Agent nodes only.
     pub transport: Option<Transport>,
+    /// Dial transport the pack declares as its signed default (agent
+    /// nodes; `None` = the h2 default). The effective transport the node
+    /// runs with is `transport ?? pack_transport ?? h2` — shown so the
+    /// UI never claims h2 while an unset preference inherits a `quic`
+    /// pack default.
+    pub pack_transport: Option<Transport>,
     /// Agent nodes only; `None` derives from the control endpoint.
     pub hub_quic_addr: Option<String>,
     /// Services the pack declares, with the effective dial address (expose
@@ -286,6 +301,12 @@ impl From<NodeSnapshot> for NodeInfo {
             state: snapshot.state.into(),
             desired_running: snapshot.desired_running,
             transport: snapshot.spec.transport.map(Transport::from),
+            pack_transport: match snapshot.spec.pack_transport.as_deref() {
+                // "h2" and anything unexpected both display as the default
+                // (None); an unexpected string fails loud at start instead.
+                Some("quic") => Some(Transport::Quic),
+                _ => None,
+            },
             hub_quic_addr: snapshot.spec.hub_quic_addr,
             services,
             mesh_ingress_rules,
@@ -701,6 +722,9 @@ pub struct AgentSummaryDto {
     pub node: String,
     pub workspace: String,
     pub role: AgentRoleDto,
+    /// Dial transport the manifest pins for this agent (expose agents;
+    /// `None` = the h2 default). The node's signed pack default.
+    pub transport: Option<Transport>,
     pub services: Vec<ManifestServiceDto>,
     pub mesh_ingress: Vec<ManifestIngressRuleDto>,
     pub mesh_egress: Vec<ManifestEgressRuleDto>,
@@ -714,6 +738,9 @@ pub struct IngressNodeDto {
     pub workspaces: Vec<String>,
     pub listen: String,
     pub control_listen: String,
+    /// Control endpoint's QUIC (UDP) listen address; `None` = the QUIC
+    /// transport is off.
+    pub quic_listen: Option<String>,
     pub edge_rate_per_ip_per_minute: Option<u32>,
 }
 
@@ -767,6 +794,7 @@ impl From<interflow_cli::manifest_edit::ManifestSummary> for ManifestSummaryDto 
                     .get(node)
                     .copied()
                     .map_or(AgentRoleDto::Empty, Into::into),
+                transport: agent.transport.map(Into::into),
                 services: agent
                     .services
                     .iter()
@@ -826,6 +854,7 @@ impl From<interflow_cli::manifest_edit::ManifestSummary> for ManifestSummaryDto 
                     workspaces: ingress.workspaces.clone(),
                     listen: ingress.listen.clone(),
                     control_listen: ingress.control_listen.clone(),
+                    quic_listen: ingress.quic_listen.clone(),
                     edge_rate_per_ip_per_minute: ingress
                         .edge
                         .as_ref()
@@ -904,6 +933,8 @@ pub struct IngressEditDto {
     pub workspaces: Vec<String>,
     pub listen: Option<String>,
     pub control_listen: Option<String>,
+    /// Blank/`None` keeps the QUIC transport off.
+    pub quic_listen: Option<String>,
     pub edge_rate_per_ip_per_minute: Option<u32>,
 }
 
@@ -979,16 +1010,35 @@ pub enum EditActionDto {
     UpsertIngress(IngressEditDto),
     RemoveIngress(String),
     CreateNode(CreateNodeDto),
-    SetAgentWorkspace { agent: String, workspace: String },
+    SetAgentWorkspace {
+        agent: String,
+        workspace: String,
+    },
+    /// `transport: None` returns the agent to the h2 default.
+    SetAgentTransport {
+        agent: String,
+        transport: Option<Transport>,
+    },
     RemoveAgent(String),
     UpsertService(ServiceEditDto),
-    RemoveService { agent: String, id: String },
+    RemoveService {
+        agent: String,
+        id: String,
+    },
     UpsertMeshIngress(MeshIngressEditDto),
-    RemoveMeshIngress { agent: String, name: String },
+    RemoveMeshIngress {
+        agent: String,
+        name: String,
+    },
     UpsertMeshEgress(MeshEgressEditDto),
-    RemoveMeshEgress { agent: String, name: String },
+    RemoveMeshEgress {
+        agent: String,
+        name: String,
+    },
     UpsertRoute(RouteEditDto),
-    RemoveRoute { host: String },
+    RemoveRoute {
+        host: String,
+    },
 }
 
 impl From<EditActionDto> for interflow_cli::manifest_edit::ManifestEdit {
@@ -1026,6 +1076,7 @@ impl From<EditActionDto> for interflow_cli::manifest_edit::ManifestEdit {
                 workspaces: edit.workspaces,
                 listen: edit.listen,
                 control_listen: edit.control_listen,
+                quic_listen: edit.quic_listen,
                 edge_rate_per_ip_per_minute: edit.edge_rate_per_ip_per_minute,
             }),
             EditActionDto::RemoveIngress(node) => Self::RemoveIngress(node),
@@ -1075,6 +1126,16 @@ impl From<EditActionDto> for interflow_cli::manifest_edit::ManifestEdit {
             EditActionDto::SetAgentWorkspace { agent, workspace } => {
                 Self::SetAgentWorkspace { agent, workspace }
             }
+            EditActionDto::SetAgentTransport { agent, transport } => Self::SetAgentTransport {
+                agent,
+                transport: transport.map(|t| {
+                    use interflow_identity::manifest::AgentTransport;
+                    match t {
+                        Transport::H2 => AgentTransport::H2,
+                        Transport::Quic => AgentTransport::Quic,
+                    }
+                }),
+            },
             EditActionDto::RemoveAgent(node) => Self::RemoveAgent(node),
             EditActionDto::UpsertService(edit) => Self::UpsertService(ServiceEdit {
                 agent: edit.agent,

@@ -33,7 +33,7 @@ use interflow_identity::issuance::{
     OFFLINE_DEFAULT_LEAF_TTL_SECONDS, OFFLINE_MAX_LEAF_TTL_SECONDS, OFFLINE_MIN_LEAF_TTL_SECONDS,
 };
 use interflow_identity::manifest::{
-    AgentConfig, IdentityMode, Manifest, MeshProtocol, PublicTlsMode,
+    AgentConfig, AgentTransport, IdentityMode, Manifest, MeshProtocol, PublicTlsMode,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -219,6 +219,13 @@ pub enum ManifestEdit {
         agent: String,
         workspace: String,
     },
+    /// An existing agent's dial transport (expose face): `None`/`h2` = the
+    /// default (an off-default key is removed), `quic` opts in. The pack
+    /// renders the value as the node's signed default.
+    SetAgentTransport {
+        agent: String,
+        transport: Option<AgentTransport>,
+    },
     RemoveAgent(String),
     /// One `[[agent.<agent>.services]]` entry, keyed by `id`.
     UpsertService(ServiceEdit),
@@ -283,6 +290,9 @@ pub struct IngressEdit {
     pub workspaces: Vec<String>,
     pub listen: Option<String>,
     pub control_listen: Option<String>,
+    /// Control endpoint's QUIC (UDP) listen address; `None`/blank keeps
+    /// the QUIC transport off.
+    pub quic_listen: Option<String>,
     pub edge_rate_per_ip_per_minute: Option<u32>,
 }
 
@@ -446,6 +456,11 @@ pub fn apply_edit(text: &str, edit: &ManifestEdit) -> Result<String> {
                 "control_listen",
                 non_blank(edit.control_listen.as_deref()),
             );
+            set_str(
+                ingress,
+                "quic_listen",
+                non_blank(edit.quic_listen.as_deref()),
+            );
             match edit.edge_rate_per_ip_per_minute {
                 Some(rate) => {
                     let edge = section_table(ingress, "edge")?;
@@ -470,6 +485,15 @@ pub fn apply_edit(text: &str, edit: &ManifestEdit) -> Result<String> {
             declare_workspace(root, &current, workspace.trim())?;
             let agent_table = agent_table_mut(root, agent)?;
             set_str(agent_table, "workspace", Some(workspace.trim()));
+        }
+        ManifestEdit::SetAgentTransport { agent, transport } => {
+            let agent_table = agent_table_mut(root, agent)?;
+            set_enum(
+                agent_table,
+                "transport",
+                transport.map_or("h2", AgentTransport::as_str),
+                "h2",
+            );
         }
         ManifestEdit::RemoveAgent(node) => {
             let agents = parent_table(root, "agent")?;
@@ -1324,12 +1348,14 @@ leaf_ttl = "45d"
 workspaces = ["default"]
 listen = "0.0.0.0:443"
 control_listen = "127.0.0.1:16666"
+quic_listen = "0.0.0.0:16666"
 
 [ingress.edge.edge]
 new_conn_rate_per_ip_per_minute = 30
 
 [agent.desktop]
 workspace = "default"
+transport = "quic"
 
 [[agent.desktop.services]]
 id = "asr"
@@ -1362,6 +1388,7 @@ service = "default/desktop/asr"
                 workspaces: manifest.ingress["edge"].workspaces.clone(),
                 listen: Some(manifest.ingress["edge"].listen.clone()),
                 control_listen: Some(manifest.ingress["edge"].control_listen.clone()),
+                quic_listen: manifest.ingress["edge"].quic_listen.clone(),
                 edge_rate_per_ip_per_minute: manifest.ingress["edge"]
                     .edge
                     .as_ref()
@@ -1370,6 +1397,10 @@ service = "default/desktop/asr"
             ManifestEdit::SetAgentWorkspace {
                 agent: "desktop".into(),
                 workspace: manifest.agent["desktop"].workspace.clone(),
+            },
+            ManifestEdit::SetAgentTransport {
+                agent: "desktop".into(),
+                transport: manifest.agent["desktop"].transport,
             },
             ManifestEdit::UpsertService(ServiceEdit {
                 agent: "desktop".into(),
@@ -1574,6 +1605,65 @@ service = "default/desktop/asr"
             "all-default state must not create the section: {edited}"
         );
         assert_eq!(edited, MESH_MANIFEST, "a no-op edit is byte-stable");
+    }
+
+    /// The transport toggle writes the agent's dial-transport default and
+    /// `None` canonicalizes back to absence (the h2 default); the explicit
+    /// port on the fixture's control endpoint is what lets the quic value
+    /// pass the valid→valid funnel.
+    #[test]
+    fn agent_transport_toggle_sets_and_clears() {
+        const EXPOSE: &str = r#"
+[realm]
+id = "t"
+control_endpoint = "tunnel.example.com:443"
+
+[identity]
+mode = "offline"
+
+[ingress.edge]
+workspaces = ["default"]
+
+[workspace.default]
+
+[agent.desktop]
+workspace = "default"
+
+[[agent.desktop.services]]
+id = "asr"
+address = "127.0.0.1:8080"
+
+[[route]]
+host = "asr.example.com"
+service = "default/desktop/asr"
+"#;
+        let set = apply_edit(
+            EXPOSE,
+            &ManifestEdit::SetAgentTransport {
+                agent: "desktop".into(),
+                transport: Some(AgentTransport::Quic),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            Manifest::parse(&set).unwrap().agent["desktop"].transport,
+            Some(AgentTransport::Quic),
+            "the quic default lands and the document stays valid"
+        );
+
+        let cleared = apply_edit(
+            &set,
+            &ManifestEdit::SetAgentTransport {
+                agent: "desktop".into(),
+                transport: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !cleared.contains("transport"),
+            "None canonicalizes to absence (h2 default): {cleared}"
+        );
+        assert!(Manifest::parse(&cleared).is_ok());
     }
 
     /// Node creation rides the same transform `node add` uses (one pack,

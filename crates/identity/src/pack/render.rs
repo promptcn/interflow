@@ -81,6 +81,7 @@ impl IngressCredentialPack {
             node: node.to_owned(),
             listen: Some(ingress_cfg.listen.clone()),
             control_listen: Some(ingress_cfg.control_listen.clone()),
+            quic_listen: ingress_cfg.quic_listen.clone(),
             control_dispatch_host,
             public_tls: match manifest.public_tls.mode {
                 crate::manifest::PublicTlsMode::Acme => "acme".to_owned(),
@@ -90,6 +91,7 @@ impl IngressCredentialPack {
             public_tls_email: manifest.public_tls.email.clone(),
             public_tls_directory: manifest.public_tls.directory.clone(),
             services: Vec::new(),
+            transport: None,
             mesh: None,
             edge: ingress_cfg.edge.clone(),
         };
@@ -170,6 +172,7 @@ impl AgentCredentialPack {
             node: node.to_owned(),
             listen: None,
             control_listen: None,
+            quic_listen: None,
             control_dispatch_host: None,
             public_tls: String::new(),
             public_tls_email: None,
@@ -182,6 +185,9 @@ impl AgentCredentialPack {
                     address: s.address.clone(),
                 })
                 .collect(),
+            // Expose-role only: `validate` rejects transport on mesh-role
+            // agents, so the mapping never has to choose a face here.
+            transport: agent_cfg.transport.map(|t| t.as_str().to_owned()),
             mesh: match mesh_role {
                 // node.toml carries node-local dial info only; the rules
                 // ride the signed policy (RuntimePolicy mesh faces).
@@ -284,11 +290,13 @@ impl HubCredentialPack {
             node: node.to_owned(),
             listen: Some(hub_cfg.listen.clone()),
             control_listen: None,
+            quic_listen: None,
             control_dispatch_host: None,
             public_tls: String::new(),
             public_tls_email: None,
             public_tls_directory: None,
             services: Vec::new(),
+            transport: None,
             mesh: None,
             edge: None,
         };

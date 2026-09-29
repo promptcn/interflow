@@ -110,6 +110,15 @@ pub struct IngressConfig {
     /// Control-plane listen address for the embedded control endpoint.
     #[serde(default = "default_control_listen")]
     pub control_listen: String,
+    /// Public UDP listen address for the control endpoint's QUIC face
+    /// (e.g. `0.0.0.0:16666` — conventionally the same port number as
+    /// `control_listen`). Absent = the QUIC transport stays off. The UDP
+    /// port is exposed directly — it cannot ride the front proxy's
+    /// TCP/SNI leg — so loopback addresses are rejected at validation.
+    /// TLS reuses the control-endpoint certificate (both faces share one
+    /// key pair; its SAN already covers the hostname clients dial).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_listen: Option<String>,
     /// Public-listener governance overrides (rendered into the ingress
     /// node config's `[edge]` section; absent = engine defaults for the
     /// deployment's topology).
@@ -158,6 +167,37 @@ pub struct AgentConfig {
     /// its own network for peers.
     #[serde(default)]
     pub mesh_egress: Vec<MeshEgressRule>,
+    /// The dial transport this agent's pack carries as its signed default.
+    /// Absent = `h2`. Machine-local preferences (the GUI profile) override
+    /// it at run time; headless nodes dial exactly this. Expose agents
+    /// only — mesh-role agents dial the mesh hub, whose transport face is
+    /// engine-configured, not manifest-pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<AgentTransport>,
+}
+
+/// The transport an expose agent dials the control endpoint over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentTransport {
+    /// HTTP/2 over TLS — the fallback-safe default.
+    #[default]
+    H2,
+    /// QUIC — per-stream loss recovery pays off on lossy/high-RTT WAN
+    /// paths. Requires the ingress's `quic_listen` face and a control
+    /// endpoint carrying an explicit port (the QUIC dial address derives
+    /// from it; implicit 80/443 cannot be assumed for UDP).
+    Quic,
+}
+
+impl AgentTransport {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentTransport::H2 => "h2",
+            AgentTransport::Quic => "quic",
+        }
+    }
 }
 
 /// A public route: `host` → named service identity.
@@ -542,6 +582,32 @@ impl Manifest {
                      role; declare a second agent node for the other role",
                 )));
             }
+            // `transport` is the expose dial face. Two fail-fasts keep every
+            // manifest field end-to-end usable: mesh-role agents dial the
+            // mesh hub (engine-configured transport), and a `quic` default
+            // has no dial address to derive from an implicit-port endpoint.
+            if let Some(transport) = agent.transport {
+                if has_mesh_role {
+                    return Err(Error::manifest(format!(
+                        "agent '{agent_id}' sets transport = \"{}\" but declares mesh rules — \
+                         transport is the expose dial face; mesh-role agents dial the mesh \
+                         hub, whose transport is engine-configured",
+                        transport.as_str()
+                    )));
+                }
+                if transport == AgentTransport::Quic
+                    && !interflow_util::parse_endpoint(&self.realm.control_endpoint)
+                        .map(|endpoint| endpoint.explicit_port.is_some())
+                        .unwrap_or(false)
+                {
+                    return Err(Error::manifest(format!(
+                        "agent '{agent_id}' transport = \"quic\" requires a control endpoint \
+                         carrying an explicit port — the QUIC dial address derives from \
+                         realm.control_endpoint and implicit 80/443 cannot be assumed for \
+                         UDP (e.g. control_endpoint = \"tunnel.example.com:443\")",
+                    )));
+                }
+            }
             let mut seen = BTreeSet::new();
             for service in &agent.services {
                 validate_name("service", &service.id)?;
@@ -600,6 +666,36 @@ impl Manifest {
                     return Err(Error::manifest(format!(
                         "ingress '{node}' references unknown workspace {workspace:?}",
                     )));
+                }
+            }
+            // The QUIC face is dialed over the public internet; its UDP port
+            // bypasses the front proxy, so a loopback bind could never be
+            // reached. Port 0 is the derived ephemeral-port mode, which only
+            // the testkit uses (clients cannot discover a kernel-assigned
+            // port from a manifest).
+            if let Some(raw) = &ingress.quic_listen {
+                match raw.parse::<SocketAddr>() {
+                    Ok(addr) if addr.ip().is_loopback() => {
+                        return Err(Error::manifest(format!(
+                            "ingress '{node}' quic_listen {raw:?} is loopback — the QUIC face \
+                             is dialed from the public internet and its UDP port bypasses the \
+                             front proxy; bind a public address (e.g. 0.0.0.0:16666)",
+                        )));
+                    }
+                    Ok(addr) if addr.port() == 0 => {
+                        return Err(Error::manifest(format!(
+                            "ingress '{node}' quic_listen {raw:?} uses port 0 — the derived \
+                             ephemeral-port mode is testkit-only; name a concrete public port \
+                             (e.g. 0.0.0.0:16666)",
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(Error::manifest(format!(
+                            "ingress '{node}' quic_listen {raw:?} is not a valid socket \
+                             address — expected <ip>:<port> (e.g. 0.0.0.0:16666)",
+                        )));
+                    }
+                    Ok(_) => {}
                 }
             }
         }
@@ -1033,6 +1129,87 @@ service = "main/desktop/asr"
                 .unwrap_err()
                 .to_string()
                 .contains("twice")
+        );
+    }
+
+    /// The QUIC face is dialed from the public internet over UDP that
+    /// bypasses the front proxy: loopback could never be reached, and the
+    /// `:0` derived-ephemeral mode is testkit-only (clients cannot discover
+    /// a kernel-assigned port from a manifest). Anything else public —
+    /// including RFC1918 under cloud NAT and the `0.0.0.0` wildcard — is a
+    /// legitimate bind.
+    #[test]
+    fn ingress_quic_listen_must_be_public_concrete() {
+        let with = |quic: &str| {
+            VALID.replace(
+                "[ingress.edge]",
+                &format!("[ingress.edge]\nquic_listen = \"{quic}\""),
+            )
+        };
+        assert!(
+            Manifest::parse(&with("0.0.0.0:16666")).is_ok(),
+            "a public wildcard bind is the canonical form"
+        );
+        assert!(
+            Manifest::parse(&with("192.0.2.10:16666")).is_ok(),
+            "a concrete public address (incl. RFC1918 under cloud NAT) is fine"
+        );
+        for rejected in ["127.0.0.1:16666", "[::1]:16666"] {
+            let err = Manifest::parse(&with(rejected)).unwrap_err().to_string();
+            assert!(err.contains("loopback"), "{rejected}: {err}");
+        }
+        let err = Manifest::parse(&with("0.0.0.0:0")).unwrap_err().to_string();
+        assert!(err.contains("port 0"), "{err}");
+        let err = Manifest::parse(&with("localhost:16666"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid socket address"), "{err}");
+        // Absent = QUIC off; every fixture without the field stays valid.
+        assert!(Manifest::parse(VALID).is_ok());
+    }
+
+    /// `transport` is the expose dial face: mesh-role agents dial the mesh
+    /// hub (engine-configured transport), and a `quic` default can only
+    /// derive its dial address from an explicit-port control endpoint.
+    #[test]
+    fn agent_transport_is_expose_face_and_needs_derivable_addr() {
+        // Explicit port: both h2 and quic defaults parse.
+        let explicit = VALID.replace(
+            "control_endpoint = \"example.com\"",
+            "control_endpoint = \"example.com:443\"",
+        );
+        assert!(Manifest::parse(&explicit).is_ok());
+        let quic = explicit.replace(
+            "[agent.desktop]\nworkspace = \"main\"",
+            "[agent.desktop]\nworkspace = \"main\"\ntransport = \"quic\"",
+        );
+        assert!(
+            Manifest::parse(&quic).is_ok(),
+            "quic + explicit port is the enabled form"
+        );
+
+        // Implicit-port control endpoint (the VALID fixture's "example.com"):
+        // the headless pack path derives the QUIC dial address from the
+        // control endpoint and declines implicit 80/443 for UDP.
+        let implicit_quic = VALID.replace(
+            "[agent.desktop]\nworkspace = \"main\"",
+            "[agent.desktop]\nworkspace = \"main\"\ntransport = \"quic\"",
+        );
+        let err = Manifest::parse(&implicit_quic).unwrap_err().to_string();
+        assert!(
+            err.contains("explicit port"),
+            "implicit-port endpoint cannot carry a quic default: {err}"
+        );
+
+        // Mesh-role agent: transport is not its dial face.
+        let mesh_quic = MESH_VALID.replace(
+            "[agent.lan-a]\nworkspace = \"main\"",
+            "[agent.lan-a]\nworkspace = \"main\"\ntransport = \"quic\"",
+        );
+        let err = Manifest::parse(&mesh_quic).unwrap_err().to_string();
+        assert!(
+            err.contains("mesh rules"),
+            "mesh-role agents must not pin a transport: {err}"
         );
     }
 

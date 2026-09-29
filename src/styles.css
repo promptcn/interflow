@@ -1,12 +1,22 @@
 :root {
   font-family: -apple-system, "PingFang SC", "Segoe UI", sans-serif;
   color-scheme: light dark;
-  /* Type scale — three tiers + display sizes at call sites. Bump the
-     tiers here, never piecemeal at call sites (2026-09-23: everything
-     felt one notch too small). */
-  --text-micro: 12px; /* badges, tags, proto pills */
-  --text-small: 13px; /* hints, mono summaries, logs, secondary chrome */
-  --text-base: 14px; /* labels, body text, headers' chrome */
+  /* Design tokens — the only place sizes are dialed. The type scale is
+     three tiers (display sizes live at call sites); the control heights
+     are the interactive hit-area floor (standard and compact); --accent
+     is the one "active/selected" color. Call sites never write
+     font-size or padding on controls — controls take the baseline or a
+     variant class (sm / primary / danger / link).
+     2026-09-23: tiers bumped one notch. 2026-09-29: tiers bumped again,
+     control heights + accent formalized — sub-13px text and sub-26px
+     hit targets had crept in through UA defaults and per-context
+     paddings. */
+  --text-micro: 13px; /* badges, tags, proto pills — the readability floor */
+  --text-small: 14px; /* hints, mono summaries, logs, secondary chrome */
+  --text-base: 15px; /* labels, body text, controls, headers' chrome */
+  --control-h: 32px; /* standard control min-height (hit-area floor) */
+  --control-h-sm: 26px; /* compact control min-height (segmented, toolbars) */
+  --accent: #0a84ff; /* focus, segmented selection — the one active color */
 }
 
 * {
@@ -58,6 +68,7 @@ body {
   background: none;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: var(--text-small);
+  min-height: var(--control-h-sm);
   opacity: 0.55;
   white-space: nowrap;
   align-self: center;
@@ -185,7 +196,7 @@ body {
 
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 12px;
   align-content: start;
 }
@@ -229,7 +240,7 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 15px;
+  font-size: 16px;
 }
 
 .node-card-summary {
@@ -247,22 +258,38 @@ body {
   white-space: nowrap;
 }
 
+/* The card contract: head / summary / tags (optional, wrap) / foot
+   (state left + one anchored action right). Tags live on their own
+   wrapping row so the foot never has to fit them alongside the quick
+   action — the daily Start/Stop stays in the same spot at the same
+   size on every card, instead of being pushed out of the card. */
+.node-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+}
+
 .node-card-foot {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   margin-top: auto;
-  min-height: 30px;
+  min-height: var(--control-h);
 }
 
 .node-card-state {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: var(--text-small);
   opacity: 0.75;
 }
 
 .node-card-tag {
   font-size: var(--text-micro);
-  padding: 0 6px;
+  padding: 1px 7px;
   border-radius: 999px;
   border: 1px solid rgba(127, 127, 127, 0.4);
   opacity: 0.8;
@@ -282,6 +309,7 @@ body {
 }
 
 .node-card-foot button {
+  flex-shrink: 0;
   margin-left: auto;
 }
 
@@ -326,7 +354,7 @@ body {
 
 .detail-topbar h2 {
   margin: 0;
-  font-size: 20px;
+  font-size: 21px;
 }
 
 .detail-topbar .dot {
@@ -411,7 +439,7 @@ body {
 }
 
 .row label {
-  width: 130px;
+  width: 140px;
   flex-shrink: 0;
   font-size: var(--text-base);
   opacity: 0.8;
@@ -431,13 +459,44 @@ body {
   opacity: 0.7;
 }
 
+/* Control baseline. WebKit form controls do NOT inherit fonts (they
+   render at the UA's ~13px default, smaller than body text) — this one
+   rule puts every control on the page's type scale. Heights are floored
+   by the control tokens; compact contexts take the sm variant, never
+   their own paddings. */
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+  font-size: var(--text-base);
+  line-height: 1.45;
+}
+
+button,
+input,
+select {
+  min-height: var(--control-h);
+}
+
 button {
-  padding: 6px 12px;
+  padding: 5px 14px;
   border-radius: 6px;
   border: 1px solid rgba(127, 127, 127, 0.4);
   background: rgba(127, 127, 127, 0.1);
   color: inherit;
   cursor: pointer;
+}
+
+button.sm {
+  min-height: var(--control-h-sm);
+  padding: 3px 12px;
+  font-size: var(--text-small);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 button:disabled {
@@ -463,14 +522,27 @@ button.danger {
   flex-wrap: wrap;
 }
 
-.transport-toggle {
-  display: flex;
-  gap: 6px;
+/* One mutually-exclusive picker (SegmentedControl in ui.tsx): the face
+   switch, deploy nav, manifest views, log scope, transport and kind
+   pickers. The single "which of these am I in" widget — one selected
+   language everywhere (it replaced eight hand-rolled copies whose
+   selected styles disagreed: green fill, blue fill, blue border). */
+.segmented {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
-.transport-toggle button.selected {
-  background: rgba(52, 199, 89, 0.2);
-  border-color: #34c759;
+.segmented button {
+  min-height: var(--control-h-sm);
+  padding: 3px 12px;
+  font-size: var(--text-small);
+}
+
+.segmented button.selected {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
   font-weight: 600;
 }
 
@@ -479,6 +551,16 @@ button.danger {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+/* Group heading inside a section (Ingress / Egress) — the section-head
+   h3 vocabulary; was an undefined class riding on `hint` before. */
+.mesh-rule-group-title {
+  font-size: var(--text-small);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.65;
 }
 
 .mesh-rule {
@@ -532,7 +614,14 @@ button.danger {
 
 .dialog h2 {
   margin: 0;
-  font-size: 17px;
+  font-size: 18px;
+}
+
+/* Wide dialogs (rule editors, the issue wizard) — referenced by Modal's
+  `wide` prop since 2026-09-23; defined 2026-09-29. Narrow windows stay
+  covered by .dialog's max-width. */
+.dialog-wide {
+  width: 760px;
 }
 
 .confirm-message {
@@ -559,7 +648,7 @@ button.danger {
 .inspection dl {
   margin: 0;
   display: grid;
-  grid-template-columns: 120px 1fr;
+  grid-template-columns: 130px 1fr;
   gap: 4px 10px;
   font-size: var(--text-base);
 }
@@ -597,22 +686,6 @@ button.danger {
 /* Logs                                                                 */
 /* ------------------------------------------------------------------ */
 
-.log-scope-row {
-  display: flex;
-  gap: 6px;
-}
-
-.log-scope-row button {
-  padding: 3px 10px;
-  font-size: var(--text-small);
-}
-
-.log-scope-row button.selected {
-  background: rgba(52, 199, 89, 0.2);
-  border-color: #34c759;
-  font-weight: 600;
-}
-
 .log-section {
   flex: 1;
   display: flex;
@@ -625,11 +698,6 @@ button.danger {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
-}
-
-.log-toolbar button {
-  padding: 2px 10px;
-  font-size: var(--text-small);
 }
 
 .log-view {
@@ -661,18 +729,18 @@ button.danger {
 .log-ts {
   flex-shrink: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.85em;
+  font-size: var(--text-micro);
   opacity: 0.55;
 }
 
 .log-level {
-  width: 44px;
+  width: 46px;
   flex-shrink: 0;
   font-weight: 600;
 }
 
 .log-node {
-  width: 110px;
+  width: 120px;
   flex-shrink: 0;
   opacity: 0.7;
   overflow: hidden;
@@ -680,7 +748,7 @@ button.danger {
 }
 
 .log-target {
-  width: 200px;
+  width: 210px;
   flex-shrink: 0;
   opacity: 0.55;
   overflow: hidden;
@@ -703,20 +771,10 @@ button.danger {
 /* Face toggle + deploy (operator) face                                 */
 /* ------------------------------------------------------------------ */
 
+/* Placement-only shells for SegmentedControl — the widget's sizing and
+   selected language live in .segmented, layouts live here. */
 .face-toggle {
   margin-left: auto;
-  display: inline-flex;
-  gap: 4px;
-}
-
-.face-toggle button {
-  min-width: auto;
-  padding: 2px 12px;
-}
-
-.face-toggle button.selected {
-  background: var(--accent, #0a84ff);
-  color: #fff;
 }
 
 .deploy-face {
@@ -733,21 +791,6 @@ button.danger {
   gap: 10px;
 }
 
-.deploy-nav-toggle {
-  display: inline-flex;
-  gap: 4px;
-}
-
-.deploy-nav-toggle button {
-  min-width: auto;
-  padding: 2px 12px;
-}
-
-.deploy-nav-toggle button.selected {
-  background: var(--accent, #0a84ff);
-  color: #fff;
-}
-
 /* ------------------------------------------------------------------ */
 /* Manifest form editor (one document, Form/TOML views)                 */
 
@@ -756,23 +799,9 @@ button.danger {
   flex-wrap: wrap;
 }
 
-.manifest-views {
-  display: inline-flex;
-  gap: 4px;
-}
-
-.manifest-views button {
-  min-width: auto;
-  padding: 2px 12px;
-}
-
-.manifest-views button.selected {
-  background: var(--accent, #0a84ff);
-  color: #fff;
-}
-
 .valid-chip {
   font-size: var(--text-small);
+  min-height: var(--control-h-sm);
   padding: 2px 10px;
   border-radius: 10px;
   border: 1px solid rgba(127, 127, 127, 0.4);
@@ -823,7 +852,7 @@ button.danger {
 
 .kind-badge.role-mesh,
 .kind-badge.role-expose {
-  border-color: var(--accent, #0a84ff);
+  border-color: var(--accent);
 }
 
 .kind-badge.role-mixed,
@@ -850,9 +879,12 @@ button.danger {
 }
 
 .ws-chip button {
-  padding: 0 4px;
+  min-height: 22px;
+  padding: 0 6px;
   border: none;
   background: none;
+  font-size: var(--text-base);
+  line-height: 1;
   opacity: 0.7;
 }
 
@@ -919,8 +951,6 @@ button.danger {
 
 .output-strip-toggle {
   align-self: flex-start;
-  font-size: var(--text-small);
-  padding: 2px 8px;
 }
 
 .deploy-output {
@@ -972,7 +1002,7 @@ button.danger {
 }
 
 button.link {
-  padding: 2px 6px;
+  padding: 3px 8px;
   border: none;
   background: none;
   font-size: var(--text-small);
@@ -987,21 +1017,6 @@ button.link {
 
 /* ------------------------------------------------------------------ */
 /* Issue wizard (IssuePackDialog)                                       */
-
-.issue-kinds {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.issue-kinds button {
-  flex: 0 1 auto;
-}
-
-.issue-kinds button.selected {
-  border-color: var(--accent, #4a9eff);
-  font-weight: 600;
-}
 
 .rule-editor {
   display: flex;
@@ -1025,6 +1040,7 @@ button.link {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
   min-width: 0;
 }
 
@@ -1038,7 +1054,6 @@ button.link {
 
 .rule-row .rule-remove {
   flex-shrink: 0;
-  padding: 2px 8px;
 }
 
 .issue-preview {

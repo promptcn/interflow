@@ -134,6 +134,9 @@ pub struct PackInfo {
     pub mesh: Option<NodeMeshConfig>,
     /// Listen address (hub/ingress).
     pub listen: Option<String>,
+    /// Dial transport the pack declares as its signed default (expose
+    /// agents; `None` = the h2 default).
+    pub transport: Option<String>,
     /// Leaf-credential health (earliest active expiry, phased). `None`
     /// when the pack has no active credential set yet.
     pub credential: Option<CredentialHealth>,
@@ -242,6 +245,7 @@ pub fn inspect_pack(pack_dir: &Path) -> Result<PackInfo, String> {
             .collect(),
         mesh,
         listen: pack.node_config.listen.clone(),
+        transport: pack.node_config.transport.clone(),
         credential: pack_credential_health(&pack),
     })
 }
@@ -278,6 +282,11 @@ pub struct NodeSpec {
     /// Public/control listener the pack declares (hub/ingress). Display
     /// cache, same lifecycle as `pack_services`.
     pub pack_listen: Option<String>,
+    /// Dial transport the pack declares as its signed manifest default
+    /// (expose agents; `None` = h2). Display cache in the same spirit:
+    /// `prepare` re-reads the pack, so the effective transport always
+    /// comes from the pack, never this cache.
+    pub pack_transport: Option<String>,
     /// Expose nodes only: per-service dial-address preferences (id →
     /// effective address), overriding the pack defaults. Empty = defaults.
     pub service_addresses: std::collections::BTreeMap<String, String>,
@@ -397,11 +406,19 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
                         .into(),
                 );
             }
+            // Effective transport = local preference over the pack's signed
+            // manifest default (h2 floor); headless parity comes from the
+            // same resolver `agent run --pack` uses.
+            let transport = interflow_cli::runtime::resolve_effective_transport(
+                spec.transport,
+                pack.node_config.transport.as_deref(),
+            )
+            .map_err(|e| format!("cannot start from this Credential Pack: {e}"))?;
             let mut args = interflow_cli::runtime::build_agent_args(
                 &pack,
                 &active,
                 &dir,
-                spec.transport.unwrap_or_default(),
+                transport,
                 spec.hub_quic_addr.clone().filter(|s| !s.trim().is_empty()),
                 &spec.service_addresses,
             )
@@ -425,12 +442,15 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
             }
             let mut config = interflow_mesh::pack::build_agent_config(&pack, &active, &dir)
                 .map_err(|e| format!("cannot start from this Credential Pack: {e}"))?;
-            // The pack path pins h2 defaults; the node preference (the same
-            // h2/QUIC choice expose agents expose) overrides the two plain
-            // fields.
-            if let Some(transport) = spec.transport {
-                config.agent.transport = transport;
-            }
+            // Same resolution as expose agents: local preference over the
+            // pack's signed default (the manifest never pins a transport on
+            // mesh-role packs, so the pack default is h2 here — the fold
+            // keeps one rule for both agent faces).
+            config.agent.transport = interflow_cli::runtime::resolve_effective_transport(
+                spec.transport,
+                pack.node_config.transport.as_deref(),
+            )
+            .map_err(|e| format!("cannot start from this Credential Pack: {e}"))?;
             let quic_addr = spec
                 .hub_quic_addr
                 .clone()
@@ -1939,7 +1959,7 @@ struct SpecWithIntent {
 
 fn spec_from_profile(persisted: crate::profile::NodeEntry) -> SpecWithIntent {
     let pack_dir = PathBuf::from(&persisted.pack_dir);
-    let (kind, name, principal, pack_services, pack_mesh, pack_listen, generation) =
+    let (kind, name, principal, pack_services, pack_mesh, pack_listen, pack_transport, generation) =
         match CredentialPack::load_runtime(&pack_dir) {
             Ok(pack) => {
                 let principal = Some(pack_principal(&pack));
@@ -1954,6 +1974,7 @@ fn spec_from_profile(persisted: crate::profile::NodeEntry) -> SpecWithIntent {
                     .collect();
                 let mesh = pack.node_config.mesh.clone();
                 let listen = pack.node_config.listen.clone();
+                let transport = pack.node_config.transport.clone();
                 (
                     NodeKind::classify(&pack),
                     pack.metadata.node,
@@ -1961,6 +1982,7 @@ fn spec_from_profile(persisted: crate::profile::NodeEntry) -> SpecWithIntent {
                     services,
                     mesh,
                     listen,
+                    transport,
                     pack.metadata.generation,
                 )
             }
@@ -1975,6 +1997,7 @@ fn spec_from_profile(persisted: crate::profile::NodeEntry) -> SpecWithIntent {
                 ),
                 None,
                 Vec::new(),
+                None,
                 None,
                 None,
                 0,
@@ -1998,6 +2021,7 @@ fn spec_from_profile(persisted: crate::profile::NodeEntry) -> SpecWithIntent {
             pack_services,
             pack_mesh,
             pack_listen,
+            pack_transport,
             service_addresses,
         },
         desired_running: persisted.desired_running,
@@ -2266,6 +2290,7 @@ target_addr = "127.0.0.1:{echo_port}"
                     pack_services: info.services,
                     pack_mesh: info.mesh,
                     pack_listen: info.listen,
+                    pack_transport: info.transport,
                     service_addresses: Default::default(),
                 })
                 .expect("add node")
@@ -2877,6 +2902,7 @@ target_addr = "127.0.0.1:{echo_port}"
                 pack_services: info.services,
                 pack_mesh: info.mesh,
                 pack_listen: info.listen,
+                pack_transport: info.transport,
                 service_addresses: Default::default(),
             })
             .expect_err("duplicate must be rejected");
@@ -2915,6 +2941,7 @@ target_addr = "127.0.0.1:{echo_port}"
                 pack_services: info.services.clone(),
                 pack_mesh: info.mesh.clone(),
                 pack_listen: info.listen.clone(),
+                pack_transport: info.transport.clone(),
                 service_addresses: Default::default(),
             })
             .expect_err("same identity must be rejected");
@@ -2938,6 +2965,7 @@ target_addr = "127.0.0.1:{echo_port}"
                 pack_services: info.services,
                 pack_mesh: info.mesh,
                 pack_listen: info.listen,
+                pack_transport: info.transport,
                 service_addresses: Default::default(),
             })
             .expect("a different identity sharing the node name must pass");
@@ -3126,6 +3154,7 @@ service = "default/desktop/web"
                     pack_services: info.services,
                     pack_mesh: info.mesh,
                     pack_listen: info.listen,
+                    pack_transport: info.transport,
                     service_addresses: Default::default(),
                 })
                 .expect("add node")

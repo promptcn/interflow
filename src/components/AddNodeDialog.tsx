@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api, formatRemainingSecs, kindBlurb, leafPhaseClass, type AddNodeParams, type PackInspection, type Transport } from "../api";
-import { KindBadge } from "./ui";
+import { KindBadge, SegmentedControl } from "./ui";
 
 /// The add-a-node flow: pick a pack directory (or import a sealed
 /// `.iflowpack`), inspect it through the same funnel the start path uses,
@@ -202,20 +202,14 @@ export default function AddNodeDialog({
               <div className="prefs">
                 <div className="row">
                   <label>Transport</label>
-                  <div className="transport-toggle">
-                    <button
-                      className={transport === "h2" ? "selected" : ""}
-                      onClick={() => setTransport("h2")}
-                    >
-                      h2
-                    </button>
-                    <button
-                      className={transport === "quic" ? "selected" : ""}
-                      onClick={() => setTransport("quic")}
-                    >
-                      QUIC
-                    </button>
-                  </div>
+                  <SegmentedControl
+                    value={transport}
+                    options={[
+                      { value: "h2", label: "h2" },
+                      { value: "quic", label: "QUIC" },
+                    ]}
+                    onChange={setTransport}
+                  />
                 </div>
                 {transport === "quic" && (
                   <div className="row">

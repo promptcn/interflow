@@ -79,20 +79,24 @@ export default function NodeCard({
           </div>
         ))}
       </div>
+      {(node.desired_running || node.generation > 0 || node.credential) && (
+        <div className="node-card-tags">
+          {node.desired_running && <span className="node-card-tag">auto-start</span>}
+          {node.generation > 0 && <span className="node-card-tag">gen {node.generation}</span>}
+          {node.credential && (
+            <span
+              className={`node-card-tag ${leafPhaseClass(node.credential)}`}
+              title={`Credentials expire ${node.credential.not_after}`}
+            >
+              leaf {formatRemainingSecs(node.credential.remaining_secs)}
+            </span>
+          )}
+        </div>
+      )}
       <div className="node-card-foot">
         <span className="node-card-state" title={stateText(node.state)}>
           {shortState(node)}
         </span>
-        {node.desired_running && <span className="node-card-tag">auto-start</span>}
-        {node.generation > 0 && <span className="node-card-tag">gen {node.generation}</span>}
-        {node.credential && (
-          <span
-            className={`node-card-tag ${leafPhaseClass(node.credential)}`}
-            title={`Credentials expire ${node.credential.not_after}`}
-          >
-            leaf {formatRemainingSecs(node.credential.remaining_secs)}
-          </span>
-        )}
         <button
           className={running ? "" : "primary"}
           disabled={node.state === "Starting" || node.state === "Stopping"}

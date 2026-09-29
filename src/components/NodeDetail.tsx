@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, formatRemainingSecs, isRunning, leafPhaseClass, stateText, type LogLine, type NodeInfo, type Transport } from "../api";
 import LogView from "./LogView";
-import { KindBadge, SectionPanel, StateDot } from "./ui";
+import { KindBadge, SectionPanel, SegmentedControl, StateDot } from "./ui";
 
 interface Props {
   node: NodeInfo;
@@ -56,7 +56,12 @@ export default function NodeDetail({
   const reconnecting =
     typeof node.state === "object" && node.state !== null && "Reconnecting" in node.state;
 
-  const [transport, setTransport] = useState<Transport>(node.transport ?? "h2");
+  // The toggle shows the *effective* transport: local preference, else the
+  // pack's signed manifest default, else h2. Saving always writes the local
+  // preference (untouched = inherited).
+  const [transport, setTransport] = useState<Transport>(
+    node.transport ?? node.pack_transport ?? "h2",
+  );
   const [hubQuicAddr, setHubQuicAddr] = useState(node.hub_quic_addr ?? "");
   // Per-service address inputs: "" = no preference (pack default runs).
   const [addresses, setAddresses] = useState<Record<string, string>>({});
@@ -69,7 +74,7 @@ export default function NodeDetail({
 
   // Reset the form when switching nodes (the page is one component).
   useEffect(() => {
-    setTransport(node.transport ?? "h2");
+    setTransport(node.transport ?? node.pack_transport ?? "h2");
     setHubQuicAddr(node.hub_quic_addr ?? "");
     setAddresses(
       Object.fromEntries(
@@ -79,7 +84,7 @@ export default function NodeDetail({
       ),
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [node.id, node.transport, node.hub_quic_addr, node.services]);
+  }, [node.id, node.transport, node.pack_transport, node.hub_quic_addr, node.services]);
 
   const addressError = (id: string): string | null => {
     const value = (addresses[id] ?? "").trim();
@@ -96,7 +101,7 @@ export default function NodeDetail({
 
   const dirty =
     isAgent &&
-    (transport !== (node.transport ?? "h2") ||
+    (transport !== (node.transport ?? node.pack_transport ?? "h2") ||
       hubQuicAddr.trim() !== (node.hub_quic_addr ?? "") ||
       addressesDirty);
 
@@ -152,7 +157,7 @@ export default function NodeDetail({
   return (
     <div className="detail-page">
       <div className="detail-topbar">
-        <button className="back" onClick={onBack} title="Esc">
+        <button onClick={onBack} title="Esc">
           ← All nodes
         </button>
         <StateDot state={node.state} size={12} />
@@ -225,7 +230,7 @@ export default function NodeDetail({
           <SectionPanel title="Mesh rules">
             {node.mesh_ingress_rules.length > 0 && (
               <div className="mesh-rule-group">
-                <div className="mesh-rule-group-title hint">Ingress</div>
+                <div className="mesh-rule-group-title">Ingress</div>
                 {node.mesh_ingress_rules.map((rule) => (
                   <div className="mesh-rule" key={rule.name}>
                     <span className="mono">{rule.listen}</span>
@@ -241,7 +246,7 @@ export default function NodeDetail({
             )}
             {node.mesh_egress_rules.length > 0 && (
               <div className="mesh-rule-group">
-                <div className="mesh-rule-group-title hint">Egress</div>
+                <div className="mesh-rule-group-title">Egress</div>
                 {node.mesh_egress_rules.map((rule) => (
                   <div className="mesh-rule" key={rule.name}>
                     <span className="mesh-rule-proto">{rule.protocol}</span>
@@ -263,22 +268,18 @@ export default function NodeDetail({
           >
             <div className="row">
               <label>Transport</label>
-              <div className="transport-toggle">
-                <button
-                  className={transport === "h2" ? "selected" : ""}
-                  disabled={running}
-                  onClick={() => setTransport("h2")}
-                >
-                  h2
-                </button>
-                <button
-                  className={transport === "quic" ? "selected" : ""}
-                  disabled={running}
-                  onClick={() => setTransport("quic")}
-                >
-                  QUIC
-                </button>
-              </div>
+              {node.transport == null && node.pack_transport === "quic" && (
+                <span className="hint">QUIC inherited from the pack default</span>
+              )}
+              <SegmentedControl
+                value={transport}
+                options={[
+                  { value: "h2", label: "h2" },
+                  { value: "quic", label: "QUIC" },
+                ]}
+                onChange={setTransport}
+                disabled={running}
+              />
             </div>
             {transport === "quic" && (
               <div className="row">
@@ -358,20 +359,14 @@ export default function NodeDetail({
           title="Logs"
           grow
           actions={
-            <span className="log-scope-row">
-              <button
-                className={logScope === "node" ? "selected" : ""}
-                onClick={() => onLogScopeChange("node")}
-              >
-                This node
-              </button>
-              <button
-                className={logScope === "machine" ? "selected" : ""}
-                onClick={() => onLogScopeChange("machine")}
-              >
-                This machine
-              </button>
-            </span>
+            <SegmentedControl
+              value={logScope}
+              options={[
+                { value: "node", label: "This node" },
+                { value: "machine", label: "This machine" },
+              ]}
+              onChange={onLogScopeChange}
+            />
           }
         >
           <LogView logs={logs} showNodeColumn={logScope === "machine"} onClear={onClearLogs} />

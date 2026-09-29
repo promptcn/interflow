@@ -209,6 +209,56 @@ fn role_bound_packs_refuse_wrong_runtime() {
     );
 }
 
+/// `plan validate` is where the QUIC fail-fasts land: a loopback QUIC face
+/// could never be dialed (its UDP port bypasses the front proxy), and a
+/// `quic` agent default has no derivable dial address under an
+/// implicit-port control endpoint.
+#[test]
+fn plan_validate_rejects_broken_quic_config() {
+    // Loopback QUIC face on the ingress.
+    let loopback_face = manifest().replacen(
+        "control_listen = \"127.0.0.1:26666\"",
+        "control_listen = \"127.0.0.1:26666\"\nquic_listen = \"127.0.0.1:36666\"",
+        1,
+    );
+    // quic agent default + implicit-port control endpoint (the fixture
+    // dials 127.0.0.1:26666 — swap to a portless endpoint first).
+    let implicit_port = manifest()
+        .replacen(
+            "control_endpoint = \"127.0.0.1:26666\"",
+            "control_endpoint = \"tunnel.example.com\"",
+            1,
+        )
+        .replacen(
+            "[agent.desktop]\nworkspace = \"default\"",
+            "[agent.desktop]\nworkspace = \"default\"\ntransport = \"quic\"",
+            1,
+        );
+    for (text, expected) in [
+        (loopback_face, "loopback"),
+        (implicit_port, "explicit port"),
+    ] {
+        let dir = tempfile_dir();
+        let manifest_path = dir.join("interflow.toml");
+        std::fs::write(&manifest_path, text).unwrap();
+        let output = Command::new(bin())
+            .args([
+                "plan",
+                "validate",
+                "--manifest",
+                &manifest_path.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "mutation must be rejected");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected),
+            "expected {expected:?} in refusal, got: {stderr}"
+        );
+    }
+}
+
 fn manifest_path_str(p: &Path) -> String {
     p.display().to_string()
 }

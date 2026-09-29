@@ -84,25 +84,24 @@ export default function PackOverview({
             </div>
             <div className="node-card-foot">
               {pack.local_node ? (
-                updateAvailable(pack) ? (
-                  <button
-                    className="primary"
-                    disabled={busy}
-                    title="stop, swap the pack in place (state kept), restart"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onUpdateLocal(pack);
-                    }}
-                  >
-                    Update {pack.local_node.name} → gen {pack.generation}
-                  </button>
-                ) : (
-                  <span className="hint">
-                    {pack.local_node.name} · gen {pack.local_node.generation}
-                  </span>
-                )
+                <span className="node-card-state" title={pack.local_node.name}>
+                  {pack.local_node.name} · gen {pack.local_node.generation}
+                </span>
               ) : (
-                <span className="hint">not on this machine</span>
+                <span className="node-card-state">not on this machine</span>
+              )}
+              {pack.local_node && updateAvailable(pack) && (
+                <button
+                  className="primary"
+                  disabled={busy}
+                  title="stop, swap the pack in place (state kept), restart"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onUpdateLocal(pack);
+                  }}
+                >
+                  Update → gen {pack.generation}
+                </button>
               )}
             </div>
           </div>

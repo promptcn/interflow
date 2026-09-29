@@ -98,6 +98,7 @@ pub async fn add_node(
         pack_services: info.services,
         pack_mesh: info.mesh,
         pack_listen: info.listen,
+        pack_transport: info.transport,
         // Fresh node: every service starts on its pack default.
         service_addresses: Default::default(),
     };

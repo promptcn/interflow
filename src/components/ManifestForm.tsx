@@ -310,7 +310,7 @@ function HubSection({
       hint="the public relay site-to-site agents dial (v1: one per realm)"
       actions={
         hubs.length === 0 ? (
-          <button disabled={busy} onClick={() => setDialog({ hub: null })}>
+          <button className="sm" disabled={busy} onClick={() => setDialog({ hub: null })}>
             + hub
           </button>
         ) : undefined
@@ -411,7 +411,7 @@ function WorkspaceSection({
           spellCheck={false}
           autoComplete="off"
         />
-        <button
+        <button className="sm"
           disabled={busy || name.trim() === ""}
           onClick={() =>
             void onEdit({ UpsertWorkspace: name.trim() }).then((ok) => {
@@ -478,6 +478,24 @@ function AgentsSection({
                 </option>
               ))}
             </select>
+            {agent.role === "expose" && (
+              <select
+                value={agent.transport ?? "h2"}
+                disabled={busy}
+                title="dial transport the pack pins as this agent's signed default (QUIC needs the ingress quic_listen face)"
+                onChange={(e) =>
+                  void onEdit({
+                    SetAgentTransport: {
+                      agent: agent.node,
+                      transport: e.target.value === "quic" ? "quic" : null,
+                    },
+                  })
+                }
+              >
+                <option value="h2">h2</option>
+                <option value="quic">quic</option>
+              </select>
+            )}
             <span style={{ flex: 1 }} />
             <button className="danger" disabled={busy} onClick={() => setRemoving(agent.node)}>
               Remove
@@ -488,7 +506,7 @@ function AgentsSection({
             <div className="rule-editor">
               <div className="rule-editor-head">
                 <span>Services — expose to public routes</span>
-                <button
+                <button className="sm"
                   disabled={busy}
                   onClick={() => setServiceDialog({ agent: agent.node, service: null })}
                 >
@@ -504,7 +522,7 @@ function AgentsSection({
                     Edit
                   </button>
                   <button
-                    className="rule-remove"
+                    className="rule-remove sm"
                     disabled={busy}
                     onClick={() => void onEdit({ RemoveService: { agent: agent.node, id: s.id } })}
                   >
@@ -520,7 +538,7 @@ function AgentsSection({
               <div className="rule-editor">
                 <div className="rule-editor-head">
                   <span>Mesh ingress — forward a local listener to a peer</span>
-                  <button
+                  <button className="sm"
                     disabled={busy}
                     onClick={() => setIngressDialog({ agent: agent.node, rule: null })}
                   >
@@ -543,7 +561,7 @@ function AgentsSection({
                       Edit
                     </button>
                     <button
-                      className="rule-remove"
+                      className="rule-remove sm"
                       disabled={busy}
                       onClick={() =>
                         void onEdit({ RemoveMeshIngress: { agent: agent.node, name: r.name } })
@@ -557,7 +575,7 @@ function AgentsSection({
               <div className="rule-editor">
                 <div className="rule-editor-head">
                   <span>Mesh egress — what this agent dials for peers</span>
-                  <button
+                  <button className="sm"
                     disabled={busy}
                     onClick={() => setEgressDialog({ agent: agent.node, rule: null })}
                   >
@@ -580,7 +598,7 @@ function AgentsSection({
                       Edit
                     </button>
                     <button
-                      className="rule-remove"
+                      className="rule-remove sm"
                       disabled={busy}
                       onClick={() =>
                         void onEdit({ RemoveMeshEgress: { agent: agent.node, name: r.name } })
@@ -717,7 +735,7 @@ function IngressSection({
       title="Ingress nodes"
       hint="public entry points for expose routes"
       actions={
-        <button disabled={busy} onClick={() => setDialog({ node: null })}>
+        <button className="sm" disabled={busy} onClick={() => setDialog({ node: null })}>
           + ingress
         </button>
       }
@@ -733,6 +751,7 @@ function IngressSection({
           <span className="mono">{node.workspaces.join(", ")}</span>
           <span className="hint">
             {node.listen}
+            {node.quic_listen != null ? ` · quic ${node.quic_listen}` : ""}
             {node.edge_rate_per_ip_per_minute != null
               ? ` · ${node.edge_rate_per_ip_per_minute}/min per IP`
               : ""}
@@ -761,6 +780,7 @@ function IngressSection({
                 workspaces: edit.workspaces,
                 listen: edit.listen === "" ? null : edit.listen,
                 control_listen: edit.control_listen === "" ? null : edit.control_listen,
+                quic_listen: edit.quic_listen === "" ? null : edit.quic_listen,
                 edge_rate_per_ip_per_minute: edit.edge_rate,
               },
             });
@@ -801,7 +821,7 @@ function RoutesSection({
       title="Routes"
       hint="public hostname → service identity (workspace/agent/service)"
       actions={
-        <button disabled={busy} onClick={() => setDialog({ route: null })}>
+        <button className="sm" disabled={busy} onClick={() => setDialog({ route: null })}>
           + route
         </button>
       }
@@ -816,7 +836,7 @@ function RoutesSection({
             Edit
           </button>
           <button
-            className="rule-remove"
+            className="rule-remove sm"
             disabled={busy}
             onClick={() => void onEdit({ RemoveRoute: { host: route.host } })}
           >

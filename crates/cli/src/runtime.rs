@@ -62,6 +62,58 @@ pub fn resolve_control_proxy_protocol(public_tls: &str) -> ProxyProtocolConfig {
     }
 }
 
+/// Resolves the control endpoint's QUIC (UDP) listen address for an
+/// ingress pack: `None` keeps the QUIC transport off, a concrete address
+/// opens the QUIC face beside the control TCP listener.
+///
+/// The manifest already validation-checked the value (public, concrete
+/// port — `Manifest::validate`); node.toml rides the pack's SHA256SUMS
+/// digest, so it cannot drift from what was validated. This resolver
+/// only does the String→SocketAddr parse, failing before any listener
+/// bind exactly like the `listen`/`control_listen` parses beside it.
+/// The `Some(:0)` derived-ephemeral state stays testkit-only: a manifest
+/// cannot express it (`validate` rejects port 0), so it never reaches
+/// this leg through a pack.
+pub fn resolve_quic_listen(raw: Option<&str>) -> Result<Option<SocketAddr>> {
+    match raw {
+        None => Ok(None),
+        Some(raw) => raw.parse().map(Some).map_err(|e| {
+            InterflowError::config(format!(
+                "control endpoint QUIC listen address {raw:?} is invalid"
+            ))
+            .with_source(e)
+        }),
+    }
+}
+
+/// Resolves the dial transport an expose agent runs with: the
+/// machine-local preference wins, the pack's signed manifest default is
+/// the fallback, h2 is the floor.
+///
+/// Single resolution point for every caller — the headless
+/// `agent run --pack` path (no profile: local is `None`, the pack default
+/// *is* the config) and the GUI (profile preference over the pack
+/// default), mirroring how service dial targets resolve (pack default +
+/// machine-local override). An unexpected pack string fails loud instead
+/// of silently degrading to h2 — node.toml is digest-covered, so this is
+/// a version-skew tripwire, not a user-facing path.
+pub fn resolve_effective_transport(
+    local: Option<interflow_mesh::config::TransportKind>,
+    pack_default: Option<&str>,
+) -> Result<interflow_mesh::config::TransportKind> {
+    use interflow_mesh::config::TransportKind;
+    if let Some(local) = local {
+        return Ok(local);
+    }
+    match pack_default {
+        None | Some("h2") => Ok(TransportKind::default()),
+        Some("quic") => Ok(TransportKind::Quic),
+        Some(other) => Err(InterflowError::config(format!(
+            "pack dial transport {other:?} is not recognized (expected \"h2\" or \"quic\")"
+        ))),
+    }
+}
+
 /// Pack load/validation failures are configuration-class (unrecoverable at
 /// boot); keep the identity error as the source-chain root.
 pub fn pack_error(e: interflow_identity::Error) -> InterflowError {
@@ -104,10 +156,12 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
         &pack,
         &ActiveCredentialSet::load_or_bootstrap(&pack).map_err(pack_error)?,
         pack_dir,
-        interflow_mesh::config::TransportKind::default(),
+        // Headless run: no profile, so no machine-local preferences — the
+        // pack's manifest-issued defaults are the whole config (every
+        // service dials its pack default; the dial transport is the pack's
+        // `transport`, h2 when the manifest leaves it unset).
+        resolve_effective_transport(None, pack.node_config.transport.as_deref())?,
         None,
-        // Headless run: no profile, so no machine-local preferences — every
-        // service dials its pack default.
         &std::collections::BTreeMap::new(),
     )?;
     let mut handle = interflow_expose::client::start(&args)?;
@@ -251,6 +305,7 @@ pub fn build_edge_config(
             ))
             .with_source(e)
         })?;
+    let quic_listen = resolve_quic_listen(pack.node_config.quic_listen.as_deref())?;
 
     // Public-HTTPS termination: `acme` terminates TLS on the ingress itself
     // (HTTP-01 + TLS-ALPN-01 + renewal, state under the pack directory);
@@ -294,7 +349,7 @@ pub fn build_edge_config(
         workspace_trust,
         principals,
         routes,
-        quic_listen: None,
+        quic_listen,
         audit_path: Some(pack_dir.join("audit.jsonl")),
         listener: EdgeListenerPolicy {
             x_forwarded_for: if fronted {
@@ -433,8 +488,8 @@ pub fn normalize_endpoint(endpoint: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        NodeEdgeConfig, resolve_control_proxy_protocol, resolve_local_services,
-        resolve_new_conn_rate,
+        NodeEdgeConfig, resolve_control_proxy_protocol, resolve_effective_transport,
+        resolve_local_services, resolve_new_conn_rate, resolve_quic_listen,
     };
     use interflow_core::security::ProxyProtocolMode;
     use interflow_identity::pack::NodeService;
@@ -577,5 +632,55 @@ mod tests {
         }
         let direct = resolve_control_proxy_protocol("acme");
         assert_eq!(direct.mode, ProxyProtocolMode::Off);
+    }
+
+    /// `None` keeps the QUIC face off (the h2-only status quo); a concrete
+    /// address parses; garbage fails naming the field before any bind —
+    /// the same fail-fast the `listen`/`control_listen` parses give.
+    #[test]
+    fn quic_listen_resolves_none_concrete_or_fails() {
+        assert_eq!(super::resolve_quic_listen(None).unwrap(), None);
+        assert_eq!(
+            resolve_quic_listen(Some("0.0.0.0:16666")).unwrap(),
+            Some("0.0.0.0:16666".parse().unwrap())
+        );
+        let err = resolve_quic_listen(Some("udp://16666")).unwrap_err();
+        assert!(
+            err.to_string().contains("QUIC listen address"),
+            "wrong error: {err}"
+        );
+    }
+
+    /// Transport resolution: a machine-local preference beats the pack's
+    /// signed default, no preference inherits it, h2 is the floor, and an
+    /// unexpected pack string fails loud (digest-covered node.toml — a
+    /// version-skew tripwire, not a user-facing path).
+    #[test]
+    fn effective_transport_pref_over_pack_default_over_h2() {
+        use interflow_mesh::config::TransportKind;
+
+        assert_eq!(
+            resolve_effective_transport(Some(TransportKind::H2), Some("quic")).unwrap(),
+            TransportKind::H2,
+            "a machine-local preference beats the pack default"
+        );
+        assert_eq!(
+            resolve_effective_transport(None, Some("quic")).unwrap(),
+            TransportKind::Quic,
+            "no preference inherits the pack's signed default"
+        );
+        assert_eq!(
+            resolve_effective_transport(None, Some("h2")).unwrap(),
+            TransportKind::default()
+        );
+        assert_eq!(
+            resolve_effective_transport(None, None).unwrap(),
+            TransportKind::default()
+        );
+        let err = resolve_effective_transport(None, Some("quic3")).unwrap_err();
+        assert!(
+            err.to_string().contains("not recognized"),
+            "version-skew tripwire fails loud: {err}"
+        );
     }
 }

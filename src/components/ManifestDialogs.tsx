@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Modal } from "./ui";
+import { Modal, SegmentedControl } from "./ui";
 import type {
   HubDto,
   IngressNodeDto,
@@ -348,6 +348,7 @@ export function IngressNodeDialog({
     workspaces: string[];
     listen: string;
     control_listen: string;
+    quic_listen: string;
     edge_rate: number | null;
   }) => void;
   onClose: () => void;
@@ -360,6 +361,7 @@ export function IngressNodeDialog({
   const [controlListen, setControlListen] = useState(
     initial && initial.control_listen !== "127.0.0.1:16666" ? initial.control_listen : "",
   );
+  const [quicListen, setQuicListen] = useState(initial?.quic_listen ?? "");
   const [edgeRate, setEdgeRate] = useState(
     initial?.edge_rate_per_ip_per_minute != null
       ? String(initial.edge_rate_per_ip_per_minute)
@@ -380,6 +382,7 @@ export function IngressNodeDialog({
             .filter((w) => w !== ""),
           listen: listen.trim(),
           control_listen: controlListen.trim(),
+          quic_listen: quicListen.trim(),
           edge_rate:
             rateNum != null && Number.isFinite(rateNum) && rateNum > 0
               ? Math.floor(rateNum)
@@ -396,6 +399,10 @@ export function IngressNodeDialog({
         {field(listen, setListen, "blank = 0.0.0.0:443", "200px")}
         <label className="hint">control listen</label>
         {field(controlListen, setControlListen, "blank = 127.0.0.1:16666", "200px")}
+      </div>
+      <div className="rule-row">
+        <label className="hint">QUIC listen</label>
+        {field(quicListen, setQuicListen, "blank = QUIC off (e.g. 0.0.0.0:16666)", "260px")}
       </div>
       <div className="rule-row">
         <label className="hint">per-IP new-conn/min</label>
@@ -464,17 +471,11 @@ export function CreateNodeDialog({
         })
       }
     >
-      <div className="issue-kinds">
-        {kinds.map(([value, label]) => (
-          <button
-            key={value}
-            className={kind === value ? "selected" : ""}
-            onClick={() => setKind(value)}
-          >
-            {label}
-          </button>
-        ))}
-      </div>
+      <SegmentedControl
+        value={kind}
+        options={kinds.map(([value, label]) => ({ value, label }))}
+        onChange={setKind}
+      />
       <div className="rule-row">
         {field(node, setNode, "node name", "140px")}
         {(kind === "agent_mesh" || kind === "agent_expose") &&
@@ -488,7 +489,7 @@ export function CreateNodeDialog({
         <div className="rule-editor">
           <div className="rule-editor-head">
             <span>Services</span>
-            <button onClick={() => setServices([...services, { id: "", address: "" }])}>
+            <button className="sm" onClick={() => setServices([...services, { id: "", address: "" }])}>
               + service
             </button>
           </div>
@@ -506,7 +507,7 @@ export function CreateNodeDialog({
                 "127.0.0.1:8080",
               )}
               <button
-                className="rule-remove"
+                className="rule-remove sm"
                 onClick={() => setServices(services.filter((_, j) => j !== i))}
               >
                 ×
@@ -521,7 +522,7 @@ export function CreateNodeDialog({
           <div className="rule-editor">
             <div className="rule-editor-head">
               <span>Mesh ingress — forward a local listener to a peer</span>
-              <button
+              <button className="sm"
                 onClick={() =>
                   setMeshIngress([
                     ...meshIngress,
@@ -543,7 +544,7 @@ export function CreateNodeDialog({
                   {field(r.target_agent, (v) => patch({ target_agent: v }), "→ agent", "100px")}
                   {field(r.remote_addr, (v) => patch({ remote_addr: v }), "127.0.0.1:11434", "160px")}
                   <button
-                    className="rule-remove"
+                    className="rule-remove sm"
                     onClick={() => setMeshIngress(meshIngress.filter((_, j) => j !== i))}
                   >
                     ×
@@ -555,7 +556,7 @@ export function CreateNodeDialog({
           <div className="rule-editor">
             <div className="rule-editor-head">
               <span>Mesh egress — what this agent dials for peers</span>
-              <button
+              <button className="sm"
                 onClick={() =>
                   setMeshEgress([
                     ...meshEgress,
@@ -584,7 +585,7 @@ export function CreateNodeDialog({
                     "127.0.0.1:8080 or 127.0.0.0/8",
                   )}
                   <button
-                    className="rule-remove"
+                    className="rule-remove sm"
                     onClick={() => setMeshEgress(meshEgress.filter((_, j) => j !== i))}
                   >
                     ×
