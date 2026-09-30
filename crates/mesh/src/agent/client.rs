@@ -438,9 +438,22 @@ impl AgentClient {
         // Every transport yields a connection watcher; only h2 yields the
         // request sender for the control proxy (`None` on QUIC — the proxy
         // is a plain h2 pass-through).
+        //
+        // The stop arm watches the PARENT token, not the session token:
+        // session construction spawns the transport loops (poll/upload
+        // tasks) before establish_tunnel returns, so a critical task can
+        // already have panicked and cancelled the session token while this
+        // select is still racing the establish arm — that is an internal
+        // death (rebuild), not a user stop. Attribution happens after the
+        // arm commits: the end-select below sees the cancelled session
+        // token (with the critical-task exit report already queued) and
+        // classifies Ended. Watching session_token here instead mapped
+        // that death to Shutdown, and the supervisor exited without
+        // reconnecting (observed as a ~1%-of-runs flake in the
+        // self-heal panic e2e, load-sensitive: 2026-09-30).
         let (agent_id, tunnel, mut connection_handle, mut hub_client_for_control, negotiated) = tokio::select! {
             r = self.establish_tunnel(&tasks) => r?.into_parts(),
-            () = session_token.cancelled() => return Ok(SessionOutcome::Shutdown),
+            () = shutdown.cancelled() => return Ok(SessionOutcome::Shutdown),
         };
 
         // Fault injection: panic in run_session's own frame right after

@@ -37,7 +37,7 @@ use interflow_core::tunnel::AgentTunnel;
 use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
 use interflow_core::tunnel::{InnerStreamHello, TargetSelector};
 use interflow_mesh::agent::{AgentHandle, AgentState};
-use interflow_mesh::config::{HeartbeatConfig, HubSecurityConfig};
+use interflow_mesh::config::{AgentConfig, HeartbeatConfig, HubSecurityConfig};
 use interflow_testkit::fault::{self, FaultPlan};
 use interflow_testkit::{
     agent_config, agent_quic_config, echo_server, hub_config, hub_config_tuned, hub_quic_config,
@@ -229,7 +229,34 @@ async fn h2_stack_with_egress() -> (SocketAddr, u16, AgentHandle) {
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent_registered(egress_cfg).await;
+    settle_fault_surface(echo_addr, agent_config("settle-probe", hub_port, certs())).await;
     (echo_addr, hub_port, egress)
+}
+
+/// Proves the stack's egress agent is past every once-each transport fault
+/// point before the test arms its plan: `spawn_agent_registered` returns
+/// while the streaming rounds (upload / poll first establish) are still
+/// settling, and the fault hook is process-global — the plan raced those
+/// settling rounds ~1-3% of runs (the harness's own egress consumed the
+/// fault, the agent under test never died, "death/stall unobserved"). One
+/// data round trip through a throwaway probe agent proves both rounds
+/// established; the probe shuts down before the test's own agents spawn.
+/// The hand-written counterpart of this discipline already existed in
+/// `quic_accept_loop_panic_rebuilds_session` (front first, then arm).
+async fn settle_fault_surface(echo_addr: SocketAddr, probe_cfg: AgentConfig) {
+    let probe = spawn_agent(probe_cfg);
+    let payload = b"fault-surface-settled\n".repeat(4);
+    let got = round_trip_eventually(
+        &probe.tunnel(),
+        "egress",
+        echo_addr,
+        &payload,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("settle probe: one round trip through the stack's egress");
+    assert_eq!(got, payload);
+    let _ = probe.shutdown_graceful().await;
 }
 
 /// A tuned fast-heartbeat hub config (aging window ≈ 2s) for the
@@ -378,6 +405,9 @@ async fn upload_task_panic_rebuilds_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn poll_task_panic_rebuilds_session() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     fault::clear();
     let (echo_addr, hub_port, egress) = h2_stack_with_egress().await;
 
@@ -434,6 +464,7 @@ async fn wedged_upload_rebuilds_via_stall_watchdog() {
     let mut egress_cfg = agent_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent_registered(egress_cfg).await;
+    settle_fault_surface(echo_addr, agent_config("settle-probe", hub_port, certs())).await;
 
     let faults = fault::install(FaultPlan::new().stall_at(FaultPoint::H2UploadLoopStall));
     let front = spawn_agent(agent_config("front", hub_port, certs()));
@@ -560,6 +591,11 @@ async fn quic_control_read_panic_rebuilds_session() {
     let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
     egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
     let egress = spawn_agent_registered(egress_cfg).await;
+    settle_fault_surface(
+        echo_addr,
+        agent_quic_config("settle-probe", hub_port, certs()),
+    )
+    .await;
 
     let faults = fault::install(FaultPlan::new().panic_at(FaultPoint::QuicControlReadLoop));
     let front = spawn_agent(agent_quic_config("front", hub_port, certs()));
