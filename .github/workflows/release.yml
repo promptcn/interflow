@@ -46,6 +46,11 @@ jobs:
       - name: Release notes from the annotated tag
         id: notes
         run: |
+          # actions/checkout materializes the triggering tag as a lightweight
+          # ref on the peeled COMMIT, dropping the annotation — fetch the
+          # real tag object first, or %(contents) below returns the commit's
+          # message instead of the curated release notes.
+          git fetch --depth=1 --force origin "tag ${GITHUB_REF_NAME}"
           {
             echo 'body<<EOF'
             git tag -l --format='%(contents)' "$GITHUB_REF_NAME"
