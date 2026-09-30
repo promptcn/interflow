@@ -482,9 +482,14 @@ async fn b3_disabled_breaker_restores_old_behavior() {
         .await;
     }
     let cf_delta = counter_value(CLOSED_CONNECT_FAILED) - cf_before;
-    assert_eq!(
-        cf_delta, 4,
-        "disabled breaker: the dead target dials through the whole burst budget (got {cf_delta})"
+    // The opted-out invariant is that the whole burst budget goes to the
+    // dead target. The exact dial count is timing-dependent: refill
+    // (rate 2/s) admits extra dials while the storm drains the bucket on
+    // a slow runner (observed 5 on GitHub vs 4 locally), so assert the
+    // bound, not the count.
+    assert!(
+        cf_delta >= 4,
+        "disabled breaker: the dead target drains the whole burst budget (got {cf_delta})"
     );
     assert!(
         counter_value(OPEN_DROP_RATE) - rate_before >= 1,
