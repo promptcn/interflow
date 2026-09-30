@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=notify
 TimeoutStartSec=30s
-ExecStart=/usr/local/bin/interflow agent run --pack /srv/interflow/packs/agent-desktop
+ExecStart=/usr/local/bin/interflow-cli agent run --pack /srv/interflow/packs/agent-desktop
 Restart=always
 RestartSec=5
 User=interflow

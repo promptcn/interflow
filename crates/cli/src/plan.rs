@@ -1,5 +1,5 @@
 //! `setup`, `plan validate`, `plan apply`, `rotate`, `revoke` — shared by
-//! the `interflow` binary and the GUI's deploy page.
+//! the `interflow-cli` binary and the GUI's deploy page.
 //!
 //! Every operation returns its human-readable output lines instead of
 //! printing: the CLI prints them, the GUI streams them into the deploy pane.
@@ -361,7 +361,7 @@ pub fn setup_template(
     let service_ref = format!("default/{agent}/{service}");
     format!(
         r#"# Interflow deployment manifest — the single source of truth.
-# Edit, then run: interflow plan apply
+# Edit, then run: interflow-cli plan apply
 [realm]
 id = "{realm}"
 control_endpoint = "{control_endpoint}"
@@ -409,7 +409,7 @@ service = "{service_ref}"
 pub fn setup_mesh_template(realm: &str, hub_name: &str, hub_endpoint: &str) -> String {
     format!(
         r#"# Interflow site-to-site mesh manifest — the single source of truth.
-# Add agents (see below), then run: interflow plan apply
+# Add agents (see below), then run: interflow-cli plan apply
 [realm]
 id = "{realm}"
 
@@ -425,13 +425,16 @@ leaf_ttl = "90d"
 # resolves directly to this machine (not one hidden behind a proxy).
 [mesh.hub.{hub_name}]
 listen = "0.0.0.0:6666"
+# quic_listen = "0.0.0.0:6666"  # optional QUIC (UDP) face; same port number
+#                                # as listen, different stack. Agents opt in
+#                                # per node: transport = "quic" under [agent.*]
 endpoint = "{hub_endpoint}"
 
 [workspace.main]
 
 # The manifest needs at least one agent before `plan apply` — add yours:
-#   service side:  interflow node add agent/<name> --mesh-egress <rule>:127.0.0.1:8080
-#   connect side:  interflow node add agent/<name> --mesh-ingress <rule>:127.0.0.1:8080:127.0.0.1:8080@<peer>
+#   service side:  interflow-cli node add agent/<name> --mesh-egress <rule>:127.0.0.1:8080
+#   connect side:  interflow-cli node add agent/<name> --mesh-ingress <rule>:127.0.0.1:8080:127.0.0.1:8080@<peer>
 "#
     )
 }
@@ -694,11 +697,11 @@ pub fn apply(
         );
         outln!(
             lines,
-            "  3. per node:  sudo interflow node install --pack packs/<kind>-<node>   # pack + unit + enable"
+            "  3. per node:  sudo interflow-cli node install --pack packs/<kind>-<node>   # pack + unit + enable"
         );
         outln!(
             lines,
-            "  or encrypt:  interflow pack seal --pack packs/<kind>-<node> --generate-passphrase"
+            "  or encrypt:  interflow-cli pack seal --pack packs/<kind>-<node> --generate-passphrase"
         );
         if render::has_registrar(&manifest) {
             outln!(
@@ -719,7 +722,7 @@ pub fn apply(
         );
         outln!(
             lines,
-            "  then reload nginx and verify: interflow doctor ingress --pack <pack>"
+            "  then reload nginx and verify: interflow-cli doctor ingress --pack <pack>"
         );
     }
     if render::has_registrar(&manifest) {
@@ -859,12 +862,12 @@ pub fn rotate(
     );
     outln!(
         lines,
-        "    interflow identity inspect --pack {}",
+        "    interflow-cli identity inspect --pack {}",
         out_dir.display()
     );
     outln!(
         lines,
-        "    interflow doctor {} --pack {}",
+        "    interflow-cli doctor {} --pack {}",
         kind,
         out_dir.display()
     );
@@ -1002,7 +1005,7 @@ pub fn revoke(
     outln!(
         lines,
         "next: re-apply packs so every node picks up the updated trust \
-         (`interflow plan apply`), then verify with `interflow doctor`"
+         (`interflow-cli plan apply`), then verify with `interflow-cli doctor`"
     );
     Ok(lines)
 }

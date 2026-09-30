@@ -18,6 +18,7 @@ import type {
   NodeKindDto,
   NodePrefs,
   NodeStateDto,
+  Transport,
 } from "./bindings";
 
 export type {
@@ -148,6 +149,18 @@ export function stateText(state: NodeStateDto | null): string {
     if (state.Failed) return `Failed: ${state.Failed.error}`;
   }
   return "Unknown";
+}
+
+/// The transport an agent node actually dials with: local preference over
+/// the pack's signed default, h2 the floor — the same fold the backend's
+/// `resolve_effective_transport` applies at start. An agent picks its
+/// transport statically (nothing is negotiated on the wire), so once the
+/// state is Connected this value IS the hub-confirmed transport form.
+export function effectiveTransport(node: {
+  transport: Transport | null;
+  pack_transport: Transport | null;
+}): Transport {
+  return node.transport ?? node.pack_transport ?? "h2";
 }
 
 /// Remaining-lifetime text (mirrors identity::expiry::format_remaining —

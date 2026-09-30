@@ -21,18 +21,18 @@ path = "src/main.rs"
 fault-injection = ["interflow-core/fault-injection"]
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.6" }
-interflow-contract = { path = "../contract", version = "0.6" }
+interflow-core = { path = "../core", version = "0.7" }
+interflow-contract = { path = "../contract", version = "0.7" }
 # Shared endpoint/authority parsing (QUIC SNI, SSRF host extraction)
-interflow-util = { path = "../util", version = "0.6" }
+interflow-util = { path = "../util", version = "0.7" }
 # Shared rcgen issuance + name validation (single implementation behind the
 # identity issuer and the test kit; mesh config validation checks names)
-interflow-certs = { path = "../certs", version = "0.6" }
+interflow-certs = { path = "../certs", version = "0.7" }
 # Credential Pack bootstrap + renewal (product site-to-site path)
-interflow-identity = { path = "../identity", version = "0.6" }
-interflow-renewal = { path = "../renewal", version = "0.6" }
+interflow-identity = { path = "../identity", version = "0.7" }
+interflow-renewal = { path = "../renewal", version = "0.7" }
 # Compile-time build identity (`version` output + engine logs)
-interflow-buildinfo = { path = "../buildinfo", version = "0.6" }
+interflow-buildinfo = { path = "../buildinfo", version = "0.7" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -85,7 +85,7 @@ clap = { version = "4.6", features = ["derive"] }
 # Shared test/bench harness (dev-dependency cycle: testkit depends on mesh,
 # supported by cargo, same pattern as tokio/tokio-test; testkit stays out of the
 # production dependency graph)
-interflow-testkit = { path = "../testkit", version = "0.6", features = ["fault-injection"] }
+interflow-testkit = { path = "../testkit", version = "0.7", features = ["fault-injection"] }
 # paused-clock unit tests (egress send-path health)
 tokio = { workspace = true, features = ["test-util"] }
 # bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion

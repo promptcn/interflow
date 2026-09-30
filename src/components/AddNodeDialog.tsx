@@ -62,7 +62,7 @@ export default function AddNodeDialog({
     try {
       const imported = await api.deployInstallSealed(sealedPath.trim(), passphrase);
       setPackDir(imported.pack_dir);
-      setInspection(imported.inspection);
+      applyInspection(imported.inspection);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -75,7 +75,7 @@ export default function AddNodeDialog({
     setInspection(null);
     setBusy(true);
     try {
-      setInspection(await api.inspectPack(packDir.trim()));
+      applyInspection(await api.inspectPack(packDir.trim()));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -83,13 +83,27 @@ export default function AddNodeDialog({
     }
   };
 
+  /// Publish one inspection and start the transport control from the pack's
+  /// signed default. The control is not rendered before this point, so the
+  /// reset can never overwrite a user choice — it IS the initial value
+  /// ((internal design notes):
+  /// a hardcoded h2 start silently overrode packs signed `quic`).
+  const applyInspection = (result: PackInspection) => {
+    setInspection(result);
+    setTransport(result.transport ?? "h2");
+  };
+
   const add = async () => {
     setError(null);
     setBusy(true);
     try {
+      // Only a choice that DIFFERS from the pack's signed default becomes a
+      // persisted local preference; the default itself stores null so the
+      /// pack stays authoritative across future re-issues.
+      const packDefault = inspection?.transport ?? "h2";
       const params: AddNodeParams = {
         pack_dir: packDir.trim(),
-        transport: isAgent ? transport : null,
+        transport: isAgent && transport !== packDefault ? transport : null,
         hub_quic_addr: isAgent && transport === "quic" && hubQuicAddr.trim() !== "" ? hubQuicAddr.trim() : null,
       };
       const created = await api.addNode(params);
@@ -210,6 +224,12 @@ export default function AddNodeDialog({
                     ]}
                     onChange={setTransport}
                   />
+                  <span
+                    className="hint"
+                    title="Only a choice different from the pack's signed default is persisted as this machine's preference; the default follows the pack on every future re-issue"
+                  >
+                    {`pack default: ${inspection.transport ?? "h2"}`}
+                  </span>
                 </div>
                 {transport === "quic" && (
                   <div className="row">

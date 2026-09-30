@@ -115,10 +115,12 @@ pub struct NodeConfig {
     pub listen: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_listen: Option<String>,
-    /// Control endpoint's QUIC (UDP) listen address, rendered from the
-    /// manifest's `[ingress.<node>] quic_listen`. `None` keeps the QUIC
-    /// transport off; the address is already validation-checked (public,
-    /// concrete port) and parsed into `EdgeConfig.quic_listen` at boot.
+    /// The node's QUIC (UDP) listen address, rendered from the manifest's
+    /// `quic_listen` — the control endpoint's face on ingress packs
+    /// (`[ingress.<node>]`), the hub's face on hub packs
+    /// (`[mesh.hub.<name>]`). `None` keeps the QUIC transport off; the
+    /// address is already validation-checked (non-loopback, concrete
+    /// port) and parsed into the engine config at boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_listen: Option<String>,
     /// Single-public-port mode (ACME topologies): connections with this
@@ -972,6 +974,77 @@ target_addr = "127.0.0.1:3000"
 
         let agent_out2 = tmp.path().join("packs/agent-desktop-quic");
         AgentCredentialPack::render(&issuer, &tuned, "desktop", 1, &agent_out2).unwrap();
+        let agent_pack = CredentialPack::load(&agent_out2).unwrap();
+        assert_eq!(
+            agent_pack.node_config.transport.as_deref(),
+            Some("quic"),
+            "the signed transport default must survive the digest-verified load"
+        );
+    }
+
+    /// The mesh face rides the same manifest → node.toml leg as the expose
+    /// face: the hub's `quic_listen` and a mesh agent's dial `transport`
+    /// render nothing when absent (old packs byte-identical) and land
+    /// verbatim — surviving the digest-verified load — when set.
+    #[test]
+    fn mesh_quic_fields_render_into_node_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issuer = IssuerStore::open(tmp.path().join("issuer"));
+        issuer.ensure_realm().unwrap();
+        issuer.ensure_workspace("alpha").unwrap();
+        issuer.ensure_workspace("beta").unwrap();
+        issuer.ensure_policy_key().unwrap();
+
+        // Absent: neither field renders (the h2-only status quo,
+        // byte-identical node.toml).
+        let manifest = Manifest::parse(&mesh_manifest_text()).unwrap();
+        let hub_out = tmp.path().join("packs/hub-central");
+        HubCredentialPack::render(&issuer, &manifest, "central", 1, &hub_out).unwrap();
+        let node_toml = std::fs::read_to_string(hub_out.join("node.toml")).unwrap();
+        assert!(
+            !node_toml.contains("quic_listen"),
+            "absent hub quic_listen must not render: {node_toml}"
+        );
+        let agent_out = tmp.path().join("packs/agent-lan-a");
+        AgentCredentialPack::render(&issuer, &manifest, "lan-a", 1, &agent_out).unwrap();
+        let agent_toml = std::fs::read_to_string(agent_out.join("node.toml")).unwrap();
+        assert!(
+            !agent_toml.contains("transport"),
+            "absent transport must not render: {agent_toml}"
+        );
+
+        // Explicit: the hub endpoint carries an explicit port, so the quic
+        // cross-check is satisfiable.
+        let tuned = Manifest::parse(
+            &mesh_manifest_text()
+                .replacen(
+                    "[mesh.hub.central]\nlisten",
+                    "[mesh.hub.central]\nquic_listen = \"0.0.0.0:6666\"\nlisten",
+                    1,
+                )
+                .replacen(
+                    "[agent.lan-a]\nworkspace = \"alpha\"",
+                    "[agent.lan-a]\nworkspace = \"alpha\"\ntransport = \"quic\"",
+                    1,
+                ),
+        )
+        .unwrap();
+        let hub_out2 = tmp.path().join("packs/hub-central-quic");
+        HubCredentialPack::render(&issuer, &tuned, "central", 1, &hub_out2).unwrap();
+        let pack = CredentialPack::load(&hub_out2).unwrap();
+        assert_eq!(
+            pack.node_config.quic_listen.as_deref(),
+            Some("0.0.0.0:6666"),
+            "hub quic_listen must survive the digest-verified load"
+        );
+        let node_toml2 = std::fs::read_to_string(hub_out2.join("node.toml")).unwrap();
+        assert!(
+            node_toml2.contains("quic_listen = \"0.0.0.0:6666\""),
+            "hub quic_listen renders as readable TOML: {node_toml2}"
+        );
+
+        let agent_out2 = tmp.path().join("packs/agent-lan-a-quic");
+        AgentCredentialPack::render(&issuer, &tuned, "lan-a", 1, &agent_out2).unwrap();
         let agent_pack = CredentialPack::load(&agent_out2).unwrap();
         assert_eq!(
             agent_pack.node_config.transport.as_deref(),

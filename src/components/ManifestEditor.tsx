@@ -278,7 +278,7 @@ export default function ManifestEditor({
   );
 }
 
-/// The starter-template builder — the GUI twin of `interflow setup`. Two
+/// The starter-template builder — the GUI twin of `interflow-cli setup`. Two
 /// skeletons: the expose deployment (registrar tier, public routes) and
 /// the site-to-site mesh (offline tier, one hub, no placeholder agents).
 function TemplateBuilder({ onTemplate }: { onTemplate: (text: string) => void }) {

@@ -1,4 +1,4 @@
-//! End-to-end flow test for the unified `interflow` CLI:
+//! End-to-end flow test for the unified `interflow-cli` CLI:
 //! setup → plan validate/apply → pack inspect → doctor → seal/install →
 //! rotate → revoke. Exercises the real binary against a temp deployment.
 
@@ -9,7 +9,7 @@ fn bin() -> PathBuf {
     let mut p = std::env::current_exe().expect("test bin path");
     p.pop(); // deps/
     p.pop(); // tests/
-    p.join(format!("interflow{}", std::env::consts::EXE_SUFFIX))
+    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn run(args: &[&str], env: &[(&str, &str)]) {
@@ -212,7 +212,11 @@ fn role_bound_packs_refuse_wrong_runtime() {
 /// `plan validate` is where the QUIC fail-fasts land: a loopback QUIC face
 /// could never be dialed (its UDP port bypasses the front proxy), and a
 /// `quic` agent default has no derivable dial address under an
-/// implicit-port control endpoint.
+/// implicit-port control endpoint. The mesh face mirrors both on the hub
+/// leg, plus the cross-check that a quic dial needs a hub that actually
+/// opened its QUIC face.
+/// ((internal design notes),
+/// (internal design notes))
 #[test]
 fn plan_validate_rejects_broken_quic_config() {
     // Loopback QUIC face on the ingress.
@@ -234,9 +238,44 @@ fn plan_validate_rejects_broken_quic_config() {
             "[agent.desktop]\nworkspace = \"default\"\ntransport = \"quic\"",
             1,
         );
+    // The mesh leg: a site-to-site section with an agent pair.
+    let mesh_section = "\n[mesh.hub.central]\nlisten = \"0.0.0.0:6666\"\nendpoint = \"mesh.example.com:6666\"\n\
+        [agent.lan-a]\nworkspace = \"default\"\n\
+        [[agent.lan-a.mesh_ingress]]\nname = \"svc\"\nlisten = \"127.0.0.1:13001\"\n\
+        target_agent = \"lan-b\"\nremote_addr = \"127.0.0.1:13000\"\n\
+        [agent.lan-b]\nworkspace = \"default\"\n\
+        [[agent.lan-b.mesh_egress]]\nname = \"svc\"\ntarget_addr = \"127.0.0.1:13000\"\n";
+    let mesh_quic_agent = mesh_section.replacen(
+        "[agent.lan-a]\nworkspace = \"default\"",
+        "[agent.lan-a]\nworkspace = \"default\"\ntransport = \"quic\"",
+        1,
+    );
+    // Loopback QUIC face on the hub.
+    let mesh_loopback = format!(
+        "{}{}",
+        manifest(),
+        mesh_section.replacen(
+            "listen = \"0.0.0.0:6666\"",
+            "listen = \"0.0.0.0:6666\"\nquic_listen = \"127.0.0.1:6666\"",
+            1,
+        )
+    );
+    // quic mesh agent + implicit-port hub endpoint: no derivable UDP
+    // address.
+    let mesh_implicit = format!(
+        "{}{}",
+        manifest(),
+        mesh_quic_agent.replacen("mesh.example.com:6666", "mesh.example.com", 1)
+    );
+    // quic mesh agent against a hub that never opened its QUIC face:
+    // runtime would only surface this as connect timeouts.
+    let mesh_no_face = format!("{}{}", manifest(), mesh_quic_agent);
     for (text, expected) in [
         (loopback_face, "loopback"),
         (implicit_port, "explicit port"),
+        (mesh_loopback, "loopback"),
+        (mesh_implicit, "explicit port"),
+        (mesh_no_face, "declares no quic_listen"),
     ] {
         let dir = tempfile_dir();
         let manifest_path = dir.join("interflow.toml");

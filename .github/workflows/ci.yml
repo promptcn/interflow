@@ -70,73 +70,27 @@ jobs:
           PEBBLE_VA_NOSLEEP: "1"
           PEBBLE_VA_ALWAYS_VALID: "1"
           PEBBLE_WFE_NONCEREJECT: "0"
+    env:
+      # Preset pebble directory signals "reuse the service container" to
+      # the stage script, which extracts the trust anchor itself.
+      INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install pebble directory trust anchor
-        run: |
-          docker cp $(docker ps -qf ancestor=ghcr.io/letsencrypt/pebble):/test/certs/pebble.minica.pem /tmp/pebble.minica.pem
-          # The rustls client in the ACME runtime reads an explicit CA file;
-          # exporting SSL_CERT_FILE additionally covers any system-root path.
-      # Test steps tee full output to a log and, on failure, append the
-      # failure extract to the job summary: anonymous API readers cannot
-      # download run logs, but check-run summaries ARE public — this is the
-      # failure-visibility channel for outside collaborators.
-      - name: unit tests (lib)
-        run: |
-          set +e
-          cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --lib > /tmp/t.log 2>&1
-          rc=$?
-          if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::unit tests (lib): $l"; done; fi
-          exit $rc
-        env:
-          INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
-          INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
-      - name: unit tests (bins)
-        run: |
-          set +e
-          cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --bins > /tmp/t.log 2>&1
-          rc=$?
-          if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::unit tests (bins): $l"; done; fi
-          exit $rc
-        env:
-          INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
-          INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
-      - name: unit tests (doc)
-        run: |
-          set +e
-          cargo test --workspace --exclude interflow-gui --all-features --no-fail-fast --doc > /tmp/t.log 2>&1
-          rc=$?
-          if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::unit tests (doc): $l"; done; fi
-          exit $rc
-        env:
-          INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
-          INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
-      # Integration tests run in parallel: every listener binds `:0` and
-      # reads its actual address from the readiness signals (hub/agent
-      # handles, EdgeReady) — the pick-then-bind race is gone at the root.
-      # Split per crate so a failure names the crate.
-      - name: e2e tests (mesh)
-        run: |
-          set +e
-          cargo test -p interflow-mesh --all-features --no-fail-fast --test '*' > /tmp/t.log 2>&1
-          rc=$?
-          if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::e2e tests (mesh): $l"; done; fi
-          exit $rc
-        env:
-          INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
-          INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
-      - name: e2e tests (rest)
-        run: |
-          set +e
-          cargo test --workspace --exclude interflow-gui --exclude interflow-mesh --all-features --no-fail-fast --test '*' > /tmp/t.log 2>&1
-          rc=$?
-          if [ $rc -ne 0 ]; then grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' | while read -r l; do [ -n "$l" ] && echo "::error::e2e tests (rest): $l"; done; fi
-          exit $rc
-        env:
-          INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
-          INTERFLOW_PEBBLE_CA: /tmp/pebble.minica.pem
+      # The five test stages (lib / bins / doc / mesh e2e / rest e2e) and
+      # the pebble environment contract live in ONE script — the same one
+      # scripts/export_public.sh runs against the exported tree before
+      # committing (public-CI parity), so the workflow and the export can
+      # never drift apart. Stages tee full output to a log and, on failure,
+      # surface ::error:: annotations: anonymous API readers cannot download
+      # run logs, but annotations ARE public — this is the failure-visibility
+      # channel for outside collaborators. Integration tests run in parallel:
+      # every listener binds `:0` and reads its actual address from readiness
+      # signals (hub/agent handles, EdgeReady); stages split per crate so a
+      # failure names the crate.
+      - name: test stages
+        run: bash scripts/ci_test_stages.sh
 
   gui:
     name: gui (tauri)

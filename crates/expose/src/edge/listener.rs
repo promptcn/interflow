@@ -638,7 +638,7 @@ where
                         "X-Forwarded-For rejected ({reason}): peer={peer} — the fronting \
                          proxy sent no X-Forwarded-For; fix the proxy with \
                          `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` \
-                         (diagnose: interflow doctor ingress)"
+                         (diagnose: interflow-cli doctor ingress)"
                     );
                 } else {
                     warn!(node = %node, "X-Forwarded-For rejected ({reason}): peer={peer}");

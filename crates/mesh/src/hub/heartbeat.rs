@@ -268,7 +268,7 @@ async fn run_heartbeat_supervisor(h: std::sync::Arc<HubState>, shutdown: Cancell
                             remaining = %remaining,
                             not_after_unix = not_after,
                             "credential_expiry: less than 20% of the agent's leaf lifetime \
-                             remains — rotate with `interflow rotate`"
+                             remains — rotate with `interflow-cli rotate`"
                         );
                     }
                     interflow_identity::expiry::LeafPhase::Healthy => {

@@ -59,7 +59,7 @@ async fn start_connect_and_graceful_shutdown() {
         "initial connect",
     )
     .await;
-    let AgentState::Connected { agent_id } = state else {
+    let AgentState::Connected { agent_id, .. } = state else {
         unreachable!()
     };
     assert_eq!(agent_id, "handle-test");

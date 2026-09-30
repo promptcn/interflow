@@ -3,11 +3,11 @@ name = "interflow-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "The unified identity-first `interflow` CLI: setup, plan, packs, doctor, identity lifecycle"
+description = "The unified identity-first `interflow-cli` CLI: setup, plan, packs, doctor, identity lifecycle"
 license.workspace = true
 
 [[bin]]
-name = "interflow"
+name = "interflow-cli"
 path = "src/main.rs"
 
 [lib]
@@ -15,16 +15,16 @@ name = "interflow_cli"
 path = "src/lib.rs"
 
 [dependencies]
-interflow-identity = { path = "../identity", version = "0.6" }
-interflow-core = { path = "../core", version = "0.6" }
-interflow-mesh = { path = "../mesh", version = "0.6" }
-interflow-expose = { path = "../expose", version = "0.6" }
+interflow-identity = { path = "../identity", version = "0.7" }
+interflow-core = { path = "../core", version = "0.7" }
+interflow-mesh = { path = "../mesh", version = "0.7" }
+interflow-expose = { path = "../expose", version = "0.7" }
 # sd_notify readiness (run_agent fires READY for Type=notify units)
-interflow-util = { path = "../util", version = "0.6" }
+interflow-util = { path = "../util", version = "0.7" }
 # Shared renewal scheduler (pack lifecycle beside the engine)
-interflow-renewal = { path = "../renewal", version = "0.6" }
+interflow-renewal = { path = "../renewal", version = "0.7" }
 # `--version` build tag — same const as `interflow-mesh version`
-interflow-buildinfo = { path = "../buildinfo", version = "0.6" }
+interflow-buildinfo = { path = "../buildinfo", version = "0.7" }
 
 tokio = { workspace = true }
 serde_json = "1"
@@ -43,6 +43,6 @@ workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-interflow-registrar = { path = "../registrar", version = "0.6" }
-interflow-renewal = { path = "../renewal", version = "0.6" }
+interflow-registrar = { path = "../registrar", version = "0.7" }
+interflow-renewal = { path = "../renewal", version = "0.7" }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }

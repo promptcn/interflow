@@ -1,4 +1,4 @@
-//! `interflow node install` — install (or upgrade) a node pack onto this
+//! `interflow-cli node install` — install (or upgrade) a node pack onto this
 //! server.
 //!
 //! The pack is self-describing: its kind, node name and mesh role derive the
@@ -482,7 +482,7 @@ mod tests {
             err.to_string()
         );
 
-        // Executable passes; plain ingress nodes want `interflow`, not
+        // Executable passes; plain ingress nodes want `interflow-cli`, not
         // `interflow-mesh`.
         #[cfg(unix)]
         {
@@ -491,10 +491,10 @@ mod tests {
         }
         ensure_engine_binary_in(dir.path(), PackKind::Hub, true).unwrap();
         let err = ensure_engine_binary_in(dir.path(), PackKind::Ingress, false)
-            .expect_err("ingress needs `interflow`");
+            .expect_err("ingress needs `interflow-cli`");
         let msg = err.to_string();
         assert!(
-            msg.contains(dir.path().join("interflow").to_str().unwrap()),
+            msg.contains(dir.path().join("interflow-cli").to_str().unwrap()),
             "{msg}"
         );
         assert!(!msg.contains("interflow-mesh"), "{msg}");

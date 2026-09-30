@@ -159,6 +159,9 @@ impl HubService {
         // Capability negotiation: the response body carries the hub's
         // heartbeat cadence; agents parse it and derive the poll watchdog /
         // task-stall timeouts (see `interflow_core::tunnel::negotiation`).
+        // The egress address is the hub's own observation of the agent —
+        // surfaced back so the agent side can show "hub-confirmed"
+        // connectivity detail (the NAT truth its own socket cannot see).
         let caps = {
             let cfg = self.state.config.read().await;
             RegisterResponse {
@@ -167,11 +170,13 @@ impl HubService {
                     .heartbeat
                     .enabled
                     .then_some(HeartbeatAd::from(&cfg.heartbeat)),
+                egress_ip: Some(self.effective_ip.to_string()),
             }
         };
-        // Serializing a plain scalar struct cannot fail; if it somehow does,
-        // degrade to a minimal capability declaration (heartbeat disabled)
-        let body = serde_json::to_string(&caps).unwrap_or_else(|_| "{}".to_string());
+        // Serializing a plain scalar struct cannot fail in practice; a real
+        // failure is a hub bug and fails the request rather than silently
+        // degrading to a declaration the agent must reject anyway.
+        let body = serde_json::to_string(&caps)?;
         Ok(json_response(StatusCode::OK, body))
     }
 

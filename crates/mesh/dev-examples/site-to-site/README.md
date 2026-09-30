@@ -1,7 +1,7 @@
 # Site-to-site private networks
 
 > Product-path example for the `interflow-mesh` site-to-site mode. The
-> desired state lives in one manifest (`interflow.toml`); `interflow plan
+> desired state lives in one manifest (`interflow.toml`); `interflow-cli plan
 > apply` renders Credential Packs, and nodes start with `interflow-mesh
 > hub/agent --pack`. No certificate is ever issued or placed by hand —
 > leaf credentials renew automatically (50% TTL) against the registrar,
@@ -26,8 +26,8 @@ LAN A client ─► lan-a :3001 ─► hub :6666 ─► lan-b ─► 127.0.0.1:3
 Build the binaries, then from this directory:
 
 ```bash
-cargo build --release --bin interflow --bin interflow-mesh
-./apply.sh          # interflow plan apply --manifest interflow.toml …
+cargo build --release --bin interflow-cli --bin interflow-mesh
+./apply.sh          # interflow-cli plan apply --manifest interflow.toml …
 ```
 
 `apply.sh` renders into `./dist` (git-ignored):
@@ -94,21 +94,21 @@ back to plaintext.
    anything is written):
 
    ```bash
-   interflow setup --face mesh --realm example --hub-name central --hub-endpoint hub.example.com:6666
-   interflow node add agent/lan-b --mesh-egress web:192.0.2.10:80        # serve side first
-   interflow node add agent/lan-a --mesh-ingress to-lan-b:127.0.0.1:3001:192.0.2.10:80@lan-b
+   interflow-cli setup --face mesh --realm example --hub-name central --hub-endpoint hub.example.com:6666
+   interflow-cli node add agent/lan-b --mesh-egress web:192.0.2.10:80        # serve side first
+   interflow-cli node add agent/lan-a --mesh-ingress to-lan-b:127.0.0.1:3001:192.0.2.10:80@lan-b
    ```
 
 2. `./apply.sh`, then distribute each pack to its node (`.iflowpack`
    sealed archives via
-   `interflow pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
+   `interflow-cli pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
    work here too — output beside the pack, passphrase printed once).
 3. Open the hub's TCP port on the firewall and start the three nodes with
    `interflow-mesh hub --pack …` / `interflow-mesh agent --pack …`
    (or install the rendered systemd units).
 4. Lifecycle is the same as everywhere else:
-   `interflow doctor hub --pack …`, `interflow rotate hub/central`,
-   `interflow revoke --pack …`.
+   `interflow-cli doctor hub --pack …`, `interflow-cli rotate hub/central`,
+   `interflow-cli revoke --pack …`.
 
 Cross-worksite routing: declare agents in different `[workspace.*]` and the
 hub admits their streams through the signed policy's cross-workspace

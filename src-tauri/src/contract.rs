@@ -100,12 +100,45 @@ impl From<NodeKind> for NodeKindDto {
 pub enum NodeStateDto {
     Starting,
     Connecting,
-    Connected { agent_id: String },
-    Reconnecting { reason: String, backoff_secs: u32 },
+    Connected {
+        agent_id: String,
+        /// The hub's registration receipt (wire form of mesh `HubReceipt`):
+        /// the egress address the hub observed plus the registration moment
+        /// — the "hub-confirmed" evidence the UI surfaces. Absent keeps the
+        /// pre-receipt wire shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hub_receipt: Option<HubReceiptDto>,
+    },
+    Reconnecting {
+        reason: String,
+        backoff_secs: u32,
+    },
     Running,
     Stopping,
     Stopped,
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
+}
+
+/// The hub's registration receipt, carried with [`NodeStateDto::Connected`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct HubReceiptDto {
+    /// The egress address the hub observed for this registration.
+    pub egress_ip: Option<String>,
+    /// When the registration exchange completed (unix seconds; u32 on the
+    /// wire — specta forbids BigInt-style types, and unix seconds beyond
+    /// 2106 are meaningless here).
+    pub registered_at_unix: u32,
+}
+
+impl From<interflow_mesh::agent::HubReceipt> for HubReceiptDto {
+    fn from(receipt: interflow_mesh::agent::HubReceipt) -> Self {
+        Self {
+            egress_ip: receipt.egress_ip,
+            registered_at_unix: u32::try_from(receipt.registered_at_unix).unwrap_or(u32::MAX),
+        }
+    }
 }
 
 impl From<NodeState> for NodeStateDto {
@@ -113,7 +146,13 @@ impl From<NodeState> for NodeStateDto {
         match state {
             NodeState::Starting => Self::Starting,
             NodeState::Connecting => Self::Connecting,
-            NodeState::Connected { agent_id } => Self::Connected { agent_id },
+            NodeState::Connected {
+                agent_id,
+                hub_receipt,
+            } => Self::Connected {
+                agent_id,
+                hub_receipt: hub_receipt.map(Into::into),
+            },
             NodeState::Reconnecting {
                 reason,
                 backoff_secs,
@@ -244,6 +283,11 @@ pub struct NodeInfo {
     pub pack_transport: Option<Transport>,
     /// Agent nodes only; `None` derives from the control endpoint.
     pub hub_quic_addr: Option<String>,
+    /// The QUIC dial address the pack implies (mesh agents: derived from
+    /// the signed hub endpoint; `None` when it carries no explicit port).
+    /// The fallback a blank [`Self::hub_quic_addr`] preference resolves
+    /// to — shown so the UI states what a quic dial will actually touch.
+    pub pack_hub_quic_addr: Option<String>,
     /// Services the pack declares, with the effective dial address (expose
     /// agents; empty for other kinds).
     pub services: Vec<ServiceAddressDto>,
@@ -265,6 +309,12 @@ pub struct NodeInfo {
 impl From<NodeSnapshot> for NodeInfo {
     fn from(snapshot: NodeSnapshot) -> Self {
         let attribution = crate::node::log_attribution(&snapshot.spec);
+        // Before the rules extraction consumes `pack_mesh` by value.
+        let pack_hub_quic_addr = snapshot
+            .spec
+            .pack_mesh
+            .as_ref()
+            .and_then(|mesh| interflow_mesh::pack::derive_quic_addr(&mesh.hub_endpoint));
         let services = snapshot
             .spec
             .pack_services
@@ -308,6 +358,7 @@ impl From<NodeSnapshot> for NodeInfo {
                 _ => None,
             },
             hub_quic_addr: snapshot.spec.hub_quic_addr,
+            pack_hub_quic_addr,
             services,
             mesh_ingress_rules,
             mesh_egress_rules,
@@ -340,6 +391,10 @@ pub struct PackInspection {
     pub mesh_egress: u32,
     /// Listen address (hub/ingress).
     pub listen: Option<String>,
+    /// Dial transport the pack declares as its signed default (agent packs;
+    /// `None` = the h2 default). The add dialog starts its transport control
+    /// here, so a pack signed `quic` never gets silently re-defaulted to h2
+    pub transport: Option<Transport>,
     /// Leaf-credential health (earliest active expiry, phased).
     pub credential: Option<CredentialHealthDto>,
 }
@@ -359,6 +414,13 @@ impl From<PackInfo> for PackInspection {
             mesh_ingress: u32::try_from(mesh_ingress).unwrap_or(u32::MAX),
             mesh_egress: u32::try_from(mesh_egress).unwrap_or(u32::MAX),
             listen: info.listen,
+            // Same mapping as `NodeInfo::pack_transport`: "h2" and anything
+            // unexpected both display as the default (None); an unexpected
+            // string fails loud at start instead.
+            transport: match info.transport.as_deref() {
+                Some("quic") => Some(Transport::Quic),
+                _ => None,
+            },
             credential: info.credential.map(Into::into),
         }
     }
@@ -399,12 +461,21 @@ pub struct NodePrefs {
 /// One rendered pack in a `plan apply` output tree (deploy page cards).
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct DeployPackDto {
-    /// Directory name under `<out>/packs/` (e.g. `ingress-edge`).
+    /// Directory name under `<out>/packs/` (e.g. `ingress-edge`) — the
+    /// display name.
     pub dir_name: String,
+    /// The pack directory's absolute path. The single source of truth for
+    /// locating the pack (update/seal/rotate/revoke all take it); the old
+    /// `<out>/packs/<dir_name>` frontend join assumed the dist-tree layout
+    /// and broke on a bare pack directory or an unpacked zip.
+    pub path: String,
     pub kind: NodeKindDto,
     pub node: String,
     /// Rotation generation (u32 on the wire — specta forbids BigInt).
     pub generation: u32,
+    /// Content digest (`sha256:…`): differs across same-generation renders,
+    /// which is how "update available" catches a re-applied manifest.
+    pub digest: String,
     pub expires: String,
     pub principal: String,
     /// The local node added from this pack's identity, if any — the
@@ -419,6 +490,9 @@ pub struct LocalNodeRefDto {
     pub name: String,
     /// Generation of the pack currently in place.
     pub generation: u32,
+    /// Content digest of the pack currently in place (display cache from
+    /// the node spec, refreshed at every GUI start and every update).
+    pub digest: String,
 }
 
 /// `deploy_update_node` result: what the swap did plus the refreshed node.
@@ -435,9 +509,11 @@ impl From<crate::deploy::DeployPack> for DeployPackDto {
     fn from(pack: crate::deploy::DeployPack) -> Self {
         Self {
             dir_name: pack.dir_name,
+            path: pack.path.display().to_string(),
             kind: pack.kind.into(),
             node: pack.node,
             generation: u32::try_from(pack.generation).unwrap_or(u32::MAX),
+            digest: pack.digest,
             expires: pack.expires,
             principal: pack.principal,
             local_node: None,
@@ -445,7 +521,7 @@ impl From<crate::deploy::DeployPack> for DeployPackDto {
     }
 }
 
-/// Parameters of the manifest template builder (mirrors `interflow setup`).
+/// Parameters of the manifest template builder (mirrors `interflow-cli setup`).
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestTemplateParams {
@@ -506,7 +582,7 @@ pub struct IssueMeshEgressDto {
     pub target_cidr: Option<String>,
 }
 
-/// `deploy_add_node` parameters — the GUI twin of `interflow node add`
+/// `deploy_add_node` parameters — the GUI twin of `interflow-cli node add`
 /// (structured, non-destructive manifest append).
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 #[serde(deny_unknown_fields)]
@@ -756,6 +832,8 @@ pub struct RouteDto {
 pub struct HubDto {
     pub name: String,
     pub listen: String,
+    /// The hub's QUIC (UDP) face; `None` = the QUIC transport stays off.
+    pub quic_listen: Option<String>,
     pub endpoint: String,
 }
 
@@ -876,6 +954,7 @@ impl From<interflow_cli::manifest_edit::ManifestSummary> for ManifestSummaryDto 
                 .map(|(name, hub)| HubDto {
                     name: name.clone(),
                     listen: hub.listen.clone(),
+                    quic_listen: hub.quic_listen.clone(),
                     endpoint: hub.endpoint.clone(),
                 })
                 .collect(),
@@ -923,6 +1002,9 @@ pub struct HubEditDto {
     pub endpoint: String,
     /// Empty/`None` = the default listen (`0.0.0.0:6666`).
     pub listen: Option<String>,
+    /// The hub's QUIC (UDP) listen address; blank/`None` keeps the QUIC
+    /// transport off.
+    pub quic_listen: Option<String>,
 }
 
 /// `[ingress.<node>]`.
@@ -1069,6 +1151,7 @@ impl From<EditActionDto> for interflow_cli::manifest_edit::ManifestEdit {
                 name: edit.name,
                 endpoint: edit.endpoint,
                 listen: edit.listen,
+                quic_listen: edit.quic_listen,
             }),
             EditActionDto::RemoveHub(name) => Self::RemoveHub(name),
             EditActionDto::UpsertIngress(edit) => Self::UpsertIngress(IngressEdit {
@@ -1185,7 +1268,7 @@ pub struct EditedManifestDto {
 }
 
 /// Parameters of the site-to-site (mesh) starter template (mirrors
-/// `interflow setup --face mesh`).
+/// `interflow-cli setup --face mesh`).
 #[derive(Debug, Clone, Deserialize, specta::Type)]
 #[serde(deny_unknown_fields)]
 pub struct MeshTemplateParams {
@@ -1261,6 +1344,34 @@ mod tests {
         );
     }
 
+    /// The inspection carries the pack's signed transport default through to
+    /// the wire (the add dialog's transport control starts from it — the
+    /// 2026-09-29 bug was exactly this field not existing).
+    #[test]
+    fn pack_inspection_carries_the_signed_transport_default() {
+        let inspection = |transport: Option<&str>| {
+            PackInspection::from(crate::node::PackInfo {
+                kind: crate::node::NodeKind::MeshAgent,
+                name: "lan-a".into(),
+                principal: "promptcn/-/agent/lan-a".into(),
+                generation: 1,
+                digest: "sha256:abc".into(),
+                control_endpoint: "hub.invalid:443".into(),
+                services: Vec::new(),
+                mesh: None,
+                listen: None,
+                transport: transport.map(str::to_string),
+                credential: None,
+            })
+        };
+        assert_eq!(inspection(Some("quic")).transport, Some(Transport::Quic));
+        assert_eq!(inspection(None).transport, None);
+        // "h2" and anything unexpected both map to the default (None), the
+        // same fold as NodeInfo::pack_transport.
+        assert_eq!(inspection(Some("h2")).transport, None);
+        assert_eq!(inspection(Some("bogus")).transport, None);
+    }
+
     /// Node states serialize to the externally-tagged wire form the
     /// frontend matches on.
     #[test]
@@ -1271,10 +1382,24 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&NodeStateDto::Connected {
-                agent_id: "expose-mac".into()
+                agent_id: "expose-mac".into(),
+                hub_receipt: None,
             })
             .unwrap(),
             r#"{"Connected":{"agent_id":"expose-mac"}}"#
+        );
+        // The hub receipt rides along when present (skip-when-none keeps the
+        // old consumers' shape).
+        assert_eq!(
+            serde_json::to_string(&NodeStateDto::Connected {
+                agent_id: "expose-mac".into(),
+                hub_receipt: Some(HubReceiptDto {
+                    egress_ip: Some("203.0.113.7".into()),
+                    registered_at_unix: 1_759_171_200,
+                }),
+            })
+            .unwrap(),
+            r#"{"Connected":{"agent_id":"expose-mac","hub_receipt":{"egress_ip":"203.0.113.7","registered_at_unix":1759171200}}}"#
         );
     }
 }

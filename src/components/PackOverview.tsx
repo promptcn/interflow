@@ -25,8 +25,14 @@ export default function PackOverview({
   onUpdateLocal: (pack: DeployPackDto) => void;
   onIssuePack: () => void;
 }) {
+  /// "Update available" = the dist pack differs from what the local node
+  /// runs. A higher generation OR a different content digest both count: a
+  /// re-applied manifest re-renders the SAME generation with different
+  /// content (e.g. an h2→QUIC transport switch), which only the digest
+  /// catches.
   const updateAvailable = (pack: DeployPackDto) =>
-    !!pack.local_node && pack.local_node.generation < pack.generation;
+    !!pack.local_node &&
+    (pack.local_node.generation < pack.generation || pack.local_node.digest !== pack.digest);
 
   return (
     <div className="pack-overview">
@@ -94,13 +100,19 @@ export default function PackOverview({
                 <button
                   className="primary"
                   disabled={busy}
-                  title="stop, swap the pack in place (state kept), restart"
+                  title={
+                    pack.local_node.generation < pack.generation
+                      ? "stop, swap the pack in place (state kept), restart"
+                      : "same generation, different content — stop, swap the pack in place (state kept), restart"
+                  }
                   onClick={(e) => {
                     e.stopPropagation();
                     onUpdateLocal(pack);
                   }}
                 >
-                  Update → gen {pack.generation}
+                  {pack.local_node.generation < pack.generation
+                    ? `Update → gen ${pack.generation}`
+                    : "Update"}
                 </button>
               )}
             </div>

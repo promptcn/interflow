@@ -25,7 +25,7 @@
 //! truncates a chain's head, and the remaining segments stay internally
 //! verifiable (each record carries its predecessor's hash). Replays and
 //! offline verification go through [`verify_audit_files`] (the
-//! `interflow audit verify` product face).
+//! `interflow-cli audit verify` product face).
 
 use crate::config::{AuditConfig, AuditRotation};
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ use tracing::warn;
 /// Audit event kinds.
 ///
 /// `Serialize` writes records; `Deserialize` exists for
-/// [`verify_audit_files`] / `interflow audit verify` (replaying a ledger
+/// [`verify_audit_files`] / `interflow-cli audit verify` (replaying a ledger
 /// is part of the ledger's contract).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -663,7 +663,7 @@ fn now_iso8601() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Ledger verification (replay) — `interflow audit verify`
+// Ledger verification (replay) — `interflow-cli audit verify`
 // ---------------------------------------------------------------------------
 
 /// What a successful verification of a ledger (or ledger excerpt) found.

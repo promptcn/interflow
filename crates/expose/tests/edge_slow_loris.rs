@@ -100,7 +100,7 @@ async fn spawn_stack(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match state.borrow_and_update().clone() {
-            AgentState::Connected { agent_id } if agent_id == client_args.agent_id => break,
+            AgentState::Connected { agent_id, .. } if agent_id == client_args.agent_id => break,
             AgentState::Failed { error } => panic!("expose client failed: {error}"),
             _ => {}
         }

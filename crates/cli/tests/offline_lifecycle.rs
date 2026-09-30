@@ -9,7 +9,7 @@ fn bin() -> PathBuf {
     let mut p = std::env::current_exe().expect("test bin path");
     p.pop();
     p.pop();
-    p.join(format!("interflow{}", std::env::consts::EXE_SUFFIX))
+    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
 }
 
 struct Run {

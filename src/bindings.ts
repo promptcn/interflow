@@ -6,14 +6,14 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 /** Commands */
 export const commands = {
 	/**  Lists the managed nodes (name order). */
-	listNodes: () => typedError<NodeInfo[], string>(__TAURI_INVOKE("list_nodes")),
+	listNodes: () => typedError<NodeInfo_Serialize[], string>(__TAURI_INVOKE("list_nodes")),
 	/**
 	 *  Validates a pack directory through the shared funnel and reports what it
 	 *  is — the add flow's preview. Nothing is persisted.
 	 */
 	inspectPack: (packDir: string) => typedError<PackInspection, string>(__TAURI_INVOKE("inspect_pack", { packDir })),
 	/**  Adds a node from a pack directory (kind and name come from the pack). */
-	addNode: (params: AddNodeParams) => typedError<NodeInfo, string>(__TAURI_INVOKE("add_node", { params })),
+	addNode: (params: AddNodeParams) => typedError<NodeInfo_Serialize, string>(__TAURI_INVOKE("add_node", { params })),
 	/**  Removes a node (must be stopped). */
 	removeNode: (id: string) => typedError<null, string>(__TAURI_INVOKE("remove_node", { id })),
 	/**
@@ -99,14 +99,14 @@ export const commands = {
 	 *  (P1-2: the GUI side of `node install`): stop → identity-checked swap
 	 *  (state carried, `.previous` kept) → restore the start intent.
 	 */
-	deployUpdateNode: (nodeId: string, sourceDir: string) => typedError<UpdatedNodeDto, string>(__TAURI_INVOKE("deploy_update_node", { nodeId, sourceDir })),
+	deployUpdateNode: (nodeId: string, sourceDir: string) => typedError<UpdatedNodeDto_Serialize, string>(__TAURI_INVOKE("deploy_update_node", { nodeId, sourceDir })),
 	/**  Rotates one node's credential (issues the next generation). */
 	deployRotate: (manifest: string, issuer: string, node: string, pack: string | null) => typedError<string[], string>(__TAURI_INVOKE("deploy_rotate", { manifest, issuer, node, pack })),
 	/**  Revokes a pack (deny list + CRL). */
 	deployRevoke: (issuer: string, pack: string, reason: string) => typedError<string[], string>(__TAURI_INVOKE("deploy_revoke", { issuer, pack, reason })),
 	/**
 	 *  Appends a node to the manifest — the issue wizard's core step, the GUI
-	 *  twin of `interflow node add`. Structured and non-destructive (comments
+	 *  twin of `interflow-cli node add`. Structured and non-destructive (comments
 	 *  and layout stay); the edited manifest must pass the full validation
 	 *  funnel before anything is written.
 	 */
@@ -135,7 +135,7 @@ export const commands = {
 /** Events */
 export const events = {
 	log: makeEvent<LogEvent>("log"),
-	nodeState: makeEvent<NodeStateEvent>("node-state"),
+	nodeState: makeEvent<NodeStateEvent_Deserialize>("node-state"),
 };
 
 /* Types */
@@ -232,12 +232,27 @@ export type DeployContextDto = {
 
 /**  One rendered pack in a `plan apply` output tree (deploy page cards). */
 export type DeployPackDto = {
-	/**  Directory name under `<out>/packs/` (e.g. `ingress-edge`). */
+	/**
+	 *  Directory name under `<out>/packs/` (e.g. `ingress-edge`) — the
+	 *  display name.
+	 */
 	dir_name: string,
+	/**
+	 *  The pack directory's absolute path. The single source of truth for
+	 *  locating the pack (update/seal/rotate/revoke all take it); the old
+	 *  `<out>/packs/<dir_name>` frontend join assumed the dist-tree layout
+	 *  and broke on a bare pack directory or an unpacked zip.
+	 */
+	path: string,
 	kind: NodeKindDto,
 	node: string,
 	/**  Rotation generation (u32 on the wire — specta forbids BigInt). */
 	generation: number,
+	/**
+	 *  Content digest (`sha256:…`): differs across same-generation renders,
+	 *  which is how "update available" catches a re-applied manifest.
+	 */
+	digest: string,
 	expires: string,
 	principal: string,
 	/**
@@ -294,6 +309,8 @@ export type EditedManifestDto = {
 export type HubDto = {
 	name: string,
 	listen: string,
+	/**  The hub's QUIC (UDP) face; `None` = the QUIC transport stays off. */
+	quic_listen: string | null,
 	endpoint: string,
 };
 
@@ -303,6 +320,23 @@ export type HubEditDto = {
 	endpoint: string,
 	/**  Empty/`None` = the default listen (`0.0.0.0:6666`). */
 	listen: string | null,
+	/**
+	 *  The hub's QUIC (UDP) listen address; blank/`None` keeps the QUIC
+	 *  transport off.
+	 */
+	quic_listen: string | null,
+};
+
+/**  The hub's registration receipt, carried with [`NodeStateDto::Connected`]. */
+export type HubReceiptDto = {
+	/**  The egress address the hub observed for this registration. */
+	egress_ip: string | null,
+	/**
+	 *  When the registration exchange completed (unix seconds; u32 on the
+	 *  wire — specta forbids BigInt-style types, and unix seconds beyond
+	 *  2106 are meaningless here).
+	 */
+	registered_at_unix: number,
 };
 
 /**
@@ -395,7 +429,7 @@ export type IssueMeshIngressDto = {
 export type IssueNodeKindDto = "agent_expose" | "agent_mesh" | "hub" | "ingress";
 
 /**
- *  `deploy_add_node` parameters — the GUI twin of `interflow node add`
+ *  `deploy_add_node` parameters — the GUI twin of `interflow-cli node add`
  *  (structured, non-destructive manifest append).
  */
 export type IssueNodeParams = {
@@ -433,6 +467,11 @@ export type LocalNodeRefDto = {
 	name: string,
 	/**  Generation of the pack currently in place. */
 	generation: number,
+	/**
+	 *  Content digest of the pack currently in place (display cache from
+	 *  the node spec, refreshed at every GUI start and every update).
+	 */
+	digest: string,
 };
 
 /**  `log` event payload (tracing capture pump → frontend log panel). */
@@ -501,7 +540,7 @@ export type ManifestSummaryDto = {
 	issues: string[],
 };
 
-/**  Parameters of the manifest template builder (mirrors `interflow setup`). */
+/**  Parameters of the manifest template builder (mirrors `interflow-cli setup`). */
 export type ManifestTemplateParams = {
 	realm: string,
 	control_endpoint: string,
@@ -559,7 +598,7 @@ export type MeshProtocolDto = "tcp" | "udp";
 
 /**
  *  Parameters of the site-to-site (mesh) starter template (mirrors
- *  `interflow setup --face mesh`).
+ *  `interflow-cli setup --face mesh`).
  */
 export type MeshTemplateParams = {
 	realm: string,
@@ -568,7 +607,10 @@ export type MeshTemplateParams = {
 };
 
 /**  One managed node (list rows, detail panes). */
-export type NodeInfo = {
+export type NodeInfo = NodeInfo_Serialize | NodeInfo_Deserialize;
+
+/**  One managed node (list rows, detail panes). */
+export type NodeInfo_Deserialize = {
 	id: string,
 	kind: NodeKindDto,
 	/**  Display name (the pack's node name). */
@@ -586,7 +628,7 @@ export type NodeInfo = {
 	attribution: string,
 	/**  Directory of the installed Credential Pack. */
 	pack_dir: string,
-	state: NodeStateDto,
+	state: NodeStateDto_Deserialize,
 	/**  Start intent: the node should be (and, on launch, will be) running. */
 	desired_running: boolean,
 	/**  Agent nodes only. */
@@ -601,6 +643,78 @@ export type NodeInfo = {
 	pack_transport: Transport | null,
 	/**  Agent nodes only; `None` derives from the control endpoint. */
 	hub_quic_addr: string | null,
+	/**
+	 *  The QUIC dial address the pack implies (mesh agents: derived from
+	 *  the signed hub endpoint; `None` when it carries no explicit port).
+	 *  The fallback a blank [`Self::hub_quic_addr`] preference resolves
+	 *  to — shown so the UI states what a quic dial will actually touch.
+	 */
+	pack_hub_quic_addr: string | null,
+	/**
+	 *  Services the pack declares, with the effective dial address (expose
+	 *  agents; empty for other kinds).
+	 */
+	services: ServiceAddressDto[],
+	/**
+	 *  Site-to-site rules the pack declares (mesh agents; empty for other
+	 *  kinds). Pack-signed truth, shown read-only.
+	 */
+	mesh_ingress_rules: MeshIngressRuleDto[],
+	/**  Serve-side mesh rules (mesh agents; empty for other kinds). */
+	mesh_egress_rules: MeshEgressRuleDto[],
+	/**  Public/control listener the pack declares (hub/ingress). */
+	listen: string | null,
+	/**  Rotation generation of the pack (display cache for update hints). */
+	generation: number,
+	/**
+	 *  Leaf-credential health (earliest active expiry, phased). `None`
+	 *  when the pack has no active credential set. Color-code `phase`:
+	 *  warn = amber, critical = red (the dirty-build visual language).
+	 */
+	credential: CredentialHealthDto | null,
+};
+
+/**  One managed node (list rows, detail panes). */
+export type NodeInfo_Serialize = {
+	id: string,
+	kind: NodeKindDto,
+	/**  Display name (the pack's node name). */
+	name: string,
+	/**
+	 *  The identity the pack carries (`realm/workspace/kind/node`);
+	 *  `None` = the pack was unreadable at restore (placeholder).
+	 */
+	principal: string | null,
+	/**
+	 *  Unique log attribution value (name + id prefix) — the `node` field
+	 *  this node's captured log lines carry and the "This node" filter
+	 *  matches on.
+	 */
+	attribution: string,
+	/**  Directory of the installed Credential Pack. */
+	pack_dir: string,
+	state: NodeStateDto_Serialize,
+	/**  Start intent: the node should be (and, on launch, will be) running. */
+	desired_running: boolean,
+	/**  Agent nodes only. */
+	transport: Transport | null,
+	/**
+	 *  Dial transport the pack declares as its signed default (agent
+	 *  nodes; `None` = the h2 default). The effective transport the node
+	 *  runs with is `transport ?? pack_transport ?? h2` — shown so the
+	 *  UI never claims h2 while an unset preference inherits a `quic`
+	 *  pack default.
+	 */
+	pack_transport: Transport | null,
+	/**  Agent nodes only; `None` derives from the control endpoint. */
+	hub_quic_addr: string | null,
+	/**
+	 *  The QUIC dial address the pack implies (mesh agents: derived from
+	 *  the signed hub endpoint; `None` when it carries no explicit port).
+	 *  The fallback a blank [`Self::hub_quic_addr`] preference resolves
+	 *  to — shown so the UI states what a quic dial will actually touch.
+	 */
+	pack_hub_quic_addr: string | null,
 	/**
 	 *  Services the pack declares, with the effective dial address (expose
 	 *  agents; empty for other kinds).
@@ -649,8 +763,43 @@ export type NodePrefs = {
  *  u64 → u32: specta forbids BigInt-style exports, and a backoff beyond
  *  u32::MAX seconds is meaningless).
  */
-export type NodeStateDto = "Starting" | "Connecting" | ({ Connected: {
+export type NodeStateDto = NodeStateDto_Serialize | NodeStateDto_Deserialize;
+
+/**
+ *  Node lifecycle (wire form of `node::NodeState`; `backoff_secs` narrows
+ *  u64 → u32: specta forbids BigInt-style exports, and a backoff beyond
+ *  u32::MAX seconds is meaningless).
+ */
+export type NodeStateDto_Deserialize = "Starting" | "Connecting" | ({ Connected: {
 	agent_id: string,
+	/**
+	 *  The hub's registration receipt (wire form of mesh `HubReceipt`):
+	 *  the egress address the hub observed plus the registration moment
+	 *  — the "hub-confirmed" evidence the UI surfaces. Absent keeps the
+	 *  pre-receipt wire shape.
+	 */
+	hub_receipt?: HubReceiptDto | null,
+} }) & { Failed?: never; Reconnecting?: never } | ({ Reconnecting: {
+	reason: string,
+	backoff_secs: number,
+} }) & { Connected?: never; Failed?: never } | "Running" | "Stopping" | "Stopped" | ({ Failed: {
+	error: string,
+} }) & { Connected?: never; Reconnecting?: never };
+
+/**
+ *  Node lifecycle (wire form of `node::NodeState`; `backoff_secs` narrows
+ *  u64 → u32: specta forbids BigInt-style exports, and a backoff beyond
+ *  u32::MAX seconds is meaningless).
+ */
+export type NodeStateDto_Serialize = "Starting" | "Connecting" | ({ Connected: {
+	agent_id: string,
+	/**
+	 *  The hub's registration receipt (wire form of mesh `HubReceipt`):
+	 *  the egress address the hub observed plus the registration moment
+	 *  — the "hub-confirmed" evidence the UI surfaces. Absent keeps the
+	 *  pre-receipt wire shape.
+	 */
+	hub_receipt?: HubReceiptDto | null,
 } }) & { Failed?: never; Reconnecting?: never } | ({ Reconnecting: {
 	reason: string,
 	backoff_secs: number,
@@ -659,9 +808,18 @@ export type NodeStateDto = "Starting" | "Connecting" | ({ Connected: {
 } }) & { Connected?: never; Reconnecting?: never };
 
 /**  `node-state` event payload: which node transitioned to what. */
-export type NodeStateEvent = {
+export type NodeStateEvent = NodeStateEvent_Serialize | NodeStateEvent_Deserialize;
+
+/**  `node-state` event payload: which node transitioned to what. */
+export type NodeStateEvent_Deserialize = {
 	id: string,
-	state: NodeStateDto,
+	state: NodeStateDto_Deserialize,
+};
+
+/**  `node-state` event payload: which node transitioned to what. */
+export type NodeStateEvent_Serialize = {
+	id: string,
+	state: NodeStateDto_Serialize,
 };
 
 /**
@@ -691,6 +849,12 @@ export type PackInspection = {
 	mesh_egress: number,
 	/**  Listen address (hub/ingress). */
 	listen: string | null,
+	/**
+	 *  Dial transport the pack declares as its signed default (agent packs;
+	 *  `None` = the h2 default). The add dialog starts its transport control
+	 *  here, so a pack signed `quic` never gets silently re-defaulted to h2
+	 */
+	transport: Transport | null,
 	/**  Leaf-credential health (earliest active expiry, phased). */
 	credential: CredentialHealthDto | null,
 };
@@ -787,8 +951,20 @@ export type ServiceEditDto = {
 export type Transport = "h2" | "quic";
 
 /**  `deploy_update_node` result: what the swap did plus the refreshed node. */
-export type UpdatedNodeDto = {
-	node: NodeInfo,
+export type UpdatedNodeDto = UpdatedNodeDto_Serialize | UpdatedNodeDto_Deserialize;
+
+/**  `deploy_update_node` result: what the swap did plus the refreshed node. */
+export type UpdatedNodeDto_Deserialize = {
+	node: NodeInfo_Deserialize,
+	generation_from: number,
+	generation_to: number,
+	/**  The node had a running intent and was restarted onto the new pack. */
+	restarted: boolean,
+};
+
+/**  `deploy_update_node` result: what the swap did plus the refreshed node. */
+export type UpdatedNodeDto_Serialize = {
+	node: NodeInfo_Serialize,
 	generation_from: number,
 	generation_to: number,
 	/**  The node had a running intent and was restarted onto the new pack. */

@@ -23,17 +23,17 @@ path = "src/bin/export_bindings.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-interflow-core = { path = "../crates/core", version = "0.6" }
-interflow-cli = { path = "../crates/cli", version = "0.6" }
-interflow-expose = { path = "../crates/expose", version = "0.6" }
-interflow-identity = { path = "../crates/identity", version = "0.6" }
-interflow-mesh = { path = "../crates/mesh", version = "0.6" }
+interflow-core = { path = "../crates/core", version = "0.7" }
+interflow-cli = { path = "../crates/cli", version = "0.7" }
+interflow-expose = { path = "../crates/expose", version = "0.7" }
+interflow-identity = { path = "../crates/identity", version = "0.7" }
+interflow-mesh = { path = "../crates/mesh", version = "0.7" }
 # Credential renewal scheduler (one per running node — GUI/binary parity)
-interflow-renewal = { path = "../crates/renewal", version = "0.6" }
+interflow-renewal = { path = "../crates/renewal", version = "0.7" }
 # Atomic profile writes
-interflow-util = { path = "../crates/util", version = "0.6" }
+interflow-util = { path = "../crates/util", version = "0.7" }
 # Compile-time build identity (machine header, tray tooltip, startup log)
-interflow-buildinfo = { path = "../crates/buildinfo", version = "0.6" }
+interflow-buildinfo = { path = "../crates/buildinfo", version = "0.7" }
 
 tauri = { version = "2", features = ["tray-icon", "image-png", "specta"] }
 tauri-plugin-clipboard-manager = "2"
@@ -70,7 +70,7 @@ uuid = { version = "1.23", features = ["v4"] }
 [dev-dependencies]
 # In-process hub + self-signed certs for the Start/Stop round-trip regression
 # tests (tunnel.rs) — the 2026-09-18 deadlock acceptance gate.
-interflow-testkit = { path = "../crates/testkit", version = "0.6" }
+interflow-testkit = { path = "../crates/testkit", version = "0.7" }
 # Bindings-freshness drift guard test (contract.rs)
 tempfile = "3"
 

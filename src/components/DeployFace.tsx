@@ -199,12 +199,13 @@ export default function DeployFace({
     if (!local) return;
     setBusy(true);
     try {
-      const result = await api.deployUpdateNode(
-        local.id,
-        `${out.trim()}/packs/${pack.dir_name}`,
-      );
+      const result = await api.deployUpdateNode(local.id, pack.path);
       say([
-        `${pack.dir_name}: ${local.name} updated gen ${result.generation_from} → ${result.generation_to}${result.restarted ? " (restarted)" : " (left stopped)"}`,
+        `${pack.dir_name}: ${local.name} updated ${
+          result.generation_from === result.generation_to
+            ? `content (gen ${result.generation_to} → ${result.generation_to})`
+            : `gen ${result.generation_from} → ${result.generation_to}`
+        }${result.restarted ? " (restarted)" : " (left stopped)"}`,
       ]);
       await Promise.all([refreshPacks(), onNodesChanged()]);
     } catch (e) {
@@ -216,7 +217,7 @@ export default function DeployFace({
 
   const seal = async (pack: DeployPackDto, target: string, passphrase: string) => {
     try {
-      await api.deploySealPack(`${out.trim()}/packs/${pack.dir_name}`, target, passphrase);
+      await api.deploySealPack(pack.path, target, passphrase);
       say([`sealed ${pack.dir_name} → ${target}`]);
     } catch (e) {
       say([`✘ ${String(e)}`]);
@@ -224,7 +225,7 @@ export default function DeployFace({
   };
 
   const copyInstallCommand = async (pack: DeployPackDto) => {
-    const command = `sudo interflow node install --pack packs/${pack.dir_name}`;
+    const command = `sudo interflow-cli node install --pack ${pack.path}`;
     try {
       await writeText(command);
       say([`copied: ${command}`]);
@@ -237,9 +238,7 @@ export default function DeployFace({
     const node = `${pack.kind === "hub" ? "hub" : pack.kind === "ingress" ? "ingress" : "agent"}/${pack.node}`;
     setBusy(true);
     try {
-      say(
-        await api.deployRotate(manifest.trim(), issuer.trim(), node, `${out.trim()}/packs/${pack.dir_name}`),
-      );
+      say(await api.deployRotate(manifest.trim(), issuer.trim(), node, pack.path));
       await Promise.all([refreshPacks(), onNodesChanged()]);
     } catch (e) {
       say([`✘ ${String(e)}`]);
@@ -250,13 +249,7 @@ export default function DeployFace({
 
   const revoke = async (pack: DeployPackDto) => {
     try {
-      say(
-        await api.deployRevoke(
-          issuer.trim(),
-          `${out.trim()}/packs/${pack.dir_name}`,
-          "operator-requested",
-        ),
-      );
+      say(await api.deployRevoke(issuer.trim(), pack.path, "operator-requested"));
       await Promise.all([refreshPacks(), onNodesChanged()]);
     } catch (e) {
       say([`✘ ${String(e)}`]);
@@ -301,7 +294,6 @@ export default function DeployFace({
       ) : selected ? (
         <PackDetail
           pack={selected}
-          out={out}
           busy={busy}
           onBack={() => onSelectPack(null)}
           onUpdateLocal={() => void updateLocalNode(selected)}

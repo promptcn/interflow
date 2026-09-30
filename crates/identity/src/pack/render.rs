@@ -185,8 +185,8 @@ impl AgentCredentialPack {
                     address: s.address.clone(),
                 })
                 .collect(),
-            // Expose-role only: `validate` rejects transport on mesh-role
-            // agents, so the mapping never has to choose a face here.
+            // The manifest-issued dial default; the dialed face follows
+            // the agent's role (expose: control endpoint, mesh: hub).
             transport: agent_cfg.transport.map(|t| t.as_str().to_owned()),
             mesh: match mesh_role {
                 // node.toml carries node-local dial info only; the rules
@@ -290,7 +290,7 @@ impl HubCredentialPack {
             node: node.to_owned(),
             listen: Some(hub_cfg.listen.clone()),
             control_listen: None,
-            quic_listen: None,
+            quic_listen: hub_cfg.quic_listen.clone(),
             control_dispatch_host: None,
             public_tls: String::new(),
             public_tls_email: None,

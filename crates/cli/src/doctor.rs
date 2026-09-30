@@ -1,4 +1,4 @@
-//! `interflow doctor` — identity-first diagnostics.
+//! `interflow-cli doctor` — identity-first diagnostics.
 //!
 //! Technical failures are mapped back to product semantics: identity
 //! membership, trust generation, route resolution, credential expiry — with
@@ -70,7 +70,7 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
             println!("  {e}");
             println!();
             println!("Fix:");
-            println!("  re-issue with `interflow plan apply` (or `interflow rotate`)");
+            println!("  re-issue with `interflow-cli plan apply` (or `interflow-cli rotate`)");
             return Err(
                 interflow_core::error::InterflowError::config("doctor failed").with_source(e),
             );
@@ -138,7 +138,7 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
             ),
             (LeafPhase::Warn, None) => (
                 "·",
-                " — offline tier: rotate manually with `interflow rotate`".to_string(),
+                " — offline tier: rotate manually with `interflow-cli rotate`".to_string(),
             ),
             (LeafPhase::Critical, Some(_)) => (
                 "✘",
@@ -146,7 +146,7 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
             ),
             (LeafPhase::Critical, None) => (
                 "✘",
-                " — offline tier: rotate NOW with `interflow rotate`; the node stops \
+                " — offline tier: rotate NOW with `interflow-cli rotate`; the node stops \
                  serving at expiry"
                     .to_string(),
             ),
@@ -328,7 +328,7 @@ fn xff_precheck(pack: &CredentialPack) -> interflow_core::error::Result<()> {
                 println!("      Fix (nginx):");
                 println!("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;");
                 println!("      in the {host} server block — see the rendered");
-                println!("      nginx/http/interflow-vhost-*.conf from interflow plan apply");
+                println!("      nginx/http/interflow-vhost-*.conf from interflow-cli plan apply");
                 return Err(interflow_core::error::InterflowError::config(
                     "fronting proxy does not inject X-Forwarded-For",
                 ));
@@ -504,7 +504,7 @@ fn check_route(host: &str, pack_dir: &std::path::Path) -> interflow_core::error:
         println!();
         println!("Diagnosis: the ingress policy predates this hostname.");
         println!(
-            "Fix: add [[route]] to the manifest, then `interflow plan apply` and restart the ingress."
+            "Fix: add [[route]] to the manifest, then `interflow-cli plan apply` and restart the ingress."
         );
         return Err(interflow_core::error::InterflowError::config(
             "route not found",
@@ -540,7 +540,7 @@ fn check_route(host: &str, pack_dir: &std::path::Path) -> interflow_core::error:
                 service.id
             );
             println!(
-                "Fix: re-run `interflow plan apply` — the pack's policy and node halves drifted."
+                "Fix: re-run `interflow-cli plan apply` — the pack's policy and node halves drifted."
             );
             return Err(interflow_core::error::InterflowError::config(
                 "service missing from node.toml",
@@ -666,7 +666,7 @@ pub fn identity_inspect(
     );
     match pack.metadata.registrar_endpoint.as_deref() {
         Some(endpoint) => println!("Registrar: {endpoint}"),
-        None => println!("Registrar: none (offline tier — rotate with `interflow rotate`)"),
+        None => println!("Registrar: none (offline tier — rotate with `interflow-cli rotate`)"),
     }
     println!("Pack digest: {}", summary.pack_digest);
     if expert {

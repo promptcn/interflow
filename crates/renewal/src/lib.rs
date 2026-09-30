@@ -1,7 +1,7 @@
 //! Unattended short-lived credential renewal.
 //!
 //! Node-runtime lifecycle, shared by every pack-driven binary (the expose
-//! `interflow` CLI and the site-to-site `interflow-mesh` binary): workspace
+//! `interflow-cli` binary and the site-to-site `interflow-mesh` binary): workspace
 //! members and realm-scoped hub principals renew themselves through
 //! `/v1/renew`; control-endpoint identities renew through the authorized
 //! `/v1/renew-control` path. The scheduler runs beside the engine and turns
@@ -275,7 +275,7 @@ pub async fn renew_all(pack_dir: &Path, force: bool) -> Result<RenewalReport> {
     let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
     if pack.metadata.identity_mode == interflow_identity::manifest::IdentityMode::Offline {
         return Err(config_error(
-            "identity.mode = \"offline\" — credentials do not renew; `interflow rotate` issues \
+            "identity.mode = \"offline\" — credentials do not renew; `interflow-cli rotate` issues \
              the next generation",
         ));
     }
@@ -458,7 +458,7 @@ async fn offline_watch(pack_dir: &Path, log_name: Option<String>) -> Result<()> 
         if now >= expiry {
             return Err(InterflowError::connection(
                 "active credential expired — offline credentials do not renew; rotate with \
-                 `interflow rotate`",
+                 `interflow-cli rotate`",
             ));
         }
         // The phase math is the workspace-wide single source (identity's
@@ -477,7 +477,7 @@ async fn offline_watch(pack_dir: &Path, log_name: Option<String>) -> Result<()> 
                 node,
                 remaining = %interflow_identity::expiry::format_remaining(health.remaining_secs),
                 "credential_expiry_warning: less than 20% of the leaf lifetime remains — \
-                 rotate with `interflow rotate` before {}",
+                 rotate with `interflow-cli rotate` before {}",
                 expiry
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_default()

@@ -13,7 +13,8 @@
 
 use crate::config::{
     AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, EgressRule,
-    EgressTarget, HubConfig, HubTlsConfig, IngressRule, InnerTlsConfig, ServerConfig, TenantConfig,
+    EgressTarget, HubConfig, HubQuicConfig, HubTlsConfig, HubTransportConfig, IngressRule,
+    InnerTlsConfig, ServerConfig, TenantConfig, TransportKind,
 };
 use crate::hub::HubServer;
 use interflow_core::config::AuditConfig;
@@ -141,6 +142,25 @@ pub fn build_hub_config(
     // set means full inter-workspace isolation).
     let acl = policy_acl(&pack.policy);
 
+    // The QUIC face is the manifest's opt-in: a signed `quic_listen` means
+    // enabled, bound exactly there (same port number as the TCP listen is
+    // the convention, different stack). Validation upstream already
+    // rejected loopback/port-0 forms; this leg is parse only.
+    let transport = match &pack.node_config.quic_listen {
+        Some(raw) => HubTransportConfig {
+            quic: HubQuicConfig {
+                enabled: true,
+                listen_addr: Some(raw.parse().map_err(|e| {
+                    config_error(format!("hub quic_listen address {raw:?} is invalid"))
+                        .with_source(e)
+                })?),
+                ..HubQuicConfig::default()
+            },
+            ..HubTransportConfig::default()
+        },
+        None => HubTransportConfig::default(),
+    };
+
     let config = HubConfig {
         server: ServerConfig {
             listen_addr: listen,
@@ -162,7 +182,7 @@ pub fn build_hub_config(
         acl,
         security: Default::default(),
         heartbeat: Default::default(),
-        transport: Default::default(),
+        transport,
         metrics: Default::default(),
         audit: AuditConfig {
             enabled: true,
@@ -213,7 +233,7 @@ pub fn build_agent_config(
     let mesh = pack.node_config.mesh.as_ref().ok_or_else(|| {
         config_error(
             "this agent pack carries no site-to-site rules — it is an expose agent; run it \
-                 with `interflow agent run --pack`",
+                 with `interflow-cli agent run --pack`",
         )
     })?;
     let trust_dir = pack_dir.join("trust");
@@ -248,10 +268,30 @@ pub fn build_agent_config(
     }
     let (egress, allowed_targets) = policy_egress_rules(&pack.policy, &pack.metadata.node)?;
 
+    // The signed dial default rides node.toml verbatim: absent/h2 keeps h2;
+    // `quic` derives the hub's UDP dial address from the signed hub
+    // endpoint (manifest validation already required its explicit port —
+    // this leg stays total for hand-built packs by failing loud).
+    let transport =
+        TransportKind::parse_dial(pack.node_config.transport.as_deref()).map_err(config_error)?;
+    let hub_quic_addr = (transport == TransportKind::Quic)
+        .then(|| {
+            derive_quic_addr(&mesh.hub_endpoint).ok_or_else(|| {
+                config_error(format!(
+                    "[agent] transport = \"quic\" requires a hub endpoint carrying an explicit \
+                     port — the QUIC dial address derives from it (got {:?})",
+                    mesh.hub_endpoint
+                ))
+            })
+        })
+        .transpose()?;
+
     let config = AgentConfig {
         agent: AgentInfo {
             id: pack.metadata.node.clone(),
             hub_url: normalize_endpoint(&mesh.hub_endpoint),
+            transport,
+            hub_quic_addr,
             ..AgentInfo::default()
         },
         ingress,
@@ -288,6 +328,36 @@ fn normalize_endpoint(endpoint: &str) -> String {
         endpoint.to_owned()
     } else {
         format!("https://{endpoint}")
+    }
+}
+
+/// Derives the hub's QUIC (UDP) dial address from a signed hub endpoint.
+///
+/// Scheme stripped, host kept verbatim (IPv6 keeps its brackets), explicit
+/// port required — `None` when the endpoint carries none (implicit 80/443
+/// cannot be assumed for UDP). Manifest validation rejects that
+/// combination upstream; this stays total for engine-TOML callers. The
+/// single source for both the headless pack path and the GUI preference
+/// fallback.
+#[must_use]
+pub fn derive_quic_addr(endpoint: &str) -> Option<String> {
+    let no_scheme = endpoint
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    if let Some((host, tail)) = no_scheme
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    {
+        // IPv6: [::1]:port
+        let port = tail.trim_start_matches(':');
+        return (!port.is_empty()).then(|| format!("[{host}]:{port}"));
+    }
+    match no_scheme.rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(no_scheme.to_string())
+        }
+        _ => None,
     }
 }
 
@@ -1044,5 +1114,118 @@ service = "alpha/desktop/web"
         let active_d = ActiveCredentialSet::load_or_bootstrap(&pack_d).unwrap();
         let err = build_agent_config(&pack_d, &active_d, &out_d).unwrap_err();
         assert!(err.to_string().contains("expose agent"), "{err}");
+    }
+
+    /// The hub's signed `quic_listen` maps onto the engine's QUIC face:
+    /// absent keeps the h2-only default; present enables the listener at
+    /// exactly the signed address.
+    #[test]
+    fn hub_config_opens_the_quic_face_from_the_signed_pack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issuer = issuer(&tmp);
+
+        // Absent: the h2-only status quo.
+        let plain = cross_workspace_manifest("hub.example.com:6666", "0.0.0.0:6666");
+        let out = tmp.path().join("packs/hub-plain");
+        HubCredentialPack::render(&issuer, &plain, "central", 1, &out).unwrap();
+        let pack = CredentialPack::load_runtime(&out).unwrap();
+        let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
+        let config = build_hub_config(&pack, &active, &out).unwrap();
+        assert!(
+            !config.transport.quic.enabled,
+            "no signed quic_listen means the QUIC face stays closed"
+        );
+        assert_eq!(config.transport.quic.listen_addr, None);
+
+        // Present: enabled, bound exactly at the signed address (same port
+        // number as the TCP listen is the convention — different stack).
+        let mut quic = cross_workspace_manifest("hub.example.com:6666", "0.0.0.0:6666");
+        quic.mesh.hub.get_mut("central").unwrap().quic_listen = Some("0.0.0.0:6666".to_owned());
+        let out2 = tmp.path().join("packs/hub-quic");
+        HubCredentialPack::render(&issuer, &quic, "central", 1, &out2).unwrap();
+        let pack2 = CredentialPack::load_runtime(&out2).unwrap();
+        let active2 = ActiveCredentialSet::load_or_bootstrap(&pack2).unwrap();
+        let config2 = build_hub_config(&pack2, &active2, &out2).unwrap();
+        assert!(config2.transport.quic.enabled);
+        assert_eq!(
+            config2.transport.quic.listen_addr,
+            Some("0.0.0.0:6666".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    /// A mesh agent's signed transport default flows into the engine dial:
+    /// `quic` carries the hub's UDP address, derived from the signed hub
+    /// endpoint (scheme stripped); the absent default stays h2 with no
+    /// QUIC address.
+    #[test]
+    fn agent_config_dials_quic_from_the_signed_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let issuer = issuer(&tmp);
+
+        // Absent transport: h2 with no QUIC dial address.
+        let plain = cross_workspace_manifest("hub.example.com:6666", "0.0.0.0:6666");
+        let out = tmp.path().join("packs/agent-plain");
+        AgentCredentialPack::render(&issuer, &plain, "lan-a", 1, &out).unwrap();
+        let pack = CredentialPack::load_runtime(&out).unwrap();
+        let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
+        let config = build_agent_config(&pack, &active, &out).unwrap();
+        assert_eq!(config.agent.transport, TransportKind::H2);
+        assert_eq!(config.agent.hub_quic_addr, None);
+
+        // Quic default: the dial address derives from the signed hub
+        // endpoint — the full-URL form proves the scheme strip.
+        let mut quic = cross_workspace_manifest("https://hub.example.com:6666", "0.0.0.0:6666");
+        quic.mesh.hub.get_mut("central").unwrap().quic_listen = Some("0.0.0.0:6666".to_owned());
+        quic.agent.get_mut("lan-a").unwrap().transport =
+            Some(interflow_identity::manifest::AgentTransport::Quic);
+        let out2 = tmp.path().join("packs/agent-quic");
+        AgentCredentialPack::render(&issuer, &quic, "lan-a", 1, &out2).unwrap();
+        let pack2 = CredentialPack::load_runtime(&out2).unwrap();
+        let active2 = ActiveCredentialSet::load_or_bootstrap(&pack2).unwrap();
+        let config2 = build_agent_config(&pack2, &active2, &out2).unwrap();
+        assert_eq!(config2.agent.transport, TransportKind::Quic);
+        assert_eq!(
+            config2.agent.hub_quic_addr.as_deref(),
+            Some("hub.example.com:6666"),
+            "the QUIC dial address is the signed endpoint, scheme stripped"
+        );
+        // A quic default against an implicit-port endpoint fails loud
+        // (manifest validation normally prevents this; hand-built packs
+        // still get a clear boot error).
+        let mut implicit = cross_workspace_manifest("hub.example.com", "0.0.0.0:6666");
+        implicit.agent.get_mut("lan-a").unwrap().transport =
+            Some(interflow_identity::manifest::AgentTransport::Quic);
+        let out3 = tmp.path().join("packs/agent-implicit");
+        AgentCredentialPack::render(&issuer, &implicit, "lan-a", 1, &out3).unwrap();
+        let pack3 = CredentialPack::load_runtime(&out3).unwrap();
+        let active3 = ActiveCredentialSet::load_or_bootstrap(&pack3).unwrap();
+        let err = build_agent_config(&pack3, &active3, &out3).unwrap_err();
+        assert!(err.to_string().contains("explicit port"), "{err}");
+    }
+
+    #[test]
+    fn quic_addr_derivation_strips_scheme_and_requires_a_port() {
+        assert_eq!(
+            derive_quic_addr("hub.example.com:6666").as_deref(),
+            Some("hub.example.com:6666")
+        );
+        assert_eq!(
+            derive_quic_addr("https://hub.example.com:6666").as_deref(),
+            Some("hub.example.com:6666")
+        );
+        assert_eq!(
+            derive_quic_addr("http://hub.example.com:6666").as_deref(),
+            Some("hub.example.com:6666")
+        );
+        assert_eq!(
+            derive_quic_addr("https://[2001:db8::1]:6666").as_deref(),
+            Some("[2001:db8::1]:6666"),
+            "IPv6 hosts keep their brackets"
+        );
+        assert_eq!(
+            derive_quic_addr("hub.example.com"),
+            None,
+            "an implicit port cannot be assumed for UDP"
+        );
     }
 }

@@ -377,7 +377,7 @@ impl CredentialPack {
                         .unwrap_or_else(|_| "unknown".to_owned());
                     return Err(Error::pack(format!(
                         "credential for {} expired at {expired} — rotate the pack \
-                         (`interflow rotate`)",
+                         (`interflow-cli rotate`)",
                         entry.principal
                     )));
                 }
@@ -467,7 +467,7 @@ pub(crate) fn validate_generation(
     Ok(())
 }
 
-/// `interflow identity inspect` output.
+/// `interflow-cli identity inspect` output.
 #[derive(Debug, Clone, Serialize)]
 pub struct PackSummary {
     pub kind: PackKind,

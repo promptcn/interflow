@@ -66,13 +66,13 @@ pub type NodeId = String;
 /// What a node is — derived from the pack, never chosen in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum NodeKind {
-    /// Public-domain tunnel agent (the `interflow agent` engine).
+    /// Public-domain tunnel agent (the `interflow-cli agent` engine).
     ExposeAgent,
     /// Site-to-site mesh agent (the `interflow-mesh agent` engine).
     MeshAgent,
     /// Site-to-site mesh hub (the `interflow-mesh hub` engine).
     Hub,
-    /// Public-domain ingress edge (the `interflow ingress` engine).
+    /// Public-domain ingress edge (the `interflow-cli ingress` engine).
     Ingress,
 }
 
@@ -125,6 +125,11 @@ pub struct PackInfo {
     pub principal: String,
     /// Rotation generation (display cache; the pack is the source).
     pub generation: u64,
+    /// Content digest of the pack as loaded (`sha256:…` over the digest
+    /// manifest). Two packs with the same generation but different content
+    /// differ here — the "update available" truth that a generation-only
+    /// comparison misses (a re-applied manifest renders generation 1 again).
+    pub digest: String,
     /// Control endpoint (agents dial it; hubs/ingress show their listen).
     pub control_endpoint: String,
     /// Expose services declared in the pack (id + default address).
@@ -233,6 +238,7 @@ pub fn inspect_pack(pack_dir: &Path) -> Result<PackInfo, String> {
         name: pack.metadata.node.clone(),
         principal: pack_principal(&pack),
         generation: pack.metadata.generation,
+        digest: pack.pack_digest.clone(),
         control_endpoint: pack.metadata.control_endpoint.clone(),
         services: pack
             .node_config
@@ -271,6 +277,12 @@ pub struct NodeSpec {
     /// Rotation generation of the pack last seen (display cache for
     /// "update available" hints; the pack is the source).
     pub generation: u64,
+    /// Content digest of the pack last installed here (display cache in the
+    /// same spirit as `generation`: re-read from the pack at every restore,
+    /// refreshed by `update_pack`). "Update available" compares BOTH — a
+    /// re-applied manifest re-renders the same generation with different
+    /// content, which only the digest catches.
+    pub pack_digest: String,
     /// Services the pack declares (id + manifest-issued default address).
     /// Display-and-validation cache: `prepare` re-reads the pack for the
     /// dial targets, so a swapped pack cannot lie about defaults for long.
@@ -323,9 +335,12 @@ pub enum NodeState {
     Starting,
     /// Agent: connecting + registering at the hub.
     Connecting,
-    /// Agent: registered and serving.
+    /// Agent: registered and serving. The hub receipt (observed egress +
+    /// registration moment) rides along — the hub-confirmed evidence the UI
+    /// surfaces instead of making operators grep the hub journal.
     Connected {
         agent_id: String,
+        hub_receipt: Option<interflow_mesh::agent::HubReceipt>,
     },
     /// Reconnect backoff (agent) or restart backoff (any engine).
     Reconnecting {
@@ -346,7 +361,13 @@ impl From<AgentState> for NodeState {
     fn from(state: AgentState) -> Self {
         match state {
             AgentState::Connecting => Self::Connecting,
-            AgentState::Connected { agent_id } => Self::Connected { agent_id },
+            AgentState::Connected {
+                agent_id,
+                hub_receipt,
+            } => Self::Connected {
+                agent_id,
+                hub_receipt,
+            },
             AgentState::Reconnecting {
                 reason,
                 backoff_secs,
@@ -443,9 +464,12 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
             let mut config = interflow_mesh::pack::build_agent_config(&pack, &active, &dir)
                 .map_err(|e| format!("cannot start from this Credential Pack: {e}"))?;
             // Same resolution as expose agents: local preference over the
-            // pack's signed default (the manifest never pins a transport on
-            // mesh-role packs, so the pack default is h2 here — the fold
-            // keeps one rule for both agent faces).
+            // pack's signed dial default, h2 the floor (one fold for both
+            // agent faces). The pack path already carried (or derived) the
+            // QUIC dial address for a quic default; the local address only
+            // overrides when the operator typed one, and a local quic
+            // preference over an h2 pack derives from the signed hub
+            // endpoint — same single-source helper the pack path uses.
             config.agent.transport = interflow_cli::runtime::resolve_effective_transport(
                 spec.transport,
                 pack.node_config.transport.as_deref(),
@@ -455,7 +479,12 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
                 .hub_quic_addr
                 .clone()
                 .filter(|s| !s.trim().is_empty())
-                .or_else(|| derive_quic_addr(&config.agent.hub_url));
+                .or_else(|| config.agent.hub_quic_addr.clone())
+                .or_else(|| {
+                    (config.agent.transport == interflow_mesh::config::TransportKind::Quic)
+                        .then(|| interflow_mesh::pack::derive_quic_addr(&config.agent.hub_url))
+                        .flatten()
+                });
             config.agent.hub_quic_addr = quic_addr;
             config.agent.log_name = Some(log_attribution(spec));
             Ok(Prepared::Mesh {
@@ -494,27 +523,6 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
 /// derivation helper; the control endpoint carries the hub dial address).
 /// Returns `None` when no explicit port is present — engine config
 /// validation then fails with its own pointed message.
-fn derive_quic_addr(hub_url: &str) -> Option<String> {
-    let no_scheme = hub_url
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    if let Some((host, tail)) = no_scheme
-        .strip_prefix('[')
-        .and_then(|rest| rest.split_once(']'))
-    {
-        // IPv6: [::1]:port
-        let port = tail.trim_start_matches(':');
-        return (!port.is_empty()).then(|| format!("[{host}]:{port}"));
-    }
-    match no_scheme.rsplit_once(':') {
-        Some((_, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            Some(no_scheme.to_string())
-        }
-        _ => None,
-    }
-}
-
 /// A running engine, normalized.
 enum Engine {
     Agent {
@@ -1157,7 +1165,7 @@ impl NodeManager {
     /// the next start via the anti-rollback check.
     pub async fn update_pack(&self, id: &str, source: &Path) -> Result<UpdateReport, String> {
         // Snapshot what we need; nothing holds the lock across an await.
-        let (pack_dir, principal, desired_running) = {
+        let (pack_dir, principal, desired_running, cached_generation) = {
             let inner = self.lock();
             let entry = inner
                 .nodes
@@ -1167,6 +1175,7 @@ impl NodeManager {
                 entry.spec.pack_dir.clone(),
                 entry.spec.principal.clone(),
                 entry.desired_running,
+                entry.spec.generation,
             )
         };
         // Identity must match — an update refreshes a node's pack, never
@@ -1191,10 +1200,21 @@ impl NodeManager {
             }
             _ => {}
         }
-        let generation_from = CredentialPack::load_runtime(&pack_dir)
-            .map_err(|e| format!("current pack rejected: {e}"))?
-            .metadata
-            .generation;
+        // The current pack's generation feeds only the report's "from"
+        // display; it must never gate the swap. An unreadable current pack
+        // (directory moved aside or emptied — e.g. while re-organizing the
+        // dist tree) is exactly what this swap repairs, so fall back to the
+        // cached generation and proceed — Update IS the recovery path
+        let generation_from = CredentialPack::load_runtime(&pack_dir).map_or_else(
+            |e| {
+                tracing::warn!(
+                    "current pack unreadable ({e}); updating anyway from the \
+                         cached generation {cached_generation}"
+                );
+                cached_generation
+            },
+            |pack| pack.metadata.generation,
+        );
 
         // Stop unconditionally: it also aborts the renewal supervisor and
         // cancels death-restart retries that could race the swap. The
@@ -1218,6 +1238,7 @@ impl NodeManager {
             entry.spec.name = installed.metadata.node;
             entry.spec.principal = Some(source_principal);
             entry.spec.generation = generation_to;
+            entry.spec.pack_digest = installed.pack_digest.clone();
             entry.spec.pack_services = installed
                 .node_config
                 .services
@@ -1959,50 +1980,61 @@ struct SpecWithIntent {
 
 fn spec_from_profile(persisted: crate::profile::NodeEntry) -> SpecWithIntent {
     let pack_dir = PathBuf::from(&persisted.pack_dir);
-    let (kind, name, principal, pack_services, pack_mesh, pack_listen, pack_transport, generation) =
-        match CredentialPack::load_runtime(&pack_dir) {
-            Ok(pack) => {
-                let principal = Some(pack_principal(&pack));
-                let services = pack
-                    .node_config
-                    .services
-                    .iter()
-                    .map(|s| PackService {
-                        id: s.id.clone(),
-                        default_address: s.address.clone(),
-                    })
-                    .collect();
-                let mesh = pack.node_config.mesh.clone();
-                let listen = pack.node_config.listen.clone();
-                let transport = pack.node_config.transport.clone();
-                (
-                    NodeKind::classify(&pack),
-                    pack.metadata.node,
-                    principal,
-                    services,
-                    mesh,
-                    listen,
-                    transport,
-                    pack.metadata.generation,
-                )
-            }
-            Err(_) => (
-                // Placeholder for display only: `prepare` re-validates and
-                // fails with the pack's real error at start. No principal —
-                // add-time identity dedup skips unreadable placeholders.
-                NodeKind::ExposeAgent,
-                pack_dir.file_name().map_or_else(
-                    || persisted.pack_dir.clone(),
-                    |n| n.to_string_lossy().into_owned(),
-                ),
-                None,
-                Vec::new(),
-                None,
-                None,
-                None,
-                0,
+    let (
+        kind,
+        name,
+        principal,
+        pack_services,
+        pack_mesh,
+        pack_listen,
+        pack_transport,
+        generation,
+        pack_digest,
+    ) = match CredentialPack::load_runtime(&pack_dir) {
+        Ok(pack) => {
+            let principal = Some(pack_principal(&pack));
+            let services = pack
+                .node_config
+                .services
+                .iter()
+                .map(|s| PackService {
+                    id: s.id.clone(),
+                    default_address: s.address.clone(),
+                })
+                .collect();
+            let mesh = pack.node_config.mesh.clone();
+            let listen = pack.node_config.listen.clone();
+            let transport = pack.node_config.transport.clone();
+            (
+                NodeKind::classify(&pack),
+                pack.metadata.node,
+                principal,
+                services,
+                mesh,
+                listen,
+                transport,
+                pack.metadata.generation,
+                pack.pack_digest,
+            )
+        }
+        Err(_) => (
+            // Placeholder for display only: `prepare` re-validates and
+            // fails with the pack's real error at start. No principal —
+            // add-time identity dedup skips unreadable placeholders.
+            NodeKind::ExposeAgent,
+            pack_dir.file_name().map_or_else(
+                || persisted.pack_dir.clone(),
+                |n| n.to_string_lossy().into_owned(),
             ),
-        };
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            0,
+            String::new(),
+        ),
+    };
     let service_addresses = persisted
         .service_addresses
         .into_iter()
@@ -2018,6 +2050,7 @@ fn spec_from_profile(persisted: crate::profile::NodeEntry) -> SpecWithIntent {
             transport: persisted.transport,
             hub_quic_addr: persisted.hub_quic_addr,
             generation,
+            pack_digest,
             pack_services,
             pack_mesh,
             pack_listen,
@@ -2034,31 +2067,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quic_addr_derivation() {
-        assert_eq!(
-            derive_quic_addr("https://127.0.0.1:6666"),
-            Some("127.0.0.1:6666".into())
-        );
-        assert_eq!(
-            derive_quic_addr("https://[2001:db8::1]:6666"),
-            Some("[2001:db8::1]:6666".into())
-        );
-        // No port: None (engine validation produces the pointed error).
-        assert_eq!(derive_quic_addr("https://hub.example.com"), None);
-        assert_eq!(
-            derive_quic_addr("127.0.0.1:6666"),
-            Some("127.0.0.1:6666".into())
-        );
-    }
-
-    #[test]
     fn node_state_maps_agent_and_hub_lifecycles() {
+        let receipt = interflow_mesh::agent::HubReceipt {
+            egress_ip: Some("203.0.113.7".into()),
+            registered_at_unix: 1_759_171_200,
+        };
         assert_eq!(
             NodeState::from(AgentState::Connected {
-                agent_id: "lan-a".into()
+                agent_id: "lan-a".into(),
+                hub_receipt: Some(receipt.clone()),
             }),
             NodeState::Connected {
-                agent_id: "lan-a".into()
+                agent_id: "lan-a".into(),
+                hub_receipt: Some(receipt),
             }
         );
         assert_eq!(NodeState::from(HubLifecycle::Running), NodeState::Running);
@@ -2280,6 +2301,7 @@ target_addr = "127.0.0.1:{echo_port}"
             manager
                 .add(NodeSpec {
                     generation: info.generation,
+                    pack_digest: info.digest.clone(),
                     id: String::new(),
                     kind: info.kind,
                     name: info.name,
@@ -2892,6 +2914,7 @@ target_addr = "127.0.0.1:{echo_port}"
             .manager
             .add(NodeSpec {
                 generation: info.generation,
+                pack_digest: info.digest.clone(),
                 id: String::new(),
                 kind: info.kind,
                 name: info.name.clone(),
@@ -2931,6 +2954,7 @@ target_addr = "127.0.0.1:{echo_port}"
             .manager
             .add(NodeSpec {
                 generation: info.generation,
+                pack_digest: info.digest.clone(),
                 id: String::new(),
                 kind: info.kind,
                 name: info.name.clone(),
@@ -2955,6 +2979,7 @@ target_addr = "127.0.0.1:{echo_port}"
             .manager
             .add(NodeSpec {
                 generation: info.generation,
+                pack_digest: info.digest.clone(),
                 id: String::new(),
                 kind: info.kind,
                 name: info.name.clone(),
@@ -3151,6 +3176,7 @@ service = "default/desktop/web"
                     transport: None,
                     hub_quic_addr: None,
                     generation: info.generation,
+                    pack_digest: info.digest.clone(),
                     pack_services: info.services,
                     pack_mesh: info.mesh,
                     pack_listen: info.listen,
@@ -3465,5 +3491,83 @@ service = "default/desktop/web"
             snapshot.spec.pack_services[0].default_address,
             "127.0.0.1:59999"
         );
+    }
+
+    /// ④ of the QUIC-switch GUI consolidation: a pack directory that was
+    /// cleared or moved aside (e.g. while re-organizing the dist tree) must
+    /// not block the update — the swap IS the repair, and the report falls
+    /// back to the cached generation.
+    #[tokio::test]
+    async fn update_pack_recovers_from_a_cleared_pack_dir() {
+        let stack = stack_with_expose_site();
+        let manager = &stack.manager;
+        let agent_dir = manager
+            .snapshots()
+            .into_iter()
+            .find(|s| s.spec.id == stack.agent_id)
+            .unwrap()
+            .spec
+            .pack_dir
+            .clone();
+
+        // Generation 2 of the same identity (same issuer discipline as the
+        // swap test above: a fresh issuer would change the identity).
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = IssuerStore::open(dir.path().join("issuer"));
+        issuer.ensure_realm().unwrap();
+        issuer.ensure_workspace("default").unwrap();
+        issuer.ensure_policy_key().unwrap();
+        let manifest = Manifest::parse(&format!(
+            r#"
+[realm]
+id = "gui-expose"
+control_endpoint = "127.0.0.1:{}"
+[public_tls]
+mode = "frontend-proxy"
+[registrar]
+endpoint = "https://registrar.invalid"
+[ingress.edge]
+workspaces = ["default"]
+[workspace.default]
+[agent.desktop]
+workspace = "default"
+[[agent.desktop.services]]
+id = "web"
+address = "127.0.0.1:59999"
+[[route]]
+host = "test.local"
+service = "default/desktop/web"
+"#,
+            crate::test_util::free_port()
+        ))
+        .unwrap();
+        let gen2 = dir.path().join("gen2");
+        AgentCredentialPack::render(&issuer, &manifest, "desktop", 2, &gen2).unwrap();
+        std::mem::forget(dir);
+
+        // The current install's directory content is gone (moved away while
+        // re-organizing; the old code died here with "current pack
+        // rejected: io error").
+        std::fs::remove_dir_all(&agent_dir).unwrap();
+
+        let report = manager
+            .update_pack(&stack.agent_id, &gen2)
+            .await
+            .expect("the swap repairs a cleared install");
+        assert_eq!(
+            report.generation_from, 1,
+            "fell back to the cached generation"
+        );
+        assert_eq!(report.generation_to, 2);
+
+        // The install is whole again and the digest cache follows.
+        let installed = CredentialPack::load_runtime(&agent_dir).unwrap();
+        assert_eq!(installed.metadata.generation, 2);
+        let snapshot = manager
+            .snapshots()
+            .into_iter()
+            .find(|s| s.spec.id == stack.agent_id)
+            .unwrap();
+        assert_eq!(snapshot.spec.pack_digest, installed.pack_digest);
     }
 }

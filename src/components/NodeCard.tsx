@@ -1,13 +1,22 @@
-import { formatRemainingSecs, isRunning, leafPhaseClass, stateText, type NodeInfo } from "../api";
+import { effectiveTransport, formatRemainingSecs, isRunning, leafPhaseClass, stateText, type NodeInfo } from "../api";
 import { KindBadge, StateDot } from "./ui";
 
 /// Short state label for the card footer — `stateText` in full (Failed
 /// carries the whole error) belongs in the detail page; the card shows the
-/// word, the tooltip carries the rest.
+/// word, the tooltip carries the rest. A connected agent also names its
+/// transport: the dial form is the node's own static choice, so Connected
+/// plus this value is the hub-confirmed form — the QUIC-switch acceptance
+/// signal that used to require grepping the hub journal.
 function shortState(node: NodeInfo): string {
   const state = node.state;
   if (typeof state === "object" && state !== null) {
-    if (state.Connected) return "Connected";
+    if (state.Connected) {
+      const isAgent = node.kind === "expose_agent" || node.kind === "mesh_agent";
+      if (isAgent) {
+        return effectiveTransport(node) === "quic" ? "QUIC · hub-confirmed" : "h2 · hub-confirmed";
+      }
+      return "Connected";
+    }
     if (state.Reconnecting) return "Reconnecting";
     if (state.Failed) return "Failed";
   }

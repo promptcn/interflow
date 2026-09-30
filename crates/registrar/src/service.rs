@@ -347,7 +347,7 @@ impl<S: KeySource> RegistrarService<S> {
             PrincipalKind::Hub => {
                 return Err(Error::issuance(
                     "hub identities are realm infrastructure, issued offline by \
-                     `interflow plan apply` — not enrolled"
+                     `interflow-cli plan apply` — not enrolled"
                         .to_owned(),
                 ));
             }

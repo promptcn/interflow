@@ -857,7 +857,7 @@ pub async fn wait_initial_registration(
         // live across the match scrutinee.
         let state = rx.borrow_and_update().clone();
         match state {
-            interflow_mesh::agent::AgentState::Connected { agent_id } => {
+            interflow_mesh::agent::AgentState::Connected { agent_id, .. } => {
                 info!(node = %node, "edge internal agent registered as {agent_id}");
                 return Ok(());
             }

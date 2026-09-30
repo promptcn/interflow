@@ -1,4 +1,4 @@
-//! `interflow ingress run --pack` / `interflow agent run --pack` —
+//! `interflow-cli ingress run --pack` / `interflow-cli agent run --pack` —
 //! Credential-Pack → runtime-engine bootstrap.
 //!
 //! The user-facing model never sees certificate paths: the pack supplies
@@ -86,9 +86,9 @@ pub fn resolve_quic_listen(raw: Option<&str>) -> Result<Option<SocketAddr>> {
     }
 }
 
-/// Resolves the dial transport an expose agent runs with: the
-/// machine-local preference wins, the pack's signed manifest default is
-/// the fallback, h2 is the floor.
+/// Resolves the dial transport an agent runs with: the machine-local
+/// preference wins, the pack's signed manifest default is the fallback,
+/// h2 is the floor.
 ///
 /// Single resolution point for every caller — the headless
 /// `agent run --pack` path (no profile: local is `None`, the pack default
@@ -96,22 +96,17 @@ pub fn resolve_quic_listen(raw: Option<&str>) -> Result<Option<SocketAddr>> {
 /// default), mirroring how service dial targets resolve (pack default +
 /// machine-local override). An unexpected pack string fails loud instead
 /// of silently degrading to h2 — node.toml is digest-covered, so this is
-/// a version-skew tripwire, not a user-facing path.
+/// a version-skew tripwire, not a user-facing path. The string semantics
+/// live on [`TransportKind::parse_dial`] (shared with the mesh pack
+/// path).
 pub fn resolve_effective_transport(
     local: Option<interflow_mesh::config::TransportKind>,
     pack_default: Option<&str>,
 ) -> Result<interflow_mesh::config::TransportKind> {
-    use interflow_mesh::config::TransportKind;
     if let Some(local) = local {
         return Ok(local);
     }
-    match pack_default {
-        None | Some("h2") => Ok(TransportKind::default()),
-        Some("quic") => Ok(TransportKind::Quic),
-        Some(other) => Err(InterflowError::config(format!(
-            "pack dial transport {other:?} is not recognized (expected \"h2\" or \"quic\")"
-        ))),
-    }
+    interflow_mesh::config::TransportKind::parse_dial(pack_default).map_err(InterflowError::config)
 }
 
 /// Pack load/validation failures are configuration-class (unrecoverable at

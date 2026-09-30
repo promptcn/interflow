@@ -31,7 +31,15 @@ pub enum AgentState {
     /// Establishing the connection to the hub (first or retry attempt).
     Connecting,
     /// Connected and registered successfully.
-    Connected { agent_id: String },
+    Connected {
+        agent_id: String,
+        /// What the hub's registration receipt said (the hub-confirmed
+        /// detail only the exchange itself can prove: the egress address the
+        /// hub observed, and when the registration happened). `None` only on
+        /// non-production constructors (tests).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hub_receipt: Option<HubReceipt>,
+    },
     /// Session ended; waiting for the backoff before reconnecting.
     Reconnecting {
         reason: String,
@@ -43,6 +51,21 @@ pub enum AgentState {
     /// Unrecoverable error (e.g. a configuration error); the agent will not
     /// retry.
     Failed { error: String },
+}
+
+/// The hub's registration receipt, surfaced with [`AgentState::Connected`].
+///
+/// The connectivity truth only the hub's socket sees (egress address after
+/// NAT) plus the registration moment — the "hub-confirmed" evidence an
+/// operator previously had to grep the hub journal for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HubReceipt {
+    /// The egress IP the hub observed for this registration (the bare IP —
+    /// no port: the QUIC source port is per-connection random and carries
+    /// no signal, so both transports report the same form).
+    pub egress_ip: Option<String>,
+    /// When the registration exchange completed (unix seconds).
+    pub registered_at_unix: u64,
 }
 
 /// Fine-grained lifecycle events (mpsc stream, with transition details).

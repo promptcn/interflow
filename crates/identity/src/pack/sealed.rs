@@ -121,7 +121,7 @@ pub fn install(sealed: &Path, out_dir: &Path, passphrase: &str) -> Result<Creden
     if !decryptor.is_scrypt() {
         return Err(Error::pack(
             "this sealed pack targets key recipients; supply the identity via \
-             `interflow pack install --identity`"
+             `interflow-cli pack install --identity`"
                 .to_owned(),
         ));
     }

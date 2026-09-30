@@ -438,7 +438,7 @@ impl AgentClient {
         // Every transport yields a connection watcher; only h2 yields the
         // request sender for the control proxy (`None` on QUIC — the proxy
         // is a plain h2 pass-through).
-        let (agent_id, tunnel, mut connection_handle, mut hub_client_for_control) = tokio::select! {
+        let (agent_id, tunnel, mut connection_handle, mut hub_client_for_control, negotiated) = tokio::select! {
             r = self.establish_tunnel(&tasks) => r?.into_parts(),
             () = session_token.cancelled() => return Ok(SessionOutcome::Shutdown),
         };
@@ -457,6 +457,12 @@ impl AgentClient {
 
         sink.set_state(AgentState::Connected {
             agent_id: agent_id.clone(),
+            hub_receipt: Some(crate::agent::handle::HubReceipt {
+                egress_ip: negotiated.egress_ip.clone(),
+                registered_at_unix: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            }),
         });
         sink.emit(crate::agent::handle::AgentEvent::SessionEstablished {
             agent_id: agent_id.clone(),
@@ -741,8 +747,9 @@ impl AgentClient {
                     Some(secs) => liveness.task_stall_timeout = Duration::from_secs(secs),
                     None => {}
                 }
+                let negotiated = conn.negotiated.clone();
                 let tunnel = AgentTunnel::from_sender(
-                    conn.negotiated.circuit_token,
+                    negotiated.circuit_token,
                     &conn.hub_url,
                     conn.send_request.clone(),
                     tasks,
@@ -753,14 +760,16 @@ impl AgentClient {
                     tunnel,
                     conn_handle: conn.conn_handle,
                     hub_client: conn.send_request,
+                    negotiated,
                 })
             }
             TransportKind::Quic => {
-                let (tunnel, closed_watcher) = self.connect_quic(tasks).await?;
+                let (tunnel, closed_watcher, negotiated) = self.connect_quic(tasks).await?;
                 Ok(EstablishedSession::Quic {
                     agent_id: self.config.agent.id.clone(),
                     tunnel,
                     closed_watcher,
+                    negotiated,
                 })
             }
         }
@@ -768,12 +777,14 @@ impl AgentClient {
 
     /// QUIC connect (with an overall timeout, aligned with the h2 path's
     /// connect_timeout semantics).
-    /// Returns the tunnel and a connection-death watcher (session-level
-    /// disconnect detection, aligned with the h2 connection future).
+    /// Returns the tunnel, a connection-death watcher (session-level
+    /// disconnect detection, aligned with the h2 connection future), and the
+    /// hub's registration declaration (surfaced to the embedder as the
+    /// hub-confirmed receipt).
     async fn connect_quic(
         &self,
         tasks: &SessionTasks,
-    ) -> Result<(AgentTunnel, tokio::task::JoinHandle<()>)> {
+    ) -> Result<(AgentTunnel, tokio::task::JoinHandle<()>, RegisterResponse)> {
         let timeout = Duration::from_secs(self.config.agent.connect_timeout_secs);
         match tokio::time::timeout(timeout, self.connect_quic_inner(tasks)).await {
             Ok(r) => r.map_err(quic_establish_error),
@@ -787,7 +798,7 @@ impl AgentClient {
     async fn connect_quic_inner(
         &self,
         tasks: &SessionTasks,
-    ) -> Result<(AgentTunnel, tokio::task::JoinHandle<()>)> {
+    ) -> Result<(AgentTunnel, tokio::task::JoinHandle<()>, RegisterResponse)> {
         let quic_addr = self.config.agent.hub_quic_addr.as_deref().ok_or_else(|| {
             InterflowError::config(
                 "[agent] transport = \"quic\" requires hub_quic_addr (host:port)".to_string(),
@@ -879,7 +890,12 @@ impl AgentClient {
                 beat.during(beat_every, watcher_tunnel.closed()).await;
             });
 
-        Ok((AgentTunnel::from_transport(tunnel), closed_watcher))
+        let negotiated = tunnel.negotiated().clone();
+        Ok((
+            AgentTunnel::from_transport(tunnel),
+            closed_watcher,
+            negotiated,
+        ))
     }
 
     /// Build the rustls ClientConfig for QUIC (ALPN `interflow`).
@@ -1103,12 +1119,14 @@ enum EstablishedSession {
         tunnel: AgentTunnel,
         conn_handle: tokio::task::JoinHandle<()>,
         hub_client: SendRequest<H2RequestBody>,
+        negotiated: RegisterResponse,
     },
     /// QUIC: tunnel facade + the connection-death watcher.
     Quic {
         agent_id: String,
         tunnel: AgentTunnel,
         closed_watcher: tokio::task::JoinHandle<()>,
+        negotiated: RegisterResponse,
     },
 }
 
@@ -1120,6 +1138,7 @@ impl EstablishedSession {
         AgentTunnel,
         tokio::task::JoinHandle<()>,
         Option<SendRequest<H2RequestBody>>,
+        RegisterResponse,
     ) {
         match self {
             Self::H2 {
@@ -1127,12 +1146,14 @@ impl EstablishedSession {
                 tunnel,
                 conn_handle,
                 hub_client,
-            } => (agent_id, tunnel, conn_handle, Some(hub_client)),
+                negotiated,
+            } => (agent_id, tunnel, conn_handle, Some(hub_client), negotiated),
             Self::Quic {
                 agent_id,
                 tunnel,
                 closed_watcher,
-            } => (agent_id, tunnel, closed_watcher, None),
+                negotiated,
+            } => (agent_id, tunnel, closed_watcher, None, negotiated),
         }
     }
 }

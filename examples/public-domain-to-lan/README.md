@@ -3,7 +3,7 @@
 This example routes requests for `app.example.com` through a public ingress
 to a service listening on port `3000` in a private network, using the
 identity-first model: you declare Ingress / Agent / Service / Route, and
-`interflow plan apply` issues every Credential Pack.
+`interflow-cli plan apply` issues every Credential Pack.
 
 ```text
 public user ─HTTPS─► nginx :443 ─► ingress edge :8443 ─► control :16666 ◄─mTLS─ lan-agent ─► 127.0.0.1:3000
@@ -21,7 +21,7 @@ public user ─HTTPS─► nginx :443 ─► ingress edge :8443 ─► control :
 units, nginx fragments, `install.sh`). **Production deployment** follows
 the deployment guide: `install.sh` once per server (machine bootstrap —
 user, dirs, binaries; it installs no units), then
-`interflow node install --pack packs/<kind>-<node>` per node (pack + unit +
+`interflow-cli node install --pack packs/<kind>-<node>` per node (pack + unit +
 enable); the scripts and `nginx.conf` here are the local-testing /
 pre-rendering reference.
 
@@ -32,7 +32,7 @@ interflow` in the repository root), then generate a local manifest and issue
 the packs:
 
 ```bash
-../../target/release/interflow setup \
+../../target/release/interflow-cli setup \
   --realm example \
   --control-endpoint 127.0.0.1:16666 \
   --host app.example.com \
@@ -41,7 +41,7 @@ the packs:
   --service-address 127.0.0.1:3000 \
   --out interflow.local.toml
 
-../../target/release/interflow plan apply \
+../../target/release/interflow-cli plan apply \
   --manifest interflow.local.toml \
   --issuer issuer \
   --out dist
@@ -50,7 +50,7 @@ the packs:
 Terminal 1 — ingress:
 
 ```bash
-INTERFLOW_BIN=../../target/release/interflow \
+INTERFLOW_BIN=../../target/release/interflow-cli \
 INTERFLOW_INGRESS_PACK="$PWD/dist/packs/ingress-edge" \
   ./start-ingress.sh
 ```
@@ -64,7 +64,7 @@ python3 -m http.server 3000
 Terminal 3 — agent:
 
 ```bash
-INTERFLOW_BIN=../../target/release/interflow \
+INTERFLOW_BIN=../../target/release/interflow-cli \
 INTERFLOW_AGENT_PACK="$PWD/dist/packs/agent-lan-agent" \
   ./start-agent.sh
 ```
@@ -84,19 +84,19 @@ curl --fail -H 'Host: app.example.com' http://127.0.0.1:8443/
 2. On an operator machine, issue the deployment:
 
    ```bash
-   interflow plan apply --manifest interflow.toml --issuer issuer --out dist
+   interflow-cli plan apply --manifest interflow.toml --issuer issuer --out dist
    ```
 
    More agents later — no TOML editing (the append is non-destructive and
    the edited manifest is fully validated before anything is written):
 
    ```bash
-   interflow node add agent/<name> --manifest interflow.toml --service web:127.0.0.1:3001
-   interflow plan apply --manifest interflow.toml --issuer issuer --out dist
+   interflow-cli node add agent/<name> --manifest interflow.toml --service web:127.0.0.1:3001
+   interflow-cli plan apply --manifest interflow.toml --issuer issuer --out dist
    ```
 
 3. Distribute only the packs (or seal them first —
-   `interflow pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
+   `interflow-cli pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
    writes the `.iflowpack` beside the pack and prints the 144-bit
    passphrase once):
 
@@ -119,5 +119,5 @@ pack-issued mTLS identity only.
 
 - Never expose the ingress HTTP listener `:8443` directly to the internet.
 - Keep the `issuer/` store offline; servers only need their own pack.
-- Rotate with `interflow rotate` and revoke with `interflow revoke` — a
+- Rotate with `interflow-cli rotate` and revoke with `interflow-cli revoke` — a
   revoked credential lands in the issuer deny list and CRL.

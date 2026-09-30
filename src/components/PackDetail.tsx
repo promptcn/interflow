@@ -8,7 +8,6 @@ import { ConfirmDialog, KindBadge, PassphraseDialog, SectionPanel } from "./ui";
 /// secret-asking steps get real dialogs, not window.prompt/confirm.
 export default function PackDetail({
   pack,
-  out,
   busy,
   onBack,
   onUpdateLocal,
@@ -18,7 +17,6 @@ export default function PackDetail({
   onRevoke,
 }: {
   pack: DeployPackDto;
-  out: string;
   busy: boolean;
   onBack: () => void;
   onUpdateLocal: () => void;
@@ -41,7 +39,13 @@ export default function PackDetail({
     if (typeof target === "string") setSealTarget(target);
   };
 
-  const updateAvailable = !!pack.local_node && pack.local_node.generation < pack.generation;
+  // Same rule as the overview grid: a higher generation OR a different
+  // content digest means the dist pack differs from what the local node
+  // runs (a re-applied manifest re-renders the same generation with new
+  // content).
+  const updateAvailable =
+    !!pack.local_node &&
+    (pack.local_node.generation < pack.generation || pack.local_node.digest !== pack.digest);
 
   return (
     <div className="detail-page">
@@ -54,7 +58,7 @@ export default function PackDetail({
       </div>
 
       <div className="detail-body">
-        <SectionPanel title="Identity" hint={`from ${out}/packs/${pack.dir_name}`}>
+        <SectionPanel title="Identity" hint={`from ${pack.path}`}>
           <div className="row">
             <label>Principal</label>
             <input value={pack.principal} readOnly title={pack.principal} />
@@ -78,10 +82,16 @@ export default function PackDetail({
                 className={updateAvailable ? "primary" : ""}
                 disabled={busy}
                 onClick={onUpdateLocal}
-                title="stop, swap the pack in place (state kept), restart"
+                title={
+                  updateAvailable && pack.local_node.generation >= pack.generation
+                    ? "same generation, different content — stop, swap the pack in place (state kept), restart"
+                    : "stop, swap the pack in place (state kept), restart"
+                }
               >
                 {updateAvailable
-                  ? `Update ${pack.local_node.name} to gen ${pack.generation}`
+                  ? pack.local_node.generation < pack.generation
+                    ? `Update ${pack.local_node.name} to gen ${pack.generation}`
+                    : `Update ${pack.local_node.name}`
                   : `Reinstall into ${pack.local_node.name}`}
               </button>
             </div>

@@ -2,7 +2,7 @@
 //!
 //! Subcommands:
 //! - `interflow-mesh hub --pack <dir>` — start the public relay from a
-//!   Credential Pack (`interflow plan apply` renders the pack)
+//!   Credential Pack (`interflow-cli plan apply` renders the pack)
 //! - `interflow-mesh agent --pack <dir>` — start a LAN agent from a
 //!   Credential Pack (can carry both ingress + egress)
 //! - `interflow-mesh version` — version information
@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 /// Top-level CLI arguments.
 #[derive(Parser)]
-#[command(name = "interflow-mesh")]
+#[command(name = env!("CARGO_PKG_NAME"))]
 #[command(about = "Site-to-site TCP tunnel (public hub + LAN agents)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -24,13 +24,13 @@ struct Cli {
 enum Commands {
     /// Start the hub (public relay between the two private networks)
     Hub {
-        /// Credential Pack directory (`interflow plan apply` renders it)
+        /// Credential Pack directory (`interflow-cli plan apply` renders it)
         #[arg(short, long)]
         pack: PathBuf,
     },
     /// Start an agent (LAN side; carries ingress + egress rules)
     Agent {
-        /// Credential Pack directory (`interflow plan apply` renders it)
+        /// Credential Pack directory (`interflow-cli plan apply` renders it)
         #[arg(short, long)]
         pack: PathBuf,
     },
@@ -48,7 +48,7 @@ async fn main() -> interflow_core::error::Result<()> {
         Commands::Version => {
             // Full identity: name anchors the binary, the shared const pins
             // the release line and exact code (`-dirty` = uncommitted
-            // changes) — the same const `interflow --version` prints, so
+            // changes) — the same const `interflow-cli --version` prints, so
             // the two CLIs cannot drift apart.
             println!(
                 "{} {}",

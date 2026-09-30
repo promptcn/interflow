@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, formatRemainingSecs, isRunning, leafPhaseClass, stateText, type LogLine, type NodeInfo, type Transport } from "../api";
+import { api, effectiveTransport, formatRemainingSecs, isRunning, leafPhaseClass, stateText, type LogLine, type NodeInfo, type Transport } from "../api";
 import LogView from "./LogView";
 import { KindBadge, SectionPanel, SegmentedControl, StateDot } from "./ui";
 
@@ -55,6 +55,19 @@ export default function NodeDetail({
   const services = node.services ?? [];
   const reconnecting =
     typeof node.state === "object" && node.state !== null && "Reconnecting" in node.state;
+  // The hub's registration receipt rides with the Connected state — the
+  // egress address the hub observed plus the registration moment.
+  const receipt =
+    typeof node.state === "object" && node.state !== null && node.state.Connected
+      ? node.state.Connected.hub_receipt
+      : null;
+  // The agent's own QUIC-timeout reason carries the "switch to h2" hint in
+  // its text; surface the actionable short form instead of burying it in
+  // the state line (the full reason still shows there).
+  const quicDialTimeout =
+    typeof node.state === "object" &&
+    node.state !== null &&
+    node.state.Reconnecting?.reason.includes("QUIC connect") === true;
 
   // The toggle shows the *effective* transport: local preference, else the
   // pack's signed manifest default, else h2. Saving always writes the local
@@ -188,7 +201,20 @@ export default function NodeDetail({
           }
         >
           <span>{stateText(node.state)}</span>
-          {reconnecting && (
+          {receipt && (
+            <span className="hint">
+              connected via {effectiveTransport(node) === "quic" ? "QUIC" : "h2"} — hub confirmed
+              {receipt.egress_ip ? ` · egress ${receipt.egress_ip}` : ""}
+              {` · registered ${new Date(receipt.registered_at_unix * 1000).toLocaleTimeString()}`}
+            </span>
+          )}
+          {quicDialTimeout && (
+            <span className="hint">
+              QUIC dial keeps timing out — check UDP egress / the hub security group; switching
+              this node's transport to h2 restores connectivity
+            </span>
+          )}
+          {reconnecting && !quicDialTimeout && (
             <span className="hint">
               Will reconnect automatically once the network recovers
             </span>
@@ -288,7 +314,11 @@ export default function NodeDetail({
                   disabled={running}
                   value={hubQuicAddr}
                   onChange={(e) => setHubQuicAddr(e.target.value)}
-                  placeholder="(optional) host:port — derived if empty"
+                  placeholder={
+                    node.pack_hub_quic_addr
+                      ? `blank = derived from the pack (${node.pack_hub_quic_addr})`
+                      : "(optional) host:port — derived if empty"
+                  }
                   autoCapitalize="none"
                   autoCorrect="off"
                   spellCheck={false}

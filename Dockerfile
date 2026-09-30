@@ -3,7 +3,7 @@
 #
 # Builds `interflow-mesh` by default (site-to-site hub/agent). For the
 # unified CLI (ingress/agent from Credential Packs):
-#   docker build --build-arg BINARY=interflow -t interflow:latest .
+#   docker build --build-arg BINARY=interflow-cli -t interflow:latest .
 #
 # Run the mesh hub (mount config and certificates; relative paths inside
 # the config resolve against the config file's directory, i.e.
@@ -21,7 +21,7 @@
 #     interflow:latest agent --config /etc/interflow/agent.toml
 #
 # Run the ingress from its Credential Pack (issue it on an operator machine
-# with `interflow plan apply`; the pack directory carries identity + trust):
+# with `interflow-cli plan apply`; the pack directory carries identity + trust):
 #   docker run -d \
 #     -p 8443:8443 -p 16666:16666 \
 #     -v $PWD/dist/packs/ingress-edge:/etc/interflow/pack:ro \

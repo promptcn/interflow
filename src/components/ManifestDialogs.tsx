@@ -290,7 +290,12 @@ export function HubDialog({
 }: {
   initial: HubDto | null;
   busy: boolean;
-  onConfirm: (edit: { name: string; endpoint: string; listen: string }) => void;
+  onConfirm: (edit: {
+    name: string;
+    endpoint: string;
+    listen: string;
+    quic_listen: string;
+  }) => void;
   onClose: () => void;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
@@ -298,13 +303,19 @@ export function HubDialog({
   const [listen, setListen] = useState(
     initial && initial.listen !== "0.0.0.0:6666" ? initial.listen : "",
   );
+  const [quicListen, setQuicListen] = useState(initial?.quic_listen ?? "");
   return (
     <DialogFrame
       title={initial ? `Hub ${initial.name}` : "New mesh hub"}
       onClose={onClose}
       busy={busy}
       onConfirm={() =>
-        onConfirm({ name: name.trim(), endpoint: endpoint.trim(), listen: listen.trim() })
+        onConfirm({
+          name: name.trim(),
+          endpoint: endpoint.trim(),
+          listen: listen.trim(),
+          quic_listen: quicListen.trim(),
+        })
       }
     >
       {initial ? (
@@ -324,11 +335,14 @@ export function HubDialog({
       <div className="rule-row">
         <label className="hint">listen</label>
         {field(listen, setListen, "blank = 0.0.0.0:6666", "220px")}
+        <label className="hint">QUIC listen</label>
+        {field(quicListen, setQuicListen, "blank = QUIC off (e.g. 0.0.0.0:6666)", "260px")}
       </div>
       <p className="hint">
         The endpoint is the address agents dial and the SAN source of the hub's server
-        credential — a hostname that resolves directly to this machine. v1 allows one
-        hub per realm.
+        credential — a hostname that resolves directly to this machine. The QUIC listen is the
+        hub's UDP face (conventionally the same port as listen); agents opt in per node with
+        transport = quic. v1 allows one hub per realm.
       </p>
     </DialogFrame>
   );

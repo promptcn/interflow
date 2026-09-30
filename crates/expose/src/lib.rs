@@ -1,7 +1,7 @@
 //! Interflow expose library entry: ngrok-style public → private-network
 //! tunnel — the engine behind the public-domain scenario.
 //!
-//! Lib-only by design: the `interflow` CLI (`ingress run` / `agent run`) and
+//! Lib-only by design: the `interflow-cli` CLI (`ingress run` / `agent run`) and
 //! the GUI drive it from Credential Packs; there is no standalone binary.
 
 #![deny(unsafe_code)]

@@ -60,7 +60,7 @@ doc-surfaces:
 ci: fmt-check lint test product-language doc-surfaces
     @echo "Local CI passed"
 
-# Release build (produces the interflow, interflow-mesh, interflow-registrar binaries)
+# Release build (produces the interflow-cli, interflow-mesh, interflow-registrar binaries)
 build-release:
     cargo build --release --locked
 
@@ -68,8 +68,8 @@ build-release:
 
 # Scenario A: public domain → LAN service
 example-public-domain-plan:
-    cargo build --release --bin interflow
-    "{{justfile_directory()}}/target/release/interflow" setup \
+    cargo build --release --bin interflow-cli
+    "{{justfile_directory()}}/target/release/interflow-cli" setup \
         --realm example \
         --control-endpoint 127.0.0.1:16666 \
         --registrar-endpoint https://127.0.0.1:18666 \
@@ -78,17 +78,17 @@ example-public-domain-plan:
         --service web \
         --service-address 127.0.0.1:3000 \
         --out "{{justfile_directory()}}/examples/public-domain-to-lan/interflow.local.toml"
-    "{{justfile_directory()}}/target/release/interflow" plan apply \
+    "{{justfile_directory()}}/target/release/interflow-cli" plan apply \
         --manifest "{{justfile_directory()}}/examples/public-domain-to-lan/interflow.local.toml" \
         --issuer "{{justfile_directory()}}/examples/public-domain-to-lan/issuer" \
         --out "{{justfile_directory()}}/examples/public-domain-to-lan/dist"
 
 example-public-domain-ingress:
-    cargo run --release --bin interflow -- ingress run \
+    cargo run --release --bin interflow-cli -- ingress run \
         --pack examples/public-domain-to-lan/dist/packs/ingress-edge
 
 example-public-domain-agent:
-    cargo run --release --bin interflow -- agent run \
+    cargo run --release --bin interflow-cli -- agent run \
         --pack examples/public-domain-to-lan/dist/packs/agent-lan-agent
 
 # ===== Common =====

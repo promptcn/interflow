@@ -1,6 +1,6 @@
 //! Leaf-credential expiry phasing — the single source of the "how close
 //! to expiry is this credential" math, consumed by the GUI card/detail
-//! views, `interflow doctor`, and the hub's per-agent credential-expiry
+//! views, `interflow-cli doctor`, and the hub's per-agent credential-expiry
 //! observations. One module so every surface shows the same phase for the
 //! same credential at the same moment.
 

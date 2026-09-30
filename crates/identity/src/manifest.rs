@@ -3,7 +3,7 @@
 //!
 //! Everything else (Credential Packs, Trust Bundles, node manifests, service
 //! units, frontend-proxy configs) is *rendered* from this file by
-//! `interflow plan apply`. Nothing on the public side ever carries an
+//! `interflow-cli plan apply`. Nothing on the public side ever carries an
 //! internal listen address or a certificate path.
 
 use crate::{Error, Result, issuance::LeafTtl, validate_name};
@@ -169,14 +169,15 @@ pub struct AgentConfig {
     pub mesh_egress: Vec<MeshEgressRule>,
     /// The dial transport this agent's pack carries as its signed default.
     /// Absent = `h2`. Machine-local preferences (the GUI profile) override
-    /// it at run time; headless nodes dial exactly this. Expose agents
-    /// only — mesh-role agents dial the mesh hub, whose transport face is
-    /// engine-configured, not manifest-pinned.
+    /// it at run time; headless nodes dial exactly this. The dialed face
+    /// follows the agent's role (one pack, one role): expose agents dial
+    /// the control endpoint, mesh-role agents dial the mesh hub.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<AgentTransport>,
 }
 
-/// The transport an expose agent dials the control endpoint over.
+/// The transport an agent dials its upstream face over (expose agents
+/// dial the control endpoint; mesh-role agents dial the mesh hub).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentTransport {
@@ -184,9 +185,11 @@ pub enum AgentTransport {
     #[default]
     H2,
     /// QUIC — per-stream loss recovery pays off on lossy/high-RTT WAN
-    /// paths. Requires the ingress's `quic_listen` face and a control
-    /// endpoint carrying an explicit port (the QUIC dial address derives
-    /// from it; implicit 80/443 cannot be assumed for UDP).
+    /// paths. Requires a QUIC face on the dialed side (the ingress's
+    /// `quic_listen` for expose agents, the hub's `quic_listen` for
+    /// mesh-role agents) and a dial endpoint carrying an explicit port
+    /// (the QUIC dial address derives from it; implicit 80/443 cannot
+    /// be assumed for UDP).
     Quic,
 }
 
@@ -218,6 +221,17 @@ pub struct HubNodeConfig {
     /// Hub listen address (rendered into the hub node config).
     #[serde(default = "default_mesh_hub_listen")]
     pub listen: String,
+    /// UDP listen address for the hub's QUIC face (e.g. `0.0.0.0:6666` —
+    /// conventionally the same port number as `listen`, same number,
+    /// different stack). Absent = the QUIC transport stays off; agents
+    /// opt in per node via `transport = "quic"` and derive their dial
+    /// address from `endpoint`. Private addresses are fine (mesh hubs
+    /// need not be public), but loopback is rejected at validation — no
+    /// agent on another machine could ever reach it. TLS reuses the
+    /// hub's server credential (both faces share one key pair; its SAN
+    /// already covers the hostname agents dial).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_listen: Option<String>,
     /// The dial address agents use to reach this hub (`host:port`, or a
     /// full `https://host:port`). Also the SAN source of the hub's server
     /// credential — agents dial exactly this address.
@@ -582,23 +596,42 @@ impl Manifest {
                      role; declare a second agent node for the other role",
                 )));
             }
-            // `transport` is the expose dial face. Two fail-fasts keep every
-            // manifest field end-to-end usable: mesh-role agents dial the
-            // mesh hub (engine-configured transport), and a `quic` default
-            // has no dial address to derive from an implicit-port endpoint.
-            if let Some(transport) = agent.transport {
+            // `transport` pins the dial default for whichever face this
+            // agent dials (one pack, one role): expose agents dial the
+            // control endpoint, mesh-role agents dial the hub. A `quic`
+            // default fail-fasts on two counts — the QUIC dial address
+            // derives from the dialed endpoint (implicit 80/443 cannot
+            // be assumed for UDP), and a mesh-role dial needs a hub that
+            // actually opened its QUIC face.
+            if agent.transport == Some(AgentTransport::Quic) {
                 if has_mesh_role {
-                    return Err(Error::manifest(format!(
-                        "agent '{agent_id}' sets transport = \"{}\" but declares mesh rules — \
-                         transport is the expose dial face; mesh-role agents dial the mesh \
-                         hub, whose transport is engine-configured",
-                        transport.as_str()
-                    )));
-                }
-                if transport == AgentTransport::Quic
-                    && !interflow_util::parse_endpoint(&self.realm.control_endpoint)
-                        .map(|endpoint| endpoint.explicit_port.is_some())
-                        .unwrap_or(false)
+                    if let Some(hub_endpoint) = self.mesh_hub_endpoint() {
+                        if !interflow_util::parse_endpoint(hub_endpoint)
+                            .map(|endpoint| endpoint.explicit_port.is_some())
+                            .unwrap_or(false)
+                        {
+                            return Err(Error::manifest(format!(
+                                "agent '{agent_id}' transport = \"quic\" requires a hub \
+                                 endpoint carrying an explicit port — the QUIC dial address \
+                                 derives from mesh.hub.<name>.endpoint and implicit 80/443 \
+                                 cannot be assumed for UDP (e.g. endpoint = \
+                                 \"mesh.example.com:6666\")",
+                            )));
+                        }
+                        if !self.mesh.hub.values().any(|hub| hub.quic_listen.is_some()) {
+                            return Err(Error::manifest(format!(
+                                "agent '{agent_id}' transport = \"quic\" but the mesh hub \
+                                 declares no quic_listen — open the hub's QUIC (UDP) face \
+                                 first (e.g. quic_listen = \"0.0.0.0:6666\" under \
+                                 [mesh.hub.<name>])",
+                            )));
+                        }
+                    }
+                    // No hub declared: validate_mesh rejects mesh rules
+                    // without one with its own dedicated error.
+                } else if !interflow_util::parse_endpoint(&self.realm.control_endpoint)
+                    .map(|endpoint| endpoint.explicit_port.is_some())
+                    .unwrap_or(false)
                 {
                     return Err(Error::manifest(format!(
                         "agent '{agent_id}' transport = \"quic\" requires a control endpoint \
@@ -798,6 +831,37 @@ impl Manifest {
                     "mesh.hub.{node}.listen {:?} is not a valid address: {e}",
                     hub.listen
                 )));
+            }
+            // The QUIC face mirrors the ingress semantics: agents dial it
+            // over the network (a loopback bind could never be reached,
+            // even on a private mesh), and port 0 is the derived
+            // ephemeral-port mode, which only the testkit uses. Private
+            // (RFC1918) addresses are fine — mesh hubs need not be public.
+            if let Some(raw) = hub.quic_listen.as_deref() {
+                match raw.parse::<SocketAddr>() {
+                    Ok(addr) if addr.ip().is_loopback() => {
+                        return Err(Error::manifest(format!(
+                            "mesh.hub.{node} quic_listen {raw:?} is loopback — the QUIC face \
+                             is dialed by agents over the network and no agent on another \
+                             machine could reach it; bind a reachable address (e.g. \
+                             0.0.0.0:6666 — private addresses are fine)",
+                        )));
+                    }
+                    Ok(addr) if addr.port() == 0 => {
+                        return Err(Error::manifest(format!(
+                            "mesh.hub.{node} quic_listen {raw:?} uses port 0 — the derived \
+                             ephemeral-port mode is testkit-only; name a concrete port \
+                             (e.g. 0.0.0.0:6666)",
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(Error::manifest(format!(
+                            "mesh.hub.{node} quic_listen {raw:?} is not a valid socket \
+                             address — expected <ip>:<port> (e.g. 0.0.0.0:6666)",
+                        )));
+                    }
+                    Ok(_) => {}
+                }
             }
         }
         if !self.mesh.hub.is_empty() {
@@ -1168,12 +1232,48 @@ service = "main/desktop/asr"
         assert!(Manifest::parse(VALID).is_ok());
     }
 
-    /// `transport` is the expose dial face: mesh-role agents dial the mesh
-    /// hub (engine-configured transport), and a `quic` default can only
-    /// derive its dial address from an explicit-port control endpoint.
+    /// The hub's QUIC face mirrors the ingress semantics: loopback could
+    /// never be reached by an agent on another machine, and `:0` is the
+    /// testkit-only derived-ephemeral mode. Private (RFC1918) addresses
+    /// are legitimate — mesh hubs need not be public.
     #[test]
-    fn agent_transport_is_expose_face_and_needs_derivable_addr() {
-        // Explicit port: both h2 and quic defaults parse.
+    fn mesh_hub_quic_listen_must_be_reachable_concrete() {
+        let with = |quic: &str| {
+            MESH_VALID.replace(
+                "[mesh.hub.central]\nlisten = \"0.0.0.0:6666\"",
+                &format!("[mesh.hub.central]\nlisten = \"0.0.0.0:6666\"\nquic_listen = \"{quic}\""),
+            )
+        };
+        assert!(
+            Manifest::parse(&with("0.0.0.0:6666")).is_ok(),
+            "a wildcard bind is the canonical form"
+        );
+        assert!(
+            Manifest::parse(&with("192.168.1.10:6666")).is_ok(),
+            "a private address is fine — mesh hubs need not be public"
+        );
+        for rejected in ["127.0.0.1:6666", "[::1]:6666"] {
+            let err = Manifest::parse(&with(rejected)).unwrap_err().to_string();
+            assert!(err.contains("loopback"), "{rejected}: {err}");
+        }
+        let err = Manifest::parse(&with("0.0.0.0:0")).unwrap_err().to_string();
+        assert!(err.contains("port 0"), "{err}");
+        let err = Manifest::parse(&with("localhost:6666"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid socket address"), "{err}");
+        // Absent = QUIC off; every fixture without the field stays valid.
+        assert!(Manifest::parse(MESH_VALID).is_ok());
+    }
+
+    /// `transport` pins the dial default for the agent's dialed face (one
+    /// pack, one role): expose agents dial the control endpoint, mesh-role
+    /// agents dial the hub. A `quic` default needs an explicit port on the
+    /// dialed endpoint (the QUIC dial address derives from it), and a mesh
+    /// dial needs a hub that opened its QUIC face.
+    #[test]
+    fn agent_transport_quic_needs_a_derivable_dial_addr() {
+        // Expose face — explicit port: both h2 and quic defaults parse.
         let explicit = VALID.replace(
             "control_endpoint = \"example.com\"",
             "control_endpoint = \"example.com:443\"",
@@ -1188,9 +1288,10 @@ service = "main/desktop/asr"
             "quic + explicit port is the enabled form"
         );
 
-        // Implicit-port control endpoint (the VALID fixture's "example.com"):
-        // the headless pack path derives the QUIC dial address from the
-        // control endpoint and declines implicit 80/443 for UDP.
+        // Expose face — implicit-port control endpoint (the VALID fixture's
+        // "example.com"): the headless pack path derives the QUIC dial
+        // address from the control endpoint and declines implicit 80/443
+        // for UDP.
         let implicit_quic = VALID.replace(
             "[agent.desktop]\nworkspace = \"main\"",
             "[agent.desktop]\nworkspace = \"main\"\ntransport = \"quic\"",
@@ -1201,15 +1302,41 @@ service = "main/desktop/asr"
             "implicit-port endpoint cannot carry a quic default: {err}"
         );
 
-        // Mesh-role agent: transport is not its dial face.
-        let mesh_quic = MESH_VALID.replace(
-            "[agent.lan-a]\nworkspace = \"main\"",
-            "[agent.lan-a]\nworkspace = \"main\"\ntransport = \"quic\"",
-        );
-        let err = Manifest::parse(&mesh_quic).unwrap_err().to_string();
+        // Mesh face — MESH_VALID's hub endpoint carries an explicit port;
+        // a quic default is accepted once the hub opens its QUIC face.
+        let mesh_quic = MESH_VALID
+            .replace(
+                "[mesh.hub.central]\nlisten = \"0.0.0.0:6666\"",
+                "[mesh.hub.central]\nlisten = \"0.0.0.0:6666\"\nquic_listen = \"0.0.0.0:6666\"",
+            )
+            .replace(
+                "[agent.lan-a]\nworkspace = \"main\"",
+                "[agent.lan-a]\nworkspace = \"main\"\ntransport = \"quic\"",
+            );
         assert!(
-            err.contains("mesh rules"),
-            "mesh-role agents must not pin a transport: {err}"
+            Manifest::parse(&mesh_quic).is_ok(),
+            "mesh agent quic + explicit-port endpoint + hub quic_listen is the enabled form"
+        );
+
+        // Mesh face without the hub's QUIC face: runtime would only surface
+        // this as connect timeouts — fail fast at validate.
+        let no_face = mesh_quic.replace("\nquic_listen = \"0.0.0.0:6666\"", "");
+        let err = Manifest::parse(&no_face).unwrap_err().to_string();
+        assert!(
+            err.contains("declares no quic_listen"),
+            "a mesh quic dial needs the hub QUIC face: {err}"
+        );
+
+        // Mesh face with an implicit-port hub endpoint: same derivation
+        // contract as the expose face.
+        let implicit_mesh = mesh_quic.replace(
+            "endpoint = \"hub.example.com:6666\"",
+            "endpoint = \"hub.example.com\"",
+        );
+        let err = Manifest::parse(&implicit_mesh).unwrap_err().to_string();
+        assert!(
+            err.contains("explicit port"),
+            "implicit-port hub endpoint cannot carry a quic default: {err}"
         );
     }
 

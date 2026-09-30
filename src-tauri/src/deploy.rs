@@ -3,7 +3,7 @@
 //! sealed-pack import for "add as node".
 //!
 //! Framework-free domain logic over `interflow_cli` (the same code paths the
-//! `interflow` binary runs); `commands.rs` wraps these as Tauri commands.
+//! `interflow-cli` binary runs); `commands.rs` wraps these as Tauri commands.
 
 use crate::node::{self, PackInfo};
 use std::path::{Path, PathBuf};
@@ -21,33 +21,86 @@ pub fn managed_packs_root() -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct DeployPack {
     pub dir_name: String,
+    /// The pack directory's absolute path — the single source of truth for
+    /// locating the pack (the layout probe may have found it outside
+    /// `<out>/packs/`).
+    pub path: PathBuf,
     pub kind: crate::node::NodeKind,
     pub node: String,
     pub generation: u64,
+    /// Content digest — the same-generation-different-content detector.
+    pub digest: String,
     pub expires: String,
     pub principal: String,
 }
 
-/// Lists the packs of a `plan apply` output tree (`<out>/packs/*`).
-pub fn list_packs(out_root: &Path) -> Result<Vec<DeployPack>, String> {
-    let packs_dir = out_root.join("packs");
-    let entries = std::fs::read_dir(&packs_dir)
-        .map_err(|e| format!("no packs under {}: {e}", packs_dir.display()))?;
-    let mut out = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("read packs dir: {e}"))?;
-        let path = entry.path();
-        if !path.join("pack.toml").is_file() {
-            continue;
+/// Resolves the pack directories under an operator-chosen output root.
+///
+/// The dist-tree shape (`<out>/packs/<name>`) is the primary layout, but a
+/// bare pack directory (`<out>/pack.toml` — e.g. an unpacked single-pack
+/// zip) and a packs root pointed at directly (`<out>/<name>/pack.toml` —
+/// e.g. the zip's wrapper directory) are accepted too: the operator's
+/// intent ("these are my packs") outranks the directory ceremony
+fn resolve_pack_dirs(out_root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    /// One directory level of `<name>/pack.toml` children; IO errors
+    /// propagate (silently skipping a failed read_dir would hide packs).
+    fn child_packs(dir: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+        let entries =
+            std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
+            let path = entry.path();
+            if path.join("pack.toml").is_file() {
+                out.push((entry.file_name().to_string_lossy().into_owned(), path));
+            }
         }
+        Ok(out)
+    }
+
+    // Primary shape: the dist tree.
+    let packs_dir = out_root.join("packs");
+    if packs_dir.is_dir() {
+        return child_packs(&packs_dir);
+    }
+    // A bare pack directory (an unpacked single-pack zip lands here).
+    if out_root.join("pack.toml").is_file() {
+        let dir_name = out_root.file_name().map_or_else(
+            || out_root.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        return Ok(vec![(dir_name, out_root.to_path_buf())]);
+    }
+    // The root used as the packs root itself (the zip's wrapper directory
+    // with `<out>/<name>/pack.toml` children). Empty falls through to the
+    // layout-spelling error below.
+    if let Ok(found) = child_packs(out_root)
+        && !found.is_empty()
+    {
+        return Ok(found);
+    }
+    Err(format!(
+        "no packs under {}: expected a dist tree (`<out>/packs/<name>/pack.toml`), a bare pack \
+         directory (one with `pack.toml` directly), or a directory of such packs",
+        out_root.display()
+    ))
+}
+
+/// Lists the packs of an output tree (`<out>/packs/*` and the accepted
+/// alternates — see [`resolve_pack_dirs`]).
+pub fn list_packs(out_root: &Path) -> Result<Vec<DeployPack>, String> {
+    let mut out = Vec::new();
+    for (dir_name, path) in resolve_pack_dirs(out_root)? {
         let pack = interflow_identity::pack::CredentialPack::load(&path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let info = node::inspect_pack(&path)?;
         out.push(DeployPack {
-            dir_name: entry.file_name().to_string_lossy().into_owned(),
+            dir_name,
+            path,
             kind: info.kind,
             node: pack.metadata.node.clone(),
             generation: pack.metadata.generation,
+            digest: pack.pack_digest,
             expires: pack.metadata.expires.clone(),
             principal: info.principal,
         });
@@ -167,5 +220,53 @@ mod tests {
             .expect("installs");
         assert!(report.installed_to.join("pack.toml").is_file());
         assert!(node::inspect_pack(&report.installed_to).is_ok());
+    }
+
+    #[test]
+    fn list_packs_accepts_bare_pack_dir_and_packs_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = dir.path().join("interflow.toml");
+        std::fs::write(
+            &manifest,
+            interflow_cli::plan::setup_template(
+                "promptcn",
+                "tunnel.example.com:443",
+                "https://registrar.example.com",
+                "app.example.com",
+                "desktop",
+                "asr",
+                "127.0.0.1:8080",
+            ),
+        )
+        .expect("write manifest");
+        let issuer = dir.path().join("issuer");
+        let out = dir.path().join("dist");
+        interflow_cli::plan::apply(&manifest, &issuer, &out, false).expect("apply");
+
+        // The primary dist shape.
+        let dist = list_packs(&out).expect("lists dist tree");
+        assert!(dist.iter().any(|p| p.dir_name == "agent-desktop"));
+        let agent_path = out.join("packs/agent-desktop");
+
+        // A bare pack directory (an unpacked single-pack zip): `out` points
+        // at the pack itself — same single entry, absolute path intact.
+        let bare = list_packs(&agent_path).expect("lists bare pack dir");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].dir_name, "agent-desktop");
+        assert_eq!(bare[0].path, agent_path);
+        assert!(!bare[0].digest.is_empty(), "digest must ride along");
+
+        // The packs root pointed at directly (the zip's wrapper directory).
+        let root = list_packs(&out.join("packs")).expect("lists packs root");
+        assert!(root.iter().any(|p| p.dir_name == "agent-desktop"));
+
+        // None of the shapes present: the error spells the expected layouts.
+        let empty = tempfile::tempdir().expect("tempdir");
+        let err = list_packs(empty.path()).unwrap_err();
+        assert!(err.contains("no packs under"), "wrong error: {err}");
+        assert!(
+            err.contains("<out>/packs/<name>/pack.toml"),
+            "layout hint missing: {err}"
+        );
     }
 }

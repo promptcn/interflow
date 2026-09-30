@@ -1,4 +1,4 @@
-//! Library surface of the unified `interflow` entry point: Credential Pack →
+//! Library surface of the unified `interflow-cli` entry point: Credential Pack →
 //! runtime-engine translation and manifest-derived deployment artifacts,
 //! shared by the CLI binary and the GUI.
 

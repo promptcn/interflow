@@ -12,12 +12,12 @@
 //!   (see [`crate::hub::routing`] and [`open_relay_stream`]).
 //!
 //! Connection lifecycle:
-//! - Control stream (first bidirectional stream): Hello (payload =
-//!   `[caps u32][name_len u16][name]`, the intended semantic id; identity is
-//!   the mTLS client certificate, CN must equal the declared name) →
-//!   HelloAck (the binary capability payload); Ping/Pong heartbeat runs
-//!   on the control stream (reusing `AgentSession::last_pong` and the
-//!   eviction primitive);
+//! - Control stream (first bidirectional stream): Hello (payload = the JSON
+//!   `{caps, agent_id}`, the intended semantic id; identity is the mTLS
+//!   client certificate, CN must equal the declared name) → HelloAck (the
+//!   same JSON capability declaration the h2 register response body
+//!   carries); Ping/Pong heartbeat runs on the control stream (reusing
+//!   `AgentSession::last_pong` and the eviction primitive);
 //! - Connection-lost watcher: deregister + sweep orphan streams.
 //!
 //! Traffic Open frames carry only a route token. The Open frame forwarded to
@@ -36,7 +36,7 @@
 use crate::hub::state::{
     AgentSession, HubState, QuicAgentConn, SharedAgents, StreamFace, TunnelData,
 };
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use interflow_core::error::{InterflowError, Result};
 use interflow_core::protocol::frame as wire;
 use interflow_core::protocol::{
@@ -49,7 +49,10 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
-use interflow_core::tunnel::negotiation::{HeartbeatAd, RegisterResponse};
+use interflow_core::tunnel::negotiation::{
+    HeartbeatAd, RegisterResponse, decode_hello_payload, decode_route_request_payload,
+    encode_error_payload, encode_route_ack_payload,
+};
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
 /// Relay channel capacity (same as the poll channel).
@@ -375,9 +378,7 @@ async fn register_quic_agent(
     }
     // The intended semantic id rides the Hello payload (the header
     // circuit field is the zero marker on Hello).
-    let Ok((hello_caps, agent_id)) =
-        interflow_core::tunnel::quic::decode_hello_payload(&hello.payload)
-    else {
+    let Ok((hello_caps, agent_id)) = decode_hello_payload(&hello.payload) else {
         warn!("QUIC Hello payload malformed ({peer})");
         return None;
     };
@@ -480,11 +481,11 @@ async fn register_quic_agent(
     )
     .await;
 
-    // HelloAck payload: the binary capability declaration (caps word +
-    // registration — the same fields the h2 register response body carries
-    // as JSON; heartbeat cadence for the agent-side stall derivation). QUIC
-    // Pongs ride the control stream, so there is nothing transport-specific
-    // to declare.
+    // HelloAck payload: the capability declaration as the same JSON the h2
+    // register response body carries (the caps word flattened in as a
+    // top-level key; heartbeat cadence for the agent-side stall
+    // derivation). QUIC Pongs ride the control stream, so there is nothing
+    // transport-specific to declare.
     let hub_caps = if quinn_caps_enabled(hub).await {
         interflow_core::tunnel::quic::CAP_DATAGRAM
     } else {
@@ -498,9 +499,16 @@ async fn register_quic_agent(
                 .heartbeat
                 .enabled
                 .then_some(HeartbeatAd::from(&cfg.heartbeat)),
+            // The registration-observed agent egress IP — the same field,
+            // same bare-IP form as the h2 register response body (the QUIC
+            // source port is per-connection random and carries no signal).
+            egress_ip: Some(conn.remote_address().ip().to_string()),
         }
     };
-    let payload = capability.encode_wire(hub_caps);
+    let Ok(payload) = capability.encode_ack_payload(hub_caps) else {
+        warn!("QUIC HelloAck encode failed");
+        return None;
+    };
     let mut ack = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
     wire::encode_frame(
         FrameType::HelloAck,
@@ -559,27 +567,29 @@ async fn register_quic_agent(
     Some((agent_key, state_arc))
 }
 
-/// Authentication failure: best-effort send of an Error frame
-/// (`[code u16][text]`), then close the connection.
+/// Authentication failure: best-effort send of an Error frame (the JSON
+/// rejection payload — code + human-oriented text), then close the
+/// connection.
 async fn send_error_and_close(conn: &quinn::Connection, msg: &str) {
     let Ok((mut tx, rx)) = conn.open_bi().await else {
         conn.close(0_u32.into(), b"auth failed");
         return;
     };
-    let mut payload = BytesMut::with_capacity(2 + msg.len());
-    payload.put_u16(interflow_contract::error_code::REGISTER_REJECTED);
-    payload.put_slice(msg.as_bytes());
-    let mut buf = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
-    wire::encode_frame(
-        FrameType::Error,
-        FLAG_HUB_ORIGIN,
-        StreamId::ZERO,
-        CircuitToken::ZERO,
-        &payload,
-        &mut buf,
-    );
-    if tx.write_all(&buf).await.is_ok() {
-        let _ = tx.finish();
+    if let Ok(payload) =
+        encode_error_payload(interflow_contract::error_code::REGISTER_REJECTED, msg)
+    {
+        let mut buf = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
+        wire::encode_frame(
+            FrameType::Error,
+            FLAG_HUB_ORIGIN,
+            StreamId::ZERO,
+            CircuitToken::ZERO,
+            &payload,
+            &mut buf,
+        );
+        if tx.write_all(&buf).await.is_ok() {
+            let _ = tx.finish();
+        }
     }
     drop(rx);
     conn.close(0_u32.into(), b"auth failed");
@@ -1035,31 +1045,19 @@ async fn handle_quic_stream(
         // The requester is identified by the connection (the RouteRequest
         // carries the correlation id + zero circuit; the codec enforces it).
         let circuit = source_state.read().await.circuit;
-        let invalid = || InterflowError::protocol("invalid QUIC route request payload");
-        if opened.payload.len() < 2 {
-            return Err(invalid());
-        }
-        let name_len = u16::from_be_bytes([opened.payload[0], opened.payload[1]]) as usize;
-        if opened.payload.len() != 2 + name_len {
-            return Err(invalid());
-        }
-        let Ok(target) = std::str::from_utf8(&opened.payload[2..]).map(str::to_owned) else {
-            return Err(invalid());
-        };
-        // RouteAck payload: `[granted u8][route token 16 B]` (zero token =
-        // denied).
-        let mut payload = BytesMut::with_capacity(1 + 16);
-        match crate::hub::routing::issue_route(&hub, &source_agent, circuit, &target).await {
-            Ok(route) => {
-                payload.put_u8(1);
-                payload.put_slice(&route.to_bytes());
-            }
-            Err(reason) => {
-                warn!("QUIC route lease denied: reason={reason}");
-                payload.put_u8(0);
-                payload.put_slice(&[0u8; 16]);
-            }
-        }
+        let target = decode_route_request_payload(&opened.payload)
+            .map_err(|_| InterflowError::protocol("invalid QUIC route request payload"))?;
+        // RouteAck payload: the in-band route receipt (denied = no token).
+        let route =
+            match crate::hub::routing::issue_route(&hub, &source_agent, circuit, &target).await {
+                Ok(route) => Some(route),
+                Err(reason) => {
+                    warn!("QUIC route lease denied: reason={reason}");
+                    None
+                }
+            };
+        let payload = encode_route_ack_payload(route)
+            .map_err(|e| InterflowError::protocol("QUIC RouteAck encode failed").with_source(e))?;
         let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
         wire::encode_frame(
             FrameType::RouteAck,

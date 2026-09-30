@@ -1,4 +1,4 @@
-//! The unified identity-first `interflow` CLI.
+//! The unified identity-first `interflow-cli` CLI.
 //!
 //! Beginner surface: setup / plan / ingress run / agent run / doctor.
 //! Operator surface: pack / trust / rotate / revoke / identity.
@@ -12,10 +12,10 @@ use interflow_identity::pack::CredentialPack;
 use interflow_identity::pack::sealed::{SealKey, install, seal};
 use std::path::PathBuf;
 
-/// Top-level `interflow` CLI.
+/// Top-level `interflow-cli` CLI.
 #[derive(Parser)]
 #[command(
-    name = "interflow",
+    name = env!("CARGO_PKG_NAME"),
     version = interflow_buildinfo::VERSION_WITH_TAG,
     about = "Identity-first tunnels: Ingress / Agent / Service / Route"
 )]
@@ -33,7 +33,7 @@ enum SetupFace {
     Mesh,
 }
 
-/// `interflow audit …` subcommands.
+/// `interflow-cli audit …` subcommands.
 #[derive(Subcommand)]
 enum AuditCommand {
     /// Replay the hash chain across the whole ledger: every record's
@@ -354,21 +354,21 @@ async fn main() -> interflow_core::error::Result<()> {
             match face {
                 SetupFace::Expose => {
                     println!(
-                        "  1. edit {} (or append nodes: interflow node add agent/<name> --service id:address)",
+                        "  1. edit {} (or append nodes: interflow-cli node add agent/<name> --service id:address)",
                         out.display()
                     );
-                    println!("  2. interflow plan apply --manifest {}", out.display());
+                    println!("  2. interflow-cli plan apply --manifest {}", out.display());
                 }
                 // The skeleton ships no placeholder agent — the first node
                 // add is what makes the mesh manifest deployable.
                 SetupFace::Mesh => {
                     println!(
-                        "  1. service side:   interflow node add agent/<name> --mesh-egress <rule>:127.0.0.1:8080"
+                        "  1. service side:   interflow-cli node add agent/<name> --mesh-egress <rule>:127.0.0.1:8080"
                     );
                     println!(
-                        "     connect side:   interflow node add agent/<name> --mesh-ingress <rule>:127.0.0.1:8080:127.0.0.1:8080@<peer>"
+                        "     connect side:   interflow-cli node add agent/<name> --mesh-ingress <rule>:127.0.0.1:8080:127.0.0.1:8080@<peer>"
                     );
-                    println!("  2. interflow plan apply --manifest {}", out.display());
+                    println!("  2. interflow-cli plan apply --manifest {}", out.display());
                 }
             }
             Ok(())
@@ -474,7 +474,7 @@ async fn main() -> interflow_core::error::Result<()> {
                     manifest.display()
                 );
                 println!(
-                    "Next: interflow plan apply --manifest {}",
+                    "Next: interflow-cli plan apply --manifest {}",
                     manifest.display()
                 );
                 Ok(())

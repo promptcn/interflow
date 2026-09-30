@@ -48,3 +48,6 @@ docs/references/
 
 # Soak guardrail artifacts (nightly local runs; CI uploads them as artifacts, never committed)
 bench-results/soak-*/
+
+# CI log bundles dropped into the tree for local analysis (e.g. GitHub run archives)
+/logs/

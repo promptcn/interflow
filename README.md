@@ -4,12 +4,12 @@
 ## Quick start
 
 ```bash
-interflow setup --realm example --control-endpoint relay.example.com:16666 \
+interflow-cli setup --realm example --control-endpoint relay.example.com:16666 \
   --host app.example.com --agent desktop --service web --service-address 127.0.0.1:8080
-interflow plan apply --manifest interflow.toml --issuer issuer --out dist
+interflow-cli plan apply --manifest interflow.toml --issuer issuer --out dist
 
-interflow ingress run --pack dist/packs/ingress-edge   # public entry node
-interflow agent run   --pack dist/packs/agent-desktop   # in-network connector
+interflow-cli ingress run --pack dist/packs/ingress-edge   # public entry node
+interflow-cli agent run   --pack dist/packs/agent-desktop   # in-network connector
 ```
 
 You declare **Ingress / Agent / Service / Route**; identities, trust, and
@@ -29,16 +29,16 @@ The same manifest model drives the mesh engine: declare a `[mesh.hub.*]`
 node and per-agent mesh rules — by hand, or structurally with
 `setup --face mesh` + `node add` (no TOML to write: the append is
 non-destructive, and the edited manifest must pass the full validation
-funnel before anything is written) — then `interflow plan apply` renders
+funnel before anything is written) — then `interflow-cli plan apply` renders
 hub and agent Credential Packs, and the nodes run on the `interflow-mesh`
 binary (a node is an identity — a machine can run any number of them, each
 in its own mesh):
 
 ```bash
-interflow setup --face mesh --realm example --hub-name central --hub-endpoint hub.example.com:6666
-interflow node add agent/lan-b --mesh-egress web:10.1.0.5:80     # serve side first
-interflow node add agent/lan-a --mesh-ingress to-lan-b:127.0.0.1:3001:10.1.0.5:80@lan-b
-interflow plan apply                          # all flags default: interflow.toml / issuer / dist
+interflow-cli setup --face mesh --realm example --hub-name central --hub-endpoint hub.example.com:6666
+interflow-cli node add agent/lan-b --mesh-egress web:10.1.0.5:80     # serve side first
+interflow-cli node add agent/lan-a --mesh-ingress to-lan-b:127.0.0.1:3001:10.1.0.5:80@lan-b
+interflow-cli plan apply                          # all flags default: interflow.toml / issuer / dist
 
 interflow-mesh hub   --pack dist/packs/hub-central   # public relay
 interflow-mesh agent --pack dist/packs/agent-lan-a    # LAN A side
@@ -46,7 +46,7 @@ interflow-mesh agent --pack dist/packs/agent-lan-b    # LAN B side
 ```
 
 Distribute a pack as an encrypted `.iflowpack` with
-`interflow pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
+`interflow-cli pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
 (the output lands beside the pack; the 144-bit passphrase prints once).
 
 Hub and agent credentials are issued offline (never enrolled), renew
@@ -69,7 +69,7 @@ handoff.
 interflow/
 ├── crates/
 │   ├── identity/   ← identity model: manifest, issuer, Credential Packs, trust bundles, policy
-│   ├── cli/        ← the unified `interflow` entry point (setup / plan / ingress / agent / lifecycle)
+│   ├── cli/        ← the unified `interflow-cli` entry point (setup / plan / ingress / agent / lifecycle)
 │   ├── expose/     ← public-domain engine (lib-only, driven from packs by the CLI/GUI)
 │   ├── mesh/       ← site-to-site engine + the `interflow-mesh` binary (pack-only)
 │   ├── core/       ← tunnel primitives (protocol / tunnel / registry / acl / tls / pump / telemetry)
@@ -86,7 +86,7 @@ interflow/
 
 ---
 
-## Public domain → LAN service (`interflow`)
+## Public domain → LAN service (`interflow-cli`)
 
 Like ngrok, it exposes a local port under a public domain — but with a fixed domain (no random assignment), and the public entry point terminates HTTPS itself: ACME by default (`[public_tls] mode = "acme"`, ports 80/443 direct), or a frontend proxy (nginx/LB) in the advanced topology.
 
@@ -96,12 +96,12 @@ Default — the ingress terminates public HTTPS itself via ACME:
 
 ```
 [public server]
-  interflow ingress run --pack …     ← single process: control endpoint + ingress listener
+  interflow-cli ingress run --pack …     ← single process: control endpoint + ingress listener
      │ public HTTPS terminated here (ACME: HTTP-01 + TLS-ALPN-01, auto-renewal)
      │ HTTP/2 tunnel (mTLS from the Credential Pack)
      ▼
 [local machine]
-  interflow agent run --pack …       ← in-network connector; services come from the pack
+  interflow-cli agent run --pack …       ← in-network connector; services come from the pack
      │
      ▼
   127.0.0.1:3000
@@ -115,7 +115,7 @@ listener (e.g. `127.0.0.1:8443`); the tunnel leg below is unchanged.
 
 ```bash
 # 1. Operator machine: declare the deployment (the single source of truth)
-interflow setup \
+interflow-cli setup \
   --realm example --control-endpoint relay.example.com:16666 \
   --registrar-endpoint https://registrar.example.com \
   --host app.example.com --agent myagent \
@@ -131,22 +131,22 @@ interflow-registrar serve --issuer issuer --listen 0.0.0.0:18666 \
   --control-endpoint relay.example.com:16666
 
 # 3. Issue every identity + Credential Pack (append more agents any time:
-#    interflow node add agent/<name> --service id:address, then re-apply)
-interflow plan apply --manifest interflow.toml --issuer issuer --out dist
+#    interflow-cli node add agent/<name> --service id:address, then re-apply)
+interflow-cli plan apply --manifest interflow.toml --issuer issuer --out dist
 
 # 4. Public server: start the ingress from its pack
-interflow ingress run --pack dist/packs/ingress-edge
+interflow-cli ingress run --pack dist/packs/ingress-edge
 
 # 5. Local machine: start the agent from its pack (transfer it encrypted:
-#    interflow pack seal --pack dist/packs/agent-myagent --generate-passphrase)
-interflow agent run --pack dist/packs/agent-myagent
+#    interflow-cli pack seal --pack dist/packs/agent-myagent --generate-passphrase)
+interflow-cli agent run --pack dist/packs/agent-myagent
 ```
 
 No certificate paths anywhere: the packs carry identity, trust, the signed
 route policy, and the node configuration. Leaf credentials default to a 24h
-TTL and renew automatically at 50% remaining lifetime. `interflow rotate`
-remains for policy/trust generation changes, revoke with `interflow revoke`,
-and diagnose with `interflow doctor`.
+TTL and renew automatically at 50% remaining lifetime. `interflow-cli rotate`
+remains for policy/trust generation changes, revoke with `interflow-cli revoke`,
+and diagnose with `interflow-cli doctor`.
 
 ### Key design
 
@@ -243,7 +243,7 @@ cargo test --workspace
 # GUI (Tauri 2, unified node manager): macOS DMG
 ./scripts/build-dmg.sh
 
-# Docker (mesh hub/agent image by default; --build-arg BINARY=interflow also works)
+# Docker (mesh hub/agent image by default; --build-arg BINARY=interflow-cli also works)
 docker build -t interflow:latest .
 ```
 

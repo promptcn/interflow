@@ -22,9 +22,24 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # Retired CLI flags / binary / command shapes (the `interflow-expose` binary
 # and the pre-v6 surface; `--transport` is the flag form — the live config
-# field is `transport = "…"` in TOML).
+# field is `transport = "…"` in TOML). The bare `interflow` CLI binary was
+# renamed `interflow-cli` on 2026-09-29 (docs/backlog/
+# 2026-09-29-binary-naming-cli-vs-mesh.md); the entries below are full
+# command shapes so project-name uses (`interflow.toml`, `/srv/interflow`,
+# the product name itself) never match.
 RETIRED_TERMS = (
     "interflow-expose",
+    "interflow plan apply",
+    "interflow node install",
+    "interflow node add",
+    "interflow ingress run",
+    "interflow agent run",
+    "interflow setup",
+    "interflow doctor",
+    "interflow rotate",
+    "interflow revoke",
+    # trailing space: `--bin interflow-cli` must never match
+    "--bin interflow ",
     # Engine TOML file face (removed 2026-09-22 with the other old-format
     # compatibility paths): the mesh CLI is pack-only.
     "--config",

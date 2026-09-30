@@ -144,8 +144,7 @@ impl H2Tunnel {
             )));
         }
         let body = response.into_body().collect().await?;
-        let parsed: crate::tunnel::negotiation::RouteResponse =
-            serde_json::from_slice(&body.to_bytes())?;
+        let parsed = crate::tunnel::negotiation::RouteResponse::parse(&body.to_bytes())?;
         self.routes
             .lock()
             .map_err(|_| InterflowError::protocol("route cache poisoned"))?

@@ -70,9 +70,11 @@ README_TRIMS = [
 ]
 
 # (name, old, new) — applied to the public copy of justfile. The
-# config-reference guard drives a private-side script against a private-side
-# doc (neither exports), so the recipe and its `ci` dependency drop out of
-# the public tree; version-contract reads docs/versioning.md (also private).
+# config-reference and private-tests guards drive private-side scripts
+# against private-side subjects (docs/, deployments/ — neither exports), so
+# the recipes and their `ci` dependencies drop out of the public tree;
+# version-contract reads docs/versioning.md (also private, ci dependency
+# only — the recipe body ships and the public workflow job runs it).
 JUSTFILE_TRIMS = [
     (
         "config-reference-recipe",
@@ -84,8 +86,18 @@ JUSTFILE_TRIMS = [
         "",
     ),
     (
+        "private-tests-recipe",
+        "# Private-fixture test placement guard (deployments/ is private-only;\n"
+        "# tests reading it must be named private_*.rs so the export drops them\n"
+        "# wholesale — enforced here and by export_public.sh preflight)\n"
+        "private-tests:\n"
+        "    python3 scripts/check_private_tests.py\n"
+        "\n",
+        "",
+    ),
+    (
         "ci-line",
-        "ci: fmt-check lint test config-reference version-contract product-language doc-surfaces\n",
+        "ci: fmt-check lint test private-tests config-reference version-contract product-language doc-surfaces\n",
         "ci: fmt-check lint test product-language doc-surfaces\n",
     ),
 ]

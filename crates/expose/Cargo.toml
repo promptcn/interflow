@@ -11,12 +11,12 @@ name = "interflow_expose"
 path = "src/lib.rs"
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.6" }
-interflow-mesh = { path = "../mesh", version = "0.6" }
+interflow-core = { path = "../core", version = "0.7" }
+interflow-mesh = { path = "../mesh", version = "0.7" }
 # Shared endpoint/authority parsing (hub QUIC addr derivation, Host routing)
-interflow-util = { path = "../util", version = "0.6" }
+interflow-util = { path = "../util", version = "0.7" }
 # Compile-time build identity (engine startup log line)
-interflow-buildinfo = { path = "../buildinfo", version = "0.6" }
+interflow-buildinfo = { path = "../buildinfo", version = "0.7" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -56,13 +56,13 @@ rlimit = "0.10"
 workspace = true
 
 [dev-dependencies]
-interflow-certs = { path = "../certs", version = "0.6" }
+interflow-certs = { path = "../certs", version = "0.7" }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tempfile = "3"
 criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
 # Shared test harness (certs for the QUIC e2e stack; fault-injection for the
 # self-healing tests; production graph unaffected)
-interflow-testkit = { path = "../testkit", version = "0.6", features = ["fault-injection"] }
+interflow-testkit = { path = "../testkit", version = "0.7", features = ["fault-injection"] }
 # e2e assertions on metrics counters (in-process recorder installed for direct snapshot reads)
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 

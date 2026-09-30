@@ -1,4 +1,4 @@
-//! Integration tests for `interflow node install` (P0-1): the real binary
+//! Integration tests for `interflow-cli node install` (P0-1): the real binary
 //! against a temp deployment — first install, idempotent upgrade, sealed
 //! `.iflowpack` input, non-root refusal, missing pack.
 
@@ -9,7 +9,7 @@ fn bin() -> PathBuf {
     let mut p = std::env::current_exe().expect("test bin path");
     p.pop(); // deps/
     p.pop(); // tests/
-    p.join(format!("interflow{}", std::env::consts::EXE_SUFFIX))
+    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
 }
 
 struct RunOutcome {

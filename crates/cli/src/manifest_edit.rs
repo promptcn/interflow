@@ -282,6 +282,9 @@ pub struct HubEdit {
     pub name: String,
     pub endpoint: String,
     pub listen: Option<String>,
+    /// The hub's QUIC (UDP) listen address; `None`/blank keeps the QUIC
+    /// transport off.
+    pub quic_listen: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +420,7 @@ pub fn apply_edit(text: &str, edit: &ManifestEdit) -> Result<String> {
                 .ok_or_else(|| unknown("hub", name))?;
             set_str(hub, "endpoint", Some(edit.endpoint.trim()));
             set_str(hub, "listen", non_blank(edit.listen.as_deref()));
+            set_str(hub, "quic_listen", non_blank(edit.quic_listen.as_deref()));
         }
         ManifestEdit::RemoveHub(name) => {
             let mesh = parent_table(root, "mesh")?;
@@ -1342,6 +1346,11 @@ email = "ops@example.com"
 mode = "offline"
 leaf_ttl = "45d"
 
+[mesh.hub.central]
+listen = "0.0.0.0:6666"
+quic_listen = "0.0.0.0:6666"
+endpoint = "mesh.example.com:6666"
+
 [workspace.default]
 
 [ingress.edge]
@@ -1360,6 +1369,23 @@ transport = "quic"
 [[agent.desktop.services]]
 id = "asr"
 address = "127.0.0.1:8080"
+
+[agent.lan-a]
+workspace = "default"
+transport = "quic"
+
+[[agent.lan-a.mesh_ingress]]
+name = "svc"
+listen = "127.0.0.1:3001"
+target_agent = "lan-b"
+remote_addr = "127.0.0.1:3000"
+
+[agent.lan-b]
+workspace = "default"
+
+[[agent.lan-b.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:3000"
 
 [[route]]
 host = "app.example.com"
@@ -1402,6 +1428,16 @@ service = "default/desktop/asr"
                 agent: "desktop".into(),
                 transport: manifest.agent["desktop"].transport,
             },
+            ManifestEdit::UpsertHub(HubEdit {
+                name: "central".into(),
+                endpoint: manifest.mesh.hub["central"].endpoint.clone(),
+                listen: Some(manifest.mesh.hub["central"].listen.clone()),
+                quic_listen: manifest.mesh.hub["central"].quic_listen.clone(),
+            }),
+            ManifestEdit::SetAgentTransport {
+                agent: "lan-a".into(),
+                transport: manifest.agent["lan-a"].transport,
+            },
             ManifestEdit::UpsertService(ServiceEdit {
                 agent: "desktop".into(),
                 id: manifest.agent["desktop"].services[0].id.clone(),
@@ -1418,6 +1454,42 @@ service = "default/desktop/asr"
             text = apply_edit(&text, edit).unwrap();
         }
         assert_eq!(text, KITCHEN_SINK, "full round-trip must be byte-stable");
+    }
+
+    /// The hub's QUIC face sets and clears canonically: an explicit address
+    /// lands as `quic_listen`, a blank edit removes the key entirely
+    /// (QUIC off).
+    #[test]
+    fn hub_quic_face_sets_and_clears() {
+        let set = apply_edit(
+            MESH_MANIFEST,
+            &ManifestEdit::UpsertHub(HubEdit {
+                name: "promptcn".into(),
+                endpoint: "mesh.example.com:6666".into(),
+                listen: Some("0.0.0.0:6666".into()),
+                quic_listen: Some("0.0.0.0:6666".into()),
+            }),
+        )
+        .unwrap();
+        assert!(
+            set.contains("quic_listen = \"0.0.0.0:6666\""),
+            "an explicit address lands as quic_listen: {set}"
+        );
+
+        let cleared = apply_edit(
+            &set,
+            &ManifestEdit::UpsertHub(HubEdit {
+                name: "promptcn".into(),
+                endpoint: "mesh.example.com:6666".into(),
+                listen: Some("0.0.0.0:6666".into()),
+                quic_listen: None,
+            }),
+        )
+        .unwrap();
+        assert!(
+            !cleared.contains("quic_listen"),
+            "a blank quic_listen removes the key (QUIC off): {cleared}"
+        );
     }
 
     /// Upsert-by-name patches the matching entry in place (entry comments

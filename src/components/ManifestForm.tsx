@@ -327,6 +327,7 @@ function HubSection({
           <span className="mono summary-key">{hub.name}</span>
           <span className="mono">{hub.endpoint}</span>
           <span className="hint">listen {hub.listen}</span>
+          {hub.quic_listen && <span className="hint">· quic {hub.quic_listen}</span>}
           <span style={{ flex: 1 }} />
           <button disabled={busy} onClick={() => setDialog({ hub })}>
             Edit
@@ -343,7 +344,12 @@ function HubSection({
           onClose={() => setDialog(null)}
           onConfirm={async (edit) => {
             const ok = await onEdit({
-              UpsertHub: { name: edit.name, endpoint: edit.endpoint, listen: edit.listen || null },
+              UpsertHub: {
+                name: edit.name,
+                endpoint: edit.endpoint,
+                listen: edit.listen || null,
+                quic_listen: edit.quic_listen || null,
+              },
             });
             if (ok) setDialog(null);
           }}
@@ -478,24 +484,22 @@ function AgentsSection({
                 </option>
               ))}
             </select>
-            {agent.role === "expose" && (
-              <select
-                value={agent.transport ?? "h2"}
-                disabled={busy}
-                title="dial transport the pack pins as this agent's signed default (QUIC needs the ingress quic_listen face)"
-                onChange={(e) =>
-                  void onEdit({
-                    SetAgentTransport: {
-                      agent: agent.node,
-                      transport: e.target.value === "quic" ? "quic" : null,
-                    },
-                  })
-                }
-              >
-                <option value="h2">h2</option>
-                <option value="quic">quic</option>
-              </select>
-            )}
+            <select
+              value={agent.transport ?? "h2"}
+              disabled={busy}
+              title="dial transport the pack pins as this agent's signed default — expose agents dial the ingress (needs its quic_listen face), mesh agents dial the hub (needs its quic_listen face)"
+              onChange={(e) =>
+                void onEdit({
+                  SetAgentTransport: {
+                    agent: agent.node,
+                    transport: e.target.value === "quic" ? "quic" : null,
+                  },
+                })
+              }
+            >
+              <option value="h2">h2</option>
+              <option value="quic">quic</option>
+            </select>
             <span style={{ flex: 1 }} />
             <button className="danger" disabled={busy} onClick={() => setRemoving(agent.node)}>
               Remove

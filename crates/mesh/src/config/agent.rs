@@ -199,6 +199,23 @@ pub enum TransportKind {
     Quic,
 }
 
+impl TransportKind {
+    /// Parses the manifest/pack wire spelling (`"h2"` / `"quic"`); the
+    /// absent form resolves to the h2 default. Single source of the
+    /// string semantics for the pack pipeline (node.toml) and the
+    /// machine-local preference fold — unknown values fail loud with the
+    /// legal spellings in the message.
+    pub fn parse_dial(raw: Option<&str>) -> std::result::Result<Self, String> {
+        match raw {
+            None | Some("" | "h2") => Ok(Self::H2),
+            Some("quic") => Ok(Self::Quic),
+            Some(other) => Err(format!(
+                "dial transport {other:?} is not recognized (expected \"h2\" or \"quic\")"
+            )),
+        }
+    }
+}
+
 /// Basic agent information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -620,6 +637,28 @@ const fn default_egress_target_breaker_cooldown_secs() -> u64 {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dial_transport_parses_the_wire_spelling() {
+        assert_eq!(TransportKind::parse_dial(None).unwrap(), TransportKind::H2);
+        assert_eq!(
+            TransportKind::parse_dial(Some("")).unwrap(),
+            TransportKind::H2
+        );
+        assert_eq!(
+            TransportKind::parse_dial(Some("h2")).unwrap(),
+            TransportKind::H2
+        );
+        assert_eq!(
+            TransportKind::parse_dial(Some("quic")).unwrap(),
+            TransportKind::Quic
+        );
+        let err = TransportKind::parse_dial(Some("http3")).unwrap_err();
+        assert!(
+            err.contains("not recognized") && err.contains("\"h2\" or \"quic\""),
+            "unknown spellings fail loud with the legal values: {err}"
+        );
+    }
 
     #[test]
     fn agent_parses_with_optional_sections() {

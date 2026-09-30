@@ -8,7 +8,7 @@ fn bin() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop();
     path.pop();
-    path.join(format!("interflow{}", std::env::consts::EXE_SUFFIX))
+    path.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
 }
 
 #[tokio::test]

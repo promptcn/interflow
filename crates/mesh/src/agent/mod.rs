@@ -13,7 +13,7 @@ pub mod target_breaker;
 
 pub use client::{AgentClient, HubConnection};
 pub use e2e::E2eRuntime;
-pub use handle::{AgentEvent, AgentHandle, AgentState};
+pub use handle::{AgentEvent, AgentHandle, AgentState, HubReceipt};
 pub use ingress_addrs::IngressAddrs;
 pub use restart::{RestartDecision, SupervisorRestartPolicy};
 pub use rules::{RuleOrigin, RuleStore};

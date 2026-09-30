@@ -95,6 +95,7 @@ pub async fn add_node(
         transport: params.transport.map(TransportKind::from),
         hub_quic_addr: params.hub_quic_addr.filter(|s| !s.trim().is_empty()),
         generation: info.generation,
+        pack_digest: info.digest,
         pack_services: info.services,
         pack_mesh: info.mesh,
         pack_listen: info.listen,
@@ -232,7 +233,7 @@ pub fn get_version_info() -> Result<VersionInfo, String> {
 }
 
 // -------------------------------------------------------------------------
-// Deploy (operator) surface — the GUI twin of the `interflow` plan/rotate/
+// Deploy (operator) surface — the GUI twin of the `interflow-cli` plan/rotate/
 // revoke/pack commands, sharing the exact same library code paths.
 // -------------------------------------------------------------------------
 
@@ -362,25 +363,34 @@ pub async fn deploy_list_packs(
     let packs = tauri::async_runtime::spawn_blocking(move || deploy::list_packs(&root))
         .await
         .map_err(|e| e.to_string())??;
-    let local: Vec<(String, String, String, u64)> = manager(&state)?
+    let local: Vec<(String, String, String, u64, String)> = manager(&state)?
         .snapshots()
         .into_iter()
         .filter_map(|s| {
-            s.spec
-                .principal
-                .map(|p| (p, s.spec.id, s.spec.name, s.spec.generation))
+            s.spec.principal.map(|p| {
+                (
+                    p,
+                    s.spec.id,
+                    s.spec.name,
+                    s.spec.generation,
+                    s.spec.pack_digest,
+                )
+            })
         })
         .collect();
     Ok(packs
         .into_iter()
         .map(|pack| {
-            let local_node = local.iter().find_map(|(principal, id, name, generation)| {
-                (principal == &pack.principal).then(|| LocalNodeRefDto {
-                    id: id.clone(),
-                    name: name.clone(),
-                    generation: u32::try_from(*generation).unwrap_or(u32::MAX),
-                })
-            });
+            let local_node = local
+                .iter()
+                .find_map(|(principal, id, name, generation, digest)| {
+                    (principal == &pack.principal).then(|| LocalNodeRefDto {
+                        id: id.clone(),
+                        name: name.clone(),
+                        generation: u32::try_from(*generation).unwrap_or(u32::MAX),
+                        digest: digest.clone(),
+                    })
+                });
             DeployPackDto {
                 local_node,
                 ..DeployPackDto::from(pack)
@@ -489,7 +499,7 @@ pub async fn deploy_revoke(
 }
 
 /// Appends a node to the manifest — the issue wizard's core step, the GUI
-/// twin of `interflow node add`. Structured and non-destructive (comments
+/// twin of `interflow-cli node add`. Structured and non-destructive (comments
 /// and layout stay); the edited manifest must pass the full validation
 /// funnel before anything is written.
 #[tauri::command]

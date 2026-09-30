@@ -37,10 +37,13 @@ use crate::protocol::frame as wire;
 use crate::protocol::{
     CircuitToken, CloseReason, FrameOrigin, FrameType, RouteToken, StreamId, StreamProto,
 };
-use crate::tunnel::negotiation::RegisterResponse;
+use crate::tunnel::negotiation::{
+    RegisterResponse, decode_error_payload, decode_route_ack_payload, encode_hello_payload,
+    encode_route_request_payload,
+};
 use crate::tunnel::transport::{TunnelData, TunnelDispatch, TunnelTransport};
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -139,68 +142,6 @@ pub const CAP_DATAGRAM: u32 = interflow_contract::caps::DATAGRAM;
 /// semantics allow out-of-order arrival).
 pub const DATAGRAM_FRAME_BUDGET: usize = 1023;
 
-/// Hello payload encoding: `[caps u32 BE][name_len u16][utf-8 name]`.
-///
-/// `name` is the agent's intended semantic id (validated by the hub against
-/// the mTLS client-certificate CN — the intent declaration, not a
-/// credential); the frame carries no credential material.
-fn encode_hello_payload(caps: u32, agent_id: &str) -> Result<Bytes> {
-    if agent_id.len() > 128 {
-        return Err(InterflowError::protocol("agent id too long for Hello"));
-    }
-    let mut buf = BytesMut::with_capacity(4 + 2 + agent_id.len());
-    buf.put_u32(caps);
-    buf.put_u16(u16::try_from(agent_id.len()).unwrap_or(u16::MAX));
-    buf.put_slice(agent_id.as_bytes());
-    Ok(buf.freeze())
-}
-
-/// Hello payload decoding: returns `(caps, name)`. A malformed payload is a
-/// protocol violation (paired deployment — the hub fails the registration).
-pub fn decode_hello_payload(payload: &[u8]) -> Result<(u32, String)> {
-    let invalid = || InterflowError::protocol("Hello payload is malformed");
-    if payload.len() < 6 {
-        return Err(invalid());
-    }
-    let caps = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let name_len = u16::from_be_bytes([payload[4], payload[5]]) as usize;
-    if payload.len() != 6 + name_len || name_len > 128 || name_len == 0 {
-        return Err(invalid());
-    }
-    let name = std::str::from_utf8(&payload[6..])
-        .map_err(|_| invalid())?
-        .to_owned();
-    Ok((caps, name))
-}
-
-/// RouteRequest payload encoding: `[name_len u16][utf-8 name]`.
-fn encode_route_request_payload(target: &str) -> Result<Bytes> {
-    if target.len() > 256 {
-        return Err(InterflowError::protocol("route target is too long"));
-    }
-    let mut buf = BytesMut::with_capacity(2 + target.len());
-    buf.put_u16(u16::try_from(target.len()).unwrap_or(u16::MAX));
-    buf.put_slice(target.as_bytes());
-    Ok(buf.freeze())
-}
-
-/// RouteAck payload decoding: `[granted u8][route token 16 B]`. `granted == 0`
-/// (zero token) means the lease was denied.
-fn decode_route_ack_payload(payload: &[u8]) -> Result<Option<RouteToken>> {
-    let invalid = || InterflowError::protocol("RouteAck payload is malformed");
-    if payload.len() != 1 + 16 {
-        return Err(invalid());
-    }
-    let granted = payload[0];
-    let mut token = [0u8; 16];
-    token.copy_from_slice(&payload[1..]);
-    let token = RouteToken::from_bytes(token);
-    if granted == 0 || token.is_zero() {
-        return Ok(None);
-    }
-    Ok(Some(token))
-}
-
 /// Write command: an ordinary frame, or a Close frame (FIN closes out after the write).
 enum WriteCmd {
     Frame(Bytes),
@@ -216,6 +157,10 @@ struct StreamHandle {
 /// The QUIC tunnel backend.
 pub struct QuicTunnel {
     circuit: CircuitToken,
+    /// The hub's registration declaration verbatim (heartbeat cadence +
+    /// observed egress); kept so embedders can surface the hub-confirmed
+    /// receipt after the exchange ([`QuicTunnel::negotiated`]).
+    negotiated: RegisterResponse,
     /// The local endpoint (held to keep the connection alive; the QUIC connection's UDP socket hangs off the endpoint).
     endpoint: quinn::Endpoint,
     conn: quinn::Connection,
@@ -660,16 +605,20 @@ impl QuicTunnel {
             ))
         })??;
 
-        // Capability negotiation: the binary HelloAck payload (caps word +
-        // registration; see RegisterResponse::parse_wire).
+        // Capability negotiation: the HelloAck payload is the same JSON
+        // declaration the h2 face carries as the /register body (the caps
+        // word flattened in as a top-level key; see
+        // RegisterResponse::parse_ack_payload).
         let (hub_caps, declaration) = match ack_frame.frame_type {
-            FrameType::HelloAck => RegisterResponse::parse_wire(&ack_frame.payload)?,
+            FrameType::HelloAck => RegisterResponse::parse_ack_payload(&ack_frame.payload)?,
             FrameType::Error => {
-                return Err(InterflowError::connection(format!(
-                    "hub rejected registration: {:#06x} {}",
-                    error_code_of(&ack_frame.payload),
-                    error_text_of(&ack_frame.payload)
-                )));
+                // A malformed Error payload must not mask the rejection
+                // itself — degrade to the generic message.
+                let detail = decode_error_payload(&ack_frame.payload).map_or_else(
+                    |_| "hub rejected registration".to_string(),
+                    |(code, text)| format!("hub rejected registration: {code:#06x} {text}"),
+                );
+                return Err(InterflowError::connection(detail));
             }
             other => {
                 return Err(InterflowError::protocol(format!(
@@ -801,6 +750,7 @@ impl QuicTunnel {
 
         Ok(Self {
             circuit: declaration.circuit_token,
+            negotiated: declaration,
             endpoint,
             conn,
             token: shutdown,
@@ -818,6 +768,14 @@ impl QuicTunnel {
     #[must_use]
     pub const fn stall_timeout(&self) -> Duration {
         self.stall_timeout
+    }
+
+    /// The hub's registration declaration for this session (the HelloAck
+    /// content) — the receipt an embedder surfaces as "hub-confirmed"
+    /// connectivity detail.
+    #[must_use]
+    pub const fn negotiated(&self) -> &RegisterResponse {
+        &self.negotiated
     }
 
     fn lookup_handle(&self, stream_id: StreamId) -> Option<StreamHandle> {
@@ -857,18 +815,6 @@ impl QuicTunnel {
         })?;
         Ok(())
     }
-}
-
-/// Error frame payload helpers: `[code u16][utf-8 text]`.
-const fn error_code_of(payload: &[u8]) -> u16 {
-    if payload.len() < 2 {
-        return 0;
-    }
-    u16::from_be_bytes([payload[0], payload[1]])
-}
-
-fn error_text_of(payload: &[u8]) -> String {
-    String::from_utf8_lossy(&payload[2.min(payload.len())..]).to_string()
 }
 
 /// Control-stream forwarding write task (lands mpsc commands on the control-stream SendStream).
@@ -1097,50 +1043,6 @@ mod tests {
     use super::*;
     use crate::protocol::CircuitToken;
     use crate::tunnel::negotiation::HeartbeatAd;
-
-    /// The Hello payload is the caps word + the length-prefixed intended
-    /// id; malformed shapes are protocol violations.
-    #[test]
-    fn hello_payload_is_caps_plus_name() {
-        let payload = encode_hello_payload(CAP_DATAGRAM, "edge-1").unwrap();
-        assert_eq!(payload.len(), 4 + 2 + 6);
-        assert_eq!(&payload[..2], &[0, 0][..]);
-        let (caps, name) = decode_hello_payload(&payload).unwrap();
-        assert_eq!(caps, CAP_DATAGRAM);
-        assert_eq!(name, "edge-1");
-        assert!(decode_hello_payload(&[]).is_err());
-        assert!(decode_hello_payload(&[0, 0, 1]).is_err());
-        // Length prefix must cover exactly the rest.
-        let mut b = payload.to_vec();
-        b[5] = 7;
-        assert!(decode_hello_payload(&b).is_err());
-        assert!(encode_hello_payload(0, &"x".repeat(129)).is_err());
-    }
-
-    /// RouteRequest/RouteAck payload round trip: name with length prefix,
-    /// granted/denied shapes, malformed rejections.
-    #[test]
-    fn route_payloads_round_trip() {
-        let payload = encode_route_request_payload("lan-b/egress-1").unwrap();
-        assert_eq!(payload[..2], [0, 14][..]); // "lan-b/egress-1".len()
-        let name = String::from_utf8(payload[2..].to_vec()).unwrap();
-        assert_eq!(name, "lan-b/egress-1");
-        assert!(encode_route_request_payload(&"x".repeat(257)).is_err());
-
-        let route = RouteToken::random().unwrap();
-        let mut ack = BytesMut::new();
-        ack.put_u8(1);
-        ack.put_slice(&route.to_bytes());
-        let ack: Bytes = ack.freeze();
-        assert_eq!(decode_route_ack_payload(&ack).unwrap(), Some(route));
-        // Denied: granted=0 with a zero token.
-        let denied = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(decode_route_ack_payload(&denied).unwrap(), None);
-        // Malformed shapes.
-        assert!(decode_route_ack_payload(&[]).is_err());
-        assert!(decode_route_ack_payload(&[1, 0]).is_err());
-        assert!(decode_route_ack_payload(&ack[..16]).is_err()); // one byte short
-    }
 
     /// The Hello frame satisfies the type × field contract (zero ids, no
     /// origin flags) and the Pong frame carries the sender circuit.

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLI_BIN="${INTERFLOW_CLI_BIN:-$SCRIPT_DIR/../../../../target/release/interflow}"
+CLI_BIN="${INTERFLOW_CLI_BIN:-$SCRIPT_DIR/../../../../target/release/interflow-cli}"
 
 exec "$CLI_BIN" plan apply \
   --manifest "$SCRIPT_DIR/interflow.toml" \
