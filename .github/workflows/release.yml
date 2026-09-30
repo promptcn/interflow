@@ -45,12 +45,16 @@ jobs:
       # don't become the Release body. Releases used to publish empty.
       - name: Release notes from the annotated tag
         id: notes
+        shell: bash
         run: |
           # actions/checkout materializes the triggering tag as a lightweight
-          # ref on the peeled COMMIT, dropping the annotation — fetch the
-          # real tag object first, or %(contents) below returns the commit's
-          # message instead of the curated release notes.
-          git fetch --depth=1 --force origin "tag ${GITHUB_REF_NAME}"
+          # ref on the peeled COMMIT, dropping the annotation — re-fetch the
+          # tag ref itself so %(contents) below returns the curated release
+          # notes instead of the commit's message. Explicit refspec form
+          # (verified locally): "tag <name>" is not a valid fetch refspec,
+          # and the ref must be force-updated over the peeled one.
+          git fetch --depth=1 --force origin \
+            "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
           {
             echo 'body<<EOF'
             git tag -l --format='%(contents)' "$GITHUB_REF_NAME"
