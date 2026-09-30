@@ -150,7 +150,11 @@ async fn open_until_rejected(
     let started = std::time::Instant::now();
     let mut tls = open_inner_tls(inj, sid, target).await;
     let mut probe = [0u8; 1];
-    let _ = tokio::time::timeout(Duration::from_secs(8), tls.read(&mut probe))
+    // Generous budget: on slow shared CI runners the storm's inner-TLS
+    // handshakes starve the rejection round trip far past the sub-second
+    // healthy case (same lesson as the self-heal suite's watchdog budgets;
+    // 8s was observed flaking on a 2vCPU runner, 2026-09-30).
+    let _ = tokio::time::timeout(Duration::from_secs(30), tls.read(&mut probe))
         .await
         .expect("timed out waiting for the rejecting Close")
         .expect_err("dead target must close the inner stream");
@@ -501,7 +505,10 @@ async fn b3_disabled_breaker_restores_old_behavior() {
         "breaker disabled: no target_circuit_open rejections"
     );
 
-    // The healthy stream is starved out: rejected (rate_limited).
+    // The healthy stream is starved out: rejected (rate_limited). "Fast"
+    // keeps clear daylight under CI starvation: a rate-limited rejection is
+    // immediate (seconds even on a starved 2vCPU runner), while riding the
+    // dead-dial path instead would cost the 15s establish timeout.
     let elapsed = open_until_rejected(
         &inj,
         interflow_testkit::opaque_stream_id("b3-starved"),
@@ -509,7 +516,7 @@ async fn b3_disabled_breaker_restores_old_behavior() {
     )
     .await;
     assert!(
-        elapsed < Duration::from_secs(3),
+        elapsed < Duration::from_secs(10),
         "rate-limited rejection is fast, got {elapsed:?}"
     );
     assert!(
