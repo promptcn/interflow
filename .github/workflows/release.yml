@@ -39,6 +39,18 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      # Release notes live on the annotated tag (scripts/release_public.sh
+      # cuts it from the milestone commit's message) — read them from the
+      # tag itself so later fix commits between the milestone and the tag
+      # don't become the Release body. Releases used to publish empty.
+      - name: Release notes from the annotated tag
+        id: notes
+        run: |
+          {
+            echo 'body<<EOF'
+            git tag -l --format='%(contents)' "$GITHUB_REF_NAME"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
       - name: Install NASM (aws-lc-sys asm on msvc)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
@@ -82,6 +94,7 @@ jobs:
       - name: Upload artifacts
         uses: softprops/action-gh-release@v2
         with:
+          body: ${{ steps.notes.outputs.body }}
           files: |
             interflow-*.tar.gz
             interflow-*.tar.gz.sha256
