@@ -7,6 +7,21 @@
 //! so a crash costs at most the tail of the current fsync window, never
 //! the whole file. Failures only warn and never block the main path.
 //!
+//! # Single-writer invariant
+//!
+//! One ledger path carries one writer. In-process this is enforced at
+//! [`AuditSink::spawn`]: a path claimed by a live sink cannot be spawned
+//! again — clone the sink instead (clones share the writer and the
+//! chain). A violation panics at the spawn site because an in-process
+//! double writer is a wiring bug whose runtime failure mode is silent:
+//! two startup seals race, two chains interleave into one file, and the
+//! ledger stops replaying. Across processes the active file itself is
+//! held under an exclusive advisory lock ([`open_active`]): a second
+//! service unit pointed at the same `audit.jsonl` (an ops
+//! misconfiguration) fails to lock, logs at ERROR, and runs disabled —
+//! integrity over availability, a corrupted ledger is worse than a
+//! missing one.
+//!
 //! # Ledger lifecycle (rotation)
 //!
 //! The active file `audit.jsonl` grows until [`AuditRotation::max_bytes`],
@@ -28,16 +43,19 @@
 //! `interflow-cli audit verify` product face).
 
 use crate::config::{AuditConfig, AuditRotation};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Audit event kinds.
 ///
@@ -51,6 +69,12 @@ pub enum AuditKind {
     AgentRegistered {
         /// The opaque connection circuit.
         circuit: String,
+        /// The registering binary's build tag (the agent's self-declared
+        /// `<commit-date>_<git-short-hash>[-dirty]`). `None`/absent = an
+        /// older agent or an implicit re-registration — the fleet view
+        /// records unknown rather than guessing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build: Option<String>,
     },
     /// Agent registration denied (wrong token, identity mismatch, etc.).
     AgentRegisterDenied {
@@ -156,6 +180,68 @@ pub enum AuditKind {
         /// The leaf's `notAfter` (unix seconds).
         not_after_unix: i64,
     },
+    /// A node's self-service stream proposal entered the hub's queue
+    /// (kube-CSR shape: nodes may only propose; minting stays with the
+    /// issuer). The proposal face's lifecycle is four events — submitted,
+    /// approved, rejected, expired — each once per proposal.
+    ProposalSubmitted {
+        /// The proposal's id (stable across its lifetime).
+        id: String,
+        /// The requesting agent's qualified id (derived from its mTLS
+        /// chain, never from the request body).
+        requester: String,
+        /// The stream's target agent (plain agent id).
+        target_agent: String,
+        /// The remote address the stream asks the target to dial.
+        remote_addr: String,
+    },
+    /// A stream proposal was refused at the door (validator funnel, queue
+    /// caps, or a no-policy-face hub) — never entered the queue.
+    ProposalSubmitDenied {
+        /// The requesting agent's qualified id.
+        requester: String,
+        /// The readable refusal reason (the same text the requester's GUI
+        /// shows).
+        reason: String,
+    },
+    /// An operator approved a stream proposal — the manifest update and
+    /// generation mint happen on the issuer machine; this records the
+    /// decision landing back at the hub (carrying the minted generation).
+    ProposalApproved {
+        id: String,
+        /// The policy generation the approval minted.
+        generation: u64,
+    },
+    /// An operator rejected a stream proposal (with a reason the
+    /// requester's GUI shows as the receipt).
+    ProposalRejected {
+        id: String,
+        /// The operator's reason.
+        reason: String,
+    },
+    /// A pending proposal aged past its TTL and was dropped.
+    ProposalExpired {
+        id: String,
+        /// The requesting agent's qualified id.
+        requester: String,
+    },
+    /// The persisted proposal queue could not be loaded at hub start
+    /// (unreadable or not valid JSON). The corrupt file is quarantined
+    /// beside the queue and the face restarts empty — the loss is explicit
+    /// (this event, one per start), never a silently missing proposals
+    /// face; requesters resubmit.
+    ProposalQueueQuarantined {
+        /// The queue file that failed to load.
+        path: String,
+        /// The quarantine name the corrupt file was moved to. `None` when
+        /// the move itself failed — then the face stays down until an
+        /// operator intervenes (persisting over the corrupt file would
+        /// destroy the evidence).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quarantined_as: Option<String>,
+        /// Why the load failed.
+        error: String,
+    },
 }
 
 /// One audit record.
@@ -189,11 +275,88 @@ struct AuditChainState {
 }
 
 /// Background audit sink. Clone-friendly (Arc inside).
+///
+/// Clones share one writer task, one hash chain, and one source identity —
+/// a second handle on a ledger is a `clone`, never a second
+/// [`AuditSink::spawn`] (see the single-writer invariant on the module
+/// docs).
 #[derive(Clone)]
 pub struct AuditSink {
     tx: Option<Arc<mpsc::Sender<AuditMsg>>>,
     source_id: String,
     chain: Arc<Mutex<AuditChainState>>,
+    /// The ledger-path claim (absent on disabled sinks). Held through an
+    /// `Arc` so it lives exactly as long as the last sink handle — the
+    /// path is reusable the moment its final handle drops.
+    _claim: Option<Arc<ClaimGuard>>,
+}
+
+/// Live ledger-path claims: the process-wide "one path, one writer"
+/// registry. Values record the first spawn site so a violation can name
+/// both writers.
+static CLAIMED_LEDGER_PATHS: OnceLock<
+    Mutex<HashMap<PathBuf, &'static std::panic::Location<'static>>>,
+> = OnceLock::new();
+
+/// Releases the ledger-path claim when the last sink handle drops.
+struct ClaimGuard {
+    key: PathBuf,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if let Some(registry) = CLAIMED_LEDGER_PATHS.get() {
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.key);
+        }
+    }
+}
+
+/// Anchors a ledger path so textually different spellings of one file
+/// collide in the claim registry. The file may not exist yet (first
+/// writer); anchor on the canonical parent then.
+fn normalize_ledger_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    match (
+        path.parent().and_then(|p| std::fs::canonicalize(p).ok()),
+        path.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Claims `path` in the process-wide registry, failing loudly on a live
+/// duplicate spawn.
+// The workspace denies panics in production code; this is a deliberate
+// exception (the same standing as fault.rs): a duplicate writer is a
+// startup wiring bug whose runtime failure mode is silent ledger
+// corruption — two interleaved chains, no replay — so the process must
+// abort before it serves anything, with both spawn sites named.
+#[allow(clippy::panic)]
+fn claim_ledger_path(
+    path: &Path,
+    called_at: &'static std::panic::Location<'static>,
+) -> Arc<ClaimGuard> {
+    let key = normalize_ledger_path(path);
+    let registry = CLAIMED_LEDGER_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(first) = registry.get(&key) {
+        panic!(
+            "duplicate audit sink for {} (already spawned at {first}, again at {called_at}); \
+             clone the existing AuditSink instead — two writers interleave chains and the \
+             ledger stops replaying",
+            key.display()
+        );
+    }
+    registry.insert(key.clone(), called_at);
+    Arc::new(ClaimGuard { key })
 }
 
 /// Writer channel message: an audit event, or a flush receipt request (FIFO guarantees events before the receipt are on disk).
@@ -211,6 +374,7 @@ impl AuditSink {
             tx: None,
             source_id: String::new(),
             chain: Arc::new(Mutex::new(AuditChainState::default())),
+            _claim: None,
         }
     }
 
@@ -220,11 +384,16 @@ impl AuditSink {
     /// - The writer task runs independently; file write failures only warn
     ///   and do not abort.
     ///
+    /// One path, one writer: a path claimed by a still-live sink cannot be
+    /// spawned again — clone this sink instead. Violations panic (see the
+    /// module's single-writer invariant).
+    ///
     /// # Panics
     ///
     /// When `config.enabled` and a path is set, must be called from within a
     /// Tokio runtime context (it spawns the writer task); it panics
-    /// otherwise.
+    /// otherwise. Also panics on a duplicate live spawn for the same path.
+    #[track_caller]
     pub fn spawn(config: &AuditConfig) -> Self {
         if !config.enabled {
             return Self::disabled();
@@ -233,6 +402,8 @@ impl AuditSink {
             warn!("[audit] enabled = true but path is missing, audit disabled");
             return Self::disabled();
         };
+
+        let claim = claim_ledger_path(Path::new(&path), std::panic::Location::caller());
 
         let (tx, mut rx) = mpsc::channel::<AuditMsg>(256);
         let tx = Arc::new(tx);
@@ -248,6 +419,7 @@ impl AuditSink {
             tx: Some(tx),
             source_id,
             chain: Arc::new(Mutex::new(AuditChainState::default())),
+            _claim: Some(claim),
         }
     }
 
@@ -374,6 +546,16 @@ async fn writer_task(path: &Path, rotation: &AuditRotation, rx: &mut mpsc::Recei
         warn!("failed to seal existing audit file {}: {e}", path.display());
     }
     let Some(mut out) = open_active(path).await else {
+        // Disabled writer (lock refused / open failed): keep answering
+        // flush receipts so a concurrent drain — e.g. shutdown's
+        // `flush().await` — returns instead of wedging on a writer that
+        // will never write. Events are discarded, matching the
+        // writer-exited behavior of `try_send` on a closed channel.
+        while let Some(msg) = rx.recv().await {
+            if let AuditMsg::Flush(otx) = msg {
+                let _ = otx.send(());
+            }
+        }
         return;
     };
     while let Some(msg) = rx.recv().await {
@@ -450,25 +632,46 @@ async fn writer_task(path: &Path, rotation: &AuditRotation, rx: &mut mpsc::Recei
     let _ = out.file.sync_all().await;
 }
 
-/// Opens (creates) the active audit file. `None` (with a warn) if the
-/// filesystem refuses — audit then runs disabled, exactly as today.
+/// Opens (creates) the active audit file under an exclusive advisory
+/// lock — the ledger's cross-process single-writer guard.
+///
+/// The lock rides the fd: it survives the async↔std conversions below,
+/// and is released only when the handle closes (startup and the
+/// rotation reopen both go through here, so each active file is locked
+/// for its own lifetime). A second process on the same path — two
+/// service units sharing a pack dir, an ops misconfiguration — fails to
+/// lock, logs at ERROR, and runs disabled: a corrupted ledger is worse
+/// than a missing one. `None` (with a warn) also when the filesystem
+/// refuses — audit then runs disabled, exactly as before.
 async fn open_active(path: &Path) -> Option<WriterFile> {
-    match OpenOptions::new()
+    let file = match OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .await
     {
-        Ok(file) => Some(WriterFile {
-            file,
+        Ok(file) => file,
+        Err(e) => {
+            warn!(
+                "failed to open audit file {}: {e}; audit disabled",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let std_file = file.into_std().await;
+    match std_file.try_lock_exclusive() {
+        Ok(()) => Some(WriterFile {
+            file: tokio::fs::File::from_std(std_file),
             written: 0,
             first_sequence: 0,
             since_sync: 0,
             last_sync: std::time::Instant::now(),
         }),
         Err(e) => {
-            warn!(
-                "failed to open audit file {}: {e}; audit disabled",
+            error!(
+                "audit file {} is held by another writer ({e}); refusing to \
+                 interleave chains — audit disabled for this process",
                 path.display()
             );
             None
@@ -921,6 +1124,7 @@ mod tests {
         sink.record(
             AuditKind::AgentRegistered {
                 circuit: "12078a05e14f4e2c99b1679be1df7c30".into(),
+                build: Some("2026-10-07_2f3633f".into()),
             },
             None,
             None,
@@ -1151,6 +1355,77 @@ mod tests {
         let active = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
         let new_chain_lines = active.lines().count();
         assert_eq!(new_chain_lines, 2, "active file holds only the new chain");
+    }
+
+    // -----------------------------------------------------------------
+    // Single-writer invariant (2026-10-09 backlog: the fused ingress
+    // process once ran two sinks on one path and interleaved two chains)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    #[should_panic(expected = "duplicate audit sink")]
+    async fn duplicate_spawn_on_a_live_path_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path(), AuditRotation::default());
+        let _first = AuditSink::spawn(&cfg);
+        // A second independent writer on the same path is a wiring bug;
+        // it must abort the process, not corrupt the ledger at runtime.
+        let _second = AuditSink::spawn(&cfg);
+    }
+
+    #[tokio::test]
+    async fn path_is_reclaimable_after_the_last_handle_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path(), AuditRotation::default());
+        let first = AuditSink::spawn(&cfg);
+        write_events(&first, 2).await;
+        // The claim dies with the last handle, not with the writer task's
+        // async wind-down — a same-path restart inside one process (the
+        // test pre-seeding pattern) must not false-positive.
+        drop(first);
+        let second = AuditSink::spawn(&cfg);
+        write_events(&second, 2).await;
+        let report = verify_audit_files(&discover_audit_files(dir.path())).unwrap();
+        assert_eq!(report.records, 4);
+        assert_eq!(report.chains, 2, "two sequential writer lifetimes");
+    }
+
+    #[tokio::test]
+    async fn clones_share_one_writer_and_one_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = AuditSink::spawn(&test_config(dir.path(), AuditRotation::default()));
+        // The embedded-edge contract: edge denials and hub events are two
+        // handles on one ledger — clone shares the writer, the sequence
+        // space, and the chain.
+        let other_side = sink.clone();
+        write_events(&sink, 3).await;
+        write_events(&other_side, 3).await;
+        let report = verify_audit_files(&discover_audit_files(dir.path())).unwrap();
+        assert_eq!(report.records, 6);
+        assert_eq!(report.chains, 1, "one continuous chain across both handles");
+    }
+
+    #[tokio::test]
+    async fn foreign_lock_disables_writer_rather_than_interleaving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        // A foreign writer holds the ledger's advisory lock.
+        let foreign = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        foreign.try_lock_exclusive().unwrap();
+        let sink = AuditSink::spawn(&test_config(dir.path(), AuditRotation::default()));
+        // flush returning (rather than wedging) also proves the writer
+        // reached its decision: the disabled path answers receipts.
+        write_events(&sink, 3).await;
+        assert_eq!(
+            std::fs::metadata(&path).map_or(0, |m| m.len()),
+            0,
+            "a locked ledger must gain no bytes from the second writer"
+        );
+        drop(foreign);
     }
 
     #[test]

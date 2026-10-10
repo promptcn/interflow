@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use interflow_core::security::AuditSink;
 use interflow_identity::credentials::ActiveCredentialSet;
 use interflow_identity::issuance::IssuerStore;
 use interflow_identity::manifest::Manifest;
@@ -98,7 +99,8 @@ remote_addr = "{echo_addr}"
     let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
     let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
     let hub_cfg = build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap();
-    let hub = HubServer::new(hub_cfg).unwrap();
+    let audit = AuditSink::spawn(&hub_cfg.audit);
+    let hub = HubServer::new(hub_cfg, audit).unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
@@ -194,7 +196,8 @@ remote_addr = "{echo_addr}"
     let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
     let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
     let hub_cfg = build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap();
-    let hub = HubServer::new(hub_cfg).unwrap();
+    let audit = AuditSink::spawn(&hub_cfg.audit);
+    let hub = HubServer::new(hub_cfg, audit).unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));

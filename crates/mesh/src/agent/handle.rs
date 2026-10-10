@@ -13,6 +13,7 @@
 use interflow_core::error::Result;
 use interflow_core::tunnel::{AgentTunnel, SessionSlot};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::agent::ingress_addrs::IngressAddrs;
+use crate::agent::ingress_listeners::{IngressListeners, ListenerStatus};
 
 /// Agent lifecycle state (broadcast via watch; each change overwrites the
 /// old value).
@@ -91,6 +93,19 @@ pub struct AgentHandle {
     established: Arc<AtomicU64>,
     ingress_ready: watch::Receiver<bool>,
     ingress_addrs: Arc<IngressAddrs>,
+    ingress_listeners: Arc<IngressListeners>,
+    /// The intrinsic policy watcher's live telemetry; `None` when the
+    /// config carried no policy plane (in-memory embedders). The watcher
+    /// task itself rides this handle's tracker — it ends with
+    /// [`Self::shutdown_graceful`].
+    policy_state: Option<Arc<crate::agent::policy_watch::PolicyWatchState>>,
+    /// The intrinsic peer watcher's live telemetry (always present — the
+    /// hub agents control plane needs no pack). Rides this handle's
+    /// tracker like the policy watcher.
+    peer_state: Arc<crate::agent::peer_watch::PeerWatchState>,
+    /// The proposal receipts face (same task as the peer watcher): this
+    /// node's own stream proposals and their decision state.
+    proposal_state: Arc<crate::agent::peer_watch::ProposalWatchState>,
 }
 
 /// Context used inside the supervisor to emit state/events.
@@ -130,6 +145,10 @@ impl AgentHandle {
         established: Arc<AtomicU64>,
         ingress_ready: watch::Receiver<bool>,
         ingress_addrs: Arc<IngressAddrs>,
+        ingress_listeners: Arc<IngressListeners>,
+        policy_state: Option<Arc<crate::agent::policy_watch::PolicyWatchState>>,
+        peer_state: Arc<crate::agent::peer_watch::PeerWatchState>,
+        proposal_state: Arc<crate::agent::peer_watch::ProposalWatchState>,
     ) -> Self {
         Self {
             state_rx,
@@ -141,7 +160,60 @@ impl AgentHandle {
             established,
             ingress_ready,
             ingress_addrs,
+            ingress_listeners,
+            policy_state,
+            peer_state,
+            proposal_state,
         }
+    }
+
+    /// The intrinsic policy watcher's live telemetry, when the config
+    /// carried a policy plane (pack-built agents). Health faces read the
+    /// atomics without locks; `None` means this agent has no signed-policy
+    /// distribution by construction, not a watcher that failed to start.
+    pub fn policy_state(&self) -> Option<Arc<crate::agent::policy_watch::PolicyWatchState>> {
+        self.policy_state.clone()
+    }
+
+    /// The intrinsic peer watcher's live telemetry — the tenant's agents
+    /// (self excluded) with presence and leaf health. Empty until the
+    /// first successful fetch on a connected session.
+    pub fn peer_state(&self) -> Arc<crate::agent::peer_watch::PeerWatchState> {
+        Arc::clone(&self.peer_state)
+    }
+
+    /// The proposal receipts face's live telemetry — this node's own
+    /// stream proposals and their decision state.
+    pub fn proposal_state(&self) -> Arc<crate::agent::peer_watch::ProposalWatchState> {
+        Arc::clone(&self.proposal_state)
+    }
+
+    /// The session slot's control-plane tunnel (clone-safe; tracks session
+    /// rebuilds) — embedders that must not hold a borrow of this handle
+    /// across an await (a std-lock-scoped lookup, the GUI's manager) use
+    /// this to reach the control plane asynchronously.
+    pub fn control_tunnel(&self) -> interflow_core::tunnel::AgentTunnel {
+        self.slot.tunnel()
+    }
+
+    /// Submits one self-service stream proposal over the current session's
+    /// control plane (the kube-CSR face). An empty slot (session
+    /// re-establishing) surfaces as the usual retry-later error.
+    pub async fn submit_stream_proposal(
+        &self,
+        request: &interflow_core::tunnel::transport::StreamProposalRequest,
+    ) -> interflow_core::error::Result<interflow_core::tunnel::transport::ProposalSubmitOutcome>
+    {
+        self.slot.tunnel().submit_stream_proposal(request).await
+    }
+
+    /// One on-demand receipts read (the watcher also pushes these — this
+    /// is the submit flow's immediate confirmation path).
+    pub async fn my_proposals(
+        &self,
+    ) -> interflow_core::error::Result<Vec<interflow_core::tunnel::transport::ProposalReceipt>>
+    {
+        self.slot.tunnel().my_proposals().await
     }
 
     /// Monotonic count of established sessions — one per completed connect
@@ -220,6 +292,31 @@ impl AgentHandle {
     /// [`wait_ingress_ready`](Self::wait_ingress_ready) is race-free.
     pub async fn wait_ingress_addr(&self, rule: &str, timeout: Duration) -> Option<SocketAddr> {
         self.ingress_addrs.wait_addr(rule, timeout).await
+    }
+
+    /// One rule's listener face: where it is actually serving, or why it
+    /// is not. This is the actual-state counterpart of the rule store —
+    /// the policy face can say `generation 8, all green` while a listener
+    /// is gone (the 2026-10-07 incident); this answers what is really
+    /// listening.
+    pub fn ingress_listener_status(&self, rule: &str) -> Option<ListenerStatus> {
+        self.ingress_listeners.get(rule)
+    }
+
+    /// Snapshot of every ingress rule's listener face.
+    pub fn ingress_listeners_snapshot(&self) -> std::collections::HashMap<String, ListenerStatus> {
+        self.ingress_listeners.snapshot()
+    }
+
+    /// Subscribe to the listener table's push face — the watch carries the
+    /// FULL table on every mutation (embedders mirror it as events, e.g.
+    /// the GUI's listeners forwarder). Hold-only-the-receiver contract:
+    /// the sender lives in this handle, so a subscriber's task rides down
+    /// with the engine.
+    pub fn subscribe_ingress_listeners(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Arc<HashMap<String, ListenerStatus>>> {
+        self.ingress_listeners.subscribe()
     }
 
     /// Whether the supervisor task has ended (for any reason).

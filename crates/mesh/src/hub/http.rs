@@ -10,12 +10,17 @@
 use interflow_identity::expiry::LeafHealth;
 use serde::{Deserialize, Serialize};
 
-/// One `GET /agents` entry: the agent's qualified id plus its
-/// credential-health reading.
+/// One `GET /agents` entry: the agent's qualified id, its reachability
+/// reading, and its credential-health reading.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentListEntry {
     /// Qualified agent id (`tenant/agent`).
     pub agent: String,
+    /// The reachability reading (`registered ≠ reachable`): a QUIC relay
+    /// session in place, or an h2 poll body in place / within reconnect
+    /// grace. Pong freshness is deliberately not part of it (QUIC agents
+    /// never answer an h2 heartbeat).
+    pub online: bool,
     /// Parsed from the registration certificate; `None` (serialized as
     /// null) when the leaf certificate did not parse.
     pub leaf_expiry: Option<LeafExpiry>,

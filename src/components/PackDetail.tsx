@@ -1,6 +1,18 @@
 import { useState } from "react";
+import { ArrowLeft } from "lucide-react";
 import { type DeployPackDto } from "../api";
-import { ConfirmDialog, KindBadge, PassphraseDialog, SectionPanel } from "./ui";
+import { useT } from "../i18n";
+import {
+  Button,
+  ConfirmDialog,
+  Hint,
+  InfoRow,
+  Input,
+  Kbd,
+  KindBadge,
+  PassphraseDialog,
+  SectionPanel,
+} from "./ui";
 
 /// One issued pack, one level below the grid. Identity and generation state
 /// up top; the lifecycle actions grouped by intent (distribute / maintain /
@@ -29,11 +41,12 @@ export default function PackDetail({
   // dialog (the recipient enters the same one on import).
   const [sealTarget, setSealTarget] = useState<string | null>(null);
   const [revoking, setRevoking] = useState(false);
+  const { t } = useT();
 
   const pickSealTarget = async () => {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const target = await save({
-      title: `Seal ${pack.dir_name} as .iflowpack`,
+      title: t("packDetail.sealAs", { name: pack.dir_name }),
       defaultPath: `${pack.dir_name}.iflowpack`,
     });
     if (typeof target === "string") setSealTarget(target);
@@ -47,81 +60,92 @@ export default function PackDetail({
     !!pack.local_node &&
     (pack.local_node.generation < pack.generation || pack.local_node.digest !== pack.digest);
 
+  const updateTitle =
+    updateAvailable && (pack.local_node?.generation ?? 0) >= pack.generation
+      ? t("pack.updateTitleContent")
+      : t("pack.updateTitle");
+
   return (
-    <div className="detail-page">
-      <div className="detail-topbar">
-        <button onClick={onBack} title="Esc">
-          ← Packs
-        </button>
-        <h2>{pack.dir_name}</h2>
+    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto">
+      <div className="flex flex-wrap items-center gap-2.5">
+        <Button variant="link" size="sm" onClick={onBack}>
+          <ArrowLeft className="size-4" />
+          {t("packDetail.backPacks")}
+          <Kbd>Esc</Kbd>
+        </Button>
+        <h2 className="m-0 text-xl font-semibold">{pack.dir_name}</h2>
         <KindBadge kind={pack.kind} />
       </div>
 
-      <div className="detail-body">
-        <SectionPanel title="Identity" hint={`from ${pack.path}`}>
-          <div className="row">
-            <label>Principal</label>
-            <input value={pack.principal} readOnly title={pack.principal} />
-          </div>
-          <div className="row">
-            <label>Generation</label>
-            <span className="hint">gen {pack.generation} · expires {pack.expires}</span>
-          </div>
+      <div className="flex min-h-0 flex-col gap-3">
+        <SectionPanel
+          title={t("packDetail.identity")}
+          hint={t("packDetail.fromPath", { path: pack.path })}
+        >
+          <InfoRow label={t("packDetail.principal")}>
+            <Hint text={pack.principal}>
+              <Input value={pack.principal} readOnly />
+            </Hint>
+          </InfoRow>
+          <InfoRow label={t("packDetail.generation")}>
+            <span className="text-small text-fg-3">
+              {t("pack.genExpires", { gen: pack.generation, expires: pack.expires })}
+            </span>
+          </InfoRow>
           {pack.local_node && (
-            <div className="row">
-              <label>Local node</label>
-              <span className="hint">{pack.local_node.name}</span>
-            </div>
+            <InfoRow label={t("packDetail.localNode")}>
+              <span className="text-small text-fg-3">{pack.local_node.name}</span>
+            </InfoRow>
           )}
         </SectionPanel>
 
         {pack.local_node && (
-          <SectionPanel title="Local node">
-            <div className="actions">
-              <button
-                className={updateAvailable ? "primary" : ""}
-                disabled={busy}
-                onClick={onUpdateLocal}
-                title={
-                  updateAvailable && pack.local_node.generation >= pack.generation
-                    ? "same generation, different content — stop, swap the pack in place (state kept), restart"
-                    : "stop, swap the pack in place (state kept), restart"
-                }
-              >
-                {updateAvailable
-                  ? pack.local_node.generation < pack.generation
-                    ? `Update ${pack.local_node.name} to gen ${pack.generation}`
-                    : `Update ${pack.local_node.name}`
-                  : `Reinstall into ${pack.local_node.name}`}
-              </button>
+          <SectionPanel title={t("packDetail.localNode")}>
+            <div className="flex flex-wrap gap-2">
+              <Hint text={updateTitle}>
+                <Button
+                  variant={updateAvailable ? "primary" : "secondary"}
+                  disabled={busy}
+                  onClick={onUpdateLocal}
+                >
+                  {updateAvailable
+                    ? pack.local_node.generation < pack.generation
+                      ? t("packDetail.updateToGen", {
+                          name: pack.local_node.name,
+                          gen: pack.generation,
+                        })
+                      : t("packDetail.updateName", { name: pack.local_node.name })
+                    : t("packDetail.reinstallInto", { name: pack.local_node.name })}
+                </Button>
+              </Hint>
             </div>
           </SectionPanel>
         )}
 
-        <SectionPanel title="Distribute">
-          <div className="actions">
-            <button onClick={() => void pickSealTarget()}>Seal .iflowpack…</button>
-            <button onClick={onCopyInstallCommand}>Copy install command</button>
+        <SectionPanel title={t("packDetail.distribute")}>
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={() => void pickSealTarget()}>{t("packDetail.sealButton")}</Button>
+            <Button onClick={onCopyInstallCommand}>{t("packDetail.copyInstall")}</Button>
           </div>
         </SectionPanel>
 
-        <SectionPanel title="Maintenance">
-          <div className="actions">
-            <button disabled={busy} onClick={onRotate}>
-              Rotate
-            </button>
-            <button className="danger" onClick={() => setRevoking(true)}>
-              Revoke…
-            </button>
+        <SectionPanel title={t("packDetail.maintenance")}>
+          <div className="flex flex-wrap gap-2">
+            <Button disabled={busy} onClick={onRotate}>
+              {t("packDetail.rotate")}
+            </Button>
+            <Button variant="danger" onClick={() => setRevoking(true)}>
+              {t("packDetail.revoke")}
+            </Button>
           </div>
         </SectionPanel>
       </div>
 
       {sealTarget !== null && (
         <PassphraseDialog
-          title={`Seal ${pack.dir_name}`}
-          description="The recipient enters it on import."
-          confirmLabel="Seal"
+          title={t("packDetail.sealTitle", { name: pack.dir_name })}
+          description={t("packDetail.sealDesc")}
+          confirmLabel={t("packDetail.sealConfirm")}
           generate
           onClose={() => setSealTarget(null)}
           onConfirm={async (passphrase) => {
@@ -134,9 +158,9 @@ export default function PackDetail({
 
       {revoking && (
         <ConfirmDialog
-          title={`Revoke ${pack.dir_name}?`}
-          message="Credentials stop being accepted everywhere (deny list + CRL). This cannot be undone."
-          confirmLabel="Revoke"
+          title={t("packDetail.revokeTitle", { name: pack.dir_name })}
+          message={t("packDetail.revokeMessage")}
+          confirmLabel={t("packDetail.revokeConfirm")}
           danger
           onClose={() => setRevoking(false)}
           onConfirm={() => {

@@ -45,6 +45,8 @@ fn frame_type() -> impl Strategy<Value = FrameType> {
         FrameType::Error,
         FrameType::RouteRequest,
         FrameType::RouteAck,
+        FrameType::PolicyPullRequest,
+        FrameType::PolicyPullResponse,
     ])
 }
 

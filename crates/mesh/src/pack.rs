@@ -14,7 +14,7 @@
 use crate::config::{
     AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, EgressRule,
     EgressTarget, HubConfig, HubQuicConfig, HubTlsConfig, HubTransportConfig, IngressRule,
-    InnerTlsConfig, ServerConfig, TenantConfig, TransportKind,
+    InnerTlsConfig, PolicyPlaneConfig, ServerConfig, TenantConfig, TransportKind,
 };
 use crate::hub::HubServer;
 use interflow_core::config::AuditConfig;
@@ -89,14 +89,21 @@ pub fn build_hub_config(
     // Tenant trust table: one entry per workspace issuer in the bundle, plus
     // the reserved `control` tenant (the realm issuer's control principals —
     // the policy publication face; data-plane endpoints reject it).
-    // CRLs: live refresh first, the rotate-embedded snapshot otherwise.
+    // CRLs: the identity tier statically pins the source directory
+    // (registrar: state/crls live refresh; offline: trust/crls snapshot —
+    // missing snapshot there fails loud as a render defect).
     let mut tenants = Vec::new();
     for name in pack.trust.metadata.issuers.keys() {
         let Some(workspace) = name.strip_prefix("workspace/") else {
             continue;
         };
         let anchor = trust_dir.join(format!("{}.crt", name.replace('/', "-")));
-        let crl = interflow_identity::pack::crl_path_for(pack_dir, &name.replace('/', "-"));
+        let crl = interflow_identity::pack::crl_path_for(
+            pack_dir,
+            pack.metadata.identity_mode,
+            &name.replace('/', "-"),
+        )
+        .map_err(pack_error)?;
         tenants.push(TenantConfig {
             name: workspace.to_owned(),
             ca_path: anchor.display().to_string(),
@@ -110,7 +117,9 @@ pub fn build_hub_config(
              agent and re-apply",
         ));
     }
-    let control_crl = interflow_identity::pack::crl_path_for(pack_dir, "control");
+    let control_crl =
+        interflow_identity::pack::crl_path_for(pack_dir, pack.metadata.identity_mode, "control")
+            .map_err(pack_error)?;
     tenants.push(TenantConfig {
         name: crate::hub::state::CONTROL_TENANT.to_owned(),
         ca_path: trust_dir.join("control.crt").display().to_string(),
@@ -123,11 +132,19 @@ pub fn build_hub_config(
     let (cert, key) = active
         .material_paths("control-endpoint")
         .map_err(pack_error)?;
+    // The renderer always writes `listen` on a hub pack; a missing value is
+    // a pre-2026-10 pack — fail loudly with the recovery action instead of
+    // silently binding a default address.
     let listen: SocketAddr = pack
         .node_config
         .listen
         .as_deref()
-        .unwrap_or("0.0.0.0:6666")
+        .ok_or_else(|| {
+            config_error(
+                "hub pack node.toml carries no listen address — re-render the pack \
+                 (interflow-cli plan apply); the silent 0.0.0.0:6666 fallback is retired",
+            )
+        })?
         .parse()
         .map_err(|e| {
             InterflowError::config(format!(
@@ -200,6 +217,9 @@ pub fn build_hub_config(
             state_policy_dir: Some(pack_dir.join("state").join("policy")),
             embedded_policy_dir: Some(pack_dir.join("policy")),
             generation: pack.policy.generation,
+            // The ACL hot-swap watcher runs intrinsically from this — the
+            // config, not the embedder, declares the capability.
+            pack_dir: Some(pack_dir.to_owned()),
         },
         logging: Default::default(),
     };
@@ -244,7 +264,8 @@ pub fn build_agent_config(
 
     // Inner peer anchors: the agent's own workspace plus every peer
     // workspace riding in the trust bundle (cross-worksite flows). The hub
-    // plane anchor (the realm issuer) stays out of the inner set.
+    // plane anchor (the realm issuer) stays out of the inner set. The CRL
+    // source follows the identity tier (static, never probed).
     let own_anchor = trust_dir.join(format!("workspace-{workspace}.crt"));
     let mut extra_trusted_cas = Vec::new();
     let mut crl_paths = Vec::new();
@@ -253,7 +274,12 @@ pub fn build_agent_config(
             continue;
         };
         let anchor = trust_dir.join(format!("{}.crt", name.replace('/', "-")));
-        if let Some(crl) = interflow_identity::pack::crl_path_for(pack_dir, &name.replace('/', "-"))
+        if let Some(crl) = interflow_identity::pack::crl_path_for(
+            pack_dir,
+            pack.metadata.identity_mode,
+            &name.replace('/', "-"),
+        )
+        .map_err(pack_error)?
         {
             crl_paths.push(crl.display().to_string());
         }
@@ -268,12 +294,13 @@ pub fn build_agent_config(
     }
     let (egress, allowed_targets) = policy_egress_rules(&pack.policy, &pack.metadata.node)?;
 
-    // The signed dial default rides node.toml verbatim: absent/h2 keeps h2;
-    // `quic` derives the hub's UDP dial address from the signed hub
-    // endpoint (manifest validation already required its explicit port —
-    // this leg stays total for hand-built packs by failing loud).
-    let transport =
-        TransportKind::parse_dial(pack.node_config.transport.as_deref()).map_err(config_error)?;
+    // The canonical dial default rides node.toml verbatim (render-time
+    // resolved: "h2" / "quic", never absent); `quic` derives the hub's UDP
+    // dial address from the signed hub endpoint (manifest validation already
+    // required its explicit port — this leg stays total for hand-built packs
+    // by failing loud).
+    let transport = TransportKind::parse_dial(Some(pack.node_config.transport.as_str()))
+        .map_err(config_error)?;
     let hub_quic_addr = (transport == TransportKind::Quic)
         .then(|| {
             derive_quic_addr(&mesh.hub_endpoint).ok_or_else(|| {
@@ -316,6 +343,12 @@ pub fn build_agent_config(
             crl_paths,
             ..InnerTlsConfig::default()
         },
+        // The signed-policy plane rides the config itself: the engine's
+        // start path spawns the watcher from this field — the pack pipeline
+        // declares the capability, no embedding surface wires it.
+        policy: Some(PolicyPlaneConfig {
+            pack_dir: pack_dir.to_owned(),
+        }),
         ..AgentConfig::default()
     };
     crate::config::validate::validate_agent(&config)
@@ -383,12 +416,6 @@ pub fn policy_acl(policy: &RuntimePolicy) -> AclConfig {
     acl
 }
 
-/// How often the node-local policy update channel (`state/policy`) is
-/// polled — the renewal scheduler's polling discipline (no platform watch
-/// dependencies); one interval of latency is well inside the product goal
-/// for policy changes ("minutes, not days").
-const POLICY_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// Fingerprint of a policy channel directory: both files' mtime + length.
 /// `None` when the channel is absent. Shared by the reload watchers and
 /// the hub's serve cache (fingerprint unchanged → the verified bytes are
@@ -406,177 +433,54 @@ pub(crate) fn policy_channel_fingerprint(
     ))
 }
 
-/// Spawns the signed-policy reload watcher for a running mesh agent.
-///
-/// Two distribution channels, one applying path: the node-local file
-/// channel (`state/policy`) and — when a tunnel facade is supplied — the
-/// hub's control-plane pull (`GET /policy`), which is how an update
-/// published at the hub reaches every agent with zero physical touches (an
-/// offline agent catches up on its first connected tick). Each tick
-/// verifies candidates against the pack's trust bundle and the
-/// anti-rollback floor, then hands the derived rules to
-/// [`AgentClient::apply_policy`]. Rejection is fail-keep: a tampered
-/// signature, a rollback, or an undervivable rule face is logged (with its
-/// category) while the current policy keeps serving.
-pub fn spawn_policy_reload(
-    pack_dir: &Path,
-    client: crate::agent::AgentClient,
-    tunnel: Option<interflow_core::tunnel::AgentTunnel>,
-) -> Result<tokio::task::JoinHandle<()>> {
-    let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
-    let node = pack.metadata.node.clone();
-    let workspace = pack.metadata.workspace.clone().unwrap_or_default();
-    let verifier_key = pack.trust.metadata.policy_key.clone();
-    let mut seen = pack.policy.generation;
-    let dir = pack_dir.to_owned();
-    Ok(tokio::spawn(async move {
-        let policy_dir = dir.join("state/policy");
-        let mut fingerprint = policy_channel_fingerprint(&policy_dir);
-        loop {
-            tokio::time::sleep(POLICY_WATCH_INTERVAL).await;
-
-            // Channel 1: the node-local file drop.
-            let current = policy_channel_fingerprint(&policy_dir);
-            if current != fingerprint {
-                fingerprint = current;
-                try_reload(&dir, &node, &workspace, &client, &mut seen).await;
-            }
-
-            // Channel 2: the hub's control plane, as a conditional request:
-            // the hub answers 304 (mapped to None here) while the caller
-            // already holds the serving generation. A pull that fails
-            // (older hub, QUIC transport, session mid-rebuild) is skipped
-            // for this tick — the next tick retries.
-            if let Some(tunnel) = &tunnel
-                && let Ok(Some(fetch)) = tunnel.pull_policy(seen).await
-                && fetch.generation > seen
-            {
-                match RuntimePolicy::verify_with_hex_key(
-                    &fetch.body,
-                    &fetch.signature,
-                    &verifier_key,
-                ) {
-                    Ok(policy) => {
-                        if let Err(e) = policy.check_not_rollback(seen) {
-                            tracing::warn!(
-                                "policy pull: rejecting hub-served generation {} (keeping \
-                                 current): {e}",
-                                fetch.generation
-                            );
-                        } else {
-                            // Persist into the node-local channel first: the
-                            // applying path (and any restart) reads exactly
-                            // these files.
-                            let channel_dir = dir.join("state/policy");
-                            if let Err(e) = std::fs::create_dir_all(&channel_dir) {
-                                tracing::warn!("policy pull: cannot persist update: {e}");
-                            } else {
-                                let write = |name: &str, bytes: &[u8]| {
-                                    let path = channel_dir.join(name);
-                                    let tmp = channel_dir.join(format!("{name}.tmp"));
-                                    std::fs::write(&tmp, bytes)
-                                        .and_then(|()| std::fs::rename(&tmp, &path))
-                                };
-                                if let Err(e) = write("policy.toml", &fetch.body)
-                                    .and_then(|()| write("policy.sig", &fetch.signature))
-                                {
-                                    tracing::warn!("policy pull: persisting update failed: {e}");
-                                } else {
-                                    fingerprint = policy_channel_fingerprint(&policy_dir);
-                                    tracing::info!(
-                                        target: "audit",
-                                        generation = fetch.generation,
-                                        "policy pull: accepted hub-served update into the \
-                                         node-local channel"
-                                    );
-                                    try_reload(&dir, &node, &workspace, &client, &mut seen).await;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "policy pull: rejecting hub-served bytes (keeping current): {e}"
-                        );
-                    }
-                }
-            }
-        }
-    }))
-}
-
-/// One apply attempt from the node-local channel: reload the pack (trust
-/// bundle + update channel), verify + anti-rollback check, derive, apply.
-/// `seen` advances only on a successful application.
-async fn try_reload(
-    dir: &Path,
-    node: &str,
-    workspace: &str,
-    client: &crate::agent::AgentClient,
-    seen: &mut u64,
-) {
-    // Re-load the pack for the trust bundle + update channel; a torn copy
-    // mid-write fails here and is retried next tick.
-    let Ok(pack) = CredentialPack::load_runtime(dir) else {
-        tracing::warn!("policy reload: pack reload failed (torn update?), keeping current policy");
-        return;
-    };
-    match pack.policy_update(*seen) {
-        Ok(Some(update)) => {
-            let generation = update.policy.generation;
-            match (
-                policy_ingress_rules(&update.policy, node, workspace),
-                policy_egress_rules(&update.policy, node),
-            ) {
-                (Ok(ingress), Ok((egress, allowed))) => {
-                    let signature = interflow_util::sha256_hex(&update.signature);
-                    tracing::info!(
-                        target: "audit",
-                        generation,
-                        signature_fingerprint = %signature,
-                        ingress_rules = ingress.len(),
-                        egress_rules = egress.len(),
-                        "policy reload: applying signed policy update"
-                    );
-                    client.apply_policy(ingress, egress, allowed).await;
-                    *seen = generation;
-                }
-                (Err(e), _) | (_, Err(e)) => {
-                    // The signed face is unusable on this node — keep the
-                    // current policy; a corrected re-drop (new fingerprint)
-                    // retries cleanly.
-                    tracing::error!(
-                        "policy reload: update does not derive valid rules, keeping current \
-                         policy: {e}"
-                    );
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            tracing::warn!("policy reload: rejecting update (keeping current policy): {e}");
-        }
-    }
-}
-
 /// Spawns the signed-policy reload watcher for a running hub.
 ///
 /// Swaps the cross-workspace admission table under the shared-config lock
 /// (effective on the next Open — never a listener rebuild). Same fail-keep
-/// contract as the agent watcher.
-pub fn spawn_hub_policy_reload(
+/// contract as the agent watcher. Spawned onto `tracker` and ending with
+/// `shutdown` — the hub's run future owns both, so the watcher is intrinsic
+/// to a pack-built hub's lifecycle (no embedder wiring exists to forget).
+pub(crate) fn spawn_hub_policy_reload(
     pack_dir: &Path,
-    hub: &HubServer,
-) -> Result<tokio::task::JoinHandle<()>> {
-    let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
-    let mut seen = pack.policy.generation;
-    let shared = hub.shared_config();
+    shared: crate::hub::SharedHubConfig,
+    shutdown: &tokio_util::sync::CancellationToken,
+    tracker: &tokio_util::task::TaskTracker,
+) {
     let dir = pack_dir.to_owned();
-    Ok(tokio::spawn(async move {
+    let shutdown = shutdown.clone();
+    tracker.spawn(async move {
         let policy_dir = dir.join("state/policy");
         let mut fingerprint = policy_channel_fingerprint(&policy_dir);
+        // The anti-rollback watermark; `None` = not yet armed (the pack was
+        // unreadable at spawn — retried each tick, a torn update defers the
+        // plane instead of killing it).
+        let mut seen: Option<u64> = None;
         loop {
-            tokio::time::sleep(POLICY_WATCH_INTERVAL).await;
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(crate::agent::policy_watch::POLICY_WATCH_INTERVAL) => {}
+            }
+            let Some(watermark) = seen else {
+                match CredentialPack::load_runtime(&dir) {
+                    Ok(pack) => {
+                        seen = Some(pack.policy.generation);
+                        tracing::info!(
+                            build = %interflow_buildinfo::BUILD_TAG,
+                            watermark = pack.policy.generation,
+                            interval_secs =
+                                crate::agent::policy_watch::POLICY_WATCH_INTERVAL.as_secs(),
+                            "hub policy watcher armed (cross-workspace admission hot-swap)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "hub policy watcher: pack unreadable, arming deferred: {}",
+                            interflow_util::format_chain(&pack_error(e))
+                        );
+                    }
+                }
+                continue;
+            };
             let current = policy_channel_fingerprint(&policy_dir);
             if current == fingerprint {
                 continue;
@@ -584,11 +488,12 @@ pub fn spawn_hub_policy_reload(
             fingerprint = current;
             let Ok(pack) = CredentialPack::load_runtime(&dir) else {
                 tracing::warn!(
-                    "policy reload: pack reload failed (torn update?), keeping current policy"
+                    "hub policy reload: pack reload failed (torn update?), keeping current \
+                     policy"
                 );
                 continue;
             };
-            match pack.policy_update(seen) {
+            match pack.policy_update(watermark) {
                 Ok(Some(update)) => {
                     let generation = update.policy.generation;
                     let acl = policy_acl(&update.policy);
@@ -602,7 +507,7 @@ pub fn spawn_hub_policy_reload(
                         acl_rules = rules,
                         "hub policy reload: cross-workspace admission table swapped"
                     );
-                    seen = generation;
+                    seen = Some(generation);
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -612,7 +517,7 @@ pub fn spawn_hub_policy_reload(
                 }
             }
         }
-    }))
+    });
 }
 
 /// Derives one agent's engine ingress rules from the signed policy's stream
@@ -714,9 +619,29 @@ pub async fn run_hub(pack_dir: &Path) -> Result<()> {
         "starting mesh hub from credential pack {}",
         pack.metadata.node
     );
+    // The serving-lineage origin, stated at startup (2026-10-07 fix): a
+    // reinstall that lost the node-local state channel used to be visible
+    // only by reverse-engineering agent inverted-watermark WARNs. `state
+    // lineage` = the node-local channel survived (the upgrade contract);
+    // `pack snapshot` = serving from the embedded render (fresh install,
+    // or a lineage loss — check whether state/ was expected to survive).
+    tracing::info!(
+        node = %pack.metadata.node,
+        generation = pack.policy.generation,
+        origin = if pack.policy_from_state_channel { "state lineage" } else { "pack snapshot" },
+        "serving policy gen {} (from {})",
+        pack.policy.generation,
+        if pack.policy_from_state_channel { "state lineage" } else { "pack snapshot" },
+    );
     let plane = crate::hub::server::build_runtime_tls_plane(&config)?;
-    let hub = HubServer::with_tls_plane(config, plane)?;
-    let mut policy_watcher = spawn_hub_policy_reload(pack_dir, &hub)?;
+    // Composition root: the hub process's one audit writer, spawned from
+    // the pack-declared destination (config.audit is data; the spawn
+    // decision lives here and here only).
+    let audit = interflow_core::security::AuditSink::spawn(&config.audit);
+    let hub = HubServer::with_tls_plane(config, plane, audit)?;
+    // The signed-policy ACL watcher is intrinsic to the hub's run future
+    // (the config's policy plane names the pack) — nothing to spawn or
+    // select over here.
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     {
@@ -762,17 +687,6 @@ pub async fn run_hub(pack_dir: &Path) -> Result<()> {
     tokio::select! {
         result = &mut hub_run => result,
         result = interflow_renewal::renewal_scheduler(pack_dir) => result,
-        // The watcher only ever returns by panic — that is a structural
-        // defect worth failing the process over rather than silently
-        // freezing the policy channel.
-        joined = &mut policy_watcher => {
-            joined.map_err(|e| {
-                InterflowError::config("hub policy watcher task failed").with_source(e)
-            })?;
-            Err(InterflowError::config(
-                "hub policy watcher exited unexpectedly (no update loop exit exists)",
-            ))
-        }
     }
 }
 
@@ -792,9 +706,9 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
     let hub_url = config.agent.hub_url.clone();
     let rules = config.ingress.len() + config.egress.len();
     let has_ingress_listeners = !config.ingress.is_empty();
-    let client = crate::agent::AgentClient::new(config)?;
-    let mut agent = client.clone().start();
-    let mut policy_watcher = spawn_policy_reload(pack_dir, client, Some(agent.tunnel()))?;
+    // The signed-policy watcher rides the engine itself (the config's
+    // policy plane) — nothing to spawn or fail over here.
+    let mut agent = crate::agent::AgentClient::new(config)?.start();
     println!(
         "mesh agent {} started: {} rule(s) → {}",
         pack.metadata.node, rules, hub_url
@@ -841,7 +755,6 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
         );
     tokio::select! {
         () = wait_for_shutdown_signal() => {
-            policy_watcher.abort();
             pump.abort();
             if let Err(e) = agent.shutdown_graceful().await {
                 tracing::error!("graceful shutdown failed: {e}");
@@ -850,25 +763,12 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
             std::process::exit(130)
         }
         joined = &mut scheduler => {
-            policy_watcher.abort();
             pump.abort();
             agent.shutdown_graceful().await?;
             joined.map_err(|e| {
                 InterflowError::config("renewal scheduler task failed").with_source(e)
             })??;
             Ok(())
-        }
-        // The watcher only ever returns by panic — fail the process rather
-        // than silently freezing the policy channel.
-        joined = &mut policy_watcher => {
-            pump.abort();
-            agent.shutdown_graceful().await?;
-            joined.map_err(|e| {
-                InterflowError::config("policy watcher task failed").with_source(e)
-            })?;
-            Err(InterflowError::config(
-                "policy watcher exited unexpectedly (no update loop exit exists)",
-            ))
         }
     }
 }

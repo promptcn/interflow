@@ -13,9 +13,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -158,6 +156,8 @@ mod setup {
             ca_path: Some(certs.ca_path().display().to_string()),
             transport: TransportKind::H2,
             hub_quic_addr: None,
+
+            identity_offline: false,
         };
         let client_handle = tokio::task::spawn(async move {
             interflow_expose::client::start(&client_args)?.join().await
@@ -170,21 +170,6 @@ mod setup {
         // it into memory at startup)
 
         (edge_listen, edge_handle, client_handle, echo_handle)
-    }
-
-    async fn wait_for_tcp(addr: SocketAddr, timeout: Duration) -> std::io::Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            match TcpStream::connect(addr).await {
-                Ok(_) => return Ok(()),
-                Err(e) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(e);
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            }
-        }
     }
 }
 

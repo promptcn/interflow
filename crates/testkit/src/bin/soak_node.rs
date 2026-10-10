@@ -92,7 +92,8 @@ async fn run_hub(
         hub_config.server.listen_addr
     );
 
-    let hub_server = interflow_mesh::hub::HubServer::new(hub_config)?;
+    let audit = interflow_core::security::AuditSink::spawn(&hub_config.audit);
+    let hub_server = interflow_mesh::hub::HubServer::new(hub_config, audit)?;
 
     let shutdown = tokio_util::sync::CancellationToken::new();
     {
@@ -123,7 +124,6 @@ async fn run_hub(
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(hub_server.run_until_signalled(shutdown, ready_tx));
-    #[allow(unused_mut)]
     // Ended before readiness: surface the run's own outcome.
     let Ok(ready) = ready_rx.await else {
         return match task.await {

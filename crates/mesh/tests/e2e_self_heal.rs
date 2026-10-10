@@ -11,8 +11,8 @@
 //! once-each): spawn the not-targeted agent FIRST and wait for registration
 //! (its consult happened before the plan existed → not consumed), then arm
 //! the plan, then spawn the targeted agent — the plan can only be consumed
-//! by the target. Tests run serially (`just test-e2e`) and each clears the
-//! hook up front.
+//! by the target. Cases within this binary run serialized (the `SERIAL`
+//! mutex below) and each clears the hook up front.
 //!
 //! Every test pairs its green assertions with a `fired` check on the fault
 //! log — a test that passes without the fault having fired is testing
@@ -25,9 +25,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_core::error::InterflowError;
 use interflow_core::fault::FaultPoint;
@@ -59,10 +57,10 @@ fn certs() -> &'static interflow_testkit::certs::TestCerts {
 const REBUILD_BUDGET: Duration = Duration::from_secs(30);
 
 /// The fault hook is process-global and plans are once-each, so this suite
-/// must not interleave within one test binary. `just test-e2e` serializes
-/// via `--test-threads=1`, but plain `cargo test` (and CI) runs test cases
-/// in parallel — a binary-local mutex restores the ordering regardless of
-/// the runner's thread count.
+/// must not interleave within one test binary. A binary-local mutex
+/// restores the ordering under libtest (`cargo test` runs cases in
+/// parallel threads); under cargo-nextest each case is its own process, so
+/// the mutex never contends — both runners keep the discipline.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // ---------------------------------------------------------------------------
@@ -815,6 +813,311 @@ async fn quic_control_write_stall_rebuilds_session() {
     let got = round_trip_eventually(&tunnel, "egress", echo_addr, &payload, REBUILD_BUDGET)
         .await
         .expect("traffic must flow again after the control-write unwedges by rebuild");
+    assert_eq!(got, payload);
+
+    fault::clear();
+    let _ = front.shutdown_graceful().await;
+    let _ = egress.shutdown_graceful().await;
+}
+
+/// The steady-state survival window (the 2026-10-07 zero-attribution case's
+/// e2e gap): every existing self-heal test observes at rebuild-budget scale
+/// — no case ever crosses the steady-state periodic horizon (the 15s
+/// ingress reconcile / egress refresh ticks, the 10s policy pull, the 15s
+/// heartbeat cadence). The 455991a field death (~18-21s after
+/// establishment, both legs) fell exactly in that blind spot. This test
+/// pins one QUIC session through a >=60s window at PRODUCTION cadence,
+/// asserting:
+/// - no rebuild: `sessions_established` stays at 1 (the monotonic counter
+///   cannot miss a fast Connected → Reconnecting → Connected cycle);
+/// - the state stays Connected;
+/// - the data plane answers at ~20s/40s/60s — the field-death instants.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_session_survives_steady_state_window() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    fault::clear();
+    let (echo_addr, _echo_handle) = echo_server().await;
+    // Production cadence on purpose: the 15s heartbeat interval is what the
+    // field deployment runs, and the window must cover the ticks that only
+    // fire at that scale.
+    let mut hub_cfg = hub_quic_config(0, certs(), Vec::new());
+    hub_cfg.heartbeat = HeartbeatConfig {
+        enabled: true,
+        interval_secs: 15,
+        max_missed: 4,
+    };
+    let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
+
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
+    egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
+    let egress = spawn_agent_registered(egress_cfg).await;
+    let front = spawn_agent_registered(agent_quic_config("front", hub_port, certs())).await;
+    assert_eq!(
+        front.sessions_established(),
+        1,
+        "precondition: exactly one established session"
+    );
+    let tunnel = front.tunnel();
+
+    // >=60s steady-state window: 4x the 15s reconcile/refresh/heartbeat
+    // ticks, 6x the 10s policy pull — the field-death instants (~18-21s)
+    // land well inside. The out-of-tree silence probe's budget (90s at this
+    // cadence) must NOT trip on a healthy session.
+    let window = Duration::from_secs(60);
+    let started = tokio::time::Instant::now();
+    let mut next_probe = started + Duration::from_secs(20);
+    let mut probes_done = 0usize;
+    while tokio::time::Instant::now() - started < window {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            front.sessions_established(),
+            1,
+            "a healthy session must not rebuild inside the steady-state window"
+        );
+        assert!(
+            matches!(front.state(), AgentState::Connected { .. }),
+            "state drifted inside the window: {:?}",
+            front.state()
+        );
+        if tokio::time::Instant::now() >= next_probe {
+            let payload = b"steady-state-probe\n".repeat(4);
+            let got = round_trip_eventually(
+                &tunnel,
+                "egress",
+                echo_addr,
+                &payload,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("data plane dead at {:?}: {e}", next_probe - started));
+            assert_eq!(got, payload);
+            probes_done += 1;
+            next_probe += Duration::from_secs(20);
+        }
+    }
+    assert!(
+        probes_done >= 3,
+        "expected >=3 data-plane probes, got {probes_done}"
+    );
+
+    fault::clear();
+    let _ = front.shutdown_graceful().await;
+    let _ = egress.shutdown_graceful().await;
+}
+
+/// The demanding tier's e2e (the 2026-10-09 one-way-blackhole case,
+/// reproduced): the hub swallows every liveness-probe roundtrip while its
+/// heartbeat Pings keep flowing — so the agent's receive ledger stays FRESH
+/// (the passive tier is blind by construction, exactly the incident's
+/// unexplained residual) and the quinn connection object stays alive. Only
+/// the demanding tier — which asks a question and believes only the answer
+/// — can see the dead path: three unanswered probes (~30s cadence) must end
+/// the session and rebuild it, and once the swallow is disarmed the session
+/// must stabilize and serve traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_demanding_probe_rebuilds_when_the_hub_stops_answering() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    fault::clear();
+    let (echo_addr, _echo_handle) = echo_server().await;
+    // Production heartbeat cadence: the Pings keep the agent's ledger fed
+    // for the whole window, pinning the passive tier out of the picture.
+    let mut hub_cfg = hub_quic_config(0, certs(), Vec::new());
+    hub_cfg.heartbeat = HeartbeatConfig {
+        enabled: true,
+        interval_secs: 15,
+        max_missed: 4,
+    };
+    let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
+
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
+    egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
+    let egress = spawn_agent_registered(egress_cfg).await;
+    let front = spawn_agent_registered(agent_quic_config("front", hub_port, certs())).await;
+    assert_eq!(front.sessions_established(), 1);
+
+    // Arm the swallow AFTER both agents registered (the injection-ordering
+    // discipline): every future liveness roundtrip opens a stream the hub
+    // drops without answering. stall_every_at = while-armed semantics, so
+    // this is the standing blackhole for probe streams only.
+    let faults =
+        fault::install(FaultPlan::new().stall_every_at(FaultPoint::HubQuicSwallowLivenessProbe));
+    // Let the first few post-arm probes be swallowed (the probe fires its
+    // first demand ~30s after session start, then one per cadence; three
+    // strikes ≈ 90-105s).
+    assert!(
+        faults
+            .wait_fired(
+                FaultPoint::HubQuicSwallowLivenessProbe,
+                Duration::from_secs(60)
+            )
+            .await,
+        "the swallow must have fired (the probe's demands reach the hub)"
+    );
+    assert!(
+        wait_session_rebuilt(&front, 1, Duration::from_secs(150)).await,
+        "three unanswered demanding probes must rebuild the session — the \
+         path is dead while the heartbeat-fed ledger stayed fresh \
+         (sessions established: {})",
+        front.sessions_established()
+    );
+
+    // Disarm: the next rebuild's probes get answered — the session must
+    // stabilize (no further rebuild across several probe cadences) and the
+    // data plane must serve.
+    fault::clear();
+    assert!(
+        wait_agent_connected(&front, Duration::from_secs(10)).await,
+        "state must return to Connected after the swallow is disarmed: {:?}",
+        front.state()
+    );
+    let stabilized_at = front.sessions_established();
+    tokio::time::sleep(Duration::from_secs(70)).await;
+    assert_eq!(
+        front.sessions_established(),
+        stabilized_at,
+        "with the swallow disarmed the session must stop rebuilding \
+         (2+ probe cadences elapsed)"
+    );
+    let tunnel = front.tunnel();
+    let payload = b"liveness-recovered\n".repeat(4);
+    let got = round_trip_eventually(&tunnel, "egress", echo_addr, &payload, REBUILD_BUDGET)
+        .await
+        .expect("traffic must flow again once the hub answers probes");
+    assert_eq!(got, payload);
+
+    let _ = front.shutdown_graceful().await;
+    let _ = egress.shutdown_graceful().await;
+}
+
+/// The hub's eviction notice (the 2026-10-09 fix's fast path): when the
+/// QUIC heartbeat dead line evicts an agent whose connection is still
+/// transport-alive (the Pong path wedged, Pings still arriving), the hub's
+/// best-effort CONNECTION_CLOSE rides the still-working reverse direction
+/// and the agent rebuilds immediately — bounded by the hub's 2s dead line,
+/// NOT by the agent's own much-longer stall line (pinned to 30s here:
+/// without the close, the only death signal left is the 30s stall
+/// watchdog, and this test's 15s budget fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_heartbeat_evict_notice_reaches_the_agent_and_rebuilds_fast() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    fault::clear();
+    let (echo_addr, _echo_handle) = echo_server().await;
+    let mut hub_cfg = hub_quic_config(0, certs(), Vec::new());
+    hub_cfg.heartbeat = HeartbeatConfig {
+        enabled: true,
+        interval_secs: 1,
+        max_missed: 1,
+    };
+    let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
+
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
+    egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
+    let egress = spawn_agent_registered(egress_cfg).await;
+
+    // Injection-ordering discipline (the plan is process-global and
+    // one-shot): egress must answer at least one Pong — its forwarder's
+    // fault consult happens on the first FORWARDED frame, a heartbeat
+    // after registration — before the plan exists, or the wedge lands on
+    // egress instead of front.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Wedge front's control-write forwarder on its first Pong (the
+    // connection stays transport-alive; the hub's heartbeat deadline is
+    // the eviction trigger).
+    let faults = fault::install(FaultPlan::new().stall_at(FaultPoint::QuicControlWriteStall));
+    let mut front_cfg = agent_quic_config("front", hub_port, certs());
+    // Pin the agent's OWN stall line far above the hub's 2s dead line, so
+    // the only sub-15s death signal available to the agent is the hub's
+    // eviction close.
+    front_cfg.agent.task_stall_timeout_secs = Some(30);
+    let front = spawn_agent(front_cfg);
+    assert!(
+        wait_agent_connected(&front, Duration::from_secs(10)).await,
+        "agent should connect initially (state: {:?})",
+        front.state()
+    );
+    assert!(
+        faults
+            .wait_fired(FaultPoint::QuicControlWriteStall, Duration::from_secs(10))
+            .await,
+        "the control-write wedge must have fired"
+    );
+    assert!(
+        wait_session_rebuilt(&front, 1, Duration::from_secs(15)).await,
+        "the hub's eviction close must reach the agent well inside its own \
+         30s stall line (sessions established: {})",
+        front.sessions_established()
+    );
+
+    // The fault was one-shot: the rebuilt session is healthy — data-plane
+    // proof that the rebuild landed on a working path.
+    fault::clear();
+    let tunnel = front.tunnel();
+    let payload = b"evict-notice-recovered\n".repeat(4);
+    let got = round_trip_eventually(&tunnel, "egress", echo_addr, &payload, REBUILD_BUDGET)
+        .await
+        .expect("traffic must flow on the post-notice rebuild");
+    assert_eq!(got, payload);
+
+    let _ = front.shutdown_graceful().await;
+    let _ = egress.shutdown_graceful().await;
+}
+
+/// The out-of-tree silence probe must spare a healthy h2 session: with a
+/// 1s heartbeat the poll watchdog is 2s, so the probe's budget is 4s —
+/// running well past 3x that budget with zero rebuilds proves the probe
+/// (and the frozen-ledger verdict behind it) cannot false-positive on a
+/// session whose downlink is merely quiet between heartbeat pings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2_out_of_tree_probe_spares_a_healthy_session() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    fault::clear();
+    let (echo_addr, _echo_handle) = echo_server().await;
+    let mut hub_cfg = hub_config(0, certs(), Vec::new());
+    hub_cfg.heartbeat = HeartbeatConfig {
+        enabled: true,
+        interval_secs: 1,
+        max_missed: 1,
+    };
+    let _hub = spawn_hub(hub_cfg).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
+
+    let mut egress_cfg = agent_config("egress", hub_port, certs());
+    egress_cfg.egress = vec![tcp_egress_rule("echo", echo_addr)];
+    let egress = spawn_agent_registered(egress_cfg).await;
+    let front = spawn_agent_registered(agent_config("front", hub_port, certs())).await;
+    assert_eq!(front.sessions_established(), 1);
+    let tunnel = front.tunnel();
+
+    // 15s > 3x the probe's 4s budget at this cadence
+    let window = Duration::from_secs(15);
+    let started = tokio::time::Instant::now();
+    while tokio::time::Instant::now() - started < window {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            front.sessions_established(),
+            1,
+            "the out-of-tree probe must not kill a healthy h2 session"
+        );
+        assert!(
+            matches!(front.state(), AgentState::Connected { .. }),
+            "state drifted: {:?}",
+            front.state()
+        );
+    }
+    let payload = b"h2-probe-spared\n".repeat(4);
+    let got = round_trip_eventually(&tunnel, "egress", echo_addr, &payload, REBUILD_BUDGET)
+        .await
+        .expect("traffic must still flow after sitting out 3x the probe budget");
     assert_eq!(got, payload);
 
     fault::clear();

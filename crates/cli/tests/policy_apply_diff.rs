@@ -132,7 +132,16 @@ fn apply_routes_policy_only_changes_without_re_signing_packs() {
     let pack_dir = env.dir.join("dist/packs/agent-home-win");
     assert!(pack_dir.join("pack.toml").is_file());
     let pack_digest_before = std::fs::read_to_string(pack_dir.join("SHA256SUMS")).unwrap();
-    assert!(!env.dir.join("dist/policy/policy.toml").is_file());
+    // The full render mirrors its bundle into dist/policy (generation 1) so
+    // the manual-distribution channel never trails what the packs embed.
+    let mirror = env.dir.join("dist/policy/policy.toml");
+    assert!(mirror.is_file(), "the full render mirrors dist/policy");
+    assert!(
+        std::fs::read_to_string(&mirror)
+            .unwrap()
+            .contains("generation = 1"),
+        "the mirror carries the render generation"
+    );
 
     // 2. Policy-only change: add the TTS rule pair.
     let v2 = env.write_manifest(&manifest_text(11434, 11434, true));
@@ -193,6 +202,48 @@ fn apply_routes_policy_only_changes_without_re_signing_packs() {
         pack_digest_after, pack_digest_final,
         "the identity-face change must re-render packs"
     );
+    // Generation continuity (2026-10-06 fix): the counter RIDES ON through
+    // the identity-face re-render — floor here is 2 (the policy-only
+    // lineage), so the packs embed generation 3 and the mirror follows. The
+    // former hard reset to 1 froze every online agent holding gen ≥ 2.
+    assert!(
+        fourth
+            .stdout
+            .contains("policy generation continues above the highest observed watermark 2"),
+        "the mint floor must be narrated: {}",
+        fourth.stdout
+    );
+    for (file, label) in [
+        (pack_dir.join("policy/policy.toml"), "embedded policy"),
+        (pack_dir.join("pack.toml"), "pack metadata"),
+        (pack_dir.join("trust/bundle.toml"), "trust bundle"),
+        (env.dir.join("dist/policy/policy.toml"), "dist mirror"),
+    ] {
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("generation = 3"),
+            "{label} must carry generation 3: {}",
+            file.display()
+        );
+    }
+    // 5. A policy-only change after the identity change continues from 3.
+    let identity_changed_rules = manifest_text(11434, 11434, false).replace(
+        "[mesh.hub.promptcn]\nlisten = \"127.0.0.1:16666\"",
+        "[mesh.hub.promptcn]\nlisten = \"127.0.0.1:16667\"",
+    );
+    let v5 = env.write_manifest(&identity_changed_rules);
+    let fifth = env.apply(&v5);
+    assert!(
+        fifth.success,
+        "post-identity policy-only apply: {}",
+        fifth.stderr
+    );
+    assert!(
+        std::fs::read_to_string(env.dir.join("dist/policy/policy.toml"))
+            .unwrap()
+            .contains("generation = 4"),
+        "the fast path must sign generation 4 after the re-render at 3"
+    );
 }
 
 /// The bundle the fast path writes is exactly what a node accepts: drop it
@@ -227,4 +278,92 @@ fn fast_path_bundle_is_node_loadable() {
         &pack_dir.display().to_string(),
     ]);
     assert!(inspect.success, "{}", inspect.stderr);
+}
+
+/// The mint floor's dist scan includes the node state mirrors
+/// (`packs/*/state/policy`): when the issuer store's bookkeeping sits at a
+/// LOW generation while a pack's state channel holds a higher watermark —
+/// the 2026-10-06 field incident's exact shape (bookkeeping reset
+/// underneath a live fleet) — the next full render must mint ABOVE the
+/// state mirror, not above the bookkeeping.
+#[test]
+fn identity_change_mints_above_node_state_watermarks() {
+    let env = Env::new();
+    let v1 = env.write_manifest(&manifest_text(11440, 11440, false));
+    assert!(env.apply(&v1).success);
+
+    // A node-local state channel holding generation 5 — the surviving
+    // watermark of record. The floor probe only reads the number (content
+    // need not verify: minting higher is always safe under monotonicity,
+    // and only a LOWER floor could manufacture a rollback).
+    let state_policy = env.dir.join("dist/packs/agent-home-win/state/policy");
+    std::fs::create_dir_all(&state_policy).unwrap();
+    std::fs::write(state_policy.join("policy.toml"), "generation = 5\n").unwrap();
+
+    // Identity-face change → full render. Floor = max(bookkeeping 1, dist
+    // artifacts 5) = 5 → the packs embed 6.
+    let identity_changed = manifest_text(11440, 11440, false).replace(
+        "[mesh.hub.promptcn]\nlisten = \"127.0.0.1:16666\"",
+        "[mesh.hub.promptcn]\nlisten = \"127.0.0.1:16668\"",
+    );
+    let v2 = env.write_manifest(&identity_changed);
+    let out = env.apply(&v2);
+    assert!(out.success, "{}", out.stderr);
+    assert!(
+        std::fs::read_to_string(env.dir.join("dist/packs/agent-home-win/policy/policy.toml"))
+            .unwrap()
+            .contains("generation = 6"),
+        "the re-render must mint above the state watermark 5"
+    );
+}
+
+/// The no-op gate is watermark-aware (2026-10-06 fix): the 2026-10-06
+/// field's exact shape — bookkeeping gen 2, an UNCHANGED manifest, and a
+/// node state mirror restored to gen 5 — must NOT short-circuit as
+/// "nothing to do". The gate observes the split and re-publishes above the
+/// watermarks (mint 6), which is precisely what the hub's inverted-
+/// watermark WARN tells the operator to do. Before the fix the digest
+/// match returned before `policy_mint_floor` ever ran, locking the
+/// recovery path the floor mechanism was built for.
+#[test]
+fn unchanged_manifest_republishes_above_diverged_watermarks() {
+    let env = Env::new();
+    let v1 = env.write_manifest(&manifest_text(11442, 11442, false));
+    assert!(env.apply(&v1).success);
+    let v2 = env.write_manifest(&manifest_text(11442, 11442, true));
+    assert!(env.apply(&v2).success, "policy-only apply: run stderr");
+
+    // The restored `.bak-gen5` state mirror: a watermark of record the
+    // issuer bookkeeping (gen 2) can no longer see. The hub endpoint is a
+    // closed port, so the divergence must be caught by the dist scan.
+    let state_policy = env.dir.join("dist/packs/agent-home-win/state/policy");
+    std::fs::create_dir_all(&state_policy).unwrap();
+    std::fs::write(state_policy.join("policy.toml"), "generation = 5\n").unwrap();
+
+    // The SAME manifest again — previously "nothing to do".
+    let out = env.apply(&v2);
+    assert!(out.success, "{}", out.stderr);
+    assert!(
+        !out.stdout.contains("nothing to do"),
+        "a watermark split must not be a no-op: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("the watermarks diverge from the issuer bookkeeping"),
+        "the gate must narrate WHY an unchanged manifest re-publishes: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("policy generation continues above the highest observed watermark 5"),
+        "the mint floor must clear the state mirror: {}",
+        out.stdout
+    );
+    assert!(
+        std::fs::read_to_string(env.dir.join("dist/policy/policy.toml"))
+            .unwrap()
+            .contains("generation = 6"),
+        "the reconcile must mint generation 6 (above the watermark 5)"
+    );
 }

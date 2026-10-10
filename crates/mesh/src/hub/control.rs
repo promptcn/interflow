@@ -1,21 +1,21 @@
 //! Control-plane dispatch: guaranteed-delivery channel for stream lifecycle
-//! notifications (Open / `_close_`).
+//! notifications (Open / Close).
 //!
 //! Before the 2026-09-14 in-session orphan-stream root fix
 //!, hub → agent
 //! close notifications shared the same capacity-256 poll data channel as
 //! business Data frames: when a traffic burst filled the channel,
-//! `try_send` silently dropped `_close_`, the egress forwarder never saw a
-//! Close, and the backend fd lingered for the whole session (EMFILE). The
-//! data plane must be bounded (backpressure) and the control plane must not
-//! drop (otherwise the peer's fd lingers) — the two semantics conflict, so
-//! the channels must be separated:
+//! `try_send` silently dropped the close notification, the egress
+//! forwarder never saw a Close, and the backend fd lingered for the whole
+//! session (EMFILE). The data plane must be bounded (backpressure) and the
+//! control plane must not drop (otherwise the peer's fd lingers) — the two
+//! semantics conflict, so the channels must be separated:
 //!
 //! - **Data channel** (capacity 256, `AgentSession::tx`): Data / Ping; when
 //!   full the sender waits in a bounded fashion (backpressure propagates to
 //!   upstream TCP flow control);
 //! - **Control channel** (unbounded, `AgentSession::ctrl_tx`): Open and
-//!   `_close_` notifications. `send` is synchronous, never blocks, and fails
+//!   Close notifications. `send` is synchronous, never blocks, and fails
 //!   only when the peer's session ends (receiver dropped) — "delivery while
 //!   online".
 //!
@@ -24,7 +24,7 @@
 //! - The hub processes frames on the same upload connection in order, and
 //!   Open and a later Close of the same stream both go through the control
 //!   channel, preserving FIFO — close-before-open cannot happen;
-//! - `_close_` is allowed to overtake **request-direction** tail data still
+//! - A Close is allowed to overtake **request-direction** tail data still
 //!   queued in the data channel (the stream is already dead at its source,
 //!   the tail request data is meaningless; termination and fd release take
 //!   priority);
@@ -165,32 +165,7 @@ pub(crate) fn close_frame(stream_id: StreamId, reason: &CloseReason) -> TunnelDa
     }
 }
 
-/// Maps a hub-internal rejection diagnostic to the Close reason code sent
-/// on the wire. The strings stay hub-internal (logs/metrics); the wire only
-/// ever carries the shared code table.
-pub(crate) fn close_reason_of(diagnostic: &str) -> CloseReason {
-    match diagnostic {
-        // Identity / forgery family.
-        "spoofed source" | "Invalid source identity" | "Source circuit not registered" => {
-            CloseReason::SecurityDenied
-        }
-        // Routing family: unknown route / bad payload / missing target or stream.
-        "Unknown route token"
-        | "invalid open payload"
-        | "Target agent not registered"
-        | "Stream not found" => CloseReason::NoTarget,
-        // Policy family.
-        "Access denied by tenant policy" => CloseReason::SecurityDenied,
-        // Capacity family.
-        "Global stream limit reached" | "Per-agent stream limit reached" => CloseReason::LocalLimit,
-        // Downstream delivery family.
-        "Target agent channel closed" => CloseReason::BackendClosed,
-        "Target agent stalled" => CloseReason::DispatchPoison,
-        _ => CloseReason::CloseFrame,
-    }
-}
-
-/// Delivers one lifecycle notification frame (Open / `_close_`) to an h2
+/// Delivers one lifecycle notification frame (Open / Close) to an h2
 /// (poll) agent via the control channel with guaranteed delivery.
 ///
 /// Returns `false` = peer not registered / a QUIC session (conveyed by the
@@ -208,8 +183,8 @@ pub(crate) async fn deliver_control(
     control_send(agents, agent_id, &ch, frame).await
 }
 
-/// `_close_` with request-direction semantics: guaranteed delivery via the
-/// control channel.
+/// A Close notification with request-direction semantics: guaranteed
+/// delivery via the control channel.
 ///
 /// Overtaking queued request-direction tail data is the **correct** semantic
 /// (the stream is already dead at its source, the tail data is meaningless,
@@ -223,10 +198,10 @@ pub(crate) async fn deliver_close_via_control(
     deliver_control(agents, agent_id, close_frame(stream_id, &reason)).await
 }
 
-/// `_close_` with response-direction semantics (backend EOF): data-channel
-/// FIFO first, falling back to the control channel on stall. `reason`
-/// (empty = ordinary close) rides in the payload so the receiving end can
-/// distinguish backend failures from normal teardown.
+/// A Close notification with response-direction semantics (backend EOF):
+/// data-channel FIFO first, falling back to the control channel on stall.
+/// `reason` rides in the payload so the receiving end can distinguish
+/// backend failures from normal teardown.
 ///
 /// Queued response tail bytes are still deliverable to the visitor — under
 /// normal congestion the Close queues after the data (`send().await` waits

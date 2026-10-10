@@ -23,6 +23,9 @@ use serde::Deserialize;
 pub struct AgentListEntry {
     /// Qualified agent id (`tenant/agent`).
     pub agent: String,
+    /// The reachability reading (`registered ≠ reachable`): QUIC relay in
+    /// place, or h2 poll body in place / within reconnect grace.
+    pub online: bool,
     /// Credential health parsed from the registration certificate; null
     /// when the leaf did not parse.
     pub leaf_expiry: Option<LeafExpiry>,

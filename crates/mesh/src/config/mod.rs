@@ -13,7 +13,7 @@ pub mod validate;
 
 pub use agent::{
     AgentConfig, AgentInfo, ControlConfig, EgressRule, EgressTarget, IngressRule, InnerTlsConfig,
-    SecurityConfig, TlsConfig as AgentTlsConfig, TransportKind,
+    PolicyPlaneConfig, SecurityConfig, TlsConfig as AgentTlsConfig, TransportKind,
 };
 pub use hub::{
     AclConfig, AclRule, AuthConfig, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig,

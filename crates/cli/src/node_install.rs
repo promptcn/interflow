@@ -98,9 +98,14 @@ pub fn install(opts: &NodeInstall) -> interflow_core::error::Result<InstallRepor
     }
 
     // Swap in: existing install becomes `<kind>-<node>.previous`.
+    // An upgrade carries the node-local `state/` over (the hub's serving
+    // lineage among it — the 2026-10-07 serving-reset bug: with
+    // preserve_state=false every `node install` re-run dropped a gen-8
+    // state lineage into `.previous` and the hub came back serving the
+    // pack's embedded gen 1); a fresh install has nothing to carry.
     let target = packs_root.join(format!("{}-{node}", kind.as_str()));
     let upgraded = target.exists();
-    commit_staged(&staging, &staged_path, &target, false)?;
+    commit_staged(&staging, &staged_path, &target, upgraded)?;
     if system_target {
         chown_tree(&target, &opts.user)?;
     }
@@ -157,10 +162,14 @@ pub fn install(opts: &NodeInstall) -> interflow_core::error::Result<InstallRepor
 /// share a filesystem (the caller stages next to the target), so the final
 /// move is a rename.
 ///
-/// `preserve_state` carries the active credential set, ACME certificates
-/// and CRL snapshots across the swap — what an in-place *update* of a
-/// running node wants (`node install` upgrades pass `false`: a fresh
-/// server install starts from the pack's own material).
+/// `preserve_state` carries the node-local `state/` (the accepted-policy
+/// serving lineage, the active credential set, ACME certificates, CRL
+/// snapshots) across the swap. It is the CONTRACT for an in-place update:
+/// `node install` passes `true` on upgrades (`target.exists()` — a
+/// re-install of an existing node is an update, and dropping its lineage
+/// resets the hub's serving to the pack's embedded snapshot); only a
+/// genuinely fresh install (no target) starts from the pack's own material.
+/// The previous install stays at `<target>.previous` for manual rollback.
 pub fn commit_staged(
     staging_root: &Path,
     staged: &Path,

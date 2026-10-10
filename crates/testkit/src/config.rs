@@ -88,6 +88,12 @@ pub fn hub_config_tuned(
 /// dual stack).
 pub fn hub_quic_config(listen_port: u16, certs: &TestCerts, acl_rules: Vec<AclRule>) -> HubConfig {
     let mut cfg = hub_config(listen_port, certs, acl_rules);
+    // One [tls] section serves both faces and QUIC mandates TLS 1.3: the
+    // QUIC variant rides the 1.3 floor on both faces (validation rejects
+    // the 1.2 + QUIC combination).
+    if let Some(tls) = cfg.tls.as_mut() {
+        tls.min_version = TlsMinVersion::V1_3;
+    }
     cfg.transport.quic = HubQuicConfig {
         enabled: true,
         // Default: same port as TCP (TCP/UDP coexist independently)

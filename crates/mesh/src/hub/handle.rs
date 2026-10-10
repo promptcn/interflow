@@ -92,7 +92,17 @@ impl HubHandle {
     /// on threads without an ambient runtime must enter one first (e.g.
     /// `Handle::enter`).
     pub fn spawn(config: HubConfig) -> Result<Self> {
-        let server = HubServer::new(config)?;
+        // Composition root for the handle's users (GUI hub nodes, testkit
+        // stacks): the audit writer is spawned here from the config's
+        // declared destination — one spawn per process/ledger, enforced by
+        // the audit module's path-claim registry.
+        let audit = interflow_core::security::AuditSink::spawn(&config.audit);
+        Ok(Self::spawn_inner(HubServer::new(config, audit)?))
+    }
+
+    /// The spawn body: the run task, the monitor, and the lifecycle
+    /// plumbing around one assembled server.
+    fn spawn_inner(server: HubServer) -> Self {
         let shutdown_token = CancellationToken::new();
         let (state_tx, state_rx) = watch::channel(HubLifecycle::Starting);
         let (result_tx, result_rx) = oneshot::channel();
@@ -147,12 +157,12 @@ impl HubHandle {
             let _ = result_tx.send(result);
         });
 
-        Ok(Self {
+        Self {
             state: state_rx,
             shutdown_token,
             result: result_rx,
             bound_addr,
-        })
+        }
     }
 
     /// The actually-bound listener address, available once the hub reaches

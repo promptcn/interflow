@@ -38,6 +38,7 @@ use crate::hub::state::{
 };
 use bytes::{Bytes, BytesMut};
 use interflow_core::error::{InterflowError, Result};
+use interflow_core::fault::FaultPoint;
 use interflow_core::protocol::frame as wire;
 use interflow_core::protocol::{
     CircuitToken, CloseReason, FLAG_E2E, FLAG_HUB_ORIGIN, FLAG_RESPONSE, FrameOrigin, FrameType,
@@ -50,9 +51,11 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use interflow_core::tunnel::negotiation::{
-    HeartbeatAd, RegisterResponse, decode_hello_payload, decode_route_request_payload,
-    encode_error_payload, encode_route_ack_payload,
+    HeartbeatAd, RegisterResponse, decode_hello_payload, decode_policy_pull_request,
+    decode_route_request_payload, encode_error_payload, encode_policy_pull_response,
+    encode_route_ack_payload,
 };
+use interflow_core::tunnel::transport::{PolicyFetch, PolicyPull};
 use tokio_rustls::rustls::pki_types::CertificateDer;
 
 /// Relay channel capacity (same as the poll channel).
@@ -105,9 +108,11 @@ pub(crate) async fn spawn_quic_listener(
     // (reload of the rustls config remains restart-required, per the
     // reload contract).
     //
-    // QUIC mandates TLS 1.3: a [tls] min_version of 1.2 is honored on the h2
-    // plane only — here it is clamped to 1.3 (quinn/rustls reject 1.2-only
-    // version lists for QUIC).
+    // QUIC mandates TLS 1.3: config validation rejects a [tls] min_version
+    // of 1.2 whenever [transport.quic] is enabled (one [tls] section serves
+    // both faces), so the V1_3 floor below is a defense-in-depth invariant
+    // rather than a silent clamp — an unreachable branch by the time a
+    // config reaches here.
     let plane = hub
         .tls_plane
         .read()
@@ -293,8 +298,10 @@ async fn handle_connection(hub: std::sync::Arc<HubState>, conn: quinn::Connectio
         let hub_stream = hub.clone();
         let source_agent = agent_id.clone();
         let source_state = state_arc.clone();
+        let peer = conn.remote_address().to_string();
         hub.tasks.spawn(async move {
-            if let Err(e) = handle_quic_stream(hub_stream, source_agent, source_state, tx, rx).await
+            if let Err(e) =
+                handle_quic_stream(hub_stream, source_agent, source_state, peer, tx, rx).await
             {
                 debug!("QUIC stream handling finished: {e}");
             }
@@ -318,6 +325,13 @@ fn drain_frames(buf: &mut BytesMut) -> Vec<wire::DecodedFrame> {
 
 /// Reads the stream until one frame decodes (`Ok(None)` = EOF;
 /// `Err` = protocol violation).
+///
+/// The **first-frame position is fail-closed**: an unknown frame type is a
+/// protocol violation, not a skippable frame — the first frame defines the
+/// stream's purpose (Hello on the control stream, a request type or Open on
+/// a request bi-stream), so there is nothing meaningful to skip past.
+/// (Mid-stream skipping for resynchronization remains the codec-level
+/// policy in `drain_frames`.)
 async fn read_first_frame(
     rx: &mut quinn::RecvStream,
     buf: &mut BytesMut,
@@ -341,7 +355,11 @@ async fn read_first_frame(
                     "invalid QUIC frame format".to_string(),
                 ));
             }
-            wire::DecodeOutcome::UnknownType { .. } => continue,
+            wire::DecodeOutcome::UnknownType { .. } => {
+                return Err(InterflowError::protocol(
+                    "unknown frame type at the first-frame position".to_string(),
+                ));
+            }
         }
     }
 }
@@ -377,8 +395,9 @@ async fn register_quic_agent(
         return None;
     }
     // The intended semantic id rides the Hello payload (the header
-    // circuit field is the zero marker on Hello).
-    let Ok((hello_caps, agent_id)) = decode_hello_payload(&hello.payload) else {
+    // circuit field is the zero marker on Hello); the optional build tag
+    // rides alongside (absent = an older agent, recorded as unknown).
+    let Ok((hello_caps, agent_id, agent_build)) = decode_hello_payload(&hello.payload) else {
         warn!("QUIC Hello payload malformed ({peer})");
         return None;
     };
@@ -449,14 +468,17 @@ async fn register_quic_agent(
             let mut session = existing.write().await;
             session.install_channels(circuit, Some(quic_conn.clone()));
             session.leaf_validity_unix = identity.leaf_validity_unix;
+            session.build.clone_from(&agent_build);
             drop(session);
             existing.clone()
         } else {
-            let arc = Arc::new(RwLock::new(AgentSession::new(
+            let mut session = AgentSession::new(
                 circuit,
                 Some(quic_conn.clone()),
                 identity.leaf_validity_unix,
-            )));
+            );
+            session.build.clone_from(&agent_build);
+            let arc = Arc::new(RwLock::new(session));
             agents.insert(agent_key.clone(), arc.clone());
             arc
         }
@@ -551,6 +573,20 @@ async fn register_quic_agent(
                 if matches!(f.frame_type, FrameType::Pong) {
                     let mut st = state_for_pong.write().await;
                     st.last_pong = std::time::Instant::now();
+                } else {
+                    // The control stream's post-Hello contract is Pong-only
+                    // (the h2 upload path kills the session on the same
+                    // violation). Fail-closed: stop feeding the ledger so
+                    // the heartbeat's last_pong staleness evicts the peer —
+                    // same mirror of upload.rs, no silent tolerance.
+                    warn!(
+                        "QUIC control stream protocol violation: non-Pong frame \
+                         type={:?} — stopping the Pong feed (heartbeat eviction follows)",
+                        f.frame_type
+                    );
+                    metrics::counter!("interflow_hub_auth_failures", "reason" => "quic_ctrl_non_pong")
+                        .increment(1);
+                    return;
                 }
             }
         }
@@ -559,11 +595,31 @@ async fn register_quic_agent(
     hub.audit.record(
         AuditKind::AgentRegistered {
             circuit: circuit.to_hex(),
+            build: agent_build,
         },
         Some(circuit.to_hex()),
         Some(peer.to_string()),
     );
-    info!("QUIC agent registered: circuit={circuit} ({peer})");
+    let session_build = state_arc.read().await.build.clone();
+    // Effective-parameter forensics (the 2026-10-09 case file §4's ask): the
+    // idle timeout is min-negotiated across endpoints, so pin what this hub
+    // actually armed — the next incident's timeline reconciliation starts
+    // from logged facts, not guesses about deployed configs.
+    let (idle_timeout_ms, keepalive_interval_ms, heartbeat_interval_secs) = {
+        let cfg = hub.config.read().await;
+        (
+            cfg.transport.quic.max_idle_timeout_ms,
+            cfg.transport.quic.keepalive_interval_ms,
+            cfg.heartbeat.enabled.then_some(cfg.heartbeat.interval_secs),
+        )
+    };
+    info!(
+        idle_timeout_ms,
+        keepalive_interval_ms,
+        heartbeat_interval_secs = ?heartbeat_interval_secs,
+        "QUIC agent registered: circuit={circuit} ({peer}) (build {})",
+        session_build.as_deref().unwrap_or("unknown")
+    );
     Some((agent_key, state_arc))
 }
 
@@ -671,6 +727,17 @@ fn spawn_quic_heartbeat(
                     "quic_heartbeat_timeout",
                 )
                 .await;
+                // Best-effort eviction notice (the 2026-10-09 one-way-blackhole
+                // fix's fast path): in the Pong-loss shape the quinn
+                // connection is typically still transport-alive, and the
+                // reverse direction is exactly the one that still delivers —
+                // a CONNECTION_CLOSE there tells the agent to rebuild now
+                // instead of waiting for its own demanding probe (the
+                // guarantee, which bounds detection regardless). Under a
+                // blackhole the frame simply never arrives; the close is then
+                // a no-op on an already-dying connection.
+                conn.conn
+                    .close(0_u32.into(), b"hub evicted: quic_heartbeat_timeout");
                 return;
             }
         }
@@ -959,9 +1026,10 @@ async fn datagram_relay_loop(
 /// removing the entry must produce a termination signal on the **peer's
 /// dispatch plane** — on the Relay plane (QUIC peer) it is conveyed by the
 /// entry drop closing the senders and the relay writer task writing the
-/// outstanding Close+FIN; on the Poll plane (h2 peer) an explicit `_close_`
-/// must be delivered, otherwise the peer's forwarder waits forever for a
-/// Close and the backend fd lingers for the whole session.
+/// outstanding Close+FIN; on the Poll plane (h2 peer) an explicit
+/// hub-origin Close notification must be delivered, otherwise the peer's
+/// forwarder waits forever for a Close and the backend fd lingers for the
+/// whole session.
 ///
 /// `response_dir = true` means the dead end is the target side (egress):
 /// the peer is the source agent, notified with response-direction semantics
@@ -1026,11 +1094,12 @@ pub(crate) async fn teardown_stream(
 }
 
 /// Handles one traffic stream from a quic agent (the first frame must be
-/// Open).
+/// Open, or one of the request-response control types).
 async fn handle_quic_stream(
     hub: std::sync::Arc<HubState>,
     source_agent: String,
     source_state: Arc<RwLock<AgentSession>>,
+    peer: String,
     mut tx: quinn::SendStream,
     rx: quinn::RecvStream,
 ) -> Result<()> {
@@ -1038,9 +1107,181 @@ async fn handle_quic_stream(
     let mut rx = rx;
     let mut buf = BytesMut::with_capacity(512);
 
-    let Some(opened) = read_first_frame(&mut rx, &mut buf).await? else {
-        return Ok(()); // EOF before Open: drop silently
+    let opened = match read_first_frame(&mut rx, &mut buf).await {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return Ok(()), // EOF before the first frame: drop silently
+        Err(e) => {
+            // Protocol violation at the first-frame position: answer on this
+            // very stream so the requester fails immediately — never a
+            // silent drop that decays into a client-side timeout.
+            write_error_frame(tx, e.to_string().as_str()).await;
+            return Err(e);
+        }
     };
+    if matches!(opened.frame_type, FrameType::LivenessPing) {
+        // The QUIC face of the demanding liveness roundtrip (`GET /ping` on
+        // h2): the agent's out-of-tree probe asks a question that must be
+        // answered on this very stream — the 2026-10-09 one-way-blackhole
+        // fix's answer arm. The correlation id rides the frame's stream_id
+        // like every other request on this carriage; the LivenessPong
+        // echoes it (the agent's control_roundtrip validates the echo).
+        // Deliberately the cheapest arm on the face: no registry read, no
+        // JSON, one fixed-size frame.
+        if interflow_core::fault::stall(FaultPoint::HubQuicSwallowLivenessProbe) {
+            // Fault injection (test-only): drop the stream without answering —
+            // the exact "session object alive, answers never arrive" form.
+            let _ = tx.finish();
+            return Ok(());
+        }
+        let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN);
+        wire::encode_frame(
+            FrameType::LivenessPong,
+            FLAG_HUB_ORIGIN,
+            opened.stream_id,
+            CircuitToken::ZERO,
+            &[],
+            &mut out,
+        );
+        tx.write_all(&out).await.map_err(|e| {
+            InterflowError::connection("QUIC liveness pong write failed".to_string()).with_source(e)
+        })?;
+        let _ = tx.finish();
+        return Ok(());
+    }
+    if matches!(opened.frame_type, FrameType::PolicyPullRequest) {
+        // The QUIC face of the policy watcher's conditional pull — same
+        // carriage as the route lease (per-request bi-stream, correlation
+        // id in the frame's stream_id, answer on the same stream). The
+        // requester is the connection's registered agent (control
+        // principals cannot register, so the data-plane-only identity
+        // contract holds by construction); the arbitration — conditional
+        // answer, audit ledger, metrics, inversion detection — is the SAME
+        // shared code path the h2 `GET /policy` face goes through.
+        let seen = decode_policy_pull_request(&opened.payload)
+            .map_err(|_| InterflowError::protocol("invalid QUIC policy pull payload"))?;
+        let pull =
+            match crate::hub::policy::serve_policy_conditional(&hub, &source_agent, &peer, seen) {
+                crate::hub::policy::PolicyServe::NoFace => PolicyPull::NoPolicyFace,
+                crate::hub::policy::PolicyServe::UpToDate { serving_generation } => {
+                    PolicyPull::UpToDate {
+                        hub_generation: serving_generation,
+                    }
+                }
+                crate::hub::policy::PolicyServe::Update {
+                    body,
+                    signature,
+                    serving_generation,
+                } => PolicyPull::Update(PolicyFetch {
+                    body,
+                    signature,
+                    generation: serving_generation,
+                }),
+            };
+        let payload = encode_policy_pull_response(&pull).map_err(|e| {
+            InterflowError::protocol("QUIC PolicyPullResponse encode failed").with_source(e)
+        })?;
+        let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
+        wire::encode_frame(
+            FrameType::PolicyPullResponse,
+            FLAG_HUB_ORIGIN,
+            opened.stream_id,
+            CircuitToken::ZERO,
+            &payload,
+            &mut out,
+        );
+        tx.write_all(&out).await.map_err(|e| {
+            InterflowError::connection("QUIC policy pull response write failed".to_string())
+                .with_source(e)
+        })?;
+        let _ = tx.finish();
+        return Ok(());
+    }
+    if matches!(opened.frame_type, FrameType::PeerListRequest) {
+        // The QUIC face of `GET /agents` — same carriage as the policy
+        // pull (per-request bi-stream, correlation id in the frame's
+        // stream_id, answer on the same stream), same shared listing body
+        // (`crate::hub::handlers::agent_list`), so both faces serve the
+        // same JSON shape by construction. The requester is the
+        // connection's registered agent; its qualified key carries the
+        // tenant, so the listing stays tenant-scoped exactly like the h2
+        // face.
+        let tenant = crate::hub::state::PeerIdentity::split_qualified(&source_agent)
+            .map(|(t, _)| t.to_owned())
+            .unwrap_or_default();
+        let list = crate::hub::handlers::agent_list(&hub, &tenant).await;
+        let payload = serde_json::to_vec(&list).map_err(|e| {
+            InterflowError::protocol("QUIC PeerListResponse encode failed").with_source(e)
+        })?;
+        let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
+        wire::encode_frame(
+            FrameType::PeerListResponse,
+            FLAG_HUB_ORIGIN,
+            opened.stream_id,
+            CircuitToken::ZERO,
+            &payload,
+            &mut out,
+        );
+        tx.write_all(&out).await.map_err(|e| {
+            InterflowError::connection("QUIC peer list response write failed".to_string())
+                .with_source(e)
+        })?;
+        let _ = tx.finish();
+        return Ok(());
+    }
+    if matches!(opened.frame_type, FrameType::ProposalSubmitRequest) {
+        // The QUIC face of the proposal submission: the session IS the
+        // registered agent (its qualified key is the requester), the
+        // payload the JSON request, the answer the JSON outcome.
+        let request: interflow_core::tunnel::transport::StreamProposalRequest =
+            match serde_json::from_slice(&opened.payload) {
+                Ok(request) => request,
+                Err(e) => {
+                    warn!("QUIC proposal submit payload malformed: {e}");
+                    let _ = tx.finish();
+                    return Ok(());
+                }
+            };
+        let outcome = crate::hub::proposals::submit_via_state(&hub, &source_agent, &request);
+        let payload = serde_json::to_vec(&outcome).map_err(|e| {
+            InterflowError::protocol("QUIC ProposalSubmitResponse encode failed").with_source(e)
+        })?;
+        let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
+        wire::encode_frame(
+            FrameType::ProposalSubmitResponse,
+            FLAG_HUB_ORIGIN,
+            opened.stream_id,
+            CircuitToken::ZERO,
+            &payload,
+            &mut out,
+        );
+        tx.write_all(&out).await.map_err(|e| {
+            InterflowError::connection("QUIC proposal response write failed".to_string())
+                .with_source(e)
+        })?;
+        let _ = tx.finish();
+        return Ok(());
+    }
+    if matches!(opened.frame_type, FrameType::ProposalMineRequest) {
+        let receipts = crate::hub::proposals::mine_via_state(&hub, &source_agent);
+        let payload = serde_json::to_vec(&receipts).map_err(|e| {
+            InterflowError::protocol("QUIC ProposalMineResponse encode failed").with_source(e)
+        })?;
+        let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
+        wire::encode_frame(
+            FrameType::ProposalMineResponse,
+            FLAG_HUB_ORIGIN,
+            opened.stream_id,
+            CircuitToken::ZERO,
+            &payload,
+            &mut out,
+        );
+        tx.write_all(&out).await.map_err(|e| {
+            InterflowError::connection("QUIC proposals-mine response write failed".to_string())
+                .with_source(e)
+        })?;
+        let _ = tx.finish();
+        return Ok(());
+    }
     if matches!(opened.frame_type, FrameType::RouteRequest) {
         // The requester is identified by the connection (the RouteRequest
         // carries the correlation id + zero circuit; the codec enforces it).
@@ -1074,6 +1315,11 @@ async fn handle_quic_stream(
         return Ok(());
     }
     if !matches!(opened.frame_type, FrameType::Open) {
+        // A known type with no handler on this carriage (or a request the
+        // codec accepted but this position forbids): answer with an Error
+        // frame on the same stream — the requester learns the refusal
+        // immediately instead of timing out.
+        write_error_frame(tx, "QUIC stream first frame must be Open").await;
         return Err(InterflowError::protocol(
             "QUIC stream first frame must be Open".to_string(),
         ));
@@ -1376,7 +1622,7 @@ async fn process_frames(
                 warn!("QUIC relay Close circuit mismatch: stream_id={stream_id}");
                 continue;
             }
-            // Termination: the poll peer's `_close_` notification is
+            // Termination: the poll peer's Close notification is
             // guaranteed delivery by teardown_stream per directional
             // semantics (the old path silently lost it when the data
             // channel was full, leaving the peer's fd lingering for the
@@ -1424,11 +1670,38 @@ async fn process_frames(
     false
 }
 
-/// Writes a hub-origin Close frame to a quinn SendStream and FINs it
+/// Writes a hub-origin Error frame (`PROTOCOL_VIOLATION` + text) to a
+/// quinn SendStream and FINs it — the refusal answer for a request the hub
+/// cannot or will not serve on this carriage. Converts what would
+/// otherwise be a silent stream drop (and a client-side timeout) into an
+/// immediate, attributable failure.
+async fn write_error_frame(mut tx: quinn::SendStream, msg: &str) {
+    if let Ok(payload) =
+        encode_error_payload(interflow_contract::error_code::PROTOCOL_VIOLATION, msg)
+    {
+        let mut buf = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
+        if wire::encode_frame(
+            FrameType::Error,
+            FLAG_HUB_ORIGIN,
+            StreamId::ZERO,
+            CircuitToken::ZERO,
+            &payload,
+            &mut buf,
+        )
+        .is_some()
+        {
+            let _ = tx.write_all(&buf).await;
+        }
+    }
+    let _ = tx.finish();
+}
+
+/// Writes a hub-origin Close frame to a quinn::SendStream and FINs it
 /// (rollback path notifying the source side; synchronous failure paths such
 /// as target missing / ACL denial / limit denial). The flags make the
-/// origin unmistakable — the former `_close_` sentinel's "must not look like an
-/// agent frame" rationale is now enforced by the codec contract itself.
+/// origin unmistakable — the wire contract itself enforces the "must not
+/// look like an agent frame" property the former sentinel era needed a
+/// convention for.
 async fn write_close_frame(mut tx: quinn::SendStream, stream_id: StreamId, reason: CloseReason) {
     let mut buf = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + 1);
     if wire::encode_frame(

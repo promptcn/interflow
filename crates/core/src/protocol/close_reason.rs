@@ -126,9 +126,28 @@ impl CloseReason {
     /// Decodes a Close frame payload slice (exactly one code byte expected;
     /// empty or longer payloads are the ordinary close — the hub relays
     /// length-checked, agents produce exactly one byte).
-    pub const fn from_payload(payload: &[u8]) -> Self {
+    ///
+    /// An unrecognized code still decodes to the ordinary close (the
+    /// paired-build doctrine), but never silently: a debug log plus a
+    /// counter make the anomaly attributable instead of invisible.
+    pub fn from_payload(payload: &[u8]) -> Self {
         match payload {
-            [b] => Self::from_code(*b),
+            [b] => {
+                let reason = Self::from_code(*b);
+                if matches!(reason, Self::CloseFrame) && *b != code::CLOSE_FRAME {
+                    tracing::debug!(
+                        code = *b,
+                        "close payload carries an unrecognized reason code — \
+                         decoding as the ordinary close"
+                    );
+                    metrics::counter!(
+                        "interflow_close_reason_unknown_code_total",
+                        "code" => b.to_string()
+                    )
+                    .increment(1);
+                }
+                reason
+            }
             _ => Self::CloseFrame,
         }
     }

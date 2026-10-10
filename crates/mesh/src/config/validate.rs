@@ -137,10 +137,10 @@ impl std::error::Error for ConfigErrorList {
 const MAX_CONFIG_ID_LEN: usize = 128;
 
 fn valid_agent_id(s: &str) -> bool {
-    // Disallow a leading `_`: the wire layer reserves sentinels (e.g.
-    // `_response_`) that reuse the source_agent field
-    !s.starts_with('_')
-        && s.len() <= MAX_CONFIG_ID_LEN
+    // The historical leading-`_` ban was a guard for the deleted wire-layer
+    // sentinel strings (`_response_` etc.) — the rationale is gone, so the
+    // allowlist is uniform.
+    s.len() <= MAX_CONFIG_ID_LEN
         && !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
@@ -317,6 +317,21 @@ pub fn validate_hub(cfg: &HubConfig) -> Result<(), ConfigErrorList> {
             errs.push(ConfigError::Invalid(
                 "[transport.quic] keepalive_interval_ms must be < max_idle_timeout_ms \
                  (otherwise keepalives cannot preempt the idle timeout)"
+                    .to_string(),
+            ));
+        }
+        // QUIC mandates TLS 1.3 (quinn/rustls reject a 1.2-only version list
+        // for QUIC): a min_version below 1.3 is honored on the h2 face only,
+        // which would silently give the two faces different security floors.
+        // Rejected here, at validation time — the QUIC listener's hard 1.3
+        // floor is a defense-in-depth invariant, not a silent clamp.
+        if let Some(tls) = cfg.tls.as_ref()
+            && tls.min_version == interflow_core::tls::TlsMinVersion::V1_2
+        {
+            errs.push(ConfigError::Invalid(
+                "[tls] min_version = \"1.2\" is incompatible with [transport.quic] \
+                 enabled = true (QUIC mandates TLS 1.3; one [tls] section serves both \
+                 faces, so the floor must be \"1.3\")"
                     .to_string(),
             ));
         }
@@ -630,7 +645,10 @@ mod tests {
                 enabled: true,
                 cert_path: dir.join("hub.crt").display().to_string(),
                 key_path: dir.join("hub.key").display().to_string(),
-                min_version: interflow_core::tls::TlsMinVersion::V1_2,
+                // 1.3 throughout: the QUIC-enabled variants of this fixture
+                // ride on it (validation rejects 1.2 + QUIC — one [tls]
+                // section serves both faces).
+                min_version: interflow_core::tls::TlsMinVersion::V1_3,
             }),
             acl: AclConfig::default(),
             security: Default::default(),
@@ -718,6 +736,29 @@ mod tests {
         );
         cfg.transport.quic.keepalive_interval_ms = 10_000;
         validate_hub(&cfg).expect("sane quic timing passes");
+    }
+
+    /// One [tls] section serves both faces: a 1.2 floor with QUIC enabled
+    /// is rejected at validation (the QUIC listener's 1.3 floor is a
+    /// defense-in-depth invariant, not a silent per-face clamp).
+    #[test]
+    fn quic_with_tls_1_2_floor_is_rejected() {
+        let mut cfg = base_hub_config();
+        cfg.transport.quic.enabled = true;
+        cfg.tls.as_mut().unwrap().min_version = interflow_core::tls::TlsMinVersion::V1_2;
+        let err = validate_hub(&cfg).expect_err("1.2 + QUIC must reject");
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, ConfigError::Invalid(m) if m.contains("min_version"))),
+            "the rejection must name min_version: {err:?}"
+        );
+        // The 1.3 floor on the same shape passes.
+        cfg.tls.as_mut().unwrap().min_version = interflow_core::tls::TlsMinVersion::V1_3;
+        validate_hub(&cfg).expect("1.3 + QUIC passes");
+        // h2-only keeps the 1.2 floor legitimate.
+        cfg.transport.quic.enabled = false;
+        cfg.tls.as_mut().unwrap().min_version = interflow_core::tls::TlsMinVersion::V1_2;
+        validate_hub(&cfg).expect("1.2 + h2-only passes");
     }
 
     #[test]

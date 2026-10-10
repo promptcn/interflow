@@ -4,7 +4,9 @@
 //! `node.toml`, `identity/`, `trust/`, `policy/`, `SHA256SUMS`) is assembled
 //! by [`render_pack`].
 
-use super::{IssuedPack, NodeConfig, NodeMeshConfig, NodeService, PackKind, PackMetadata};
+use super::{
+    IssuedPack, NodeConfig, NodeEdgeConfig, NodeMeshConfig, NodeService, PackKind, PackMetadata,
+};
 use crate::issuance::{IdentityMaterial, IssuerStore};
 use crate::policy::RuntimePolicy;
 use crate::timestamp::{rfc3339, rfc3339_now};
@@ -89,11 +91,24 @@ impl IngressCredentialPack {
                 crate::manifest::PublicTlsMode::Manual => "manual".to_owned(),
             },
             public_tls_email: manifest.public_tls.email.clone(),
-            public_tls_directory: manifest.public_tls.directory.clone(),
+            // Canonical: the unset directory resolves to the concrete LE
+            // production URL, so node.toml always names the directory the
+            // ingress will dial.
+            public_tls_directory: manifest
+                .public_tls
+                .directory
+                .clone()
+                .unwrap_or_else(|| interflow_util::LETS_ENCRYPT_PRODUCTION.to_owned()),
             services: Vec::new(),
-            transport: None,
+            // The ingress has no dial face.
+            transport: String::new(),
             mesh: None,
-            edge: ingress_cfg.edge.clone(),
+            // Canonical: always present, fully resolved (overrides over the
+            // deployment topology's defaults).
+            edge: Some(resolve_edge(
+                ingress_cfg.edge.as_ref(),
+                fronted_topology(manifest),
+            )),
         };
         let trust_workspaces: Vec<String> = principals
             .keys()
@@ -118,6 +133,7 @@ impl IngressCredentialPack {
                 } else {
                     Some(manifest.registrar.endpoint.clone())
                 },
+                rendered_by: interflow_buildinfo::VERSION_WITH_TAG.to_owned(),
             },
             principals,
             store,
@@ -176,7 +192,8 @@ impl AgentCredentialPack {
             control_dispatch_host: None,
             public_tls: String::new(),
             public_tls_email: None,
-            public_tls_directory: None,
+            // No public-TLS face on an agent pack.
+            public_tls_directory: String::new(),
             services: agent_cfg
                 .services
                 .iter()
@@ -185,16 +202,19 @@ impl AgentCredentialPack {
                     address: s.address.clone(),
                 })
                 .collect(),
-            // The manifest-issued dial default; the dialed face follows
-            // the agent's role (expose: control endpoint, mesh: hub).
-            transport: agent_cfg.transport.map(|t| t.as_str().to_owned()),
+            // The manifest-issued dial default, resolved at render time (an
+            // unset manifest becomes the explicit "h2"); the dialed face
+            // follows the agent's role (expose: control endpoint, mesh:
+            // hub).
+            transport: agent_cfg
+                .transport
+                .map(|t| t.as_str().to_owned())
+                .unwrap_or_else(|| "h2".to_owned()),
             mesh: match mesh_role {
                 // node.toml carries node-local dial info only; the rules
                 // ride the signed policy (RuntimePolicy mesh faces).
                 true => Some(NodeMeshConfig {
                     hub_endpoint: hub_endpoint()?,
-                    ingress: Vec::new(),
-                    egress: Vec::new(),
                 }),
                 false => None,
             },
@@ -232,6 +252,7 @@ impl AgentCredentialPack {
                 } else {
                     Some(manifest.registrar.endpoint.clone())
                 },
+                rendered_by: interflow_buildinfo::VERSION_WITH_TAG.to_owned(),
             },
             principals,
             store,
@@ -294,9 +315,10 @@ impl HubCredentialPack {
             control_dispatch_host: None,
             public_tls: String::new(),
             public_tls_email: None,
-            public_tls_directory: None,
+            // No public-TLS face on a hub pack.
+            public_tls_directory: String::new(),
             services: Vec::new(),
-            transport: None,
+            transport: String::new(),
             mesh: None,
             edge: None,
         };
@@ -319,6 +341,7 @@ impl HubCredentialPack {
                 } else {
                     Some(manifest.registrar.endpoint.clone())
                 },
+                rendered_by: interflow_buildinfo::VERSION_WITH_TAG.to_owned(),
             },
             principals,
             store,
@@ -326,6 +349,63 @@ impl HubCredentialPack {
             node_config,
             &trust_workspaces,
         )
+    }
+}
+
+/// Whether the deployment's public leg sits behind a front proxy (nginx
+/// stream map / LB): `frontend-proxy` and `manual` topologies do, `acme`
+/// terminates TLS on the ingress itself. This is the one bit that decides
+/// every `[edge]` topology default below.
+fn fronted_topology(manifest: &crate::manifest::Manifest) -> bool {
+    matches!(
+        manifest.public_tls.mode,
+        crate::manifest::PublicTlsMode::FrontendProxy | crate::manifest::PublicTlsMode::Manual
+    )
+}
+
+/// Resolves the manifest's human-authored (partial) `[edge]` overrides into
+/// the canonical, all-concrete [`NodeEdgeConfig`] the pack carries: every
+/// unset field takes the deployment topology's default **at render time**, so
+/// node.toml never leaves a knob to the engine's boot-time guessing.
+/// The value table mirrors the engine contract pinned in `interflow-util`
+/// (`DEFAULT_*_NEW_CONN_RATE_PER_IP_PER_MINUTE`) — single-sourced there so
+/// renderer and engine cannot drift.
+fn resolve_edge(
+    overrides: Option<&crate::manifest::EdgeOverrides>,
+    fronted: bool,
+) -> NodeEdgeConfig {
+    let pick = |slot: Option<&str>, fronted_value: &str, direct_value: &str| {
+        let default = if fronted { fronted_value } else { direct_value };
+        slot.map(str::to_owned)
+            .unwrap_or_else(|| default.to_owned())
+    };
+    NodeEdgeConfig {
+        new_conn_rate_per_ip_per_minute: overrides
+            .and_then(|o| o.new_conn_rate_per_ip_per_minute)
+            .unwrap_or(if fronted {
+                interflow_util::DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE
+            } else {
+                interflow_util::DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE
+            }),
+        // Fronted default `required`: nothing but the front may talk to the
+        // listener (and it always emits XFF); direct default `off`: the TCP
+        // peer is the real client.
+        x_forwarded_for: pick(
+            overrides.and_then(|o| o.x_forwarded_for.as_deref()),
+            "required",
+            "off",
+        ),
+        // Fronted default `on`: the front's SNI map emits the PROXY preamble
+        // on every target including the mTLS-passthrough control leg;
+        // direct default `off`: nothing fronts the control listener.
+        control_proxy_protocol: pick(
+            overrides.and_then(|o| o.control_proxy_protocol.as_deref()),
+            "on",
+            "off",
+        ),
+        acme_http_listen: overrides
+            .and_then(|o| o.acme_http_listen.clone())
+            .unwrap_or_else(|| "0.0.0.0:80".to_owned()),
     }
 }
 

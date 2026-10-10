@@ -5,7 +5,12 @@ import * as __TAURI_EVENT from "@tauri-apps/api/event";
 
 /** Commands */
 export const commands = {
-	/**  Lists the managed nodes (name order). */
+	/**
+	 *  Lists the managed nodes (name order). The assembly lives in
+	 *  [`node_infos`] so tests can assert on exactly what the GUI command
+	 *  layer produces (the 2026-10-07 stale-panel bug hid in the gap between
+	 *  the domain query and this composition).
+	 */
 	listNodes: () => typedError<NodeInfo_Serialize[], string>(__TAURI_INVOKE("list_nodes")),
 	/**
 	 *  Validates a pack directory through the shared funnel and reports what it
@@ -56,7 +61,23 @@ export const commands = {
 	 *  second template).
 	 */
 	deployMeshTemplate: (params: MeshTemplateParams) => typedError<string, string>(__TAURI_INVOKE("deploy_mesh_template", { params })),
-	/**  Reads a manifest (or any text file the deploy pane edits). */
+	/**
+	 *  The deployments root backing the deploy pane's placeholders and the
+	 *  create-deployment dialog's starting folder: **one deployment = one
+	 *  folder**, named by realm, under `~/interflow-deployments/`. Inside,
+	 *  the names are fixed — `interflow.toml` / `issuer/` / `dist/` — which is
+	 *  exactly the CLI's CWD-relative default set, so a `cd` into the folder
+	 *  makes every CLI flag optional and the GUI's triple collapses to one
+	 *  root. The root sits in the home directory (visible, operator-browsable,
+	 *  never touched by the Documents-folder cloud sync); key material stays
+	 *  protected by permissions (0600), not by hiding.
+	 */
+	deployDefaults: () => typedError<DeployDefaultsDto, string>(__TAURI_INVOKE("deploy_defaults")),
+	/**
+	 *  Reads a manifest (or any text file the deploy pane edits). A missing
+	 *  file is named in the user's language — the read-failure class the
+	 *  Overview must be able to tell apart from a TOML syntax error.
+	 */
 	deployReadText: (path: string) => typedError<string, string>(__TAURI_INVOKE("deploy_read_text", { path })),
 	/**
 	 *  Saves the deploy pane's manifest text back to its path — the editor's
@@ -64,6 +85,15 @@ export const commands = {
 	 *  one silent `.bak` generation, then the atomic replace.
 	 */
 	deployWriteText: (path: string, text: string) => typedError<null, string>(__TAURI_INVOKE("deploy_write_text", { path, text })),
+	/**
+	 *  Creates a new manifest at `path` from generated template text — the
+	 *  write half of the create-deployment flow. Mirrors `interflow-cli
+	 *  setup`: an existing file is refused outright (Save-in-the-editor stays
+	 *  the only path that may overwrite, with its `.bak` discipline); missing
+	 *  parent directories are created because template text always targets a
+	 *  fresh deployment folder.
+	 */
+	deployCreateManifest: (path: string, text: string) => typedError<null, string>(__TAURI_INVOKE("deploy_create_manifest", { path, text })),
 	/**
 	 *  Parses manifest text into the Form view's read model — shape-level, so
 	 *  an under-construction document (a fresh mesh skeleton) still renders,
@@ -80,7 +110,53 @@ export const commands = {
 	/**  Validates a manifest; returns the human-readable report lines. */
 	deployValidate: (manifest: string) => typedError<string[], string>(__TAURI_INVOKE("deploy_validate", { manifest })),
 	/**  Issues identities + packs from the manifest (the deploy page's Apply). */
-	deployApply: (manifest: string, issuer: string, out: string) => typedError<string[], string>(__TAURI_INVOKE("deploy_apply", { manifest, issuer, out })),
+	deployApply: (manifest: string, issuer: string, out: string) => typedError<ApplyReportDto, string>(__TAURI_INVOKE("deploy_apply", { manifest, issuer, out })),
+	/**
+	 *  The bookkeeping-level "would apply do anything" pre-check — the Deploy
+	 *  overview's "unapplied changes" badge and next-steps face. No minting,
+	 *  no hub dial (apply re-runs the full watermark-aware funnel).
+	 */
+	deployChangeState: (manifest: string, issuer: string) => typedError<ChangeStateDto, string>(__TAURI_INVOKE("deploy_change_state", { manifest, issuer })),
+	/**
+	 *  The running hub's operator overview (watermarks + fleet presence and
+	 *  pull convergence) — the Apply-result card and the fleet table's online
+	 *  column. `None` = the manifest names no hub endpoint. Errors (hub
+	 *  unreachable / issuer unreadable) surface as the caller's hint text.
+	 */
+	deployHubOverview: (manifest: string, issuer: string) => typedError<{
+	/**  The anti-rollback floor (includes absorbed node watermarks). */
+	floor: number,
+	/**  What the hub actually serves; `None` = this hub cannot report it. */
+	serving: number | null,
+	/**
+	 *  Every registered fleet member with presence and last-pulled
+	 *  watermark.
+	 */
+	agents: HubAgentRowDto[],
+} | null, string>(__TAURI_INVOKE("deploy_hub_overview", { manifest, issuer })),
+	/**
+	 *  The hub's stream-proposal queue (the operator's approve/reject face).
+	 *  `None` = the manifest names no hub endpoint.
+	 */
+	deployListProposals: (manifest: string, issuer: string) => typedError<ControlProposalDto[] | null, string>(__TAURI_INVOKE("deploy_list_proposals", { manifest, issuer })),
+	/**
+	 *  Approve one stream proposal: edit the manifest (the single source of
+	 *  truth) → apply (mint + publish, no-op gate protects a double-approve)
+	 *  → record the decision at the hub. Returns the apply report (the
+	 *  Overview's result card renders it like a manual apply).
+	 */
+	deployApproveProposal: (manifest: string, issuer: string, out: string, id: string) => typedError<ApplyReportDto, string>(__TAURI_INVOKE("deploy_approve_proposal", { manifest, issuer, out, id })),
+	/**
+	 *  Reject one stream proposal with a reason (the requester's GUI shows it
+	 *  as the receipt).
+	 */
+	deployRejectProposal: (manifest: string, issuer: string, id: string, reason: string) => typedError<null, string>(__TAURI_INVOKE("deploy_reject_proposal", { manifest, issuer, id, reason })),
+	/**
+	 *  Submits one self-service stream proposal through a running mesh
+	 *  agent's session (the requester's face; the answer is the hub funnel's
+	 *  verdict).
+	 */
+	meshSubmitProposal: (nodeId: string, request: StreamProposalRequestDto) => typedError<ProposalSubmitOutcomeDto, string>(__TAURI_INVOKE("mesh_submit_proposal", { nodeId, request })),
 	/**
 	 *  Lists the packs of a dist tree (the page's pack cards), enriched with
 	 *  the local node matching each pack's identity — the "update local node"
@@ -130,12 +206,27 @@ export const commands = {
 	 *  the frontend owns dedupe/promotion).
 	 */
 	deployPrefsSave: (recent: DeployContextDto[]) => typedError<null, string>(__TAURI_INVOKE("deploy_prefs_save", { recent })),
+	/**
+	 *  Loads the GUI-wide preferences (interface language) — the frontend
+	 *  awaits this before first paint, so the window never flashes the wrong
+	 *  language.
+	 */
+	guiPrefsLoad: () => typedError<GuiPrefsDto, string>(__TAURI_INVOKE("gui_prefs_load")),
+	/**
+	 *  Persists the interface language and rebuilds the tray in place — one
+	 *  switch flips every surface (window, tray, command errors) at once.
+	 */
+	guiPrefsSave: (language: GuiLanguageDto) => typedError<null, string>(__TAURI_INVOKE("gui_prefs_save", { language })),
 };
 
 /** Events */
 export const events = {
 	log: makeEvent<LogEvent>("log"),
+	meshListeners: makeEvent<MeshListenersEvent>("mesh-listeners"),
+	meshPeers: makeEvent<MeshPeersEvent>("mesh-peers"),
+	meshProposals: makeEvent<MeshProposalsEvent>("mesh-proposals"),
 	nodeState: makeEvent<NodeStateEvent_Deserialize>("node-state"),
+	policyPlane: makeEvent<PolicyPlaneEvent>("policy-plane"),
 };
 
 /* Types */
@@ -184,6 +275,54 @@ export type AgentSummaryDto = {
 };
 
 /**
+ *  One apply's structured outcome — the report lines (what the CLI prints
+ *  verbatim) plus the generation it landed on. The Deploy overview's
+ *  Apply-result card renders both.
+ */
+export type ApplyReportDto = {
+	lines: string[],
+	/**
+	 *  The policy generation this apply minted — or, on a no-op, the live
+	 *  generation it confirmed.
+	 */
+	generation: number,
+};
+
+/**
+ *  The bookkeeping-level "would apply do anything" pre-check (no minting,
+ *  no hub dial): the "unapplied changes" badge and the next-steps face.
+ */
+export type ChangeStateDto = 
+/**
+ *  No applied state in this issuer store — the first apply performs a
+ *  full render.
+ */
+{ kind: "never_applied" } | 
+/**  The manifest matches the applied state exactly. */
+{ kind: "applied"; generation: number } | 
+/**
+ *  Only the policy face moved (mesh rules, idle budgets) — the next
+ *  apply takes the policy-only fast path (hot, ≤10s to the fleet).
+ */
+{ kind: "policy_edits_pending" } | 
+/**
+ *  The identity/trust/dial face changed — the next apply re-renders
+ *  every pack.
+ */
+{ kind: "identity_edits_pending" };
+
+/**  One queue entry as the operator's Deploy face shows it. */
+export type ControlProposalDto = {
+	id: string,
+	/**  The requesting agent's qualified id. */
+	requester: string,
+	rule: StreamProposalRequestDto,
+	submitted_at_unix: number,
+	expires_at_unix: number,
+	status: ProposalStatusDto,
+};
+
+/**
  *  Whole-node creation with role content — the same append the issue
  *  wizard performs, minus the wizard's paths (the document being edited is
  *  the target). Shape mirrors [`IssueNodeParams`].
@@ -228,6 +367,16 @@ export type DeployContextDto = {
 	manifest: string,
 	issuer: string,
 	out: string,
+};
+
+/**
+ *  `deploy_defaults` payload: the deployments root — one deployment = one
+ *  realm-named folder under it, with the fixed inner layout
+ *  `interflow.toml` / `issuer/` / `dist/`.
+ */
+export type DeployDefaultsDto = {
+	/**  Absolute deployments root (home-based, e.g. `~/interflow-deployments`). */
+	root: string,
 };
 
 /**  One rendered pack in a `plan apply` output tree (deploy page cards). */
@@ -305,6 +454,34 @@ export type EditedManifestDto = {
 	summary: ManifestSummaryDto,
 };
 
+/**
+ *  The GUI's interface language (wire form of `gui_prefs::Lang`; English
+ *  is the default, Chinese is opt-in from the header switch).
+ */
+export type GuiLanguageDto = "en" | "zh";
+
+/**
+ *  `gui_prefs_load` payload: GUI-wide preferences. The language is shared
+ *  with the Rust-rendered surfaces (tray, user-facing command errors), so
+ *  one switch flips every surface at once.
+ */
+export type GuiPrefsDto = {
+	language: GuiLanguageDto,
+};
+
+/**  One fleet member's row in a [`HubOverviewDto`]. */
+export type HubAgentRowDto = {
+	/**  Qualified agent id (`tenant/agent`). */
+	agent: string,
+	/**  Presence (`registered ≠ reachable`). */
+	online: boolean,
+	/**
+	 *  The generation this agent last pulled; `None` = no completed pull
+	 *  since the hub process started.
+	 */
+	seen: number | null,
+};
+
 /**  One `[mesh.hub.<name>]`. */
 export type HubDto = {
 	name: string,
@@ -325,6 +502,23 @@ export type HubEditDto = {
 	 *  transport off.
 	 */
 	quic_listen: string | null,
+};
+
+/**
+ *  The running hub's operator overview: watermarks plus the fleet's
+ *  presence and pull convergence (from the control-credential
+ *  `GET /policy/floor` — all facts the hub already holds).
+ */
+export type HubOverviewDto = {
+	/**  The anti-rollback floor (includes absorbed node watermarks). */
+	floor: number,
+	/**  What the hub actually serves; `None` = this hub cannot report it. */
+	serving: number | null,
+	/**
+	 *  Every registered fleet member with presence and last-pulled
+	 *  watermark.
+	 */
+	agents: HubAgentRowDto[],
 };
 
 /**  The hub's registration receipt, carried with [`NodeStateDto::Connected`]. */
@@ -450,6 +644,9 @@ export type IssueServiceSpecDto = {
 	address: string,
 };
 
+/**  The leaf-health phase spelling (snake_case on the wire). */
+export type LeafPhaseDto = "healthy" | "warn" | "critical";
+
 /**
  *  The identity tier's `leaf_ttl` bounds and default as display text —
  *  computed from the issuance constants, so the form's hint and the
@@ -459,6 +656,24 @@ export type LeafTtlBoundsDto = {
 	min: string,
 	max: string,
 	default: string,
+};
+
+/**
+ *  One ingress rule's listener actual state — where it is really serving,
+ *  or why it is not (the actual-state counterpart of the rule store; the
+ *  2026-10-09 honesty axis: a green session card plus a gone listener
+ *  surfaces as exactly that).
+ */
+export type ListenerStatusDto = {
+	/**  The ingress rule the listener serves. */
+	rule: string,
+	/**
+	 *  The actually-bound address, port materialized (`:0` picks show the
+	 *  real port) — `null` = no listener is up for the rule.
+	 */
+	bound_addr: string | null,
+	/**  The last bind failure (`null` = healthy). */
+	last_error: string | null,
 };
 
 /**  A local node matching a dist pack's identity (Deploy page cards). */
@@ -593,6 +808,41 @@ export type MeshIngressRuleDto = {
 	remote_addr: string,
 };
 
+/**
+ *  `mesh-listeners` event payload: a running mesh agent's ingress-listener
+ *  actual state moved (engine reconciler → manager forwarder → here). The
+ *  node card's listener badge and the detail's Health section patch their
+ *  node's `listeners` from these — a bind failure mid-flight surfaces
+ *  immediately, not at the next `list_nodes` (same push-not-poll contract
+ *  as [`MeshPeersEvent`]; the 2026-10-09 honesty axis).
+ */
+export type MeshListenersEvent = {
+	id: string,
+	listeners: ListenerStatusDto[],
+};
+
+/**
+ *  `mesh-peers` event payload: a running mesh agent's peer telemetry moved
+ *  (engine peer watcher → manager forwarder → here). The node detail's
+ *  Peers section patches its node's `peers` field from these — same
+ *  push-not-poll contract as [`PolicyPlaneEvent`].
+ */
+export type MeshPeersEvent = {
+	id: string,
+	peers: PeersPlaneDto,
+};
+
+/**
+ *  `mesh-proposals` event payload: a running mesh agent's proposal
+ *  receipts moved (engine watcher → manager forwarder → here). The node
+ *  detail's "Requested streams" section patches its node's `proposals`
+ *  from these.
+ */
+export type MeshProposalsEvent = {
+	id: string,
+	proposals: ProposalReceiptDto[],
+};
+
 /**  Wire protocol of a mesh rule (wire form of manifest `MeshProtocol`). */
 export type MeshProtocolDto = "tcp" | "udp";
 
@@ -672,6 +922,28 @@ export type NodeInfo_Deserialize = {
 	 *  warn = amber, critical = red (the dirty-build visual language).
 	 */
 	credential: CredentialHealthDto | null,
+	/**
+	 *  The policy plane's live face (mesh agents only). `None` for other
+	 *  kinds or an unreadable pack.
+	 */
+	policy: PolicyPlaneDto | null,
+	/**
+	 *  The peer plane's live face (mesh agents only, running). `None` for
+	 *  other kinds or a stopped node — presence has no meaningful stale
+	 *  display.
+	 */
+	peers: PeersPlaneDto | null,
+	/**
+	 *  This node's stream-proposal receipts (mesh agents only, running) —
+	 *  `None` for other kinds or a stopped node.
+	 */
+	proposals: ProposalReceiptDto[] | null,
+	/**
+	 *  Every ingress rule's listener actual state (mesh agents only,
+	 *  running) — `None` for other kinds or a stopped node. This is what
+	 *  is REALLY listening, not what the policy wants.
+	 */
+	listeners: ListenerStatusDto[] | null,
 };
 
 /**  One managed node (list rows, detail panes). */
@@ -737,6 +1009,28 @@ export type NodeInfo_Serialize = {
 	 *  warn = amber, critical = red (the dirty-build visual language).
 	 */
 	credential: CredentialHealthDto | null,
+	/**
+	 *  The policy plane's live face (mesh agents only). `None` for other
+	 *  kinds or an unreadable pack.
+	 */
+	policy: PolicyPlaneDto | null,
+	/**
+	 *  The peer plane's live face (mesh agents only, running). `None` for
+	 *  other kinds or a stopped node — presence has no meaningful stale
+	 *  display.
+	 */
+	peers: PeersPlaneDto | null,
+	/**
+	 *  This node's stream-proposal receipts (mesh agents only, running) —
+	 *  `None` for other kinds or a stopped node.
+	 */
+	proposals: ProposalReceiptDto[] | null,
+	/**
+	 *  Every ingress rule's listener actual state (mesh agents only,
+	 *  running) — `None` for other kinds or a stopped node. This is what
+	 *  is REALLY listening, not what the policy wants.
+	 */
+	listeners: ListenerStatusDto[] | null,
 };
 
 /**
@@ -859,6 +1153,109 @@ export type PackInspection = {
 	credential: CredentialHealthDto | null,
 };
 
+/**  One peer as the node's peer watcher reads it. */
+export type PeerStatusDto = {
+	/**  Qualified peer id (`tenant/agent`). */
+	agent: string,
+	/**
+	 *  Presence (`registered ≠ reachable`): a QUIC relay session in place,
+	 *  or an h2 poll body in place / within reconnect grace.
+	 */
+	online: boolean,
+	/**
+	 *  The peer's leaf-health phase (`None` = its leaf did not parse).
+	 *  Color-code like the node's own credential face: warn = amber,
+	 *  critical = red.
+	 */
+	leaf_phase: LeafPhaseDto | null,
+	/**  Seconds of leaf validity remaining (`0` with phase `None`). */
+	leaf_remaining_secs: number,
+	/**
+	 *  The leaf's `notAfter` unix seconds (`0` with phase `None`; capped
+	 *  at u32 — unix seconds stay inside it until 2106).
+	 */
+	leaf_not_after_unix: number,
+};
+
+/**
+ *  The peer plane's live face for one mesh agent node — the tenant's other
+ *  agents with presence and leaf health (the 2026-10-08
+ *  peer-observability surface; the first local answer to "is the far end
+ *  up"). Information-minimal: name, presence, leaf phase.
+ */
+export type PeersPlaneDto = {
+	/**  The tenant's registered agents, self excluded. */
+	peers: PeerStatusDto[],
+	/**  Unix seconds of the last successful fetch; `0` = never. */
+	last_ok_unix: number,
+	/**  Failed fetches since the node started. */
+	failures_total: number,
+};
+
+/**
+ *  The policy plane's live face for one mesh agent node — "which policy
+ *  generation is this node actually running, from which channel, and is
+ *  the hub ahead or behind it" (the policy-health surface; a
+ *  `hub_generation` below `generation` is the lineage-deadlock signature
+ *  and surfaces color-code it amber).
+ */
+export type PolicyPlaneDto = {
+	/**  The generation this node currently runs. */
+	generation: number,
+	/**  Which face the live policy came from. */
+	source: PolicySourceDto,
+	/**
+	 *  The hub's serving generation as of the watcher's last poll;
+	 *  `None` = never polled / the hub did not report / node not running.
+	 */
+	hub_generation: number | null,
+	/**
+	 *  The control-plane pull channel's own health while the node runs;
+	 *  `None` = the node is stopped.
+	 */
+	pull: PullHealthDto | null,
+};
+
+/**
+ *  `policy-plane` event payload: a running mesh agent's policy telemetry
+ *  moved (engine watcher → manager forwarder → here). The health panel
+ *  patches its node's `policy` field from these, so it tracks the engine's
+ *  live watermark and pull health instead of freezing on whatever
+ *  `list_nodes` happened to return at node start
+ */
+export type PolicyPlaneEvent = {
+	id: string,
+	plane: PolicyPlaneDto,
+};
+
+/**  Which distribution face a node's live policy came from. */
+export type PolicySourceDto = 
+/**  The pack's embedded snapshot. */
+"pack" | 
+/**
+ *  The node-local update channel (`state/policy`) — hub pulls and
+ *  manual injections land here.
+ */
+"state_policy";
+
+/**  One of this node's own proposals (the receipts face). */
+export type ProposalReceiptDto = {
+	id: string,
+	rule: StreamProposalRequestDto,
+	submitted_at_unix: number,
+	expires_at_unix: number,
+	status: ProposalStatusDto,
+};
+
+/**  A proposal's decision state (wire shape mirrors the hub record's). */
+export type ProposalStatusDto = { status: "pending" } | { status: "approved"; generation: number } | { status: "rejected"; reason: string };
+
+/**
+ *  The hub's answer to one submission (queued / idempotent duplicate /
+ *  denied with the funnel's readable reason).
+ */
+export type ProposalSubmitOutcomeDto = { outcome: "queued"; id: string; expires_at_unix: number } | { outcome: "duplicate"; id: string; expires_at_unix: number } | { outcome: "denied"; reason: string };
+
 /**  `[public_tls]` as the form sees it. */
 export type PublicTlsDto = {
 	mode: PublicTlsModeDto,
@@ -878,6 +1275,22 @@ export type PublicTlsEditDto = {
  *  `PublicTlsMode`).
  */
 export type PublicTlsModeDto = "acme" | "frontend-proxy" | "manual";
+
+/**
+ *  The distribution plane's liveness face — distinct from whichever
+ *  generation it delivered: `last_ok_unix == 0` on a connected agent is a
+ *  channel that has never completed a pull (the 2026-10-07 frozen-mesh
+ *  signature), and `last_tick_unix` frozen in the past is a dead watcher
+ *  task.
+ */
+export type PullHealthDto = {
+	/**  Unix seconds of the last completed pull; `0` = never. */
+	last_ok_unix: number,
+	/**  Total failed pull attempts since the node started. */
+	failures_total: number,
+	/**  Unix seconds of the watcher's most recent wake. */
+	last_tick_unix: number,
+};
 
 /**
  *  `[realm]` as the form sees it (empty `control_endpoint` = site-to-site
@@ -942,6 +1355,20 @@ export type ServiceEditDto = {
 	agent: string,
 	id: string,
 	address: string,
+};
+
+/**
+ *  One stream-proposal request (the requester's form = the validator's
+ *  fields, verbatim).
+ */
+export type StreamProposalRequestDto = {
+	name: string,
+	listen: string,
+	/**  tcp / udp. */
+	protocol: MeshProtocolDto,
+	target_agent: string,
+	remote_addr: string,
+	idle_timeout_secs: number | null,
 };
 
 /**

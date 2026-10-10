@@ -152,8 +152,38 @@ impl AgentTunnel {
     /// Pulls the hub's current signed policy bundle over this session's
     /// control plane as a conditional request (`seen` = the generation the
     /// caller already holds; see [`TunnelTransport::pull_policy`]).
-    pub async fn pull_policy(&self, seen: u64) -> Result<Option<crate::tunnel::PolicyFetch>> {
+    pub async fn pull_policy(&self, seen: u64) -> Result<crate::tunnel::transport::PolicyPull> {
         self.inner.pull_policy(seen).await
+    }
+
+    /// Fetches the tenant's registered agents over this session's control
+    /// plane — the peer-observability read (see
+    /// [`TunnelTransport::list_agents`]).
+    pub async fn list_agents(&self) -> Result<Vec<crate::tunnel::transport::PeerInfo>> {
+        self.inner.list_agents().await
+    }
+
+    /// Submits one self-service stream proposal over this session's control
+    /// plane (see [`TunnelTransport::submit_stream_proposal`]).
+    pub async fn submit_stream_proposal(
+        &self,
+        request: &crate::tunnel::transport::StreamProposalRequest,
+    ) -> Result<crate::tunnel::transport::ProposalSubmitOutcome> {
+        self.inner.submit_stream_proposal(request).await
+    }
+
+    /// Fetches this node's own proposals (see
+    /// [`TunnelTransport::my_proposals`]).
+    pub async fn my_proposals(&self) -> Result<Vec<crate::tunnel::transport::ProposalReceipt>> {
+        self.inner.my_proposals().await
+    }
+
+    /// One demanding liveness roundtrip over the current session's control
+    /// plane (see [`TunnelTransport::liveness_roundtrip`]) — the supervisor's
+    /// out-of-tree probe rides this facade, so the probe never touches a
+    /// concrete backend or a session-tree task.
+    pub async fn liveness_roundtrip(&self) -> Result<()> {
+        self.inner.liveness_roundtrip().await
     }
 
     /// Session-termination contract: releases all stream resources of this tunnel (idempotent).
@@ -250,6 +280,13 @@ struct SlotBackend {
 impl SessionSlot {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The current backend's receive-liveness ledger — the out-of-tree
+    /// silence probe's read face. Task-independent by construction; `None`
+    /// while the slot is empty (establishment/backoff phases).
+    pub fn steady_state_liveness(&self) -> Option<crate::tunnel::transport::SteadyStateLiveness> {
+        self.inner.steady_state_liveness()
     }
 
     /// The embedder-facing tunnel: an [`AgentTunnel`] backed by this slot.
@@ -381,11 +418,59 @@ impl TunnelTransport for SlotBackend {
 
     /// Policy pull rides whatever backend the current session installed
     /// (an empty slot retries on the next tick).
-    async fn pull_policy(&self, seen: u64) -> Result<Option<crate::tunnel::PolicyFetch>> {
+    async fn pull_policy(&self, seen: u64) -> Result<crate::tunnel::transport::PolicyPull> {
         let Some(backend) = self.backend() else {
             return Err(slot_empty_error());
         };
         backend.pull_policy(seen).await
+    }
+
+    /// The agents control-plane read rides the current session backend the
+    /// same way (an empty slot retries on the next tick).
+    async fn list_agents(&self) -> Result<Vec<crate::tunnel::transport::PeerInfo>> {
+        let Some(backend) = self.backend() else {
+            return Err(slot_empty_error());
+        };
+        backend.list_agents().await
+    }
+
+    /// The proposal control plane rides the current session backend the
+    /// same way.
+    async fn submit_stream_proposal(
+        &self,
+        request: &crate::tunnel::transport::StreamProposalRequest,
+    ) -> Result<crate::tunnel::transport::ProposalSubmitOutcome> {
+        let Some(backend) = self.backend() else {
+            return Err(slot_empty_error());
+        };
+        backend.submit_stream_proposal(request).await
+    }
+
+    async fn my_proposals(&self) -> Result<Vec<crate::tunnel::transport::ProposalReceipt>> {
+        let Some(backend) = self.backend() else {
+            return Err(slot_empty_error());
+        };
+        backend.my_proposals().await
+    }
+
+    /// The demanding liveness probe rides the current session backend the
+    /// same way. An empty slot is NOT a strike for the caller's strike
+    /// counter — the supervisor's probe parks while liveness is unreadable
+    /// (establishment/backoff phases are bounded by their own timeouts).
+    async fn liveness_roundtrip(&self) -> Result<()> {
+        let Some(backend) = self.backend() else {
+            return Err(slot_empty_error());
+        };
+        backend.liveness_roundtrip().await
+    }
+
+    /// The current session backend's receive-liveness ledger, verbatim —
+    /// the supervisor's out-of-tree probe reads it through the slot (an
+    /// empty slot is no signal, matching the establishment/backoff phases
+    /// where the probe must stay out of the way).
+    fn steady_state_liveness(&self) -> Option<crate::tunnel::transport::SteadyStateLiveness> {
+        self.backend()
+            .and_then(|backend| backend.steady_state_liveness())
     }
 }
 

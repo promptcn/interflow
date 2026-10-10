@@ -108,12 +108,26 @@ fn offline_apply_marks_metadata_and_skips_registrar() {
         "pack metadata carries the tier: {pack_toml}"
     );
     assert!(
-        !pack_toml.contains("registrar_endpoint"),
-        "offline packs carry no registrar endpoint: {pack_toml}"
+        pack_toml.contains("registrar_endpoint = \"\""),
+        "offline packs carry no registrar endpoint (canonical empty value): {pack_toml}"
     );
     assert!(
         pack_toml.contains("leaf_ttl_secs = 7776000"),
         "90d leaf: {pack_toml}"
+    );
+    // Fresh offline apply embeds the revocation snapshot from generation 1:
+    // the offline CRL source is statically the embedded `trust/crls`
+    // snapshot, so "every offline pack carries one" must hold before any
+    // rotate.
+    assert!(
+        dist.join("packs/ingress-edge/trust/crls/control.crl.pem")
+            .exists(),
+        "offline apply embeds the CRL snapshot from generation 1"
+    );
+    assert!(
+        dist.join("packs/agent-desktop/trust/crls/control.crl.pem")
+            .exists(),
+        "every rendered pack gets the snapshot"
     );
 
     // No registrar unit, no registrar section in the bootstrap script.
@@ -123,8 +137,9 @@ fn offline_apply_marks_metadata_and_skips_registrar() {
         !install.contains("registrar"),
         "install.sh skips registrar: {install}"
     );
-    // The old binary keeps reading registrar packs byte-identically: the
-    // tier field is omitted when it is the default.
+    // Canonical form (2026-10-10): the tier key is written on registrar
+    // packs too — "old binary keeps registrar packs byte-identically" died
+    // with the byte-stability doctrine (re-render is the upgrade model).
     let text = OFFLINE_MANIFEST.replace("mode = \"offline\"\nleaf_ttl = \"90d\"", "leaf_ttl = \"24h\"")
         .replace("[public_tls]\nmode = \"frontend-proxy\"\n", "[public_tls]\nmode = \"frontend-proxy\"\n[registrar]\nendpoint = \"https://registrar.invalid\"\n");
     let dir2 = tempfile::tempdir().expect("tempdir").keep();
@@ -141,7 +156,10 @@ fn offline_apply_marks_metadata_and_skips_registrar() {
     ]);
     let registrar_pack =
         std::fs::read_to_string(dir2.join("dist/packs/ingress-edge/pack.toml")).unwrap();
-    assert!(!registrar_pack.contains("identity_mode"));
+    assert!(
+        registrar_pack.contains("identity_mode = \"registrar\""),
+        "the tier is always written: {registrar_pack}"
+    );
     assert!(registrar_pack.contains("registrar_endpoint"));
 }
 
@@ -254,7 +272,7 @@ fn revoke_then_rotate_embeds_the_deny_list_snapshot() {
         "--pack",
         &gen1.display().to_string(),
         "--reason",
-        "operator-requested",
+        "key-compromise",
     ]);
 
     // …then rotate: the next generation carries the deny list as an embedded
@@ -283,12 +301,45 @@ fn revoke_then_rotate_embeds_the_deny_list_snapshot() {
     // The pack still loads clean with the snapshot folded into the digests.
     run_ok(&["pack", "inspect", "--pack", &gen2.display().to_string()]);
 
-    // Consumers find the embedded snapshot (mesh hub lookups).
-    let stem = "control";
-    let found = interflow_identity::pack::crl_path_for(&gen2, stem);
+    // The CRL source is statically pinned by the tier (no probing between
+    // directories): offline reads the embedded snapshot directly, and a
+    // stray live-refresh file in state/crls can never change the source —
+    // the exact implicit-branch behavior this batch retired.
+    use interflow_identity::manifest::IdentityMode;
+    let found = interflow_identity::pack::crl_path_for(&gen2, IdentityMode::Offline, "control")
+        .expect("offline lookup resolves");
     assert_eq!(
         found,
         Some(gen2.join("trust/crls/control.crl.pem")),
-        "helper prefers state, falls back to trust/crls"
+        "offline packs read the embedded snapshot"
+    );
+    let stray = gen2.join("state/crls/control.crl.pem");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    std::fs::write(&stray, b"# stray live-refresh file").unwrap();
+    let found = interflow_identity::pack::crl_path_for(&gen2, IdentityMode::Offline, "control")
+        .expect("offline lookup resolves");
+    assert_eq!(
+        found,
+        Some(gen2.join("trust/crls/control.crl.pem")),
+        "a stray state/crls file must not change the offline CRL source"
+    );
+    // Registrar packs read only the live directory (absent = not refreshed
+    // yet — the scheduler's convergence, never the embedded snapshot).
+    let found = interflow_identity::pack::crl_path_for(&gen2, IdentityMode::Registrar, "control")
+        .expect("registrar lookup tolerates absence");
+    assert_eq!(
+        found,
+        Some(stray.clone()),
+        "registrar packs read state/crls when present"
+    );
+    let empty = dir.join("nonexistent-pack");
+    let found = interflow_identity::pack::crl_path_for(&empty, IdentityMode::Registrar, "control")
+        .expect("registrar lookup tolerates absence");
+    assert_eq!(found, None, "absent live CRL is Ok(None), not an error");
+    let err = interflow_identity::pack::crl_path_for(&empty, IdentityMode::Offline, "control")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("render defect"),
+        "a missing offline snapshot fails loud: {err}"
     );
 }

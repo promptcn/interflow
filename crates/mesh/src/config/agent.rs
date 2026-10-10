@@ -117,9 +117,32 @@ pub struct AgentConfig {
     /// `[transport]` (see [`crate::config::transport`]).
     #[serde(default)]
     pub transport: AgentTransportConfig,
+    /// The signed-policy plane: when present, [`crate::agent::AgentClient`]'s
+    /// start path runs the policy watcher intrinsically (the node-local
+    /// `state/policy` channel + the hub's control-plane conditional pull,
+    /// converging onto the live rule tables). Present exactly on pack-built
+    /// configs; in-memory embedders (the expose edge, the soak harness)
+    /// carry no signed-policy distribution and leave it absent. This field
+    /// is the wiring: before it, every embedding surface hand-spawned the
+    /// watcher and the one that forgot shipped silently
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyPlaneConfig>,
     /// Logging.
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+/// The signed-policy plane's single input: the credential pack directory.
+///
+/// The watcher reads the trust bundle (policy verification key) and the
+/// embedded policy snapshot from the pack, polls and persists the
+/// node-local update channel (`<pack>/state/policy`), and derives the
+/// agent's rules from whatever generation it verifies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyPlaneConfig {
+    /// The credential pack directory.
+    pub pack_dir: std::path::PathBuf,
 }
 
 /// Agent-side transport tuning: h2 keepalive plus the QUIC endpoint
@@ -166,6 +189,7 @@ impl Default for AgentConfig {
             tls: None,
             inner_tls: InnerTlsConfig::default(),
             transport: AgentTransportConfig::default(),
+            policy: None,
             logging: LoggingConfig::default(),
         }
     }

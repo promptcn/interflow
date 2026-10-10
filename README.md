@@ -1,5 +1,22 @@
 # Interflow
 
+Identity-first tunnels with mTLS by default. One manifest declares the
+deployment; every node — public ingress, in-network agent, mesh hub — runs
+from a self-describing **Credential Pack** that carries its identity, trust,
+and signed routing policy. There are no shared secrets and no certificate
+paths to manage by hand: the client certificate *is* the credential, and the
+tenant behind it is derived from which CA anchors the chain.
+
+Two faces share one engine core:
+
+- **Public domain → LAN** (`interflow-cli ingress / agent run`) — expose a
+  local service under a fixed public domain, with the public entry point
+  terminating HTTPS itself (ACME by default).
+- **Site-to-site mesh** (`interflow-mesh hub / agent`) — private network ↔
+  private network over a pure stream-relay hub.
+
+A Tauri 2 GUI manages all node kinds side by side on its host, each from its
+own pack — a node is an identity, not a machine.
 
 ## Quick start
 
@@ -45,6 +62,11 @@ interflow-mesh agent --pack dist/packs/agent-lan-a    # LAN A side
 interflow-mesh agent --pack dist/packs/agent-lan-b    # LAN B side
 ```
 
+Mesh rules are TCP by default; prefix one with `udp/`
+(`--mesh-egress udp/dns:10.1.0.1:53`, per-rule idle timeouts) to declare a
+UDP service — datagrams then ride an encrypted agent-to-agent QUIC
+association (see [Transports and UDP](#transports-and-udp)).
+
 Distribute a pack as an encrypted `.iflowpack` with
 `interflow-cli pack seal --pack dist/packs/<kind>-<node> --generate-passphrase`
 (the output lands beside the pack; the 144-bit passphrase prints once).
@@ -54,14 +76,69 @@ automatically against the registrar, and respond to the same `rotate` /
 `revoke` / `doctor` lifecycle as expose packs. The runnable scenario lives
 in `crates/mesh/dev-examples/site-to-site/`.
 
+## The identity model
+
+`interflow.toml` is the single source of truth. `interflow-cli plan apply`
+validates it and renders one Credential Pack per node under
+`dist/packs/<kind>-<node>/`:
+
+```
+pack.toml     canonical metadata: kind / realm / workspace / node / generation /
+              identity_mode / rendered_by (the provenance stamp)
+node.toml     fully resolved node configuration (listeners, services,
+              transport, edge settings — every scalar key always written)
+identity/     leaf certificate + key per principal (an agent gets exactly
+              its workspace principal; an ingress one per served workspace)
+trust/        issuer CA certs + Trust Bundle metadata; offline packs embed
+              the revocation snapshot here
+policy/       policy.toml + policy.sig — the ed25519-signed runtime policy
+SHA256SUMS    digest manifest over every pack file; state/ is outside it
+state/        node-local runtime state (ACME cache, live policy, live CRLs)
+              — deliberately never sealed
+```
+
+Every pack is stamped with an `identity_mode`, chosen in the manifest:
+
+- **`registrar`** (default) — short-lived leaves (1 h–24 h, default 24 h)
+  that renew unattended against the independent registrar at 50% remaining
+  lifetime; renewal completion is a graceful process exit so the supervisor
+  restarts onto the new material. The node pulls fresh CRLs every 60 s and
+  verification fails closed after a 1 h staleness bound.
+- **`offline`** — no registrar section allowed; long-lived leaves
+  (7 d–365 d, default 90 d) rotated manually. The pack embeds a revocation
+  snapshot at `plan apply` / `rotate` time; a missing snapshot is a render
+  defect, never a runtime fallback.
+
+The mode statically pins where a node reads its CRLs from (`state/crls`
+when registrar-managed, `trust/crls` when offline) — there is no
+existence-probing fallback between the two.
+
+### Lifecycle surface
+
+| Command | What it does |
+|---|---|
+| `interflow-cli doctor ingress \| agent \| hub \| route \| trust \| issuer` | diagnose identity, trust, routes, and connectivity in product terms |
+| `interflow-cli identity inspect [--expert]` / `identity renew` | inspect the identity a pack carries (X.509 detail) / force one renewal cycle |
+| `interflow-cli rotate --manifest … <node>` | issue the next pack generation (an identity + trust change) |
+| `interflow-cli revoke --pack … [--reason key-compromise]` | deny-list + CRL entry; the RFC 5280 reason code distinguishes a leak emergency from a planned retirement |
+| `interflow-cli trust --pack …` | export the realm Trust Bundle (public verification material) |
+| `interflow-cli audit verify <path>` | verify an audit ledger's hash chain, gzip segments included |
+| `interflow-cli issuer backup init / now / status / rekey`, `issuer verify`, `issuer restore` | encrypted backups of the issuer store — the deployment's entire signing capability |
+| `interflow-cli proposals list / approve / reject` | the mesh stream-proposal queue (approve = manifest edit + mint + publish) |
+| `interflow-cli node install --pack …` | idempotent server install: pack + systemd unit; re-running is an upgrade |
+
+Rule-only changes never rotate identity: `plan apply` signs the next policy
+generation and publishes it — nodes pick it up within 10 s (anti-rollback
+watermark), no restart.
+
 ## Engine components
 
 The `interflow-mesh` engine is driven exclusively from Credential Packs
-(the binary exposes only `hub/agent --pack`). Engine development and
-isolated test topologies go through the same pack machinery
-(`crates/mesh/dev-examples/site-to-site/` renders packs from a manifest);
-the dev soak harness uses a testkit-only node binary with a JSON config
-handoff.
+(the binary exposes `hub` / `agent` under `--pack`, plus `version`).
+Engine development and isolated test topologies go through the same pack
+machinery (`crates/mesh/dev-examples/site-to-site/` renders packs from a
+manifest); the dev soak harness uses a testkit-only node binary with a JSON
+config handoff.
 
 ## Repository layout
 
@@ -77,7 +154,8 @@ interflow/
 │   ├── renewal/    ← shared credential-renewal scheduler (pack lifecycle beside every engine)
 │   ├── certs/      ← shared rcgen issuance behind the issuer and the test kit
 │   ├── contract/   ← FORMAT_VERSION / Generation machine contracts
-│   ├── util/       ← shared micro-utilities (authority parsing, atomic writes)
+│   ├── buildinfo/  ← the one BUILD_TAG composing every binary's version body (CLI version output, GUI top bar, pack `rendered_by` stamps)
+│   ├── util/       ← shared micro-utilities (topology defaults, digests, authority parsing, atomic writes, systemd units)
 │   └── testkit/    ← dev-only test/bench harness
 ├── src/, src-tauri/ ← Tauri 2 GUI (unified node manager: expose agents, mesh agents, hubs, and ingresses side by side, each from a Credential Pack — each node is an identity, not a machine, and the GUI manages any number of them on its host)
 ├── examples/      ← generic, runnable scenario examples
@@ -98,7 +176,7 @@ Default — the ingress terminates public HTTPS itself via ACME:
 [public server]
   interflow-cli ingress run --pack …     ← single process: control endpoint + ingress listener
      │ public HTTPS terminated here (ACME: HTTP-01 + TLS-ALPN-01, auto-renewal)
-     │ HTTP/2 tunnel (mTLS from the Credential Pack)
+     │ tunnel (mTLS from the Credential Pack; h2 by default, QUIC opt-in)
      ▼
 [local machine]
   interflow-cli agent run --pack …       ← in-network connector; services come from the pack
@@ -143,17 +221,18 @@ interflow-cli agent run --pack dist/packs/agent-myagent
 ```
 
 No certificate paths anywhere: the packs carry identity, trust, the signed
-route policy, and the node configuration. Leaf credentials default to a 24h
-TTL and renew automatically at 50% remaining lifetime. `interflow-cli rotate`
-remains for policy/trust generation changes, revoke with `interflow-cli revoke`,
-and diagnose with `interflow-cli doctor`.
+route policy, and the node configuration. In `registrar` identity mode
+leaves default to a 24h TTL and renew automatically at 50% remaining
+lifetime; `offline` packs default to 90-day leaves under manual rotation.
+`interflow-cli rotate` handles policy/trust generation changes, revoke with
+`interflow-cli revoke`, and diagnose with `interflow-cli doctor`.
 
 ### Key design
 
 - **The ingress is a consolidated component**, not a "hub + ingress bundle": the public listener and the tunnel server cooperate directly on the same event loop — public request → peek the first 8 KB for the `Host` header → route-table lookup (from the signed policy, in memory) → open a tunnel stream to the target egress agent → pass the byte stream through
 - **Public HTTPS**: ACME terminates TLS on the ingress by default (HTTP-01 + TLS-ALPN-01, auto-renewal); the fronted topology keeps nginx terminating TLS with the ingress receiving plaintext HTTP/1 from `proxy_pass`
 - **L4 passthrough**: the edge does not parse the full HTTP protocol — it only peeks the Host header for routing; the remaining byte stream crosses the tunnel untouched, and the backend service (a local HTTP server / SSH / any TCP service) parses it itself
-- **h2 tunnel by default, QUIC opt-in**: the agent↔ingress leg can switch to QUIC via the pack / GUI transport preference (verified e2e in `crates/expose/tests/e2e_expose_quic.rs`); the control leg stays on h2, and a QUIC listener on the ingress side is on the manifest roadmap
+- **h2 tunnel by default, QUIC opt-in**: an agent whose pack carries `transport = "quic"` moves its whole session with the ingress — control roundtrips included — onto QUIC, so tunnel streams run as QUIC native streams; the ingress side declares its QUIC face with a `quic_listen` on the ingress node (e2e-verified in `crates/expose/tests/e2e_expose_quic.rs`)
 
 ### Deployment notes: long silent windows and SSE
 
@@ -181,9 +260,9 @@ location / {
 
 ## Transports and UDP
 
-**h2 is the default transport** — it connects wherever TCP egress is allowed. **QUIC is an opt-in upgrade** for the agent↔ingress leg (a transport preference in the pack / GUI): tunnel streams then run on QUIC native streams (custom frames written raw), eliminating single-TCP-connection head-of-line blocking. The choice is static per agent with no automatic fallback between the two — which is exactly why h2 stays the default. ACL / stream limits / mTLS / cert-pin keep identical semantics on both transports.
+**h2 is the default transport** — it connects wherever TCP egress is allowed. **QUIC is an opt-in upgrade** (a per-agent `transport = "quic"` in the manifest / GUI): the agent's entire session — control roundtrips included — moves onto QUIC, and tunnel streams then run on QUIC native streams (custom frames written raw), eliminating single-TCP-connection head-of-line blocking. The dialed side must open its QUIC face: `quic_listen` on the ingress node or on the mesh hub (both are manifest fields; absence keeps QUIC off). The choice is static per agent with no automatic fallback between the two — which is exactly why h2 stays the default. ACL / stream limits / mTLS / cert-pin keep identical semantics on both transports.
 
-**UDP** is carried as datagrams over an encrypted agent-to-agent QUIC association: datagram boundaries are preserved (RFC 9221 DATAGRAM frames), large packets are explicitly fragmented and reassembled (never silently truncated), and bidirectional per-IP / return-path anti-amplification rate limits are on by default. The engine carries UDP today in the site-to-site engine mode; exposing UDP services in the manifest is on the roadmap.
+**UDP** is carried as datagrams over an encrypted agent-to-agent QUIC association: datagram boundaries are preserved (RFC 9221 DATAGRAM frames), large packets are explicitly fragmented and reassembled (never silently truncated), and bidirectional per-IP / return-path anti-amplification rate limits are on by default. Site-to-site rules declare UDP in the manifest today (`node add` mesh rules take a `udp/` prefix, with per-rule idle timeouts); carrying UDP on the public-domain face is on the roadmap.
 
 ---
 
@@ -203,7 +282,7 @@ One-line positioning: **frp is the most feature-complete bundle with the largest
 | Topology | expose family (stcp / xtcp visitor) | expose only | public-domain tunnels (L4 passthrough + Host routing) + **site-to-site engine mode** |
 | TCP data plane | reliable stream | reliable stream | **structured and lossless**: per-stream channels, no frame-loss path in the data plane; end-to-end stall bounds (dispatch 5s / backend write 10s / hub dispatch 30s), failures visible in metrics by reason |
 | Resource defense | server-side limits (maxPoolCount / maxPorts, …) | none | hub concurrency limits + ACL + audit; **independent agent-side defenses** (local stream caps / stream-open rate limiting / dial double timeouts, independent of hub configuration) |
-| Change contract | frpc admin API (re-reads the file) | file watch (notify) | **explicit by construction**: a pack generation is immutable — route/trust changes go through `rotate` / re-`plan apply` and are verifiable (`doctor`, Trust Bundles with generation + digest); the engine-level hub additionally supports SIGHUP hot reload with a documented immediate / new-connections-only / restart-required contract |
+| Change contract | frpc admin API (re-reads the file) | file watch (notify) | **explicit by construction**: a pack generation is immutable — trust/identity changes go through `rotate` / re-`plan apply` and are verifiable (`doctor`, Trust Bundles with generation + digest); rule-only changes hot-apply as a newly signed policy generation (nodes pull it within 10 s, anti-rollback watermark) — no restart, no file watching |
 | Binary size | ~10 MiB | minimal build 574 KiB (feature trimming + upx) | several MiB (minimization is not a goal — see the product decisions below) |
 | Feature surface | plugin family / P2P hole punching / load balancing / health checks / dashboard | minimal | no plugins, no P2P (explicit trade-offs) |
 | Ecosystem | the largest community and distribution ecosystem | OpenWrt / embedded niche | new project |
@@ -212,7 +291,7 @@ One-line positioning: **frp is the most feature-complete bundle with the largest
 
 - **frp**: P2P hole punching (xtcp, relay-free direct connection), aggressive KCP transport, client plugins (protocol conversion / static files / socks5 egress), L7 vhost routing, proxy load balancing and health checks, OIDC, a web dashboard, and the largest community and third-party ecosystem.
 - **rathole**: a ~574 KiB embedded minimal build (a dropbear-class presence on routers / OpenWrt), the minimal-configuration mindset of certificate-free Noise; its "one connection per stream" model naturally has no cross-stream head-of-line blocking on TCP.
-- **interflow's known boundaries**: h2 mode has cross-stream TCP head-of-line blocking (solved by the QUIC transport; h2 remains the default — deployable wherever TCP egress works — while QUIC is an opt-in upgrade that requires UDP egress); the public-domain product path does not expose UDP yet (the engine carries it today in the site-to-site mode; manifest-level exposure is on the roadmap); community size and third-party ecosystem start from zero.
+- **interflow's known boundaries**: h2 mode has cross-stream TCP head-of-line blocking (solved by the QUIC transport; h2 remains the default — deployable wherever TCP egress works — while QUIC is an opt-in upgrade that requires UDP egress); the public-domain face does not carry UDP yet (site-to-site mesh rules declare it in the manifest today; the public-domain face is on the roadmap); community size and third-party ecosystem start from zero.
 
 ### Explicitly out of scope (product decisions, not missing capability)
 
@@ -232,8 +311,16 @@ cargo build --workspace
 # Tests (workspace-wide unit + e2e: adversarial and resilience scenarios such
 # as silent-link recovery / slow backends / Open floods / disconnect
 # self-healing, plus config-invariant locks: liveness-chain derivations,
-# negotiation compatibility matrix, schema validation rules)
-cargo test --workspace
+# negotiation compatibility matrix, schema validation rules).
+# cargo-nextest runs cases each in its own process and test binaries in
+# parallel — the e2e suite is wall-clock-bound on real timers, so this is
+# ~4.8x faster than a sequential libtest run (doc tests stay on libtest:
+# nextest does not run them). Install: brew install cargo-nextest
+# (or `cargo install cargo-nextest --locked`).
+# Enforced at runtime: e2e binaries assembled via interflow-testkit refuse
+# plain `cargo test` and fail fast with a hint (doc tests and benches are
+# exempt; INTERFLOW_LIBTEST_OK=1 overrides for libtest-specific debugging).
+cargo nextest run --workspace --all-features
 
 # Cross-platform release builds (zig for cross-compilation; artifacts land in artifacts/)
 ./scripts/build-linux.sh       # x86_64 musl; pass "aarch64" for the arm build
@@ -250,7 +337,7 @@ docker build -t interflow:latest .
 ### Common just targets
 
 ```
-just test          # all tests
+just test          # all tests (cargo-nextest + doc tests on libtest)
 just lint          # strict clippy (forbid unsafe / deny panic)
 just example-public-domain-plan
 just example-public-domain-ingress

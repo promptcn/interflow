@@ -6,6 +6,7 @@
 //! inner QUIC DATAGRAM.
 
 use crate::agent::e2e::E2eRuntime;
+use crate::agent::ingress::ServingRule;
 use crate::config::IngressRule;
 use bytes::Bytes;
 use interflow_core::protocol::StreamProto;
@@ -62,23 +63,49 @@ struct Association {
     cipher_limiter: Option<ByteRateLimiter>,
 }
 
-/// Runs a UDP listener until the caller cancels the agent session.
+/// Runs a UDP listener until the caller cancels the agent session. The
+/// rule rides the serving-rule cell: param-level policy changes write the
+/// cell and are picked up at the consumption points below (limits,
+/// association target, per-session knobs) without the socket moving.
 pub(crate) async fn run_udp_listener(
     socket: UdpSocket,
-    rule: IngressRule,
+    cell: ServingRule,
     tunnel: AgentTunnel,
     e2e: Arc<E2eRuntime>,
+    node: String,
 ) {
-    info!(
-        "Starting UDP ingress listener: {} -> {} (target_addr={:?})",
-        rule.listen_addr, rule.target_agent, rule.remote_addr
-    );
-    serve(socket, rule, tunnel, e2e).await;
+    let (listen, target, remote) = {
+        let rule = serving(&cell);
+        (
+            rule.listen_addr,
+            rule.target_agent.clone(),
+            rule.remote_addr.clone(),
+        )
+    };
+    info!(node = %node, "Starting UDP ingress listener: {listen} -> {target} (target_addr={remote:?})");
+    serve(socket, cell, tunnel, e2e, node).await;
 }
 
-async fn serve(socket: UdpSocket, rule: IngressRule, tunnel: AgentTunnel, e2e: Arc<E2eRuntime>) {
+fn serving(cell: &ServingRule) -> std::sync::RwLockReadGuard<'_, IngressRule> {
+    cell.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+async fn serve(
+    socket: UdpSocket,
+    cell: ServingRule,
+    tunnel: AgentTunnel,
+    e2e: Arc<E2eRuntime>,
+    node: String,
+) {
     let socket = Arc::new(socket);
-    let ingress_limiter = rule.udp_ingress_limiter();
+    let name = serving(&cell).name.clone();
+    // The limiter knobs it was built from (rebuild when they move).
+    let mut applied_limits = {
+        let rule = serving(&cell);
+        (rule.udp_per_ip_pps, rule.udp_per_ip_bytes_per_sec)
+    };
+    let mut ingress_limiter = serving(&cell).udp_ingress_limiter();
     let clients: ClientSessions = Arc::new(Mutex::new(HashMap::new()));
     let inner_sessions: InnerSessions = Arc::new(Mutex::new(HashMap::new()));
     let mut association: Option<Association> = None;
@@ -88,15 +115,30 @@ async fn serve(socket: UdpSocket, rule: IngressRule, tunnel: AgentTunnel, e2e: A
         let (n, client) = match socket.recv_from(&mut buf).await {
             Ok(value) => value,
             Err(e) => {
-                warn!("UDP recv_from error (rule {}): {e}", rule.name);
+                warn!(node = %node, "UDP recv_from error (rule {}): {e}", name);
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
         if n == UDP_RECV_BUF {
             metrics::counter!("interflow_udp_datagram_truncated").increment(1);
-            warn!("Likely truncated datagram ({n} bytes), dropping");
+            warn!(node = %node, "Likely truncated datagram ({n} bytes), dropping");
             continue;
+        }
+        // Hot-applied limits: rebuild the limiter only when the knobs moved
+        // (token-bucket state survives unchanged knobs).
+        {
+            let rule = serving(&cell);
+            let limits = (rule.udp_per_ip_pps, rule.udp_per_ip_bytes_per_sec);
+            if limits != applied_limits {
+                applied_limits = limits;
+                ingress_limiter = rule.udp_ingress_limiter();
+                info!(
+                    node = %node,
+                    "UDP ingress limits hot-applied (rule {}): {} pps / {} B/s",
+                    name, limits.0, limits.1
+                );
+            }
         }
         if let Some(limiter) = &ingress_limiter
             && !limiter.check(client.ip(), n)
@@ -106,11 +148,14 @@ async fn serve(socket: UdpSocket, rule: IngressRule, tunnel: AgentTunnel, e2e: A
         }
 
         if association.is_none() {
+            // The association target rides the serving rule (a param-level
+            // change applies on the next association build).
+            let rule = serving(&cell).clone();
             match open_association(&tunnel, &rule, &e2e, inner_sessions.clone()).await {
                 Ok(value) => association = Some(value),
                 Err(e) => {
                     metrics::counter!("interflow_udp_session_open_failed").increment(1);
-                    debug!("UDP inner QUIC association failed: {e}");
+                    debug!(node = %node, "UDP inner QUIC association failed: {e}");
                     continue;
                 }
             }
@@ -125,10 +170,17 @@ async fn serve(socket: UdpSocket, rule: IngressRule, tunnel: AgentTunnel, e2e: A
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains_key(&client)
         {
-            let selector = rule
-                .remote_addr
-                .clone()
-                .map_or_else(|| TargetSelector::Default, TargetSelector::Address);
+            // Per-session knobs read from the serving rule at open time —
+            // a param-level policy change reaches sessions opened after it.
+            let (remote, idle_timeout, egress_bps) = {
+                let rule = serving(&cell);
+                (
+                    rule.remote_addr.clone(),
+                    rule.effective_idle_timeout(),
+                    rule.udp_egress_bytes_per_sec,
+                )
+            };
+            let selector = remote.map_or_else(|| TargetSelector::Default, TargetSelector::Address);
             match open_session(
                 assoc.carrier.clone(),
                 selector,
@@ -138,8 +190,8 @@ async fn serve(socket: UdpSocket, rule: IngressRule, tunnel: AgentTunnel, e2e: A
                 socket.clone(),
                 client,
                 clients.clone(),
-                rule.effective_idle_timeout(),
-                rule.udp_egress_bytes_per_sec,
+                idle_timeout,
+                egress_bps,
                 e2e.handshake_timeout,
             )
             .await
@@ -148,9 +200,9 @@ async fn serve(socket: UdpSocket, rule: IngressRule, tunnel: AgentTunnel, e2e: A
                 Err(e) => {
                     metrics::counter!("interflow_udp_session_open_failed").increment(1);
                     if e.to_string().contains("inner UDP session rejected") {
-                        debug!("UDP inner session rejected for {client}: {e}");
+                        debug!(node = %node, "UDP inner session rejected for {client}: {e}");
                     } else {
-                        warn!("UDP inner session failed for {client}: {e}; rebuilding association");
+                        warn!(node = %node, "UDP inner session failed for {client}: {e}; rebuilding association");
                         close_association(
                             association.take().as_ref(),
                             &tunnel,
@@ -185,7 +237,7 @@ async fn serve(socket: UdpSocket, rule: IngressRule, tunnel: AgentTunnel, e2e: A
             Ok(fragments) => fragments,
             Err(e) => {
                 metrics::counter!("interflow_udp_fragment_invalid_total").increment(1);
-                debug!("UDP datagram rejected before inner QUIC: {e}");
+                debug!(node = %node, "UDP datagram rejected before inner QUIC: {e}");
                 continue;
             }
         };
@@ -207,7 +259,7 @@ async fn serve(socket: UdpSocket, rule: IngressRule, tunnel: AgentTunnel, e2e: A
             }
         }
         if failed {
-            warn!("UDP inner QUIC send failed; rebuilding association");
+            warn!(node = %node, "UDP inner QUIC send failed; rebuilding association");
             close_association(
                 association.take().as_ref(),
                 &tunnel,

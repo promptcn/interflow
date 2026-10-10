@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type DeployContextDto, type EditActionDto, type ManifestSummaryDto, type ManifestTemplateParams } from "../api";
+import { api, type DeployContextDto, type EditActionDto, type ManifestSummaryDto } from "../api";
+import { useT } from "../i18n";
 import ManifestForm from "./ManifestForm";
-import { SegmentedControl } from "./ui";
+import RecentContextSelect from "./RecentContextSelect";
+import TemplateBuilder from "./TemplateBuilder";
+import { Badge, Button, Field, Hint, Input, SegmentedControl } from "./ui";
 
 /// The manifest page — one document, two views.
 ///
@@ -16,6 +19,7 @@ export default function ManifestEditor({
   manifest,
   issuer,
   out,
+  placeholders,
   text,
   busy,
   dirty,
@@ -34,6 +38,9 @@ export default function ManifestEditor({
   manifest: string;
   issuer: string;
   out: string;
+  /// Per-OS default paths — the fields' placeholder hints (a hint, never a
+  /// value: an empty field is honest, a fake default is the first-run bug).
+  placeholders: { manifest?: string; issuer?: string; out?: string };
   text: string | null;
   busy: boolean;
   /// The editor text differs from what was last saved/loaded — Save (or
@@ -53,6 +60,7 @@ export default function ManifestEditor({
   onValidate: () => void;
   onApply: () => void;
 }) {
+  const { t } = useT();
   const [view, setView] = useState<"form" | "toml">("form");
   const [summary, setSummary] = useState<ManifestSummaryDto | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
@@ -126,274 +134,150 @@ export default function ManifestEditor({
     if (text === null) return null;
     if (parseError !== null) {
       return (
-        <button className="valid-chip invalid" onClick={() => setView("toml")} title={parseError}>
-          ✕ unparseable — fix in TOML
-        </button>
+        <Hint text={parseError}>
+          <button onClick={() => setView("toml")} className="cursor-pointer">
+            <Badge tone="critical">{t("manifest.unparseable")}</Badge>
+          </button>
+        </Hint>
       );
     }
-    if (summary === null) return <span className="valid-chip">…</span>;
+    if (summary === null) return <Badge>…</Badge>;
     if (summary.issues.length > 0) {
       return (
-        <button
-          className="valid-chip invalid"
-          onClick={() => setView("form")}
-          title={summary.issues.join("\n")}
-        >
-          ✕ {summary.issues.length} issue{summary.issues.length > 1 ? "s" : ""}
-        </button>
+        <Hint text={summary.issues.join("\n")}>
+          <button onClick={() => setView("form")} className="cursor-pointer">
+            <Badge tone="critical">
+              {summary.issues.length > 1
+                ? t("manifest.issuesCount", { n: summary.issues.length })
+                : t("manifest.issueCount", { n: summary.issues.length })}
+            </Badge>
+          </button>
+        </Hint>
       );
     }
-    return <span className="valid-chip valid">✓ valid</span>;
+    return <Badge tone="success">{t("manifest.valid")}</Badge>;
   };
 
+  const pathRow = (
+    label: string,
+    value: string,
+    placeholder: string | undefined,
+    onChange: (v: string) => void,
+    onBrowse: () => void,
+    extra?: React.ReactNode,
+  ) => (
+    <Field label={label}>
+      {(id) => (
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <Input
+            id={id}
+            value={value}
+            placeholder={placeholder}
+            onChange={(e) => onChange(e.target.value)}
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            autoComplete="off"
+            className="flex-1"
+          />
+          <Button onClick={onBrowse}>…</Button>
+          {extra}
+        </div>
+      )}
+    </Field>
+  );
+
   return (
-    <div className="manifest-page">
-      <div className="manifest-paths">
+    <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto">
+      <div className="flex flex-col gap-2">
         {recentContexts.length > 1 && (
-          <div className="row">
-            <label>Recent</label>
-            <select
-              value={`${manifest}|${issuer}|${out}`}
-              onChange={(e) => {
-                const picked = recentContexts.find(
-                  (c) => `${c.manifest}|${c.issuer}|${c.out}` === e.target.value,
-                );
-                if (picked) onPickContext(picked);
-              }}
-            >
-              {recentContexts.map((c) => (
-                <option
-                  key={`${c.manifest}|${c.issuer}|${c.out}`}
-                  value={`${c.manifest}|${c.issuer}|${c.out}`}
-                >
-                  {c.manifest} · {c.issuer} · {c.out}
-                </option>
-              ))}
-            </select>
+          <div className="flex items-center gap-2">
+            <span className="w-[140px] shrink-0 text-base text-fg-2">{t("manifest.recent")}</span>
+            <RecentContextSelect
+              contexts={recentContexts}
+              current={{ manifest, issuer, out }}
+              onPick={onPickContext}
+            />
           </div>
         )}
-        <div className="row">
-          <label>Manifest</label>
-          <input
-            value={manifest}
-            onChange={(e) => onManifestChange(e.target.value)}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-            autoComplete="off"
-          />
-          <button onClick={() => onPickFile(onManifestChange, false, "Choose the manifest")}>
-            …
-          </button>
-          <button disabled={busy} onClick={onLoad}>
-            Load
-          </button>
-          <button disabled={busy || text === null} onClick={onSave}>
-            Save{dirty ? " •" : ""}
-          </button>
-        </div>
-        <div className="row">
-          <label>Issuer</label>
-          <input
-            value={issuer}
-            onChange={(e) => onIssuerChange(e.target.value)}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-            autoComplete="off"
-          />
-          <button onClick={() => onPickFile(onIssuerChange, true, "Choose the issuer directory")}>
-            …
-          </button>
-        </div>
-        <div className="row">
-          <label>Output</label>
-          <input
-            value={out}
-            onChange={(e) => onOutChange(e.target.value)}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-            autoComplete="off"
-          />
-          <button onClick={() => onPickFile(onOutChange, true, "Choose the dist directory")}>
-            …
-          </button>
-        </div>
+        {pathRow(
+          t("manifest.manifest"),
+          manifest,
+          placeholders.manifest,
+          onManifestChange,
+          () => onPickFile(onManifestChange, false, t("manifest.chooseManifest")),
+          <>
+            <Button disabled={busy} onClick={onLoad}>
+              {t("manifest.load")}
+            </Button>
+            <Button disabled={busy || text === null} onClick={onSave}>
+              {t("manifest.save")}
+              {dirty ? " •" : ""}
+            </Button>
+          </>,
+        )}
+        {pathRow(t("manifest.issuer"), issuer, placeholders.issuer, onIssuerChange, () =>
+          onPickFile(onIssuerChange, true, t("manifest.chooseIssuer")),
+        )}
+        {pathRow(t("manifest.output"), out, placeholders.out, onOutChange, () =>
+          onPickFile(onOutChange, true, t("manifest.chooseDist")),
+        )}
       </div>
 
-      <div className="row manifest-toolbar">
+      <div className="flex flex-wrap items-center gap-2">
         <SegmentedControl
           value={view}
           options={[
-            { value: "form", label: "Form" },
-            { value: "toml", label: "TOML" },
+            { value: "form", label: t("manifest.form") },
+            { value: "toml", label: t("manifest.toml") },
           ]}
           onChange={setView}
           disabled={text === null}
         />
         {statusChip()}
-        {dirty && <span className="hint">unsaved — Save writes the file (with a .bak)</span>}
-        <span style={{ flex: 1 }} />
+        {dirty && <span className="text-small text-warn">{t("manifest.unsavedHint")}</span>}
+        <span className="flex-1" />
         <TemplateBuilder onTemplate={onTextChange} />
       </div>
 
       {text === null ? (
-        <p className="hint">load a manifest, or generate a template</p>
+        <p className="text-small text-fg-3">{t("manifest.loadHint")}</p>
       ) : view === "toml" ? (
         <textarea
-          className="manifest-editor"
           value={text}
           onChange={(e) => onTextChange(e.target.value)}
           spellCheck={false}
+          className="min-h-[320px] flex-none resize-y rounded-lg border border-line bg-bg-3 p-2.5 font-mono text-small text-fg-1 outline-none focus-visible:border-accent focus-visible:ring-[3px] focus-visible:ring-accent-tint"
         />
       ) : parseError !== null ? (
-        <div className="manifest-form">
-          <div className="dialog-error">{parseError}</div>
-          <p className="hint">
-            The text does not parse — switch to the TOML view to fix it; the Form view
-            returns as soon as it does.
-          </p>
+        <div className="flex flex-col gap-2.5">
+          <div className="text-base whitespace-pre-wrap text-critical">{parseError}</div>
+          <p className="text-small text-fg-3">{t("manifest.parseFail")}</p>
         </div>
       ) : summary !== null ? (
         <>
           {summary.issues.length > 0 && (
-            <div className="dialog-error">{summary.issues.join("\n")}</div>
+            <div className="rounded-lg border border-critical/40 bg-critical/10 p-2.5 text-base whitespace-pre-wrap text-critical">
+              {summary.issues.join("\n")}
+            </div>
           )}
-          {editError !== null && <div className="dialog-error">✕ {editError}</div>}
+          {editError !== null && (
+            <div className="rounded-lg border border-critical/40 bg-critical/10 p-2.5 text-base whitespace-pre-wrap text-critical">
+              {editError}
+            </div>
+          )}
           <ManifestForm summary={summary} busy={formBusy} onEdit={applyAction} />
         </>
       ) : (
-        <p className="hint">parsing…</p>
+        <p className="text-small text-fg-3">{t("manifest.parsing")}</p>
       )}
-      <div className="row deploy-actions">
-        <button disabled={busy} onClick={onValidate}>
-          Validate
-        </button>
-        <button className="primary" disabled={busy || text === null} onClick={onApply}>
-          Apply — issue packs
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/// The starter-template builder — the GUI twin of `interflow-cli setup`. Two
-/// skeletons: the expose deployment (registrar tier, public routes) and
-/// the site-to-site mesh (offline tier, one hub, no placeholder agents).
-function TemplateBuilder({ onTemplate }: { onTemplate: (text: string) => void }) {
-  const [open, setOpen] = useState<"expose" | "mesh" | null>(null);
-  const [params, setParams] = useState<ManifestTemplateParams>({
-    realm: "promptcn",
-    control_endpoint: "tunnel.example.com:443",
-    registrar_endpoint: "https://registrar.example.com",
-    host: "app.example.com",
-    agent: "desktop",
-    service: "asr",
-    service_address: "127.0.0.1:8080",
-  });
-  const [mesh, setMesh] = useState({ realm: "promptcn-mesh", hub_name: "central", hub_endpoint: "mesh.example.com:6666" });
-
-  const field = (
-    key: keyof ManifestTemplateParams,
-    label: string,
-    setter: (params: ManifestTemplateParams) => void,
-  ) => (
-    <div className="row" key={key}>
-      <label>{label}</label>
-      <input
-        value={params[key]}
-        onChange={(e) => setter({ ...params, [key]: e.target.value })}
-        autoCapitalize="none"
-        autoCorrect="off"
-        spellCheck={false}
-      />
-    </div>
-  );
-
-  const generate = async () => {
-    try {
-      onTemplate(await api.deployManifestTemplate(params));
-      setOpen(null);
-    } catch (e) {
-      // The builder only formats; a failure here is a GUI bug, surface it.
-      console.error("template failed:", e);
-    }
-  };
-
-  const generateMesh = async () => {
-    try {
-      onTemplate(await api.deployMeshTemplate(mesh));
-      setOpen(null);
-    } catch (e) {
-      console.error("template failed:", e);
-    }
-  };
-
-  if (open === null) {
-    return (
-      <>
-        <button onClick={() => setOpen("expose")}>Expose template…</button>
-        <button onClick={() => setOpen("mesh")}>Mesh template…</button>
-      </>
-    );
-  }
-  if (open === "mesh") {
-    return (
-      <div className="template-builder">
-        <div className="row">
-          <label>Realm</label>
-          <input
-            value={mesh.realm}
-            onChange={(e) => setMesh({ ...mesh, realm: e.target.value })}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-          />
-        </div>
-        <div className="row">
-          <label>Hub name</label>
-          <input
-            value={mesh.hub_name}
-            onChange={(e) => setMesh({ ...mesh, hub_name: e.target.value })}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-          />
-        </div>
-        <div className="row">
-          <label>Hub endpoint</label>
-          <input
-            value={mesh.hub_endpoint}
-            onChange={(e) => setMesh({ ...mesh, hub_endpoint: e.target.value })}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-          />
-        </div>
-        <div className="row">
-          <button onClick={() => setOpen(null)}>Cancel</button>
-          <button className="primary" onClick={generateMesh}>
-            Generate
-          </button>
-        </div>
-      </div>
-    );
-  }
-  return (
-    <div className="template-builder">
-      {field("realm", "Realm", setParams)}
-      {field("control_endpoint", "Control endpoint", setParams)}
-      {field("registrar_endpoint", "Registrar endpoint", setParams)}
-      {field("host", "Public host", setParams)}
-      {field("agent", "Agent node", setParams)}
-      {field("service", "Service id", setParams)}
-      {field("service_address", "Service address", setParams)}
-      <div className="row">
-        <button onClick={() => setOpen(null)}>Cancel</button>
-        <button className="primary" onClick={generate}>
-          Generate
-        </button>
+      <div className="flex justify-end gap-2">
+        <Button disabled={busy} onClick={onValidate}>
+          {t("manifest.validate")}
+        </Button>
+        <Button variant="primary" disabled={busy || text === null} onClick={onApply}>
+          {t("manifest.applyButton")}
+        </Button>
       </div>
     </div>
   );

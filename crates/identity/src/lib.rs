@@ -16,6 +16,7 @@
 //! public API here speaks in CNs or file paths; everything speaks in Realm /
 //! Workspace / Node / Principal / Service / Route.
 
+pub mod backup;
 pub mod credentials;
 pub mod expiry;
 pub mod issuance;

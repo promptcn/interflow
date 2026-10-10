@@ -17,7 +17,7 @@ use crate::hub::SharedHubConfig;
 use crate::hub::state::HubState;
 use crate::hub::state::SharedTlsPlane;
 use interflow_core::error::{InterflowError, Result};
-use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker};
+use interflow_core::security::{AuditKind, AuditSink, AuthRateLimiter, ConnTracker};
 use interflow_core::tls::{TenantTrustRoot, TlsPlane, build_tls_plane};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,24 +84,34 @@ pub struct HubReady {
 }
 
 impl HubServer {
-    /// Assembles a hub server. The mTLS TLS plane (acceptor + tenant
-    /// derivation set) is initialized here; failures return an error
-    /// immediately rather than being deferred to accept.
-    pub fn new(config: HubConfig) -> Result<Self> {
+    /// Assembles a hub server around an injected audit sink. The mTLS TLS
+    /// plane (acceptor + tenant derivation set) is initialized here;
+    /// failures return an error immediately rather than being deferred to
+    /// accept.
+    ///
+    /// The sink is a parameter, not a `config.audit` spawn: one process
+    /// keeps one ledger (the embedded edge shares its edge sink here), and
+    /// a second writer on one path corrupts both chains — see the
+    /// single-writer invariant on `interflow_core::security::audit`.
+    /// `config.audit` remains pure configuration data, consumed by
+    /// composition roots that own the spawn decision (`pack::run_hub`,
+    /// `HubHandle::spawn`).
+    pub fn new(config: HubConfig, audit: AuditSink) -> Result<Self> {
         // mTLS-only: the TLS plane is built from the tenant trust table.
         // Validation guarantees non-empty tenants + [tls] present; the
         // builder re-checks (the embedded edge constructs configs
         // programmatically, bypassing the pack validator).
         let plane = build_runtime_tls_plane(&config)?;
-        Self::with_tls_plane(config, plane)
+        Self::with_tls_plane(config, plane, audit)
     }
 
     /// [`Self::new`] with a prebuilt TLS plane — the embedded edge's entry
     /// point: it mixes in-memory trust roots (tenant CAs from the CLI plus
-    /// the stable gateway principal) that have no ca_path files.
-    pub fn with_tls_plane(config: HubConfig, plane: TlsPlane) -> Result<Self> {
+    /// the stable gateway principal) that have no ca_path files. The audit
+    /// sink is likewise the caller's (for the edge, the very sink its
+    /// connection denials go to — one process, one ledger).
+    pub fn with_tls_plane(config: HubConfig, plane: TlsPlane, audit: AuditSink) -> Result<Self> {
         let limits = crate::hub::state::HubLimits::from_config(&config);
-        let original_audit_config = config.audit.clone();
         let conn_tracker = Arc::new(ConnTracker::new(
             config.security.max_connections_per_ip,
             config.security.max_connections_total,
@@ -147,6 +157,63 @@ impl HubServer {
             }
             _ => None,
         };
+        // The proposal queue rides the policy channel's presence (its
+        // funnel validates against the serving policy) and its state dir
+        // (`<pack>/state/proposals.json`, beside `state/policy`).
+        //
+        // A corrupt queue file is neither fatal nor silent: the data plane
+        // keeps serving (a 72h-TTL approval queue must not take every
+        // tenant's connectivity down), the corrupt file is quarantined
+        // beside the queue, one audit event records exactly what was lost,
+        // and the face restarts empty — requesters resubmit. Only when the
+        // quarantine move itself fails does the face stay down: persisting
+        // over the corrupt file would destroy the evidence.
+        let proposals = match policy_channel.as_ref() {
+            None => None,
+            Some(channel) => {
+                let path = channel
+                    .dir
+                    .parent()
+                    .map(|state_dir| state_dir.join("proposals.json"));
+                match crate::hub::proposals::ProposalStore::load(path.clone()) {
+                    Ok(store) => Some(store),
+                    Err(e) => {
+                        let path_text = path
+                            .as_ref()
+                            .map_or_else(|| "-".to_owned(), |p| p.display().to_string());
+                        let quarantined_as = path
+                            .as_deref()
+                            .and_then(crate::hub::proposals::quarantine_corrupt_queue);
+                        warn!(
+                            "proposal queue at {path_text} failed to load: {e}; quarantined as {}",
+                            quarantined_as.as_ref().map_or_else(
+                                || "NOTHING (move failed; proposals face stays down)".to_owned(),
+                                |p| p.display().to_string()
+                            )
+                        );
+                        audit.record(
+                            AuditKind::ProposalQueueQuarantined {
+                                path: path_text,
+                                quarantined_as: quarantined_as
+                                    .as_ref()
+                                    .map(|p| p.display().to_string()),
+                                error: e.to_string(),
+                            },
+                            None,
+                            None,
+                        );
+                        if quarantined_as.is_some() {
+                            // The corrupt file is out of the way — an empty
+                            // queue with a live persistence path.
+                            crate::hub::proposals::ProposalStore::load(path).ok()
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        };
+        let proposals = proposals.map(Arc::new);
         let config: SharedHubConfig = Arc::new(RwLock::new(config));
         let state = Arc::new(HubState {
             agents: Arc::new(RwLock::new(HashMap::new())),
@@ -157,9 +224,11 @@ impl HubServer {
             limits,
             rate_limiter,
             stream_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            audit: AuditSink::spawn(&original_audit_config),
+            audit,
             policy_channel,
             policy_pull_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            proposals,
+            stale_watermark_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             expiry_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             conn_tracker,
             tasks: tokio_util::task::TaskTracker::new(),
@@ -167,13 +236,6 @@ impl HubServer {
         });
 
         Ok(Self { state })
-    }
-
-    /// The live shared config — the signed-policy reload path swaps the ACL
-    /// table through this handle (effective on the next Open; never a
-    /// listener rebuild).
-    pub fn shared_config(&self) -> crate::hub::SharedHubConfig {
-        Arc::clone(&self.state.config)
     }
 
     /// Runs until the server dies (error or task end) — the embedding entry
@@ -269,6 +331,20 @@ impl HubServer {
             &state.tasks,
             state.shutdown.clone(),
         );
+
+        // The signed-policy ACL hot-swap watcher: intrinsic to a pack-built
+        // hub (the config's policy plane names the pack) — every runner of
+        // this future (the binary, the GUI handle, each e2e) gets it by
+        // construction; no embedder wiring exists to forget
+        let policy_pack_dir = state.config.read().await.policy.pack_dir.clone();
+        if let Some(pack_dir) = policy_pack_dir {
+            crate::pack::spawn_hub_policy_reload(
+                &pack_dir,
+                Arc::clone(&state.config),
+                &state.shutdown,
+                &state.tasks,
+            );
+        }
 
         // QUIC dual-stack listener (when enabled; failures propagate
         // immediately — configuration errors must not silently degrade)

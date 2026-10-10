@@ -76,24 +76,12 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default public-stream idle timeout in seconds.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 
-/// Default per-IP new-connection rate limit per minute for direct (ACME)
-/// topologies.
-///
-/// The browser's own HTTP keepalive keeps new connections rare, and there
-/// is no front proxy to shield the listener, so a tight cap preserves most
-/// of its connect-loop defense.
-pub const DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE: u32 = 30;
-
-/// Default per-IP new-connection rate limit per minute for fronted topologies
-/// (nginx/`proxy_pass` in front).
-///
-/// Each proxied request opens a **new** edge connection (conn → tunnel
-/// stream is one-to-one; the front cannot reuse them), so a single user's
-/// normal SPA browsing alone exceeds the direct default. 600/min matches
-/// the reference front's own `limit_req 10r/s` — the edge gate aligns with
-/// what the front lets through anyway, while still capping connect floods
-/// (see (internal design notes)).
-pub const DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE: u32 = 600;
+// Per-IP new-connection rate defaults: single-sourced in interflow-util so
+// the pack renderer (which pins them into node.toml at render time) and the
+// engine's hand-built fallbacks can never drift apart.
+pub use interflow_util::defaults::{
+    DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE, DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE,
+};
 
 /// Default route-breaker policy (10 failures / 60s window / 30s cooldown).
 pub const DEFAULT_ROUTE_BREAKER: RouteBreakerPolicy = RouteBreakerPolicy {
@@ -282,6 +270,13 @@ pub struct EdgeConfig {
     /// it. Same contract as the agent side's `ExposeArgs::log_name` /
     /// `AgentInfo::log_name`.
     pub log_name: Option<String>,
+    /// Whether this deployment runs the offline identity tier — pins the
+    /// CRL source to the pack-embedded `trust/crls` snapshot instead of the
+    /// registrar-refreshed `state/crls` (mirrors
+    /// `interflow_identity::pack::crl_path_for`; the engine crate
+    /// deliberately does not depend on the identity crate, so the pack
+    /// loader fills this from `pack.metadata.identity_mode`).
+    pub identity_offline: bool,
 }
 
 impl EdgeConfig {
@@ -318,6 +313,7 @@ impl Default for EdgeConfig {
             agent_recovery_timeout: Duration::from_secs(DEFAULT_AGENT_RECOVERY_TIMEOUT_SECS),
             control_dispatch_host: None,
             log_name: None,
+            identity_offline: false,
         }
     }
 }
@@ -411,6 +407,7 @@ async fn run_until_inner(
     let identity = Arc::new(IngressIdentity::new(
         config.principals.clone(),
         config.workspace_trust.clone(),
+        config.identity_offline,
     )?);
 
     // 0a. Real-IP restoration is one mechanism per topology: the PROXY
@@ -440,7 +437,7 @@ async fn run_until_inner(
             .with_source(e)
         })?;
         let mut crls = Vec::new();
-        if let Some(crl_path) = workspace_crl_path(&trust.ca) {
+        if let Some(crl_path) = workspace_crl_path(&trust.ca, config.identity_offline)? {
             crls.push(interflow_core::tls::load_crl(&crl_path)?);
         }
         workspace_roots.push(TenantTrustRoot::from_pem_with_crls(
@@ -471,7 +468,11 @@ async fn run_until_inner(
         router.len()
     );
 
-    // 2. Audit sink (shared by edge connection denials + hub audit events)
+    // 2. Audit sink — the process's ONE ledger writer (this was once a
+    //    lie: the hub used to re-spawn its own sink on the same path and
+    //    the two startup seals raced; see backlog 2026-10-09). Clones go
+    //    to the edge denials below and to the embedded hub in step 4;
+    //    clones share the writer and the chain.
     let audit_cfg = AuditConfig {
         enabled: config.audit_path.is_some(),
         path: config.audit_path.as_ref().map(|p| p.display().to_string()),
@@ -509,8 +510,12 @@ async fn run_until_inner(
     }
 
     // 4. Assemble the control endpoint config and spawn the HubServer. The
-    //    TLS plane is built here from the in-memory trust table.
-    let hub_cfg = build_hub_config(&config, &audit_cfg);
+    //    TLS plane is built here from the in-memory trust table; the audit
+    //    sink is the one spawned above — the embedded hub shares the edge's
+    //    writer and chain (one process, one ledger; a second sink on the
+    //    same path would race its startup seal against ours and interleave
+    //    two chains).
+    let hub_cfg = build_hub_config(&config);
     let plane = interflow_core::tls::build_tls_plane(
         &config.control_tls.cert.display().to_string(),
         &config.control_tls.key.display().to_string(),
@@ -519,7 +524,7 @@ async fn run_until_inner(
     )?;
     let hub_plane_config = plane.config.clone();
 
-    let hub_server = interflow_mesh::hub::HubServer::with_tls_plane(hub_cfg, plane)?;
+    let hub_server = interflow_mesh::hub::HubServer::with_tls_plane(hub_cfg, plane, audit.clone())?;
     // Single-public-port mode: remember the hub's TLS configuration and a
     // serve handle before the server task owns them, so the public listener
     // can dispatch control-plane SNIs into the same plane.
@@ -619,6 +624,7 @@ async fn run_until_inner(
     let route_breaker = config.listener.route_breaker.enabled.then(|| {
         Arc::new(interflow_mesh::agent::target_breaker::TargetBreakers::new(
             interflow_mesh::agent::target_breaker::BreakerKind::Route,
+            node.clone(),
             interflow_core::config::params::BreakerPolicy {
                 failure_threshold: config.listener.route_breaker.failure_threshold.max(1),
                 failure_window: Duration::from_secs(
@@ -940,7 +946,7 @@ pub async fn watch_agent_health(
 /// workspace issuer. Workspace isolation is enforced by the control
 /// endpoint's default inter-workspace-deny policy — each session opens only
 /// within its own workspace, so no ACL entries are needed for routing.
-fn build_hub_config(config: &EdgeConfig, audit_cfg: &AuditConfig) -> HubConfig {
+fn build_hub_config(config: &EdgeConfig) -> HubConfig {
     HubConfig {
         server: ServerConfig {
             listen_addr: config.control_listen_addr,
@@ -964,13 +970,24 @@ fn build_hub_config(config: &EdgeConfig, audit_cfg: &AuditConfig) -> HubConfig {
             enabled: true,
             cert_path: config.control_tls.cert.display().to_string(),
             key_path: config.control_tls.key.display().to_string(),
-            min_version: interflow_core::tls::TlsMinVersion::V1_2,
+            // One [tls] section serves both faces: when the QUIC face is on,
+            // the floor must be 1.3 (QUIC mandates it; validation rejects
+            // the 1.2 + QUIC combination). h2-only edges keep the 1.2
+            // floor.
+            min_version: if config.quic_listen.is_some() {
+                interflow_core::tls::TlsMinVersion::V1_3
+            } else {
+                interflow_core::tls::TlsMinVersion::V1_2
+            },
         }),
         acl: AclConfig::default(),
         security: Default::default(),
         heartbeat: Default::default(),
         metrics: Default::default(),
-        audit: audit_cfg.clone(),
+        // No audit declaration of its own: the embedded hub audits through
+        // the injected edge sink (see run_until_inner step 4) — config and
+        // writer stay single-sourced.
+        audit: Default::default(),
         // No policy publication face on the embedded expose edge — that is
         // the mesh hub's control plane.
         policy: Default::default(),
@@ -992,19 +1009,34 @@ fn build_hub_config(config: &EdgeConfig, audit_cfg: &AuditConfig) -> HubConfig {
     }
 }
 
-fn workspace_crl_path(anchor: &Path) -> Option<String> {
-    // Live refresh first, the rotate-embedded snapshot (trust/crls) second —
-    // mirrors interflow_identity::pack::crl_path_for (the engine crate
-    // deliberately does not depend on the identity crate).
-    let pack_root = anchor.parent()?.parent()?;
-    let stem = anchor.file_stem()?.to_string_lossy();
+fn workspace_crl_path(anchor: &Path, offline: bool) -> Result<Option<String>> {
+    // The identity tier statically pins the CRL source directory — mirrors
+    // interflow_identity::pack::crl_path_for (the engine crate deliberately
+    // does not depend on the identity crate). Registrar: the node-local live
+    // refresh (`state/crls`; absent = not refreshed yet). Offline: the
+    // pack-embedded snapshot (`trust/crls`; absent = render defect, fail
+    // loud). A stray file in the other directory can never change the source.
+    let Some(pack_root) = anchor.parent().and_then(Path::parent) else {
+        return Ok(None);
+    };
+    let Some(stem) = anchor.file_stem() else {
+        return Ok(None);
+    };
+    let stem = stem.to_string_lossy();
     let file = format!("{stem}.crl.pem");
-    let live = pack_root.join("state").join("crls").join(&file);
-    if live.is_file() {
-        return Some(live.display().to_string());
+    if offline {
+        let embedded = pack_root.join("trust").join("crls").join(&file);
+        if embedded.is_file() {
+            Ok(Some(embedded.display().to_string()))
+        } else {
+            Err(InterflowError::config(format!(
+                "offline pack carries no embedded CRL snapshot for issuer {stem:?} in                  trust/crls — a render defect; re-apply or rotate the pack"
+            )))
+        }
+    } else {
+        let live = pack_root.join("state").join("crls").join(&file);
+        Ok(live.is_file().then(|| live.display().to_string()))
     }
-    let embedded = pack_root.join("trust").join("crls").join(&file);
-    embedded.is_file().then(|| embedded.display().to_string())
 }
 
 /// Build one workspace session's agent config: dial the local control

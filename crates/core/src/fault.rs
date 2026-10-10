@@ -52,6 +52,14 @@ pub enum FaultPoint {
     /// Wedge (park forever) the QUIC control-stream write forwarder after
     /// registration (Pong path dead while the connection stays healthy).
     QuicControlWriteStall,
+    /// Drop every QUIC liveness-probe roundtrip stream without answering
+    /// while armed (the hub's answer arm stays up, the connection and the
+    /// heartbeat Ping both keep flowing) — the "session object alive,
+    /// answers never arrive" one-way-blackhole form of 2026-10-09. Unlike
+    /// the stall-class points this one is **re-consulted per probe** and
+    /// never parks the handler task, so disarming restores service on the
+    /// next roundtrip.
+    HubQuicSwallowLivenessProbe,
 }
 
 impl FaultPoint {
@@ -70,6 +78,7 @@ impl FaultPoint {
             "quicacceptloop" => Self::QuicAcceptLoop,
             "quicclosedwatcher" => Self::QuicClosedWatcher,
             "quiccontrolwritestall" => Self::QuicControlWriteStall,
+            "hubquicswallowlivenessprobe" => Self::HubQuicSwallowLivenessProbe,
             _ => return None,
         })
     }

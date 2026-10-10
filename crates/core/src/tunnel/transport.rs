@@ -159,18 +159,153 @@ pub trait TunnelTransport: Send + Sync + 'static {
     async fn shutdown(&self);
 
     /// Pulls the hub's current signed policy bundle over this session's
-    /// control plane (`GET /policy`), as a conditional request: `seen` is
-    /// the generation the caller already holds, and a hub at or below it
-    /// answers `304 Not Modified`. `Ok(None)` = no newer bundle (304, or an
-    /// older hub without a policy face). Transports without a
-    /// request/response control plane (QUIC) keep the default: an
-    /// unsupported error the caller treats as "this deployment distributes
-    /// policy through the node-local file channel".
-    async fn pull_policy(&self, _seen: u64) -> Result<Option<PolicyFetch>> {
+    /// control plane, as a conditional request: `seen` is the generation the
+    /// caller already holds, and a hub at or below it answers "not modified"
+    /// (HTTP `304` on the h2 face; the `unchanged` outcome in the QUIC
+    /// frame face). Transports without a request/response control plane keep
+    /// the default: an unsupported error the caller treats as "this
+    /// deployment distributes policy through the node-local file channel".
+    async fn pull_policy(&self, _seen: u64) -> Result<PolicyPull> {
         Err(InterflowError::protocol(
             "this transport has no policy control plane".to_string(),
         ))
     }
+
+    /// Fetches the tenant's registered agents over this session's control
+    /// plane (`GET /agents` on the h2 face; the [`PeerListRequest`
+    /// frame](crate::protocol::FrameType::PeerListRequest) on the QUIC
+    /// face) — presence plus leaf health per agent, the peer-observability
+    /// read the GUI's Peers section renders. Transports without a
+    /// request/response control plane keep the default: an unsupported
+    /// error the caller renders as "peers unavailable on this session".
+    async fn list_agents(&self) -> Result<Vec<PeerInfo>> {
+        Err(InterflowError::protocol(
+            "this transport has no agents control plane".to_string(),
+        ))
+    }
+
+    /// Submits one self-service stream proposal over this session's control
+    /// plane (`POST /proposals` on h2; the [`ProposalSubmitRequest`
+    /// frame](crate::protocol::FrameType::ProposalSubmitRequest) on QUIC).
+    /// The requester is this session's identity; the hub's funnel answers
+    /// queued / duplicate / denied-with-reason.
+    async fn submit_stream_proposal(
+        &self,
+        _request: &StreamProposalRequest,
+    ) -> Result<ProposalSubmitOutcome> {
+        Err(InterflowError::protocol(
+            "this transport has no proposals control plane".to_string(),
+        ))
+    }
+
+    /// Fetches this node's own proposals (pending and decided, until each
+    /// record's TTL lapses) — the receipts face (`GET /proposals/mine` on
+    /// h2; the [`ProposalMineRequest`
+    /// frame](crate::protocol::FrameType::ProposalMineRequest) on QUIC).
+    async fn my_proposals(&self) -> Result<Vec<ProposalReceipt>> {
+        Err(InterflowError::protocol(
+            "this transport has no proposals control plane".to_string(),
+        ))
+    }
+
+    /// One demanding liveness roundtrip: a probe whose success means, and
+    /// only means, that the hub answered within the backend's internal
+    /// deadline ([`FrameType::LivenessPing`] request /
+    /// [`FrameType::LivenessPong`] response on a fresh short-lived
+    /// bi-stream on the QUIC face; `GET /ping` on h2) — the carriage the
+    /// supervisor's out-of-tree probe rides.
+    ///
+    /// This is the transport-side half of the 2026-10-09 one-way-blackhole
+    /// fix: quinn's idle timer resets only on *received* authenticated
+    /// packets and its keep-alive is send-only, so a session whose inbound
+    /// direction still delivers stays "alive" at every transport-layer
+    /// sensor while its outbound path is black-holed. The only reliable
+    /// proof of a bidirectional path is an answer to a question we asked —
+    /// this method is that question.
+    ///
+    /// Deliberately a required method, not a defaulted one: a default
+    /// `Err` would read as strikes to the probe (rebuild loops on any
+    /// backend that merely forgot to implement it), a default `Ok` would
+    /// assert liveness no one proved. Every backend must state its answer
+    /// explicitly.
+    async fn liveness_roundtrip(&self) -> Result<()>;
+
+    /// Steady-state receive liveness — see [`SteadyStateLiveness`]. The
+    /// default (`None`) opts a backend or form out of the supervisor's
+    /// out-of-tree silence probe (no provably-fatal silence, no signal).
+    fn steady_state_liveness(&self) -> Option<SteadyStateLiveness> {
+        None
+    }
+}
+
+/// Steady-state receive liveness of a transport backend: the
+/// out-of-session-tree death signal.
+///
+/// Design constraint (the 2026-10-07 zero-attribution session-death case):
+/// every *in-tree* death sensor (critical tasks, stall monitors, connection
+/// watchers) shares fate with the session task tree it watches — when the
+/// tree wedges as a whole, all sensors go blind together and the supervisor,
+/// which merely awaits the session, sees nothing. The last line of defense
+/// therefore must be **task-independent shared state**: `last_rx_unix_millis`
+/// is an atomic maintained by the transport object on every receive path,
+/// readable without any task being alive, and observed from *outside* the
+/// session tree.
+///
+/// This ledger is the *passive* tier of the out-of-tree probe. The 2026-10-09
+/// one-way-blackhole case added the *demanding* tier
+/// ([`TunnelTransport::liveness_roundtrip`]): a ledger can only report what
+/// arrived, and an unexplained feeder (or a wall-clock rollback) can keep it
+/// looking fresh while every answer the path owes us is lost — so the probe
+/// now also asks a question on its own monotonic cadence and believes only
+/// its own roundtrips' outcomes.
+///
+/// `None` (the default) means this backend/form has no death-decidable
+/// silence: a backend may only return `Some` when it can itself prove that
+/// prolonged inbound silence is fatal (a guaranteed downlink cadence —
+/// heartbeat pings, in-connection request/response exchanges) — otherwise it
+/// would turn a legitimately quiet connection into a rebuild loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SteadyStateLiveness {
+    /// Unix epoch milliseconds of the last inbound byte from the hub on any
+    /// receive path of this backend (control frames, stream data, datagrams,
+    /// request/response exchanges riding the connection). Initialized to the
+    /// connection/registration completion instant.
+    pub last_rx_unix_millis: u64,
+    /// How long without any inbound data this connection must be considered
+    /// dead (a rebuild, not a wait). Derived from the backend's guaranteed
+    /// downlink cadence; always strictly above the in-tree stall/death lines
+    /// so a living tree reacts first and this stays a pure backstop.
+    pub silence_budget: Duration,
+}
+
+/// Shared time source for [`SteadyStateLiveness`] timestamps (unix epoch
+/// milliseconds; 0 only if the clock is before the epoch, which no consumer
+/// treats differently from "long ago").
+pub fn unix_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The result of one conditional policy pull over the session's control
+/// plane — the transport-uniform shape of the hub's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyPull {
+    /// The hub serves nothing newer than the caller's watermark. Carries
+    /// the hub's **reported** serving generation — always a real value on
+    /// this variant (a 304 without `x-policy-generation` is a protocol
+    /// violation, not a zero here); a serving generation *below* the
+    /// caller's watermark is the lineage-deadlock signature the watcher
+    /// reports.
+    UpToDate { hub_generation: u64 },
+    /// The hub carries no policy distribution face (or no bundle behind
+    /// one) — an explicit, legitimate state (e.g. an embedded edge hub),
+    /// distinct from "nothing newer": there is no generation to report and
+    /// nothing this session can pull. The node-local file channel remains
+    /// the only distribution path.
+    NoPolicyFace,
+    /// A bundle newer than the caller's watermark.
+    Update(PolicyFetch),
 }
 
 /// One signed policy bundle served by the hub's `GET /policy`.
@@ -178,11 +313,145 @@ pub trait TunnelTransport: Send + Sync + 'static {
 /// The opaque canonical bytes, their detached signature, and the serving
 /// generation — the caller verifies the signature against its own trust
 /// anchor; the hub is a distributor, never an authority.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyFetch {
     pub body: Bytes,
     pub signature: Vec<u8>,
     pub generation: u64,
+}
+
+/// One registered agent of the connection's tenant, as the control plane
+/// reports it.
+///
+/// The transport-uniform shape both faces decode into (h2 `GET /agents`
+/// JSON and the QUIC `PeerListResponse` payload carry the same bytes; the
+/// hub-side producer type is `interflow_mesh::hub::http::AgentListEntry`,
+/// whose JSON shape these serde derives mirror field-for-field).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerInfo {
+    /// Qualified agent id (`tenant/agent`).
+    pub agent: String,
+    /// The reachability reading (`registered ≠ reachable`): a QUIC relay
+    /// session in place, or an h2 poll body in place / within reconnect
+    /// grace. Pong freshness is deliberately not part of it.
+    pub online: bool,
+    /// Credential health parsed from the registration certificate; `None`
+    /// (null on the wire) when the leaf did not parse.
+    pub leaf_expiry: Option<PeerLeafExpiry>,
+}
+
+/// The `leaf_expiry` object of a [`PeerInfo`] — the flat wire shape
+/// `{not_after_unix, remaining_secs, phase}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeerLeafExpiry {
+    pub not_after_unix: i64,
+    pub remaining_secs: i64,
+    pub phase: PeerLeafPhase,
+}
+
+/// The leaf-health phase on the wire.
+///
+/// Mirrors `interflow_identity::expiry::LeafPhase` (snake_case spelling);
+/// held as a core-local enum so this crate's serde stays independent of
+/// the identity crate — the e2e guards parse real hub output through this
+/// type and fail on any spelling drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerLeafPhase {
+    /// More than the warn ratio of the TTL remains.
+    Healthy,
+    /// Less than the warn ratio remains — rotate soon.
+    Warn,
+    /// Less than the critical ratio remains (or already expired).
+    Critical,
+}
+
+/// One self-service stream proposal's request face — a node asking its
+/// operator for one more `mesh_ingress` stream.
+///
+/// kube-CSR shape: the node can only propose; minting stays with the
+/// issuer. The fields ARE the manifest validator's fields, so the hub's
+/// submit funnel can run the same pairing checks the apply-time validator
+/// runs. The requester is NEVER taken from this struct — the mTLS identity
+/// of the connection is the requester.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StreamProposalRequest {
+    /// The listen-side rule name (unique per agent).
+    pub name: String,
+    /// The loopback listen address (`host:port`) on the requester.
+    pub listen: String,
+    /// tcp / udp.
+    pub protocol: StreamProtoWire,
+    /// The agent whose network dials `remote_addr` (plain agent id).
+    pub target_agent: String,
+    /// The address the target dials for this stream.
+    pub remote_addr: String,
+    /// Stream idle budget (1..=86400; `None` = protocol default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+}
+
+/// The protocol spelling on the proposal wire (snake_case; mirrors
+/// `StreamProto` without dragging the frame-layer type into JSON payloads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamProtoWire {
+    Tcp,
+    Udp,
+}
+
+impl From<StreamProto> for StreamProtoWire {
+    fn from(p: StreamProto) -> Self {
+        match p {
+            StreamProto::Tcp => Self::Tcp,
+            StreamProto::Udp => Self::Udp,
+        }
+    }
+}
+
+impl From<StreamProtoWire> for StreamProto {
+    fn from(p: StreamProtoWire) -> Self {
+        match p {
+            StreamProtoWire::Tcp => Self::Tcp,
+            StreamProtoWire::Udp => Self::Udp,
+        }
+    }
+}
+
+/// The hub's answer to one proposal submission.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ProposalSubmitOutcome {
+    /// Queued for the operator (carries the proposal's id and expiry).
+    Queued { id: String, expires_at_unix: u64 },
+    /// An identical pending proposal already exists (idempotent resubmit).
+    Duplicate { id: String, expires_at_unix: u64 },
+    /// Refused at the door — the funnel's readable reason (the same text
+    /// the apply-time validator would produce, delivered at request time).
+    Denied { reason: String },
+}
+
+/// One proposal of this node, as the receipts query returns it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProposalReceipt {
+    pub id: String,
+    pub rule: StreamProposalRequest,
+    pub submitted_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub status: ProposalStatusWire,
+}
+
+/// A proposal's decision state on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProposalStatusWire {
+    /// Awaiting the operator.
+    Pending,
+    /// Approved — the approval minted `generation`; the stream arrives
+    /// through the ordinary policy distribution (≤1 watch interval).
+    Approved { generation: u64 },
+    /// Rejected — `reason` is the operator's receipt text.
+    Rejected { reason: String },
 }
 
 /// Capacity (in frames) of the per-stream dedicated channel. A healthy
@@ -878,7 +1147,7 @@ mod tests {
         }
     }
 
-    /// Close-notification (`_close_`) routing: with a req-table entry (egress forwarder in service) → delivered to
+    /// Close-notification routing: with a req-table entry (egress forwarder in service) → delivered to
     /// the req channel (the forwarder reclaims the slot upon receipt); with no
     /// req-table entry → goes to the resp table (no regression on the
     /// ingress/edge stream-teardown path).
@@ -890,7 +1159,7 @@ mod tests {
         let ev = rx.recv().await.expect("Open handed off");
         let mut frames = ev.frames;
 
-        // _close_ notification → req channel (the forwarder side receives the Close frame)
+        // Close notification → req channel (the forwarder side receives the Close frame)
         dispatch
             .dispatch(TunnelData {
                 stream_id: sid(4),

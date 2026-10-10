@@ -18,6 +18,8 @@ mod commands;
 mod contract;
 mod deploy;
 mod deploy_prefs;
+mod gui_prefs;
+mod i18n;
 mod node;
 mod profile;
 mod tracing_capture;
@@ -54,12 +56,20 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::get_version_info,
             commands::deploy_manifest_template,
             commands::deploy_mesh_template,
+            commands::deploy_defaults,
             commands::deploy_read_text,
             commands::deploy_write_text,
+            commands::deploy_create_manifest,
             commands::deploy_parse_manifest,
             commands::deploy_edit_manifest,
             commands::deploy_validate,
             commands::deploy_apply,
+            commands::deploy_change_state,
+            commands::deploy_hub_overview,
+            commands::deploy_list_proposals,
+            commands::deploy_approve_proposal,
+            commands::deploy_reject_proposal,
+            commands::mesh_submit_proposal,
             commands::deploy_list_packs,
             commands::deploy_seal_pack,
             commands::deploy_install_sealed,
@@ -71,9 +81,15 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::deploy_seal_to_downloads,
             commands::deploy_prefs_load,
             commands::deploy_prefs_save,
+            commands::gui_prefs_load,
+            commands::gui_prefs_save,
         ])
         .events(tauri_specta::collect_events![
             contract::NodeStateEvent,
+            contract::PolicyPlaneEvent,
+            contract::MeshPeersEvent,
+            contract::MeshProposalsEvent,
+            contract::MeshListenersEvent,
             contract::LogEvent
         ])
 }
@@ -179,14 +195,22 @@ pub fn run() {
             // engines from any thread — including Tauri's sync-command
             // pool, which has no ambient Tokio runtime
             let nodes_app = app.handle().clone();
+            let policy_app = app.handle().clone();
+            let peers_app = app.handle().clone();
+            let proposals_app = app.handle().clone();
+            let listeners_app = app.handle().clone();
             let manager = NodeManager::new(
                 tauri::async_runtime::handle().inner().clone(),
                 move |id, state| emit_node_state(&nodes_app, id, state),
-                |entries| {
+                move |entries| {
                     if let Err(e) = profile::save(&profile::Profile::new(entries.to_vec())) {
                         tracing::error!(node = "gui", "profile save failed: {e}");
                     }
                 },
+                move |id, plane| emit_policy_plane(&policy_app, id, plane),
+                move |id, plane| emit_mesh_peers(&peers_app, id, plane),
+                move |id, receipts| emit_mesh_proposals(&proposals_app, id, receipts),
+                move |id, faces| emit_mesh_listeners(&listeners_app, id, faces),
             );
 
             // Restore the persisted node set, then bring the desired set up
@@ -269,6 +293,60 @@ fn emit_node_state(app: &AppHandle, id: &str, state: &NodeState) {
     if let Some(tray) = app.tray_by_id("main") {
         tray::refresh(app, &tray);
     }
+}
+
+/// Policy telemetry → frontend `policy-plane` event. Same consumer-task
+/// context as [`emit_node_state`]; no tray refresh — the tray shows no
+/// policy face. The panel patches the node's `policy` field from these
+/// pushes; `list_nodes` remains the on-demand/baseline read of the same
+/// values.
+fn emit_policy_plane(app: &AppHandle, id: &str, plane: &node::PolicyPlane) {
+    use tauri_specta::Event;
+    let _ = contract::PolicyPlaneEvent {
+        id: id.to_string(),
+        plane: plane.clone().into(),
+    }
+    .emit(app);
+}
+
+/// Peer telemetry → frontend `mesh-peers` event. Same consumer-task
+/// context and push-not-poll contract as [`emit_policy_plane`]; the node
+/// detail's Peers section patches the node's `peers` field from these.
+fn emit_mesh_peers(app: &AppHandle, id: &str, plane: &node::PeersPlane) {
+    use tauri_specta::Event;
+    let _ = contract::MeshPeersEvent {
+        id: id.to_string(),
+        peers: plane.clone().into(),
+    }
+    .emit(app);
+}
+
+/// Proposal receipts → frontend `mesh-proposals` event. Same consumer-task
+/// context and push-not-poll contract as [`emit_mesh_peers`].
+fn emit_mesh_proposals(
+    app: &AppHandle,
+    id: &str,
+    receipts: &[interflow_core::tunnel::transport::ProposalReceipt],
+) {
+    use tauri_specta::Event;
+    let _ = contract::MeshProposalsEvent {
+        id: id.to_string(),
+        proposals: receipts.iter().cloned().map(Into::into).collect(),
+    }
+    .emit(app);
+}
+
+/// Ingress-listener actual state → frontend `mesh-listeners` event. Same
+/// consumer-task context and push-not-poll contract as
+/// [`emit_mesh_peers`]; the node card's listener badge and the detail's
+/// Health section patch the node's `listeners` field from these.
+fn emit_mesh_listeners(app: &AppHandle, id: &str, faces: &[node::ListenerStatusFace]) {
+    use tauri_specta::Event;
+    let _ = contract::MeshListenersEvent {
+        id: id.to_string(),
+        listeners: faces.iter().cloned().map(Into::into).collect(),
+    }
+    .emit(app);
 }
 
 /// Test-only helpers shared across the crate's unit modules.

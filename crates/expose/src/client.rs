@@ -91,6 +91,13 @@ pub struct ExposeArgs {
     /// per-slot unique value; registration and certificate semantics never
     /// read it.
     pub log_name: Option<String>,
+    /// Whether this deployment runs the offline identity tier — pins the
+    /// CRL source to the pack-embedded `trust/crls` snapshot instead of the
+    /// registrar-refreshed `state/crls` (mirrors
+    /// `interflow_identity::pack::crl_path_for`; the engine crate
+    /// deliberately does not depend on the identity crate, so the pack
+    /// loader fills this from `pack.metadata.identity_mode`).
+    pub identity_offline: bool,
 }
 
 impl ExposeArgs {
@@ -195,7 +202,7 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
     // QUIC mandates TLS end-to-end: without a [tls] section the agent's QUIC
     // path pins an all-zero fingerprint and the handshake can never succeed.
     // For h2, TLS still follows the https:// scheme as before.
-    let ingress_crl_path = ingress_crl_path(&ingress_ca_path);
+    let ingress_crl_path = ingress_crl_path(&ingress_ca_path, args.identity_offline)?;
 
     let tls = if args.hub_url.starts_with("https://") || args.transport == TransportKind::Quic {
         Some(TlsConfig {
@@ -246,20 +253,36 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
     })
 }
 
-fn ingress_crl_path(anchor: &str) -> Option<String> {
-    // Live refresh first, the rotate-embedded snapshot (trust/crls) second —
-    // mirrors interflow_identity::pack::crl_path_for (the engine crate
-    // deliberately does not depend on the identity crate).
+fn ingress_crl_path(anchor: &str, offline: bool) -> interflow_core::error::Result<Option<String>> {
+    // The identity tier statically pins the CRL source directory — mirrors
+    // interflow_identity::pack::crl_path_for (the engine crate deliberately
+    // does not depend on the identity crate). Registrar: the node-local live
+    // refresh (`state/crls`; absent = not refreshed yet). Offline: the
+    // pack-embedded snapshot (`trust/crls`; absent = render defect, fail
+    // loud).
     let anchor_path = std::path::Path::new(anchor);
-    let pack_root = anchor_path.parent()?.parent()?;
-    let stem = anchor_path.file_stem()?.to_string_lossy();
+    let Some(pack_root) = anchor_path.parent().and_then(std::path::Path::parent) else {
+        return Ok(None);
+    };
+    let Some(stem) = anchor_path.file_stem() else {
+        return Ok(None);
+    };
+    let stem = stem.to_string_lossy();
     let file = format!("{stem}.crl.pem");
-    let live = pack_root.join("state").join("crls").join(&file);
-    if live.is_file() {
-        return Some(live.display().to_string());
+    if offline {
+        let embedded = pack_root.join("trust").join("crls").join(&file);
+        if embedded.is_file() {
+            Ok(Some(embedded.display().to_string()))
+        } else {
+            Err(interflow_core::error::InterflowError::config(format!(
+                "offline pack carries no embedded CRL snapshot for issuer {stem:?} in \
+                 trust/crls — a render defect; re-apply or rotate the pack"
+            )))
+        }
+    } else {
+        let live = pack_root.join("state").join("crls").join(&file);
+        Ok(live.is_file().then(|| live.display().to_string()))
     }
-    let embedded = pack_root.join("trust").join("crls").join(&file);
-    embedded.is_file().then(|| embedded.display().to_string())
 }
 
 /// Resolve the hub QUIC address: an explicit value wins; otherwise derive it
@@ -300,6 +323,7 @@ mod tests {
             ingress_ca_path: Some("gateway-ca.crt".into()),
             transport,
             hub_quic_addr: hub_quic_addr.map(str::to_string),
+            identity_offline: false,
         }
     }
 

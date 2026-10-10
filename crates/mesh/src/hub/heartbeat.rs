@@ -214,6 +214,11 @@ async fn run_heartbeat_supervisor(h: std::sync::Arc<HubState>, shutdown: Cancell
         let mut full = 0u64;
         let mut evicted = 0u64;
         let now_unix = interflow_identity::expiry::now_unix();
+        // Proposal-TTL sweep rides the same tick: expiry is a transition
+        // (one audit event per lapsed proposal), not a per-proposal timer.
+        if let Some(proposals) = h.proposals.clone() {
+            proposals.sweep_expired(&h, now_unix.max(0).cast_unsigned());
+        }
         for (agent_id, state) in &snapshot {
             let (alive, tx, is_quic, circuit, leaf_validity) = {
                 let st = state.read().await;

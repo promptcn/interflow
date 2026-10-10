@@ -1,0 +1,219 @@
+/* ------------------------------------------------------------------ */
+/* Interflow GUI 主题层 — 语义令牌的唯一居所                             */
+/* ------------------------------------------------------------------ */
+
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "@fontsource-variable/inter";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+
+/* 暗色走挂类策略:src/theme.ts 跟随系统偏好切换 <html>.dark。
+   light/dark 双主题同等完整(立项:(internal design notes))。 */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ------------------------------------------------------------------ */
+/* 语义变量(light / .dark 两套,组件只准引用语义名,禁 opacity 做层级)   */
+/* ------------------------------------------------------------------ */
+
+:root {
+  /* 表面三级:页面底 / 卡片抬升 / 内嵌(输入框、代码、日志) */
+  --bg-1: #fafafa;
+  --bg-2: #ffffff;
+  --bg-3: #f4f4f5;
+  /* 中性交互 hover(按钮、卡片悬浮、菜单项) */
+  --bg-hover: #f4f4f5;
+  /* 文字三级:主 / 次 / 提示 — 实色,不用 opacity 调层级 */
+  --fg-1: #17171a;
+  --fg-2: #55555e;
+  --fg-3: #8a8a92;
+  /* 边框两级 */
+  --border: #e4e4e7;
+  --border-strong: #d0d0d4;
+
+  /* 单一蓝 accent:动作/选中/焦点。绿只表达状态(success),不再做主按钮。 */
+  --accent: #0a84ff;
+  --accent-hover: #0873e0;
+  --accent-fg: #ffffff;
+  --accent-tint: rgba(10, 132, 255, 0.1);
+
+  /* 状态色:success=运行/已连接/有效;warn=过渡态(Starting/Reconnecting)
+     与凭据 leaf <20%;critical=Failed 与 leaf <10%/过期;neutral=停止。
+     (原过渡态黄 #ffcc00 与 leaf 琥珀 #ff9f0a 两种琥珀并存,统一为 warn。) */
+  --success: #34a853;
+  --warn: #e08a00;
+  --critical: #e5484d;
+  --neutral: #8a8a92;
+
+  /* kind 语义色(色相沿用旧版:hub 蓝 / ingress 紫 / mesh 橙 / expose 绿) */
+  --kind-hub: #0a84ff;
+  --kind-ingress: #a044d8;
+  --kind-mesh: #e08a00;
+  --kind-expose: #34a853;
+
+  /* 海拔三档:卡片悬浮 / 弹窗 / 菜单 */
+  --elevate-1: 0 1px 2px rgba(0, 0, 0, 0.05), 0 0 0 1px var(--border);
+  --elevate-2: 0 8px 28px rgba(0, 0, 0, 0.12), 0 0 0 1px var(--border);
+  --elevate-3: 0 12px 36px rgba(0, 0, 0, 0.16), 0 0 0 1px var(--border);
+
+  color-scheme: light;
+}
+
+.dark {
+  --bg-1: #0b0b0d;
+  --bg-2: #141417;
+  --bg-3: #1b1b1f;
+  --bg-hover: #222227;
+  --fg-1: #ededf0;
+  --fg-2: #a4a4ad;
+  --fg-3: #70707a;
+  --border: #26262b;
+  --border-strong: #35353c;
+
+  --accent: #3d9bff;
+  --accent-hover: #5cabff;
+  --accent-fg: #0b0b0d;
+  --accent-tint: rgba(61, 155, 255, 0.14);
+
+  --success: #4cc38a;
+  --warn: #f0a03c;
+  --critical: #ff6369;
+  --neutral: #70707a;
+
+  --kind-hub: #3d9bff;
+  --kind-ingress: #c678ff;
+  --kind-mesh: #f0a03c;
+  --kind-expose: #4cc38a;
+
+  --elevate-1: 0 1px 2px rgba(0, 0, 0, 0.4), 0 0 0 1px var(--border);
+  --elevate-2: 0 8px 28px rgba(0, 0, 0, 0.55), 0 0 0 1px var(--border);
+  --elevate-3: 0 12px 36px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--border);
+
+  color-scheme: dark;
+}
+
+/* ------------------------------------------------------------------ */
+/* 令牌映射进 Tailwind 工具体系(inline = 引用变量,运行时随 .dark 切换)  */
+/* ------------------------------------------------------------------ */
+
+@theme inline {
+  --color-bg-1: var(--bg-1);
+  --color-bg-2: var(--bg-2);
+  --color-bg-3: var(--bg-3);
+  --color-bg-hover: var(--bg-hover);
+  --color-fg-1: var(--fg-1);
+  --color-fg-2: var(--fg-2);
+  --color-fg-3: var(--fg-3);
+  --color-line: var(--border);
+  --color-line-strong: var(--border-strong);
+
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-tint: var(--accent-tint);
+
+  --color-success: var(--success);
+  --color-warn: var(--warn);
+  --color-critical: var(--critical);
+  --color-neutral: var(--neutral);
+
+  --color-kind-hub: var(--kind-hub);
+  --color-kind-ingress: var(--kind-ingress);
+  --color-kind-mesh: var(--kind-mesh);
+  --color-kind-expose: var(--kind-expose);
+
+  --shadow-elevate-1: var(--elevate-1);
+  --shadow-elevate-2: var(--elevate-2);
+  --shadow-elevate-3: var(--elevate-3);
+
+  /* 字号三档继续有效(2026-09-29 控件系统契约):micro 13 / small 14 / base 15 */
+  --text-micro: 13px;
+  --text-micro--line-height: 1.35;
+  --text-small: 14px;
+  --text-small--line-height: 1.4;
+  --text-base: 15px;
+  --text-base--line-height: 1.45;
+
+  /* 控件热区下限(2026-09-29 契约):标准 32 / 紧凑 26 */
+  --spacing-control: 32px;
+  --spacing-control-sm: 26px;
+
+  --font-sans: "Inter Variable", -apple-system, "PingFang SC", "Segoe UI",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* ------------------------------------------------------------------ */
+/* 基础层                                                               */
+/* ------------------------------------------------------------------ */
+
+@layer base {
+  body {
+    background: var(--bg-1);
+    color: var(--fg-1);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection {
+    background: var(--accent-tint);
+  }
+
+  /* WKWebView 细滚动条(与边框同语言) */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 5px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--fg-3);
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-corner,
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  /* 动效默认 120–160ms;系统要求减少动效时全局归零 */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+    }
+  }
+}
+
+/* toast 进出(ToastProvider 使用;时长克制) */
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@keyframes toast-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* toast 生命周期:150ms 进、停 1.45s、300ms 淡出(toast.tsx 使用) */
+.toast-item {
+  animation:
+    toast-in 150ms ease-out,
+    toast-out 300ms ease-in 1.45s forwards;
+}

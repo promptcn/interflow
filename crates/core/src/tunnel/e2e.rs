@@ -172,11 +172,6 @@ impl E2eTunnelIo {
         }
     }
 
-    /// Whether a Close frame or channel closure already ended the read side.
-    pub const fn is_eof(&self) -> bool {
-        self.eof
-    }
-
     fn record_close(&mut self, data: &[u8]) {
         self.eof = true;
         let reason = CloseReason::from_payload(data);
@@ -652,7 +647,7 @@ mod tests {
     /// sends lands in the other adapter's receiver — the two adapters plus
     /// two cross-wired sinks model two agents talking through a hub that
     /// only relays frames (closes included: teardown must propagate like
-    /// the hub's `_close_` notifications do).
+    /// the hub's Close notifications do).
     struct WiredSink {
         tx: mpsc::Sender<TunnelData>,
     }

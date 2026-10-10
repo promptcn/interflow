@@ -63,3 +63,49 @@ pub fn opaque_stream_id(label: &str) -> interflow_core::protocol::StreamId {
     // The OR-1 lineage guarantees nonzero.
     interflow_core::protocol::StreamId::from_bytes(bytes)
 }
+
+/// Runner policy guard for every e2e suite assembled through this crate.
+///
+/// Plain libtest (`cargo test`) executes the workspace's test binaries as
+/// one strictly sequential queue — a full run costs ~14 minutes where
+/// cargo-nextest's per-test processes do the same work in ~5 (baseline
+/// 730s → 158s, (internal design notes)). This
+/// guard turns that mistake into a fast, loud failure at the first
+/// stack/cert construction — seconds into the run — instead of a silent
+/// slow one. Documentation alone does not hold this line; the binaries
+/// hold it themselves.
+///
+/// Legitimate libtest surfaces are untouched: doctests
+/// (`cargo test --doc`) never execute these binaries, and bench binaries
+/// run with `--bench` (exempted below). Single-test iteration is
+/// identical under nextest — same arguments, one process. IDE runners
+/// that hardcode `cargo test` should switch (rust-analyzer:
+/// `rust-analyzer.runnables.command = "nextest"`); the
+/// `INTERFLOW_LIBTEST_OK=1` escape hatch exists for libtest-specific
+/// debugging only.
+pub fn assert_nextest_runner() {
+    // cargo bench runs these same binaries in bench mode (`--bench` on the
+    // argv); benches are single-binary invocations, not the slow queue
+    // this guard exists for.
+    if std::env::args().any(|a| a == "--bench") {
+        return;
+    }
+    // nextest marks every test process with its reserved NEXTEST* env
+    // namespace (it rejects user variables with that prefix, so presence
+    // here is authoritative).
+    let nextest = std::env::vars_os().any(|(k, _)| {
+        let k = k.to_string_lossy();
+        k == "NEXTEST" || k.starts_with("NEXTEST_")
+    });
+    if nextest || std::env::var_os("INTERFLOW_LIBTEST_OK").is_some() {
+        return;
+    }
+    panic!(
+        "this e2e suite is running under plain libtest (`cargo test`): libtest queues every \
+         test binary sequentially — a full run takes ~14 min where cargo-nextest takes ~5 \
+        \n\
+         one suite:   cargo nextest run -p <pkg> --test <binary> [test-name]\n\
+         full run:    just test\n\
+         override:    INTERFLOW_LIBTEST_OK=1 (libtest-specific debugging only)"
+    );
+}

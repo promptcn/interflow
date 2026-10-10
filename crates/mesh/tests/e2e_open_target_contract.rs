@@ -4,13 +4,13 @@
 //!
 //! - h2 plane: rejected at the upload payload-validation gate
 //!   (`crates/mesh/src/hub/upload.rs`): `valid_agent_id` refuses the empty
-//!   string, so the open never reaches `frame_open`; the sender's `_close_`
+//!   string, so the open never reaches `frame_open`; the sender's Close
 //!   frame (via /poll) carries the reason "invalid open payload".
 //! - QUIC plane: the relay path performs no target form validation (a known
 //!   asymmetry with the h2 gate); the empty target qualifies to
 //!   `"{tenant}/"`, on which `tenant_policy_allows` fails closed
 //!   (`split_qualified` → `None` → deny). The stream is closed with an
-//!   empty-payload `_close_` frame — no reason text (the second observable
+//!   reason-code-only Close frame — no reason text (the second observable
 //!   difference between the gates).
 //!
 //! The shared invariant under protection: an empty-target open never creates
@@ -25,9 +25,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use std::net::SocketAddr;
 use std::sync::Arc;

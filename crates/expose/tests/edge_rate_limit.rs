@@ -18,9 +18,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_expose::client::{ExposeArgs, LocalService};
 use interflow_expose::edge::{
@@ -91,6 +89,7 @@ async fn spawn_stack(rate_per_ip_per_min: u32) -> SocketAddr {
         ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
+        identity_offline: false,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(

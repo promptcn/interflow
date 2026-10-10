@@ -7,11 +7,16 @@
 
 pub mod atomic_write;
 pub mod authority;
+pub mod defaults;
 pub mod digest;
 pub mod error_chain;
 pub mod systemd;
 
 pub use atomic_write::{WriteMode, atomic_write};
 pub use authority::{EndpointAuthority, EndpointParseError, parse_authority, parse_endpoint};
+pub use defaults::{
+    DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE, DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE,
+    LETS_ENCRYPT_PRODUCTION,
+};
 pub use digest::sha256_hex;
 pub use error_chain::format_chain;

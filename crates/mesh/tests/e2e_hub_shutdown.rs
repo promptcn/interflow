@@ -14,12 +14,11 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 
 use interflow_core::protocol::StreamProto;
+use interflow_core::security::AuditSink;
 use interflow_mesh::agent::{AgentClient, AgentState};
 use interflow_mesh::config::{EgressRule, EgressTarget, TransportKind};
 use interflow_mesh::hub::HubServer;
@@ -41,7 +40,7 @@ async fn hub_run_until_returns_and_releases_port() {
     // Port 0 = kernel-assigned at bind: no pick-then-bind race window under
     // parallel `cargo test` (the readiness signal carries the real address).
     let cfg = hub_config(0, certs(), vec![]);
-    let server = HubServer::new(cfg).expect("hub build");
+    let server = HubServer::new(cfg, AuditSink::disabled()).expect("hub build");
 
     let token = CancellationToken::new();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -77,7 +76,7 @@ async fn hub_shutdown_drains_registered_agent() {
 
     // Port 0 = kernel-assigned; the readiness signal carries the real port.
     let cfg = hub_config(0, certs(), vec![]);
-    let server = HubServer::new(cfg).expect("hub build");
+    let server = HubServer::new(cfg, AuditSink::disabled()).expect("hub build");
     let token = CancellationToken::new();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let hub_task = {
@@ -151,7 +150,7 @@ async fn hub_shutdown_closes_quic_endpoint() {
     // Port 0 = kernel-assigned; the readiness signal carries the real port
     // (QUIC shares it as the dual-stack second listener).
     let cfg = hub_quic_config(0, certs(), Vec::new());
-    let server = HubServer::new(cfg).expect("hub build");
+    let server = HubServer::new(cfg, AuditSink::disabled()).expect("hub build");
     let token = CancellationToken::new();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let hub_task = {

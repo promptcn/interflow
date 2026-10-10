@@ -27,6 +27,7 @@ impl HubService {
     pub(crate) async fn handle_register(
         &self,
         agent_id: String,
+        build: Option<String>,
     ) -> Result<Response<HubResponseBody>> {
         // Identity binding: the claimed bare id must equal the mTLS-derived
         // identity's agent (CN). The tenant is never claimable — it comes
@@ -87,8 +88,9 @@ impl HubService {
         let circuit = CircuitToken::random()?;
         *self.connection_circuit.write().await = Some(circuit);
         info!(
-            "Agent registered: circuit={circuit} from {}",
-            self.effective_ip
+            "Agent registered: circuit={circuit} from {} (build {})",
+            self.effective_ip,
+            build.as_deref().unwrap_or("unknown")
         );
         self.state
             .route_leases
@@ -106,21 +108,18 @@ impl HubService {
         // another tenant is a different, non-colliding entry.
         let registered_count = {
             let mut agents = self.state.agents.write().await;
-            match agents.get(&agent_key) {
-                Some(existing) => {
-                    // h2 registration overwrites a QUIC session: the old
-                    // relay connection closes itself out via its
-                    // connection-lost watcher
-                    let mut session = existing.write().await;
-                    session.install_channels(circuit, None);
-                    session.leaf_validity_unix = leaf_validity;
-                }
-                None => {
-                    agents.insert(
-                        agent_key.clone(),
-                        Arc::new(RwLock::new(AgentSession::new(circuit, None, leaf_validity))),
-                    );
-                }
+            if let Some(existing) = agents.get(&agent_key) {
+                // h2 registration overwrites a QUIC session: the old
+                // relay connection closes itself out via its
+                // connection-lost watcher
+                let mut session = existing.write().await;
+                session.install_channels(circuit, None);
+                session.leaf_validity_unix = leaf_validity;
+                session.build.clone_from(&build);
+            } else {
+                let mut session = AgentSession::new(circuit, None, leaf_validity);
+                session.build.clone_from(&build);
+                agents.insert(agent_key.clone(), Arc::new(RwLock::new(session)));
             }
             agents.len()
         };
@@ -151,6 +150,7 @@ impl HubService {
         self.state.audit.record(
             AuditKind::AgentRegistered {
                 circuit: circuit.to_hex(),
+                build,
             },
             Some(circuit.to_hex()),
             Some(self.peer_str()),
@@ -215,6 +215,7 @@ impl HubService {
         self.state.audit.record(
             AuditKind::AgentRegistered {
                 circuit: circuit.to_hex(),
+                build: None,
             },
             Some(circuit.to_hex()),
             Some(self.peer_str()),
@@ -240,7 +241,7 @@ impl HubService {
     /// The termination signal is dispatched by the peer's dispatch plane
     /// (2026-09-14 in-session root fix for orphan streams, see `hub::control`):
     /// - **poll plane** (h2 peer): the control channel guarantees delivery of
-    ///   `_close_` (reason = `agent-evicted`) — otherwise the peer's
+    ///   Close notification (reason = `agent-evicted`) — otherwise the peer's
     ///   forwarder waits forever for a Close and the backend fd lingers for
     ///   the whole session (the EMFILE recurrence path);
     /// - **relay plane** (QUIC peer): removing the table entry itself drops

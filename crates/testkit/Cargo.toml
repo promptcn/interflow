@@ -28,9 +28,9 @@ name = "interflow-soak-node"
 path = "src/bin/soak_node.rs"
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.7" }
-interflow-expose = { path = "../expose", version = "0.7" }
-interflow-mesh = { path = "../mesh", version = "0.7" }
+interflow-core = { path = "../core", version = "0.8" }
+interflow-expose = { path = "../expose", version = "0.8" }
+interflow-mesh = { path = "../mesh", version = "0.8" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -38,7 +38,7 @@ tokio-util = { workspace = true, features = ["rt"] }
 
 # Certificate issuance — the single rcgen implementation shared with
 # internal issuance and the test kit
-interflow-certs = { path = "../certs", version = "0.7" }
+interflow-certs = { path = "../certs", version = "0.8" }
 
 # Metrics-snapshot assertion harness (same versions as mesh)
 metrics = "0.24.6"
@@ -71,6 +71,12 @@ http-body-util = "0.1.3"
 
 # Soak error typing (dev-binary surface)
 thiserror = "2"
+
+# Signal-0 pid-liveness probe for the stale cert-directory sweep (unix-only;
+# libc is already everywhere in the tree — declaring it directly adds no new
+# external code)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # paused-clock unit tests (impair delay line)

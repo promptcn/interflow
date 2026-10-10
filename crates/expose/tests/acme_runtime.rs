@@ -96,6 +96,8 @@ async fn acme_issues_serves_and_routes() {
         ingress_ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
+
+        identity_offline: false,
     };
     let client = interflow_expose::client::start(&args).expect("agent start");
     assert!(

@@ -11,12 +11,15 @@
 
 use crate::SharedState;
 use crate::contract::{
-    AddNodeParams, AddedNodeDto, DeployContextDto, DeployPackDto, DeployPrefsDto, EditActionDto,
-    EditedManifestDto, ImportedPackDto, IssueNodeParams, LocalNodeRefDto, ManifestSummaryDto,
-    ManifestTemplateParams, MeshTemplateParams, NodeInfo, NodePrefs, PackInspection, SealedPackDto,
-    UpdatedNodeDto, VersionInfo,
+    AddNodeParams, AddedNodeDto, ApplyReportDto, ChangeStateDto, ControlProposalDto,
+    DeployContextDto, DeployDefaultsDto, DeployPackDto, DeployPrefsDto, EditActionDto,
+    EditedManifestDto, GuiLanguageDto, GuiPrefsDto, HubOverviewDto, ImportedPackDto,
+    IssueNodeParams, LocalNodeRefDto, ManifestSummaryDto, ManifestTemplateParams,
+    MeshTemplateParams, NodeInfo, NodePrefs, PackInspection, ProposalSubmitOutcomeDto,
+    SealedPackDto, StreamProposalRequestDto, UpdatedNodeDto, VersionInfo,
 };
 use crate::deploy;
+use crate::i18n;
 use crate::node::{self, NodeKind, NodeSpec};
 use interflow_core::config::paths::expand_tilde;
 use interflow_mesh::config::TransportKind;
@@ -39,32 +42,55 @@ fn manager(state: &State<'_, SharedState>) -> Result<node::NodeManager, String> 
 
 /// Expands a leading `~` (hand-typed paths are shell muscle memory; Browse
 /// emits absolute paths) and verifies existence. The expanded value is what
-/// gets used, while the error shows the user's original input.
-fn expanded_existing(field: &mut String, label: &str) -> Result<(), String> {
+/// gets used, while the error shows the user's original input. `s` carries
+/// the caller's language so the error speaks it (tests pin English).
+fn expanded_existing(field: &mut String, label: &str, s: &i18n::Strings) -> Result<(), String> {
     let expanded = expand_tilde(field);
     if !std::path::Path::new(&expanded).exists() {
-        return Err(format!("{label} does not exist: {field}"));
+        return Err(i18n::render(
+            s.err_path_not_exists,
+            &[("label", label), ("path", field)],
+        ));
     }
     *field = expanded;
     Ok(())
 }
 
-/// Lists the managed nodes (name order).
+/// Lists the managed nodes (name order). The assembly lives in
+/// [`node_infos`] so tests can assert on exactly what the GUI command
+/// layer produces (the 2026-10-07 stale-panel bug hid in the gap between
+/// the domain query and this composition).
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
 pub fn list_nodes(state: State<'_, SharedState>) -> Result<Vec<NodeInfo>, String> {
     let manager = manager(&state)?;
-    Ok(manager
+    Ok(node_infos(&manager))
+}
+
+/// One full `NodeInfo` per managed node: the snapshot plus the credential,
+/// policy, and peer health faces. This is the single composition the GUI's
+/// node faces consume, on demand and (via `list_nodes`) as the baseline
+/// behind the `policy-plane` / `mesh-peers` event streams.
+pub fn node_infos(manager: &node::NodeManager) -> Vec<NodeInfo> {
+    manager
         .snapshots()
         .into_iter()
         .map(|snapshot| {
             let id = snapshot.spec.id.clone();
             let mut info: NodeInfo = snapshot.into();
             info.credential = manager.credential_health(&id).map(Into::into);
+            info.policy = manager.policy_plane(&id).map(Into::into);
+            info.peers = manager.peers_plane(&id).map(Into::into);
+            info.proposals = manager
+                .proposals_plane(&id)
+                .map(|receipts| receipts.into_iter().map(Into::into).collect());
+            info.listeners = manager
+                .listeners_plane(&id)
+                .map(|faces| faces.into_iter().map(Into::into).collect());
             info
         })
-        .collect())
+        .collect()
 }
 
 /// Validates a pack directory through the shared funnel and reports what it
@@ -72,7 +98,8 @@ pub fn list_nodes(state: State<'_, SharedState>) -> Result<Vec<NodeInfo>, String
 #[tauri::command]
 #[specta::specta]
 pub fn inspect_pack(mut pack_dir: String) -> Result<PackInspection, String> {
-    expanded_existing(&mut pack_dir, "Credential Pack directory")?;
+    let s = i18n::current();
+    expanded_existing(&mut pack_dir, s.label_credential_pack_dir, s)?;
     node::inspect_pack(std::path::Path::new(&pack_dir)).map(PackInspection::from)
 }
 
@@ -84,7 +111,8 @@ pub async fn add_node(
     state: State<'_, SharedState>,
     mut params: AddNodeParams,
 ) -> Result<NodeInfo, String> {
-    expanded_existing(&mut params.pack_dir, "Credential Pack directory")?;
+    let s = i18n::current();
+    expanded_existing(&mut params.pack_dir, s.label_credential_pack_dir, s)?;
     let info = node::inspect_pack(std::path::Path::new(&params.pack_dir))?;
     let spec = NodeSpec {
         id: String::new(), // minted by the manager
@@ -163,13 +191,9 @@ pub fn update_node_prefs(
         .into_iter()
         .find(|s| s.spec.id == id)
         .map(|s| s.spec.kind)
-        .ok_or_else(|| "unknown node".to_string())?;
+        .ok_or_else(|| i18n::current().err_unknown_node.to_string())?;
     if !matches!(kind, NodeKind::ExposeAgent | NodeKind::MeshAgent) {
-        return Err(
-            "only agent nodes have local preferences — what this node is (identity, \
-                    services) still comes entirely from its pack"
-                .into(),
-        );
+        return Err(i18n::current().err_agent_prefs_only.to_string());
     }
     manager.set_prefs(
         &id,
@@ -214,9 +238,12 @@ pub fn clear_logs(state: State<'_, SharedState>) -> Result<(), String> {
 #[tauri::command]
 #[specta::specta]
 pub fn get_host_name() -> Result<String, String> {
-    gethostname::gethostname()
-        .into_string()
-        .map_err(|e| format!("hostname unavailable: {}", e.to_string_lossy()))
+    gethostname::gethostname().into_string().map_err(|e| {
+        i18n::render(
+            i18n::current().err_hostname,
+            &[("err", &e.to_string_lossy())],
+        )
+    })
 }
 
 /// This build's identity (machine header): crate version + the compile-time
@@ -253,13 +280,27 @@ pub fn deploy_manifest_template(params: ManifestTemplateParams) -> Result<String
     ))
 }
 
-/// Reads a manifest (or any text file the deploy pane edits).
+/// Reads a manifest (or any text file the deploy pane edits). A missing
+/// file is named in the user's language — the read-failure class the
+/// Overview must be able to tell apart from a TOML syntax error.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
 pub fn deploy_read_text(path: String) -> Result<String, String> {
     let path = expanded(&path);
-    std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
+    std::fs::read_to_string(&path).map_err(|e| {
+        let s = i18n::current();
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return i18n::render(s.err_not_found, &[("path", &path.display().to_string())]);
+        }
+        i18n::render(
+            s.err_read,
+            &[
+                ("path", &path.display().to_string()),
+                ("err", &e.to_string()),
+            ],
+        )
+    })
 }
 
 /// Saves the deploy pane's manifest text back to its path — the editor's
@@ -270,8 +311,83 @@ pub fn deploy_read_text(path: String) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
 pub fn deploy_write_text(path: String, text: String) -> Result<(), String> {
     let path = expanded(&path);
-    interflow_cli::manifest_edit::save_manifest(&path, &text)
-        .map_err(|e| format!("write {}: {e}", path.display()))
+    interflow_cli::manifest_edit::save_manifest(&path, &text).map_err(|e| {
+        let s = i18n::current();
+        i18n::render(
+            s.err_write,
+            &[
+                ("path", &path.display().to_string()),
+                ("err", &e.to_string()),
+            ],
+        )
+    })
+}
+
+/// The deployments root backing the deploy pane's placeholders and the
+/// create-deployment dialog's starting folder: **one deployment = one
+/// folder**, named by realm, under `~/interflow-deployments/`. Inside,
+/// the names are fixed — `interflow.toml` / `issuer/` / `dist/` — which is
+/// exactly the CLI's CWD-relative default set, so a `cd` into the folder
+/// makes every CLI flag optional and the GUI's triple collapses to one
+/// root. The root sits in the home directory (visible, operator-browsable,
+/// never touched by the Documents-folder cloud sync); key material stays
+/// protected by permissions (0600), not by hiding.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::unnecessary_wraps)] // Tauri command shape — every command returns Result
+pub fn deploy_defaults() -> Result<DeployDefaultsDto, String> {
+    Ok(DeployDefaultsDto {
+        root: dirs::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("interflow-deployments")
+            .display()
+            .to_string(),
+    })
+}
+
+/// Creates a new manifest at `path` from generated template text — the
+/// write half of the create-deployment flow. Mirrors `interflow-cli
+/// setup`: an existing file is refused outright (Save-in-the-editor stays
+/// the only path that may overwrite, with its `.bak` discipline); missing
+/// parent directories are created because template text always targets a
+/// fresh deployment folder.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
+pub fn deploy_create_manifest(path: String, text: String) -> Result<(), String> {
+    let path = expanded(&path);
+    let s = i18n::current();
+    if path.exists() {
+        return Err(i18n::render(
+            s.err_manifest_exists,
+            &[("path", &path.display().to_string())],
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            i18n::render(
+                s.err_write,
+                &[
+                    ("path", &parent.display().to_string()),
+                    ("err", &e.to_string()),
+                ],
+            )
+        })?;
+    }
+    interflow_util::atomic_write(
+        &path,
+        text.as_bytes(),
+        interflow_util::WriteMode::PreserveOr(0o644),
+    )
+    .map_err(|e| {
+        i18n::render(
+            s.err_write,
+            &[
+                ("path", &path.display().to_string()),
+                ("err", &e.to_string()),
+            ],
+        )
+    })
 }
 
 /// Parses manifest text into the Form view's read model — shape-level, so
@@ -337,17 +453,147 @@ pub async fn deploy_validate(manifest: String) -> Result<Vec<String>, String> {
 /// Issues identities + packs from the manifest (the deploy page's Apply).
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
 pub async fn deploy_apply(
     manifest: String,
     issuer: String,
     out: String,
-) -> Result<Vec<String>, String> {
+) -> Result<ApplyReportDto, String> {
     let (manifest, issuer, out) = (expanded(&manifest), expanded(&issuer), expanded(&out));
     tauri::async_runtime::spawn_blocking(move || {
-        interflow_cli::plan::apply(&manifest, &issuer, &out, false).map_err(|e| e.to_string())
+        interflow_cli::plan::apply(
+            &manifest,
+            &issuer,
+            &out,
+            false,
+            &interflow_cli::plan::BackupInitOptions::default(),
+        )
+        .map(ApplyReportDto::from)
+        .map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// The bookkeeping-level "would apply do anything" pre-check — the Deploy
+/// overview's "unapplied changes" badge and next-steps face. No minting,
+/// no hub dial (apply re-runs the full watermark-aware funnel).
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
+pub async fn deploy_change_state(
+    manifest: String,
+    issuer: String,
+) -> Result<ChangeStateDto, String> {
+    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::plan::change_state(&manifest, &issuer)
+            .map(ChangeStateDto::from)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The running hub's operator overview (watermarks + fleet presence and
+/// pull convergence) — the Apply-result card and the fleet table's online
+/// column. `None` = the manifest names no hub endpoint. Errors (hub
+/// unreachable / issuer unreadable) surface as the caller's hint text.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
+pub async fn deploy_hub_overview(
+    manifest: String,
+    issuer: String,
+) -> Result<Option<HubOverviewDto>, String> {
+    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::plan::hub_overview(&manifest, &issuer)
+            .map(|o| o.map(HubOverviewDto::from))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The hub's stream-proposal queue (the operator's approve/reject face).
+/// `None` = the manifest names no hub endpoint.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
+pub async fn deploy_list_proposals(
+    manifest: String,
+    issuer: String,
+) -> Result<Option<Vec<ControlProposalDto>>, String> {
+    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::plan::list_proposals(&manifest, &issuer)
+            .map(|list| list.map(|l| l.into_iter().map(Into::into).collect()))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Approve one stream proposal: edit the manifest (the single source of
+/// truth) → apply (mint + publish, no-op gate protects a double-approve)
+/// → record the decision at the hub. Returns the apply report (the
+/// Overview's result card renders it like a manual apply).
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
+pub async fn deploy_approve_proposal(
+    manifest: String,
+    issuer: String,
+    out: String,
+    id: String,
+) -> Result<ApplyReportDto, String> {
+    let (manifest, issuer, out) = (expanded(&manifest), expanded(&issuer), expanded(&out));
+    tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::plan::approve_proposal(&manifest, &issuer, &out, &id, false)
+            .map(ApplyReportDto::from)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Reject one stream proposal with a reason (the requester's GUI shows it
+/// as the receipt).
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
+pub async fn deploy_reject_proposal(
+    manifest: String,
+    issuer: String,
+    id: String,
+    reason: String,
+) -> Result<(), String> {
+    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::plan::reject_proposal(&manifest, &issuer, &id, &reason)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Submits one self-service stream proposal through a running mesh
+/// agent's session (the requester's face; the answer is the hub funnel's
+/// verdict).
+#[tauri::command]
+#[specta::specta]
+pub async fn mesh_submit_proposal(
+    state: State<'_, SharedState>,
+    node_id: String,
+    request: StreamProposalRequestDto,
+) -> Result<ProposalSubmitOutcomeDto, String> {
+    let manager = manager(&state)?;
+    let wire = interflow_core::tunnel::transport::StreamProposalRequest::from(request);
+    manager
+        .submit_stream_proposal(&node_id, &wire)
+        .await
+        .map(Into::into)
 }
 
 /// Lists the packs of a dist tree (the page's pack cards), enriched with
@@ -446,7 +692,8 @@ pub async fn deploy_update_node(
     node_id: String,
     mut source_dir: String,
 ) -> Result<UpdatedNodeDto, String> {
-    expanded_existing(&mut source_dir, "source pack directory")?;
+    let s = i18n::current();
+    expanded_existing(&mut source_dir, s.label_source_pack_dir, s)?;
     let report = manager(&state)?
         .update_pack(&node_id, std::path::Path::new(&source_dir))
         .await?;
@@ -454,7 +701,7 @@ pub async fn deploy_update_node(
         .snapshots()
         .into_iter()
         .find(|s| s.spec.id == node_id)
-        .ok_or_else(|| "node vanished during update".to_string())?;
+        .ok_or_else(|| i18n::current().err_node_vanished.to_string())?;
     Ok(UpdatedNodeDto {
         node: node.into(),
         generation_from: u32::try_from(report.generation_from).unwrap_or(u32::MAX),
@@ -611,7 +858,7 @@ pub async fn deploy_seal_to_downloads(
 ) -> Result<SealedPackDto, String> {
     let pack_dir = expanded(&pack_dir);
     let downloads =
-        dirs::download_dir().ok_or_else(|| "cannot resolve the Downloads directory".to_string())?;
+        dirs::download_dir().ok_or_else(|| i18n::current().err_downloads_dir.to_string())?;
     let name = pack_dir
         .file_name()
         .map_or_else(|| "pack".to_owned(), |n| n.to_string_lossy().into_owned());
@@ -673,17 +920,46 @@ pub fn deploy_prefs_save(recent: Vec<DeployContextDto>) -> Result<(), String> {
     })
 }
 
+/// Loads the GUI-wide preferences (interface language) — the frontend
+/// awaits this before first paint, so the window never flashes the wrong
+/// language.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::unnecessary_wraps)] // Tauri command shape (load never fails)
+pub fn gui_prefs_load() -> Result<GuiPrefsDto, String> {
+    Ok(GuiPrefsDto {
+        language: crate::gui_prefs::load().language.into(),
+    })
+}
+
+/// Persists the interface language and rebuilds the tray in place — one
+/// switch flips every surface (window, tray, command errors) at once.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters are deserialized by value
+pub fn gui_prefs_save(app: tauri::AppHandle, language: GuiLanguageDto) -> Result<(), String> {
+    crate::gui_prefs::save(crate::gui_prefs::GuiPrefs {
+        language: language.into(),
+    })?;
+    if let Some(tray) = app.tray_by_id("main") {
+        crate::tray::refresh(&app, &tray);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::expanded_existing;
+    use crate::i18n;
 
     /// A hand-typed `~/…` path that does not exist must fail with the
     /// user's original input in the message (the 2026-09-18 papercut:
-    /// `~` reached `Path::exists` as a literal).
+    /// `~` reached `Path::exists` as a literal). Pinned in English — the
+    /// language is an argument, not the machine's gui.toml.
     #[test]
     fn expanded_existing_reports_missing_tilde_path_with_original_input() {
         let mut field = "~/interflow-packs/missing-pack".to_string();
-        let err = expanded_existing(&mut field, "Credential Pack directory")
+        let err = expanded_existing(&mut field, i18n::EN.label_credential_pack_dir, &i18n::EN)
             .expect_err("missing pack must fail");
         assert!(
             err.contains("Credential Pack directory does not exist")
@@ -698,9 +974,70 @@ mod tests {
     fn expanded_existing_accepts_real_directory_unchanged() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut field = dir.path().display().to_string();
-        expanded_existing(&mut field, "Credential Pack directory")
+        expanded_existing(&mut field, i18n::EN.label_credential_pack_dir, &i18n::EN)
             .expect("existing directory passes");
         assert_eq!(field, dir.path().display().to_string());
+    }
+
+    /// The deployments default is the one-deployment-one-folder root: an
+    /// absolute home-based path ending in `interflow-deployments` — the
+    /// convention the CLI's CWD-relative defaults (`interflow.toml` /
+    /// `issuer` / `dist`) already encode, and never a cloud-synced
+    /// documents folder.
+    #[test]
+    fn defaults_root_is_absolute_home_based_folder() {
+        let dto = super::deploy_defaults().expect("defaults never fail");
+        let root = std::path::Path::new(&dto.root);
+        assert!(root.is_absolute(), "not absolute: {}", dto.root);
+        assert_eq!(
+            root.file_name().and_then(|s| s.to_str()),
+            Some("interflow-deployments"),
+            "wrong root name: {}",
+            dto.root
+        );
+    }
+
+    /// Creation writes missing parent directories and lands the text; a
+    /// second create at the same path is refused (the CLI setup semantic —
+    /// overwriting is the editor Save path's job, with its `.bak`).
+    #[test]
+    fn create_manifest_creates_parents_then_refuses_existing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir
+            .path()
+            .join("nested")
+            .join("deploy")
+            .join("interflow.toml");
+        let text = "# starter skeleton\n";
+        super::deploy_create_manifest(path.display().to_string(), text.to_string())
+            .expect("fresh path creates");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("created file reads back"),
+            text
+        );
+        let err = super::deploy_create_manifest(path.display().to_string(), text.to_string())
+            .expect_err("existing manifest must be refused");
+        assert!(
+            err.contains("interflow.toml"),
+            "refusal names the path: {err}"
+        );
+    }
+
+    /// A missing file is the read-failure class, not a syntax error: the
+    /// message names the path in the UI language and never leaks the raw
+    /// io errno string (English on every OS). Asserted locale-independently
+    /// because `i18n::current()` reads this machine's gui.toml.
+    #[test]
+    fn read_text_names_missing_file_without_errno_noise() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("absent.toml");
+        let err = super::deploy_read_text(missing.display().to_string())
+            .expect_err("missing file must fail");
+        assert!(err.contains("absent.toml"), "names the path: {err}");
+        assert!(
+            !err.contains("os error"),
+            "no raw errno in the UI message: {err}"
+        );
     }
 
     /// The wizard's kind split maps onto the CLI core correctly: both agent

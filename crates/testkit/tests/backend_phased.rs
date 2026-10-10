@@ -9,9 +9,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 
 use interflow_testkit::backend::{BackendPhase, decode_chunk, sse_backend, verify_chunk_payload};

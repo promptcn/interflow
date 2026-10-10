@@ -9,6 +9,12 @@
 //! in-process atomic sequence number + a caller-provided tag), so parallel
 //! tests/scenarios never mix up certificates. Private key files are set to
 //! 0600 as the hub's validation requires.
+//!
+//! Lifecycle: dropping a `TestCerts` removes its directory (best-effort).
+//! What Drop cannot cover — static `OnceLock` sets that never drop, panics,
+//! `kill -9` — is reclaimed by the once-per-process stale-directory sweep
+//! in [`TestCerts::generate`]: directory names embed the owning pid, so a
+//! directory whose pid is gone is garbage by construction.
 
 use std::path::{Path, PathBuf};
 
@@ -40,10 +46,85 @@ fn write_file(path: &Path, content: &str, secret: bool) -> PathBuf {
     path.to_path_buf()
 }
 
+impl Drop for TestCerts {
+    /// Best-effort on-disk cleanup. Scope safety: every in-process consumer
+    /// reaches the files only through `&self` methods, and the one
+    /// cross-process consumer (the soak runner) terminates and waits its
+    /// children before dropping its set — so by the time Drop runs no
+    /// consumer can be left. Errors are ignored on purpose: a leaked
+    /// directory is reclaimed by the stale-dir sweep, while a panicking
+    /// Drop would poison the whole test run. Static `OnceLock` sets never
+    /// drop — the sweep is their backstop.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The owning pid of an `interflow-{tag}-{pid}-{seq}` directory name, when
+/// the two trailing components are numeric (tags may contain dashes, so the
+/// pid is anchored as the second-to-last component). `None` for anything
+/// else — the sweep must only ever touch directories it can attribute to a
+/// dead interflow test process.
+fn owner_pid_of(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("interflow-")?;
+    let mut trailing = rest.rsplitn(3, '-');
+    let seq = trailing.next()?;
+    let pid = trailing.next()?;
+    trailing.next()?; // a tag must exist ahead of the pid
+    seq.parse::<u32>().ok()?;
+    pid.parse::<u32>().ok()
+}
+
+/// Signal-0 liveness probe: `kill(pid, 0)` performs no action — the classic
+/// existence check. `EPERM` means the pid exists but belongs to another
+/// user (alive — conservative skip); only `ESRCH` (no such process) counts
+/// as dead. Pid recycling can only make a dead owner look alive, never the
+/// reverse, so the sweep can never delete a live consumer's directory.
+#[cfg(unix)]
+#[allow(unsafe_code)] // workspace denies unsafe; this test-only FFI probe is the sanctioned local opt-out
+fn owner_dead(pid: u32) -> bool {
+    // SAFETY: kill(2) with signal 0 delivers nothing; the pid comes from our
+    // own directory names, and libc::kill has no preconditions beyond that.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Off unix there is no portable signal-0 probe; never report dead (the
+/// Drop cleanup still covers local instances).
+#[cfg(not(unix))]
+fn owner_dead(_pid: u32) -> bool {
+    false
+}
+
+/// Once per process: remove stale `interflow-*` cert directories whose
+/// owning pid no longer exists. Panics, `kill -9` and never-dropping static
+/// sets all leak this way; a dead owner can never have a live consumer, so
+/// removal is safe by construction. Concurrent test processes sweeping
+/// simultaneously just race to the same deletions (errors ignored).
+fn sweep_stale_dirs() {
+    static SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SWEPT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(owner_pid_of) else {
+            continue;
+        };
+        if owner_dead(pid) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 impl TestCerts {
     /// Generate CA + server certificate + a default client certificate (`client_cn` is
     /// usually the agent id; mTLS CN-binding tests depend on it).
     pub fn generate(tag: &str, client_cn: &str) -> TestCerts {
+        crate::assert_nextest_runner();
+        sweep_stale_dirs();
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =

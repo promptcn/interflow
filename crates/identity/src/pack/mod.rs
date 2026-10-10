@@ -21,6 +21,7 @@ pub mod sealed;
 use crate::PrincipalPath;
 use crate::policy::RuntimePolicy;
 use crate::trust::TrustBundle;
+use crate::{Error, Result};
 use interflow_contract::Generation;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -53,6 +54,27 @@ impl std::fmt::Display for PackKind {
     }
 }
 
+/// Canonical optional-string serde for the pack's machine formats: the key
+/// is **always written** (`None` renders as `""`) and **always required**
+/// (a missing key is a pre-canonical pack — fail closed with a re-render
+/// error, never a silent default). One byte-form per state: there is no
+/// "absent ≡ engine default" ambiguity left.
+mod canonical_opt_string {
+    pub fn serialize<S: serde::Serializer>(
+        value: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(value.as_deref().unwrap_or(""))
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        let raw: String = serde::Deserialize::deserialize(deserializer)?;
+        Ok(if raw.is_empty() { None } else { Some(raw) })
+    }
+}
+
 /// `pack.toml` — the self-describing metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,8 +84,9 @@ pub struct PackMetadata {
     pub realm: String,
     /// Agent packs carry exactly one workspace (their membership).
     /// Ingress packs serve the workspaces listed in the runtime policy
-    /// (`ingress_authorizations`) and carry one credential per workspace.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// (`ingress_authorizations`) and carry one credential per workspace;
+    /// they render `workspace = ""`.
+    #[serde(with = "canonical_opt_string")]
     pub workspace: Option<String>,
     pub node: String,
     /// Rotation generation shared by this pack and its Trust Bundle / Policy.
@@ -74,104 +97,156 @@ pub struct PackMetadata {
     pub control_endpoint: String,
     /// End-entity credential lifetime in seconds.
     pub leaf_ttl_secs: u64,
-    /// How this deployment's credentials live. Omitted on registrar packs so
-    /// their byte shape is unchanged (offline packs require a current
-    /// binary). Renewal scheduling derives from this field — pack readers
-    /// never see the server-side choice.
-    #[serde(default, skip_serializing_if = "identity_mode_is_registrar")]
+    /// How this deployment's credentials live — written unconditionally
+    /// (canonical form; renewal scheduling derives from this field, and pack
+    /// readers never see the server-side choice).
     pub identity_mode: crate::manifest::IdentityMode,
-    /// HTTPS registrar endpoint used for unattended renewal; `None` in
-    /// offline deployments (rotate/revoke are manual).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// HTTPS registrar endpoint used for unattended renewal; `""` in offline
+    /// deployments (rotate/revoke are manual).
+    #[serde(with = "canonical_opt_string")]
     pub registrar_endpoint: Option<String>,
+    /// Non-normative provenance stamp: which renderer build produced this
+    /// pack (`interflow_buildinfo::VERSION_WITH_TAG`). Purely diagnostic —
+    /// loaders never branch on it; the next format-breaking upgrade question
+    /// ("which era is this pack?") becomes read-and-diff instead of content
+    /// archaeology. Digest-covered like the rest of pack.toml.
+    pub rendered_by: String,
 }
 
-fn identity_mode_is_registrar(mode: &crate::manifest::IdentityMode) -> bool {
-    matches!(mode, crate::manifest::IdentityMode::Registrar)
-}
-
-/// Where a verifier finds the CRL for one issuer: the live `state/crls`
-/// directory first (registrar refresh), then the `trust/crls` snapshot
-/// embedded at rotate time (offline deployments). CRLs are signed by the
-/// issuer, so the snapshot needs no extra integrity story.
-pub fn crl_path_for(pack_dir: &std::path::Path, issuer_stem: &str) -> Option<std::path::PathBuf> {
+/// Where a verifier finds the CRL for one issuer — **statically determined
+/// by the deployment's identity tier**, never probed between sources.
+///
+/// Registrar packs read the node-local live-refresh directory `state/crls`
+/// (the renewal scheduler populates it and restarts onto changes; its
+/// absence merely means "not refreshed yet" — the tier's fail-loud for
+/// unrevocable credentials is the scheduler's 1h staleness bound, not the
+/// boot path). Offline packs read the apply/rotate-embedded snapshot in
+/// `trust/crls`; a missing snapshot is a **render defect** (every offline
+/// apply/rotate embeds one) and fails loud with the recovery action.
+/// Either way a stray file in the other directory can never change the
+/// CRL source. CRLs are signed by the issuer, so the snapshot needs no
+/// extra integrity story.
+/// ((internal design notes) §2;
+/// earlier contract: (internal design notes) P1-1)
+pub fn crl_path_for(
+    pack_dir: &std::path::Path,
+    mode: crate::manifest::IdentityMode,
+    issuer_stem: &str,
+) -> Result<Option<std::path::PathBuf>> {
     let file = format!("{issuer_stem}.crl.pem");
-    let live = pack_dir.join("state").join("crls").join(&file);
-    if live.is_file() {
-        return Some(live);
+    match mode {
+        crate::manifest::IdentityMode::Registrar => {
+            let live = pack_dir.join("state").join("crls").join(&file);
+            Ok(live.is_file().then_some(live))
+        }
+        crate::manifest::IdentityMode::Offline => {
+            let embedded = pack_dir.join("trust").join("crls").join(&file);
+            if embedded.is_file() {
+                Ok(Some(embedded))
+            } else {
+                Err(Error::pack(format!(
+                    "offline pack carries no embedded CRL snapshot for issuer {issuer_stem:?} \
+                     in trust/crls — a render defect; re-apply or rotate the pack"
+                )))
+            }
+        }
     }
-    let embedded = pack_dir.join("trust").join("crls").join(&file);
-    embedded.is_file().then_some(embedded)
 }
 
 /// `node.toml` — the node's runtime configuration rendered from the
 /// manifest (listen addresses, public TLS mode, agent services).
+///
+/// Canonical form: every scalar key is always written ("" = no value / face
+/// off — same rule the agent packs' `public_tls = ""` already followed), so
+/// one byte-form expresses each state. The two structural sections (`mesh`,
+/// `edge`) are the deliberate exception: a table cannot carry a null, and
+/// their **presence** is role structure (a non-mesh agent has no mesh face),
+/// not a default choice — when present, their contents are canonical and
+/// complete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub kind: PackKind,
     pub node: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The node's listener address ("" on kinds that never listen).
+    #[serde(with = "canonical_opt_string")]
     pub listen: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Control-plane listener address ("" where not served).
+    #[serde(with = "canonical_opt_string")]
     pub control_listen: Option<String>,
     /// The node's QUIC (UDP) listen address, rendered from the manifest's
     /// `quic_listen` — the control endpoint's face on ingress packs
     /// (`[ingress.<node>]`), the hub's face on hub packs
-    /// (`[mesh.hub.<name>]`). `None` keeps the QUIC transport off; the
-    /// address is already validation-checked (non-loopback, concrete
-    /// port) and parsed into the engine config at boot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// (`[mesh.hub.<name>]`). `""` keeps the QUIC transport off; a concrete
+    /// address is already validation-checked (non-loopback, concrete port)
+    /// and parsed into the engine config at boot.
+    #[serde(with = "canonical_opt_string")]
     pub quic_listen: Option<String>,
     /// Single-public-port mode (ACME topologies): connections with this
     /// SNI on the public listener are dispatched to the control plane, so
-    /// the deployment needs only 443. `None` on fronted topologies (the
-    /// front proxy's stream map owns that dispatch) and whenever the
-    /// control endpoint keeps its own port.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// the deployment needs only 443. `""` on fronted topologies (the front
+    /// proxy's stream map owns that dispatch) and whenever the control
+    /// endpoint keeps its own port.
+    #[serde(with = "canonical_opt_string")]
     pub control_dispatch_host: Option<String>,
     pub public_tls: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// ACME account contact email ("" when the manifest sets none).
+    #[serde(with = "canonical_opt_string")]
     pub public_tls_email: Option<String>,
-    /// ACME directory URL override (`None` = Let's Encrypt production).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_tls_directory: Option<String>,
+    /// ACME directory URL — the renderer resolves the unset manifest value
+    /// to the concrete Let's Encrypt production URL, so the pack always
+    /// names the directory it will dial.
+    pub public_tls_directory: String,
     /// Agent services: the manifest-issued **default** dial targets (a
     /// machine-local preference may override each one at run time; the
     /// signed policy carries the ids only).
     pub services: Vec<NodeService>,
     /// The manifest-issued **default** dial transport for an agent pack
-    /// (`"h2"` / `"quic"`; present on agent packs only when the manifest
-    /// sets it). A machine-local preference overrides it at run time;
-    /// headless nodes dial exactly this.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport: Option<String>,
+    /// (`"h2"` / `"quic"`, resolved at render time — unset becomes `"h2"`;
+    /// `""` on kinds that do not dial). A machine-local preference
+    /// overrides it at run time; headless nodes dial exactly this.
+    pub transport: String,
     /// Site-to-site runtime rules — present on mesh-role agent packs (the
     /// hub dial target plus this agent's local rules). Absent on expose
-    /// packs.
+    /// packs (structural: this pack has no mesh face).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<NodeMeshConfig>,
-    /// Ingress public-listener governance overrides (present on ingress
-    /// packs only when the manifest sets them; absent = engine defaults for
-    /// the pack's topology).
+    /// Ingress public-listener governance, **fully resolved at render time**
+    /// (manifest overrides over the deployment topology's defaults).
+    /// Present on every ingress pack; absent on kinds with no public
+    /// listener (structural).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge: Option<NodeEdgeConfig>,
 }
 
-/// Ingress `[edge]` overrides carried in `node.toml`: public-listener
-/// governance the deployment pins explicitly. Absent fields fall back to
-/// the engine's topology-aware default (the whole section is omitted from
-/// the rendered `node.toml` when the manifest sets none of it).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Ingress `[edge]` section in canonical `node.toml`: the public-listener
+/// governance this deployment pins, with every knob concrete — the renderer
+/// resolves topology defaults when the manifest leaves a field unset, so
+/// "absent ≡ engine default" and "explicit default value" collapse into one
+/// form. (The manifest side keeps its own partial-tolerant
+/// [`crate::manifest::EdgeOverrides`] for human authoring.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeEdgeConfig {
     /// Per-IP new-connection limit per minute on the public listener
-    /// (0 = unlimited). Absent = engine default for the topology
-    /// (fronted 600 / direct 30 — a front proxy opens one new connection
-    /// per proxied request, so its budget must scale with request rate,
-    /// not browser behavior).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_conn_rate_per_ip_per_minute: Option<u32>,
+    /// (0 = unlimited). Fronted topologies default to 600 (a front proxy
+    /// opens one new connection per proxied request, so its budget must
+    /// scale with request rate, not browser behavior); direct ones to 30.
+    pub new_conn_rate_per_ip_per_minute: u32,
+    /// Public-listener `X-Forwarded-For` mode: `"off"` / `"on"` /
+    /// `"required"` (fronted defaults to `required` — nothing but the front
+    /// may talk to the listener; direct defaults to `off`).
+    pub x_forwarded_for: String,
+    /// Control-listener PROXY protocol mode: `"on"` / `"off"` (fronted
+    /// defaults to `on` — the front's SNI map emits the preamble on every
+    /// target including the mTLS-passthrough control leg; direct defaults to
+    /// `off`). Loopback trust stays engine-fixed.
+    pub control_proxy_protocol: String,
+    /// ACME HTTP-01 challenge listener (`host:port`); the renderer pins the
+    /// `0.0.0.0:80` default the ACME protocol practically requires
+    /// (port-80 reachability), an explicit value moves the challenge
+    /// listener behind a forward or onto another interface.
+    pub acme_http_listen: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,16 +255,10 @@ pub struct NodeMeshConfig {
     /// The mesh hub this agent dials (`https://host:port`). The site-to-site
     /// rules themselves live in the signed policy (`policy/policy.toml`) —
     /// node-local dial info is all `node.toml` carries for the mesh face.
+    /// (Pre-separation packs that carry inline `ingress`/`egress` rules here
+    /// fail the `deny_unknown_fields` parse; re-render them with
+    /// `plan apply`.)
     pub hub_endpoint: String,
-    /// Legacy pre-policy-face fields (rules carried here before the
-    /// policy-identity separation). Parsed so an old pack gets a precise
-    /// migration error instead of a bare unknown-field parse failure;
-    /// a non-empty value is rejected at load and the renderer never
-    /// writes these.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ingress: Vec<crate::manifest::MeshIngressRule>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub egress: Vec<crate::manifest::MeshEgressRule>,
 }
 
 /// One declared agent service and its manifest-issued default address
@@ -213,6 +282,11 @@ pub struct CredentialPack {
     pub trust: TrustBundle,
     pub policy: RuntimePolicy,
     pub policy_signature: Vec<u8>,
+    /// Whether the live policy came from the node-local update channel
+    /// (`state/policy`) rather than the pack's embedded snapshot — the
+    /// provenance face for "which distribution channel this node is
+    /// actually running" (an update accepted from the hub lands there too).
+    pub policy_from_state_channel: bool,
     pub node_config: NodeConfig,
     /// sha256 over the SHA256SUMS manifest content.
     pub pack_digest: String,
@@ -308,12 +382,56 @@ service = "main/desktop/asr"
             "spiffe://promptcn/main/ingress/edge"
         );
 
+        // Canonical form (2026-10-10): pack.toml names the tier and the
+        // renderer build even on the registrar default, and every scalar
+        // key is written — "" where the value does not apply.
+        let pack_toml = std::fs::read_to_string(ingress_out.join("pack.toml")).unwrap();
+        assert!(
+            pack_toml.contains("identity_mode = \"registrar\""),
+            "the tier is always written: {pack_toml}"
+        );
+        assert!(
+            pack_toml.contains(&format!(
+                "rendered_by = \"{}\"",
+                interflow_buildinfo::VERSION_WITH_TAG
+            )),
+            "the renderer build tag is always written: {pack_toml}"
+        );
+        assert!(
+            pack_toml.contains("workspace = \"\""),
+            "ingress packs carry no single workspace: {pack_toml}"
+        );
+        let node_toml = std::fs::read_to_string(ingress_out.join("node.toml")).unwrap();
+        assert!(
+            node_toml.contains("quic_listen = \"\""),
+            "an off QUIC face is an explicit empty value: {node_toml}"
+        );
+        assert!(
+            node_toml.contains(
+                "public_tls_directory = \"https://acme-v02.api.letsencrypt.org/directory\""
+            ),
+            "the unset ACME directory resolves to the concrete production URL: {node_toml}"
+        );
+        let edge = pack
+            .node_config
+            .edge
+            .as_ref()
+            .expect("ingress edge section");
+        assert_eq!(edge.new_conn_rate_per_ip_per_minute, 30);
+        assert_eq!(edge.x_forwarded_for, "off");
+        assert_eq!(edge.control_proxy_protocol, "off");
+        assert_eq!(edge.acme_http_listen, "0.0.0.0:80");
+
         let agent_out = tmp.path().join("packs/agent-desktop");
         AgentCredentialPack::render(&issuer, &manifest, "desktop", 1, &agent_out).unwrap();
         let agent_pack = CredentialPack::load(&agent_out).unwrap();
         assert_eq!(
             agent_pack.primary_identity().unwrap().principal.to_string(),
             "spiffe://promptcn/main/agent/desktop"
+        );
+        assert_eq!(
+            agent_pack.node_config.transport, "h2",
+            "an unset manifest transport resolves to the explicit h2 default"
         );
     }
 
@@ -626,7 +744,11 @@ target_addr = "127.0.0.1:3000"
         // signed policy.
         let mesh = pack.node_config.mesh.as_ref().expect("mesh role");
         assert_eq!(mesh.hub_endpoint, "hub.example.com:6666");
-        assert!(mesh.ingress.is_empty() && mesh.egress.is_empty());
+        let node_toml = std::fs::read_to_string(out.join("node.toml")).unwrap();
+        assert!(
+            !node_toml.contains("[[mesh."),
+            "no rule tables ride node.toml: {node_toml}"
+        );
         let stream = &pack.policy.mesh[0];
         assert_eq!(stream.source_agent, "lan-a");
         assert_eq!(stream.target_agent, "lan-b");
@@ -764,11 +886,11 @@ target_addr = "127.0.0.1:3000"
         );
     }
 
-    /// Packs from before the policy-identity separation (rules in
-    /// node.toml) fail with the migration instruction, not a bare parse
-    /// error.
+    /// Packs from before the policy-identity separation (inline rules in
+    /// node.toml) are rejected by the `deny_unknown_fields` parse — the
+    /// unknown field is named, and the pack must be re-rendered.
     #[test]
-    fn pre_separation_pack_is_rejected_with_migration_hint() {
+    fn pre_separation_pack_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let issuer = mesh_issuer(&tmp);
         let manifest = Manifest::parse(&mesh_manifest_text()).unwrap();
@@ -785,10 +907,18 @@ target_addr = "127.0.0.1:3000"
         std::fs::write(out.join("node.toml"), legacy).unwrap();
         write_digests(&out).unwrap();
 
-        let err = CredentialPack::load_runtime(&out).unwrap_err().to_string();
+        let err = CredentialPack::load_runtime(&out).unwrap_err();
+        // The field name rides the error's source chain (serde detail).
+        let mut msg = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(e) = source {
+            msg.push('\n');
+            msg.push_str(&e.to_string());
+            source = e.source();
+        }
         assert!(
-            err.contains("predates the signed-policy rule face"),
-            "migration hint must be present: {err}"
+            msg.contains("unknown field") && msg.contains("ingress"),
+            "the offending field must be named: {msg}"
         );
     }
 
@@ -811,7 +941,8 @@ target_addr = "127.0.0.1:3000"
         );
 
         // Fronted topology: no in-process dispatch (the front proxy's stream
-        // map owns it), and the field stays out of node.toml entirely.
+        // map owns it) — canonical form still writes the key, as an explicit
+        // empty value.
         let fronted_text = manifest_text().replacen(
             "[ingress.edge]",
             "[public_tls]\nmode = \"frontend-proxy\"\n\n[ingress.edge]",
@@ -822,15 +953,15 @@ target_addr = "127.0.0.1:3000"
         IngressCredentialPack::render(&issuer, &fronted, "edge", 1, &out2).unwrap();
         let node_toml2 = std::fs::read_to_string(out2.join("node.toml")).unwrap();
         assert!(
-            !node_toml2.contains("control_dispatch_host"),
+            node_toml2.contains("control_dispatch_host = \"\""),
             "fronted ingress does not dispatch in-process: {node_toml2}"
         );
     }
 
     /// `[ingress.<node>.edge]` overrides ride the manifest → node.toml leg:
-    /// absent overrides render no section (old packs unchanged, engine
-    /// topology defaults apply); explicit ones land verbatim and survive the
-    /// digest-verified load.
+    /// absent overrides still render a **complete** section (the topology's
+    /// defaults, resolved at render time — the fixture is ACME/direct);
+    /// explicit ones land verbatim and survive the digest-verified load.
     #[test]
     fn ingress_edge_overrides_render_into_node_toml() {
         let tmp = tempfile::tempdir().unwrap();
@@ -844,9 +975,20 @@ target_addr = "127.0.0.1:3000"
         IngressCredentialPack::render(&issuer, &manifest, "edge", 1, &out).unwrap();
         let node_toml = std::fs::read_to_string(out.join("node.toml")).unwrap();
         assert!(
-            !node_toml.contains("[edge]"),
-            "absent manifest overrides must not render an [edge] section: {node_toml}"
+            node_toml.contains("[edge]\n"),
+            "every ingress pack carries an [edge] section: {node_toml}"
         );
+        for (key, direct_default) in [
+            ("new_conn_rate_per_ip_per_minute", "30"),
+            ("x_forwarded_for", "\"off\""),
+            ("control_proxy_protocol", "\"off\""),
+            ("acme_http_listen", "\"0.0.0.0:80\""),
+        ] {
+            assert!(
+                node_toml.contains(&format!("{key} = {direct_default}")),
+                "unset {key} resolves to the direct-topology default: {node_toml}"
+            );
+        }
 
         let tuned_text = manifest_text().replacen(
             "[workspace.main]",
@@ -861,8 +1003,9 @@ target_addr = "127.0.0.1:3000"
             pack.node_config
                 .edge
                 .as_ref()
-                .and_then(|edge| edge.new_conn_rate_per_ip_per_minute),
-            Some(120),
+                .expect("canonical edge section")
+                .new_conn_rate_per_ip_per_minute,
+            120,
             "the [edge] override must survive the digest-verified load"
         );
         let node_toml2 = std::fs::read_to_string(out2.join("node.toml")).unwrap();
@@ -872,52 +1015,155 @@ target_addr = "127.0.0.1:3000"
         );
     }
 
-    /// node.toml's `[edge]` section is optional (old packs parse), carries
-    /// its knob optionally, and stays strict against unknown fields like the
-    /// rest of NodeConfig.
+    /// node.toml's `[edge]` section is canonical (all four knobs concrete and
+    /// required) and strict (unknown fields rejected, missing fields
+    /// rejected — a pre-canonical pack fails closed with a re-render error,
+    /// never a silent engine default).
     #[test]
-    fn node_edge_config_serde_is_optional_and_strict() {
-        let base =
-            "kind = \"ingress\"\nnode = \"edge\"\npublic_tls = \"frontend-proxy\"\nservices = []\n";
-        let parsed: NodeConfig = toml::from_str(base).unwrap();
+    fn node_edge_config_serde_is_canonical_and_strict() {
+        let scalars = "kind = \"ingress\"\nnode = \"edge\"\nlisten = \"0.0.0.0:443\"\n\
+                       control_listen = \"127.0.0.1:16666\"\nquic_listen = \"\"\n\
+                       control_dispatch_host = \"\"\npublic_tls = \"frontend-proxy\"\n\
+                       public_tls_email = \"\"\npublic_tls_directory = \"\"\nservices = []\n\
+                       transport = \"\"\n";
+        let edge = "[edge]\nnew_conn_rate_per_ip_per_minute = 30\n\
+                    x_forwarded_for = \"required\"\ncontrol_proxy_protocol = \"on\"\n\
+                    acme_http_listen = \"0.0.0.0:80\"\n";
+        let full = format!("{scalars}{edge}");
+        let parsed: NodeConfig = toml::from_str(&full).unwrap();
+        let parsed_edge = parsed.edge.expect("present [edge]");
+        assert_eq!(parsed_edge.new_conn_rate_per_ip_per_minute, 30);
+        assert_eq!(parsed_edge.x_forwarded_for, "required");
+        assert_eq!(parsed_edge.control_proxy_protocol, "on");
+        assert_eq!(parsed_edge.acme_http_listen, "0.0.0.0:80");
         assert!(
-            parsed.edge.is_none(),
-            "a node.toml without [edge] must parse"
-        );
-        assert!(
-            parsed.quic_listen.is_none() && parsed.transport.is_none(),
-            "absent QUIC fields default to off/h2 (old packs parse unchanged)"
+            parsed.quic_listen.is_none() && parsed.transport.is_empty(),
+            "the explicit empty value reads back as off / no-dial-face"
         );
 
-        // 0 = unlimited is a legitimate explicit override and must survive.
-        let with_edge = format!("{base}\n[edge]\nnew_conn_rate_per_ip_per_minute = 0\n");
-        let parsed: NodeConfig = toml::from_str(&with_edge).unwrap();
+        // Every canonical scalar key is required: dropping one is a
+        // pre-canonical pack, not a silent default.
+        for key in ["quic_listen", "transport", "public_tls_directory"] {
+            let stripped = full
+                .lines()
+                .filter(|line| !line.starts_with(key))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let err = toml::from_str::<NodeConfig>(&stripped).unwrap_err();
+            assert!(
+                err.to_string().contains("missing field"),
+                "dropping {key} must fail closed (missing field), got: {err}"
+            );
+        }
+
+        // Every [edge] knob is required: a partial section is a render
+        // defect, not "absent ≡ topology default".
+        let partial = format!("{scalars}[edge]\nnew_conn_rate_per_ip_per_minute = 0\n");
+        let err = toml::from_str::<NodeConfig>(&partial).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field"),
+            "a partial [edge] section must fail closed, got: {err}"
+        );
+        // 0 = unlimited is a legitimate explicit override and survives.
+        let unlimited = full.replace(
+            "new_conn_rate_per_ip_per_minute = 30",
+            "new_conn_rate_per_ip_per_minute = 0",
+        );
+        let parsed: NodeConfig = toml::from_str(&unlimited).unwrap();
         assert_eq!(
             parsed.edge.unwrap().new_conn_rate_per_ip_per_minute,
-            Some(0)
+            0,
+            "0 (unlimited) must survive the round trip"
         );
 
-        let empty_section = format!("{base}\n[edge]\n");
-        let parsed: NodeConfig = toml::from_str(&empty_section).unwrap();
-        assert_eq!(
-            parsed.edge.unwrap(),
-            NodeEdgeConfig {
-                new_conn_rate_per_ip_per_minute: None
-            },
-            "a present-but-empty [edge] still means topology defaults"
-        );
-
-        let garbage = format!("{base}\n[edge]\nsurprise = 1\n");
+        let garbage = format!("{scalars}[edge]\nsurprise = 1\n");
         assert!(
             toml::from_str::<NodeConfig>(&garbage).is_err(),
             "unknown [edge] fields must be rejected (deny_unknown_fields)"
         );
     }
 
+    /// The canonical optional-string helper: one byte-form per state — `None`
+    /// renders as "" and parses back to `None`; a missing key is an error.
+    #[test]
+    fn canonical_opt_string_has_one_byte_form() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Debug)]
+        struct Holder {
+            #[serde(with = "super::canonical_opt_string")]
+            value: Option<String>,
+        }
+        let none = toml::to_string(&Holder { value: None }).unwrap();
+        assert!(
+            none.contains("value = \"\""),
+            "None renders as the explicit empty string: {none}"
+        );
+        let round: Holder = toml::from_str(&none).unwrap();
+        assert_eq!(round.value, None);
+
+        let some = toml::to_string(&Holder {
+            value: Some("0.0.0.0:16666".to_owned()),
+        })
+        .unwrap();
+        assert!(some.contains("value = \"0.0.0.0:16666\""));
+        let round: Holder = toml::from_str(&some).unwrap();
+        assert_eq!(round.value.as_deref(), Some("0.0.0.0:16666"));
+
+        assert!(
+            toml::from_str::<Holder>("").is_err(),
+            "a missing key must fail closed (pre-canonical byte shape)"
+        );
+    }
+
+    /// The CRL source is statically pinned by the identity tier — never
+    /// probed between directories. Registrar: the live `state/crls` only
+    /// (absent = Ok(None), the scheduler's convergence). Offline: the
+    /// embedded `trust/crls` only (absent = render defect, fail loud). A
+    /// stray file in the other directory changes nothing.
+    #[test]
+    fn crl_path_is_pinned_by_identity_mode() {
+        use crate::manifest::IdentityMode;
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("state/crls/control.crl.pem");
+        let embedded = tmp.path().join("trust/crls/control.crl.pem");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(embedded.parent().unwrap()).unwrap();
+
+        // Both present: each tier reads its own directory, no preference
+        // probing between them.
+        std::fs::write(&live, "live").unwrap();
+        std::fs::write(&embedded, "embedded").unwrap();
+        assert_eq!(
+            crl_path_for(tmp.path(), IdentityMode::Registrar, "control").unwrap(),
+            Some(live.clone())
+        );
+        assert_eq!(
+            crl_path_for(tmp.path(), IdentityMode::Offline, "control").unwrap(),
+            Some(embedded.clone())
+        );
+
+        // Registrar with no live file yet (fresh install before the first
+        // scheduler refresh): absence is a lifecycle fact, not an error —
+        // and the embedded snapshot must NOT be silently consulted.
+        std::fs::remove_file(&live).unwrap();
+        assert_eq!(
+            crl_path_for(tmp.path(), IdentityMode::Registrar, "control").unwrap(),
+            None
+        );
+
+        // Offline with no embedded snapshot: render defect, fail loud with
+        // the recovery action.
+        std::fs::remove_file(&embedded).unwrap();
+        let err = crl_path_for(tmp.path(), IdentityMode::Offline, "control").unwrap_err();
+        assert!(
+            err.to_string().contains("render defect"),
+            "wrong error: {err}"
+        );
+    }
+
     /// The QUIC face and the agent dial transport ride the manifest →
-    /// node.toml leg: absent fields render nothing (old packs unchanged,
-    /// engine defaults apply); explicit ones land verbatim and survive the
-    /// digest-verified load.
+    /// node.toml leg: unset fields render their **explicit** canonical value
+    /// (`quic_listen = ""` = off, `transport = "h2"` = the resolved default);
+    /// explicit ones land verbatim and survive the digest-verified load.
     #[test]
     fn quic_fields_render_into_node_toml() {
         let tmp = tempfile::tempdir().unwrap();
@@ -926,22 +1172,22 @@ target_addr = "127.0.0.1:3000"
         issuer.ensure_workspace("main").unwrap();
         issuer.ensure_policy_key().unwrap();
 
-        // Absent: neither field renders, and the loaded pack reports both
-        // as None (the h2-only status quo, byte-identical node.toml).
+        // Unset: both keys are still written — an off QUIC face and the
+        // resolved h2 default are explicit values, not absent keys.
         let manifest = Manifest::parse(&manifest_text()).unwrap();
         let out = tmp.path().join("packs/ingress-edge");
         IngressCredentialPack::render(&issuer, &manifest, "edge", 1, &out).unwrap();
         let node_toml = std::fs::read_to_string(out.join("node.toml")).unwrap();
         assert!(
-            !node_toml.contains("quic_listen"),
-            "absent quic_listen must not render: {node_toml}"
+            node_toml.contains("quic_listen = \"\""),
+            "an unset quic_listen renders as the explicit empty value: {node_toml}"
         );
         let agent_out = tmp.path().join("packs/agent-desktop");
         AgentCredentialPack::render(&issuer, &manifest, "desktop", 1, &agent_out).unwrap();
         let agent_toml = std::fs::read_to_string(agent_out.join("node.toml")).unwrap();
         assert!(
-            !agent_toml.contains("transport"),
-            "absent transport must not render: {agent_toml}"
+            agent_toml.contains("transport = \"h2\""),
+            "an unset transport resolves to the explicit h2: {agent_toml}"
         );
 
         // Explicit: the fixture's control endpoint carries an explicit
@@ -976,16 +1222,15 @@ target_addr = "127.0.0.1:3000"
         AgentCredentialPack::render(&issuer, &tuned, "desktop", 1, &agent_out2).unwrap();
         let agent_pack = CredentialPack::load(&agent_out2).unwrap();
         assert_eq!(
-            agent_pack.node_config.transport.as_deref(),
-            Some("quic"),
+            agent_pack.node_config.transport, "quic",
             "the signed transport default must survive the digest-verified load"
         );
     }
 
     /// The mesh face rides the same manifest → node.toml leg as the expose
     /// face: the hub's `quic_listen` and a mesh agent's dial `transport`
-    /// render nothing when absent (old packs byte-identical) and land
-    /// verbatim — surviving the digest-verified load — when set.
+    /// render their explicit canonical values when unset (`""` / `"h2"`)
+    /// and land verbatim — surviving the digest-verified load — when set.
     #[test]
     fn mesh_quic_fields_render_into_node_toml() {
         let tmp = tempfile::tempdir().unwrap();
@@ -995,22 +1240,21 @@ target_addr = "127.0.0.1:3000"
         issuer.ensure_workspace("beta").unwrap();
         issuer.ensure_policy_key().unwrap();
 
-        // Absent: neither field renders (the h2-only status quo,
-        // byte-identical node.toml).
+        // Unset: both keys are still written (canonical form).
         let manifest = Manifest::parse(&mesh_manifest_text()).unwrap();
         let hub_out = tmp.path().join("packs/hub-central");
         HubCredentialPack::render(&issuer, &manifest, "central", 1, &hub_out).unwrap();
         let node_toml = std::fs::read_to_string(hub_out.join("node.toml")).unwrap();
         assert!(
-            !node_toml.contains("quic_listen"),
-            "absent hub quic_listen must not render: {node_toml}"
+            node_toml.contains("quic_listen = \"\""),
+            "an unset hub quic_listen renders as the explicit empty value: {node_toml}"
         );
         let agent_out = tmp.path().join("packs/agent-lan-a");
         AgentCredentialPack::render(&issuer, &manifest, "lan-a", 1, &agent_out).unwrap();
         let agent_toml = std::fs::read_to_string(agent_out.join("node.toml")).unwrap();
         assert!(
-            !agent_toml.contains("transport"),
-            "absent transport must not render: {agent_toml}"
+            agent_toml.contains("transport = \"h2\""),
+            "an unset transport resolves to the explicit h2: {agent_toml}"
         );
 
         // Explicit: the hub endpoint carries an explicit port, so the quic
@@ -1047,8 +1291,7 @@ target_addr = "127.0.0.1:3000"
         AgentCredentialPack::render(&issuer, &tuned, "lan-a", 1, &agent_out2).unwrap();
         let agent_pack = CredentialPack::load(&agent_out2).unwrap();
         assert_eq!(
-            agent_pack.node_config.transport.as_deref(),
-            Some("quic"),
+            agent_pack.node_config.transport, "quic",
             "the signed transport default must survive the digest-verified load"
         );
     }

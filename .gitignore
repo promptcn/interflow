@@ -18,6 +18,12 @@ artifacts/
 *.token
 *.token.*
 
+# Live deployment configs, tuned in place as operational state (not source;
+# untracked 2026-10-08). Final baseline of each stays in git history — compare
+# against the last known-good via `git show HEAD:<path>`. READMEs and start
+# scripts under deployments/ remain tracked.
+deployments/**/interflow.toml
+
 # Certificates and keys never enter git (policy: 2026-09-15; history purged the
 # same day — any cert material is issued on demand by the offline issuer and
 # lives only on the machine that runs it)
@@ -39,6 +45,10 @@ certs/
 .vscode/
 .zcode/
 *.swp
+
+# AI agent working instructions: local-only, each machine keeps its own
+# (untracked 2026-10-10; baseline preserved in git history at dc85e69)
+CLAUDE.md
 
 # local reference data (unrelated to build)
 /data/

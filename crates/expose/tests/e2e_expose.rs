@@ -17,9 +17,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_expose::client::{ExposeArgs, LocalService};
 use interflow_expose::edge::{
@@ -129,6 +127,8 @@ async fn full_edge_expose_round_trip() {
         ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
+
+        identity_offline: false,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(
@@ -268,6 +268,8 @@ async fn two_services_route_by_id_not_position() {
         ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
+
+        identity_offline: false,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(

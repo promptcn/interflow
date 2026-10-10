@@ -170,7 +170,7 @@ fn full_identity_first_flow() {
             "--pack",
             &agent.display().to_string(),
             "--reason",
-            "test",
+            "cessation-of-operation",
         ],
         &[],
     );

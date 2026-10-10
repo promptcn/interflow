@@ -8,7 +8,7 @@
 use crate::config::{AgentConfig, EgressRule, IngressRule};
 use serde::Serialize;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tracing::info;
 
 /// Rule origin: seeded from the startup policy / changed at runtime via the
@@ -64,6 +64,29 @@ struct Inner {
 /// Rule truth shared across sessions.
 pub struct RuleStore {
     inner: RwLock<Inner>,
+    /// Log attribution (`AgentInfo::effective_log_name`): carried on the
+    /// audit lines so rule mutations are attributable to a node.
+    node: String,
+    /// Bumped on every mutation so runtime faces (ingress listeners, egress
+    /// matching) can reconcile level-triggered: they subscribe via
+    /// [`RuleStore::version_rx`] and re-derive their runtime state from the
+    /// store, never from a pushed snapshot. A missed wake-up (or a send
+    /// that raced a session teardown) only delays the next reconcile —
+    /// the store, not a message, is the desired-state truth.
+    version: watch::Sender<u64>,
+}
+
+impl RuleStore {
+    fn bump(&self) {
+        self.version.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    /// Subscribe to change notifications. Every mutation (control-API
+    /// add/remove, signed-policy replace) bumps the version; observers
+    /// reconcile from `ingress_snapshot`/`egress_snapshot` on wake.
+    pub fn version_rx(&self) -> watch::Receiver<u64> {
+        self.version.subscribe()
+    }
 }
 
 fn rule_change(kind: &'static str, operation: &'static str, result: &'static str) {
@@ -74,6 +97,7 @@ fn rule_change(kind: &'static str, operation: &'static str, result: &'static str
 impl RuleStore {
     /// Build from the startup config.
     pub fn from_config(config: &AgentConfig) -> Arc<Self> {
+        let (version, _) = watch::channel(0);
         Arc::new(Self {
             inner: RwLock::new(Inner {
                 ingress: config
@@ -89,6 +113,8 @@ impl RuleStore {
                     .map(|r| (r, RuleOrigin::Startup))
                     .collect(),
             }),
+            node: config.agent.effective_log_name().to_string(),
+            version,
         })
     }
 
@@ -98,8 +124,9 @@ impl RuleStore {
         let mut inner = self.inner.write().await;
         upsert(&mut inner.ingress, rule, RuleOrigin::Api);
         drop(inner);
+        self.bump();
         rule_change("ingress", "add", "ok");
-        info!(target: "audit", rule = %name, kind = "ingress", "control API added ingress rule");
+        info!(target: "audit", node = %self.node, rule = %name, kind = "ingress", "control API added ingress rule");
         Ok(())
     }
 
@@ -111,8 +138,9 @@ impl RuleStore {
         }
         inner.ingress.retain(|(r, _)| r.name != name);
         drop(inner);
+        self.bump();
         rule_change("ingress", "remove", "ok");
-        info!(target: "audit", rule = name, "control API removed ingress rule");
+        info!(target: "audit", node = %self.node, rule = name, "control API removed ingress rule");
         Ok(())
     }
 
@@ -122,8 +150,9 @@ impl RuleStore {
         let mut inner = self.inner.write().await;
         upsert(&mut inner.egress, rule, RuleOrigin::Api);
         drop(inner);
+        self.bump();
         rule_change("egress", "add", "ok");
-        info!(target: "audit", rule = %name, kind = "egress", "control API added egress rule");
+        info!(target: "audit", node = %self.node, rule = %name, kind = "egress", "control API added egress rule");
         Ok(())
     }
 
@@ -135,8 +164,9 @@ impl RuleStore {
         }
         inner.egress.retain(|(r, _)| r.name != name);
         drop(inner);
+        self.bump();
         rule_change("egress", "remove", "ok");
-        info!(target: "audit", rule = name, "control API removed egress rule");
+        info!(target: "audit", node = %self.node, rule = name, "control API removed egress rule");
         Ok(())
     }
 
@@ -149,8 +179,9 @@ impl RuleStore {
         let mut inner = self.inner.write().await;
         inner.ingress = rules.into_iter().map(|r| (r, RuleOrigin::Policy)).collect();
         drop(inner);
+        self.bump();
         rule_change("ingress", "replace", "ok");
-        info!(target: "audit", kind = "ingress", count = n, "policy reload replaced ingress rules");
+        info!(target: "audit", node = %self.node, kind = "ingress", count = n, "policy reload replaced ingress rules");
     }
 
     /// Wholesale egress replacement from a verified signed-policy reload
@@ -160,8 +191,9 @@ impl RuleStore {
         let mut inner = self.inner.write().await;
         inner.egress = rules.into_iter().map(|r| (r, RuleOrigin::Policy)).collect();
         drop(inner);
+        self.bump();
         rule_change("egress", "replace", "ok");
-        info!(target: "audit", kind = "egress", count = n, "policy reload replaced egress rules");
+        info!(target: "audit", node = %self.node, kind = "egress", count = n, "policy reload replaced egress rules");
     }
 
     /// Ingress rule snapshot (for the handler to start listeners).

@@ -18,9 +18,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_mesh::agent::handle::{AgentHandle, AgentState};
 use interflow_testkit::{agent_config, hub_config, spawn_hub};

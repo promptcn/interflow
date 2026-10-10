@@ -45,7 +45,7 @@
 
 use interflow_identity::credentials::ActiveCredentialSet;
 use interflow_identity::manifest::{MeshEgressRule, MeshIngressRule};
-use interflow_identity::pack::{CredentialPack, NodeMeshConfig, PackKind};
+use interflow_identity::pack::{CredentialPack, PackKind};
 use interflow_mesh::agent::{
     AgentClient, AgentHandle, AgentState, RestartDecision, SupervisorRestartPolicy,
 };
@@ -134,9 +134,9 @@ pub struct PackInfo {
     pub control_endpoint: String,
     /// Expose services declared in the pack (id + default address).
     pub services: Vec<PackService>,
-    /// Site-to-site rules the pack carries (mesh agents; the rule counts
-    /// derive from its vecs).
-    pub mesh: Option<NodeMeshConfig>,
+    /// Site-to-site face of the pack (mesh agents; the rule counts derive
+    /// from its vecs).
+    pub mesh: Option<PackMeshRules>,
     /// Listen address (hub/ingress).
     pub listen: Option<String>,
     /// Dial transport the pack declares as its signed default (expose
@@ -159,6 +159,177 @@ pub struct CredentialHealth {
     pub remaining_secs: i64,
     /// Phase: healthy / warn (<20% of the TTL) / critical (<10%).
     pub phase: interflow_identity::expiry::LeafPhase,
+}
+
+/// The policy plane's live face for one mesh agent node — "which policy
+/// generation is this node actually running, from which channel, and is
+/// the hub ahead or behind it" (2026-10-06 policy-health surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyPlane {
+    /// The generation this node currently runs (the state/policy override
+    /// when present, the pack's embedded snapshot otherwise).
+    pub generation: u64,
+    /// Which face the live policy came from.
+    pub source: PolicySource,
+    /// The hub's serving generation as of the watcher's last control-plane
+    /// poll; `None` = never polled / the hub did not report / node not
+    /// running. A value BELOW `generation` is the lineage-deadlock
+    /// signature.
+    pub hub_generation: Option<u64>,
+    /// The control-plane pull's own health while the node runs; `None` =
+    /// the node is stopped (the watcher is not alive to report).
+    pub pull: Option<PullHealth>,
+}
+
+impl PolicyPlane {
+    /// Assembles the live face from a watcher snapshot — the one
+    /// construction both consumption paths share (the `policy_plane` query
+    /// and the event forwarder), so a value shown on demand and a value
+    /// pushed as an event can never disagree.
+    fn live(snap: interflow_mesh::agent::PolicyWatchSnapshot) -> Self {
+        Self {
+            generation: snap.seen,
+            source: if snap.state_channel {
+                PolicySource::StatePolicy
+            } else {
+                PolicySource::Pack
+            },
+            // 0 = the hub did not report one (never polled / no tunnel).
+            hub_generation: (snap.hub_generation > 0).then_some(snap.hub_generation),
+            // The control-plane pull's own health — the 2026-10-07
+            // lesson: "never completed a pull" on a connected agent is
+            // a dead distribution plane, and it must be readable as
+            // such, not as an absent field.
+            pull: Some(PullHealth {
+                last_ok_unix: snap.pull_last_ok_unix,
+                failures_total: snap.pull_failures_total,
+                last_tick_unix: snap.last_tick_unix,
+            }),
+        }
+    }
+}
+
+/// The hub control-plane pull channel's liveness face — the distribution
+/// plane's own health, separate from whichever generation it delivered
+/// (2026-10-07: a channel that never completes a pull looked identical to
+/// a hub with nothing to say, and the distinction is the difference
+/// between a working mesh and an 8-day-frozen one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullHealth {
+    /// Unix seconds of the last completed pull (`UpToDate` or `Update`
+    /// alike). `0` = never completed one — on a connected agent this is a
+    /// dead distribution plane, not an idle one.
+    pub last_ok_unix: u64,
+    /// Total failed pull attempts since the node started (each is also a
+    /// warn-once log line at the engine level).
+    pub failures_total: u64,
+    /// Unix seconds of the watcher's most recent wake. Frozen in the past
+    /// while the node runs = the watcher task itself is dead.
+    pub last_tick_unix: u64,
+}
+
+/// Which distribution face a node's live policy came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicySource {
+    /// The pack's embedded snapshot.
+    Pack,
+    /// The node-local update channel (`state/policy`) — hub pulls and
+    /// manual injections land here.
+    StatePolicy,
+}
+
+/// The peer plane's live face for one mesh agent node — "who else is in
+/// the tenant's fleet, is each peer reachable right now, and how is each
+/// peer's leaf credential doing" (the 2026-10-08 peer-observability
+/// surface: the first local answer to "is the far end up", which used to
+/// require hub-journal forensics). Information-minimal by design: name,
+/// presence, leaf phase — nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeersPlane {
+    /// The tenant's registered agents, self excluded (sorted by id).
+    pub peers: Vec<PeerStatus>,
+    /// Unix seconds of the last successful fetch; `0` = never fetched.
+    pub last_ok_unix: u64,
+    /// Failed fetches since the node started (each also a warn-once log
+    /// line at the engine level).
+    pub failures_total: u64,
+}
+
+impl PeersPlane {
+    /// Assembles the live face from a watcher snapshot — the one
+    /// construction the query path and the event forwarder share (same
+    /// contract as [`PolicyPlane::live`]).
+    fn live(snap: interflow_mesh::agent::PeerWatchSnapshot) -> Self {
+        Self {
+            peers: snap
+                .peers
+                .into_iter()
+                .map(|p| PeerStatus {
+                    agent: p.agent,
+                    online: p.online,
+                    leaf_phase: p.leaf_expiry.as_ref().map(|l| l.phase),
+                    leaf_remaining_secs: p.leaf_expiry.as_ref().map_or(0, |l| l.remaining_secs),
+                    leaf_not_after_unix: p.leaf_expiry.as_ref().map_or(0, |l| l.not_after_unix),
+                })
+                .collect(),
+            last_ok_unix: snap.last_ok_unix,
+            failures_total: snap.failures_total,
+        }
+    }
+}
+
+/// One peer of the tenant's fleet as the node's peer watcher reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerStatus {
+    /// Qualified peer id (`tenant/agent`).
+    pub agent: String,
+    /// Presence: a QUIC relay session in place, or an h2 poll body in
+    /// place / within reconnect grace. `registered ≠ reachable`.
+    pub online: bool,
+    /// The peer's leaf-health phase (`None` = its leaf did not parse).
+    /// Same warn/critical tiering the node's own credential face uses —
+    /// the colors match across self and peers.
+    pub leaf_phase: Option<interflow_core::tunnel::transport::PeerLeafPhase>,
+    /// Seconds of leaf validity remaining (`0` with phase `None`).
+    pub leaf_remaining_secs: i64,
+    /// The leaf's `notAfter` unix seconds (`0` with phase `None`).
+    pub leaf_not_after_unix: i64,
+}
+
+/// The listeners plane's live face for one mesh agent node — every ingress
+/// rule's actual listener state (the actual-state counterpart of the rule
+/// store: the policy face can say "generation green" while a listener is
+/// gone; this answers what is really listening). The honesty axis the
+/// 2026-10-09 one-way-blackhole case demanded at the GUI layer: a green
+/// session card plus a dead listener must be visible as exactly that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerStatusFace {
+    /// The ingress rule the listener serves.
+    pub rule: String,
+    /// The actually-bound address (`None` = no listener is up for the rule).
+    pub bound_addr: Option<String>,
+    /// The last bind failure (`None` = healthy).
+    pub last_error: Option<String>,
+}
+
+impl ListenerStatusFace {
+    /// Assembles the live face from the engine table — the one construction
+    /// the query path and the event forwarder share (same contract as
+    /// [`PeersPlane::live`]).
+    fn live(
+        snap: std::collections::HashMap<String, interflow_mesh::agent::ListenerStatus>,
+    ) -> Vec<Self> {
+        let mut faces: Vec<Self> = snap
+            .into_iter()
+            .map(|(rule, status)| Self {
+                rule,
+                bound_addr: status.bound_addr.map(|a| a.to_string()),
+                last_error: status.last_error,
+            })
+            .collect();
+        faces.sort_by(|a, b| a.rule.cmp(&b.rule));
+        faces
+    }
 }
 
 /// Computes a pack's credential health: from its ACTIVE credential set
@@ -193,17 +364,21 @@ pub fn pack_credential_health(pack: &CredentialPack) -> Option<CredentialHealth>
     })
 }
 
-/// Inspects a pack directory through the shared validation funnel — the same
-/// `CredentialPack::load_runtime` the start path uses, so a pack that
-/// inspects clean also starts clean (the 2026-09-18 papercuts lesson:
-/// validation lives in the shared layer, not the GUI).
-pub fn inspect_pack(pack_dir: &Path) -> Result<PackInfo, String> {
-    let pack = CredentialPack::load_runtime(pack_dir)
-        .map_err(|e| format!("Credential Pack rejected: {e}"))?;
-    // Mesh rules display from the AUTHORITATIVE policy face (state/policy
-    // override included — what the engine actually runs), same as
-    // `build_agent_config`; node.toml carries only the dial target.
-    let mesh = pack.node_config.mesh.as_ref().map(|mesh| NodeMeshConfig {
+/// Mesh display model for one node: the hub dial target (from `node.toml`,
+/// which carries dial info only) plus the rules this node runs. The rules
+/// come from the AUTHORITATIVE policy face (state/policy override included
+/// — what the engine actually runs, same as `build_agent_config`), never
+/// from node.toml.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PackMeshRules {
+    pub hub_endpoint: String,
+    pub ingress: Vec<MeshIngressRule>,
+    pub egress: Vec<MeshEgressRule>,
+}
+
+/// The mesh display model of a loaded pack (`None` for non-mesh packs).
+fn mesh_rules_from_pack(pack: &CredentialPack) -> Option<PackMeshRules> {
+    pack.node_config.mesh.as_ref().map(|mesh| PackMeshRules {
         hub_endpoint: mesh.hub_endpoint.clone(),
         ingress: pack
             .policy
@@ -232,7 +407,17 @@ pub fn inspect_pack(pack_dir: &Path) -> Result<PackInfo, String> {
                 udp_idle_timeout_secs: o.udp_idle_timeout_secs,
             })
             .collect(),
-    });
+    })
+}
+
+/// Inspects a pack directory through the shared validation funnel — the same
+/// `CredentialPack::load_runtime` the start path uses, so a pack that
+/// inspects clean also starts clean (the 2026-09-18 papercuts lesson:
+/// validation lives in the shared layer, not the GUI).
+pub fn inspect_pack(pack_dir: &Path) -> Result<PackInfo, String> {
+    let pack = CredentialPack::load_runtime(pack_dir)
+        .map_err(|e| format!("Credential Pack rejected: {e}"))?;
+    let mesh = mesh_rules_from_pack(&pack);
     Ok(PackInfo {
         kind: NodeKind::classify(&pack),
         name: pack.metadata.node.clone(),
@@ -251,7 +436,8 @@ pub fn inspect_pack(pack_dir: &Path) -> Result<PackInfo, String> {
             .collect(),
         mesh,
         listen: pack.node_config.listen.clone(),
-        transport: pack.node_config.transport.clone(),
+        transport: (!pack.node_config.transport.is_empty())
+            .then(|| pack.node_config.transport.clone()),
         credential: pack_credential_health(&pack),
     })
 }
@@ -290,7 +476,7 @@ pub struct NodeSpec {
     /// Site-to-site rules the pack declares (mesh agents). Display cache in
     /// the same spirit as `pack_services`: the pack is the signed truth, the
     /// GUI shows it read-only — `prepare` re-reads the pack to run.
-    pub pack_mesh: Option<NodeMeshConfig>,
+    pub pack_mesh: Option<PackMeshRules>,
     /// Public/control listener the pack declares (hub/ingress). Display
     /// cache, same lifecycle as `pack_services`.
     pub pack_listen: Option<String>,
@@ -398,13 +584,18 @@ impl From<HubLifecycle> for NodeState {
 #[allow(clippy::large_enum_variant)]
 enum Prepared {
     Expose(interflow_expose::client::ExposeArgs),
-    /// The mesh agent config plus its pack dir — the signed-policy reload
-    /// watcher polls the pack's `state/policy` update channel from the dir.
+    /// The mesh agent config. The signed-policy plane (and the pack dir it
+    /// reads) rides the config itself — the engine spawns its own watcher
+    /// at start.
     Mesh {
         config: AgentConfig,
-        pack_dir: std::path::PathBuf,
     },
-    Hub(HubConfig),
+    /// The hub config — the signed-policy ACL watcher rides the engine's
+    /// run future via the config's policy plane (pack_dir embedded by
+    /// `build_hub_config`); the GUI spawns nothing itself.
+    Hub {
+        config: HubConfig,
+    },
     Ingress(interflow_expose::edge::EdgeConfig),
 }
 
@@ -432,7 +623,7 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
             // same resolver `agent run --pack` uses.
             let transport = interflow_cli::runtime::resolve_effective_transport(
                 spec.transport,
-                pack.node_config.transport.as_deref(),
+                pack.node_config.transport.as_str(),
             )
             .map_err(|e| format!("cannot start from this Credential Pack: {e}"))?;
             let mut args = interflow_cli::runtime::build_agent_args(
@@ -472,7 +663,7 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
             // endpoint — same single-source helper the pack path uses.
             config.agent.transport = interflow_cli::runtime::resolve_effective_transport(
                 spec.transport,
-                pack.node_config.transport.as_deref(),
+                pack.node_config.transport.as_str(),
             )
             .map_err(|e| format!("cannot start from this Credential Pack: {e}"))?;
             let quic_addr = spec
@@ -487,10 +678,7 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
                 });
             config.agent.hub_quic_addr = quic_addr;
             config.agent.log_name = Some(log_attribution(spec));
-            Ok(Prepared::Mesh {
-                config,
-                pack_dir: dir,
-            })
+            Ok(Prepared::Mesh { config })
         }
         NodeKind::Hub => {
             if pack.metadata.kind != PackKind::Hub {
@@ -502,7 +690,7 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
             let mut config = interflow_mesh::pack::build_hub_config(&pack, &active, &dir)
                 .map_err(|e| format!("cannot start from this Credential Pack: {e}"))?;
             config.server.node_name = Some(log_attribution(spec));
-            Ok(Prepared::Hub(config))
+            Ok(Prepared::Hub { config })
         }
         NodeKind::Ingress => {
             if pack.metadata.kind != PackKind::Ingress {
@@ -525,13 +713,8 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
 /// validation then fails with its own pointed message.
 /// A running engine, normalized.
 enum Engine {
-    Agent {
-        handle: AgentHandle,
-        /// The signed-policy reload watcher (mesh agents only); aborted
-        /// together with the engine on stop.
-        policy_watcher: Option<tokio::task::JoinHandle<()>>,
-    },
-    Hub(HubHandle),
+    Agent { handle: AgentHandle },
+    Hub { handle: HubHandle },
     Ingress(FutureEngine),
 }
 
@@ -546,23 +729,18 @@ impl Engine {
             }
             // The hub monitor reaches a terminal lifecycle when (and only
             // when) the run future ended.
-            Self::Hub(h) => !h.is_finished(),
+            Self::Hub { handle, .. } => !handle.is_finished(),
             Self::Ingress(e) => !matches!(e.state(), NodeState::Stopped | NodeState::Failed { .. }),
         }
     }
 
     async fn shutdown_graceful(self) -> Result<(), String> {
         match self {
-            Self::Agent {
-                handle,
-                policy_watcher,
-            } => {
-                if let Some(watcher) = policy_watcher {
-                    watcher.abort();
-                }
-                handle.shutdown_graceful().await.map_err(|e| e.to_string())
-            }
-            Self::Hub(h) => h.shutdown_graceful().await.map_err(|e| e.to_string()),
+            // The policy watchers ride the handles' own task groups (the
+            // engines run them intrinsically) — no per-surface abort left
+            // to forget.
+            Self::Agent { handle } => handle.shutdown_graceful().await.map_err(|e| e.to_string()),
+            Self::Hub { handle } => handle.shutdown_graceful().await.map_err(|e| e.to_string()),
             Self::Ingress(e) => e.shutdown_graceful().await,
         }
     }
@@ -727,6 +905,30 @@ pub type StateSink = Arc<dyn Fn(&str, &NodeState) + Send + Sync>;
 /// profile writes (no concurrent `save` interleaving from parallel
 /// start/stop paths).
 pub type PersistSink = Arc<dyn Fn(&[crate::profile::NodeEntry]) + Send + Sync>;
+/// Delivers a running mesh agent's policy-plane telemetry to the UI (wired
+/// to the frontend `policy-plane` event). Fired by the forwarder task each
+/// time the engine's watcher publishes a changed snapshot — the 2026-10-07
+/// stale-panel bug was exactly this face missing: the panel sampled the
+/// watcher's atomics once at node start and nothing ever told it the values
+/// had moved. Same consumer contract as [`StateSink`].
+pub type PolicySink = Arc<dyn Fn(&str, &PolicyPlane) + Send + Sync>;
+/// Delivers a running mesh agent's peer-plane telemetry to the UI (wired
+/// to the frontend `mesh-peers` event). Fired by the forwarder task each
+/// time the engine's peer watcher publishes a changed snapshot — same
+/// push-not-poll contract as [`PolicySink`], so the Peers section can
+/// never freeze on its start-time reading.
+pub type PeersSink = Arc<dyn Fn(&str, &PeersPlane) + Send + Sync>;
+/// Delivers a running mesh agent's proposal receipts to the UI (wired to
+/// the frontend `mesh-proposals` event). Same push-not-poll contract as
+/// [`PeersSink`].
+pub type ProposalsSink =
+    Arc<dyn Fn(&str, &[interflow_core::tunnel::transport::ProposalReceipt]) + Send + Sync>;
+/// Delivers a running mesh agent's ingress-listener actual state to the UI
+/// (wired to the frontend `mesh-listeners` event). Fired by the forwarder
+/// task each time the engine's reconciler records a bind or a failure —
+/// the honesty axis of the 2026-10-09 case: a green card plus a gone
+/// listener must surface as exactly that, not as nothing.
+pub type ListenersSink = Arc<dyn Fn(&str, &[ListenerStatusFace]) + Send + Sync>;
 
 /// What the manager tells its sinks, in order. Mutation code only ever
 /// *sends* these — inside the critical section, right where the state is
@@ -741,6 +943,34 @@ enum ManagerEvent {
     },
     Persist {
         entries: Vec<crate::profile::NodeEntry>,
+    },
+    /// A running mesh agent's policy telemetry moved (forwarder task →
+    /// [`PolicySink`]). Sent outside the critical section — unlike
+    /// State/Persist it mirrors engine-side atomics, not manager state.
+    PolicyPlane {
+        id: NodeId,
+        plane: PolicyPlane,
+    },
+    /// A running mesh agent's peer telemetry moved (forwarder task →
+    /// [`PeersSink`]). Mirrors engine-side watcher state, not manager
+    /// state — same outside-the-lock contract as [`ManagerEvent::PolicyPlane`].
+    PeersPlane {
+        id: NodeId,
+        plane: PeersPlane,
+    },
+    /// A running mesh agent's proposal receipts moved (forwarder task →
+    /// [`ProposalsSink`]).
+    Proposals {
+        id: NodeId,
+        receipts: Vec<interflow_core::tunnel::transport::ProposalReceipt>,
+    },
+    /// A running mesh agent's ingress-listener actual state moved
+    /// (forwarder task → [`ListenersSink`]). Mirrors the engine's
+    /// reconciler table, not manager state — same outside-the-lock
+    /// contract as [`ManagerEvent::PeersPlane`].
+    Listeners {
+        id: NodeId,
+        faces: Vec<ListenerStatusFace>,
     },
     /// Round-trip marker behind [`NodeManager::settle`].
     Settled {
@@ -869,11 +1099,22 @@ impl NodeManager {
         rt: tokio::runtime::Handle,
         on_state: impl Fn(&str, &NodeState) + Send + Sync + 'static,
         on_persist: impl Fn(&[crate::profile::NodeEntry]) + Send + Sync + 'static,
+        on_policy_plane: impl Fn(&str, &PolicyPlane) + Send + Sync + 'static,
+        on_peers_plane: impl Fn(&str, &PeersPlane) + Send + Sync + 'static,
+        on_proposals: impl Fn(&str, &[interflow_core::tunnel::transport::ProposalReceipt])
+        + Send
+        + Sync
+        + 'static,
+        on_listeners: impl Fn(&str, &[ListenerStatusFace]) + Send + Sync + 'static,
     ) -> Self {
         Self::with_renewal(
             rt,
             on_state,
             on_persist,
+            on_policy_plane,
+            on_peers_plane,
+            on_proposals,
+            on_listeners,
             Arc::new(|pack_dir, log_name| {
                 // The future owns the path (it outlives the closure call).
                 Box::pin(async move {
@@ -889,6 +1130,13 @@ impl NodeManager {
         rt: tokio::runtime::Handle,
         on_state: impl Fn(&str, &NodeState) + Send + Sync + 'static,
         on_persist: impl Fn(&[crate::profile::NodeEntry]) + Send + Sync + 'static,
+        on_policy_plane: impl Fn(&str, &PolicyPlane) + Send + Sync + 'static,
+        on_peers_plane: impl Fn(&str, &PeersPlane) + Send + Sync + 'static,
+        on_proposals: impl Fn(&str, &[interflow_core::tunnel::transport::ProposalReceipt])
+        + Send
+        + Sync
+        + 'static,
+        on_listeners: impl Fn(&str, &[ListenerStatusFace]) + Send + Sync + 'static,
         renewal: RenewalFactory,
     ) -> Self {
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -896,11 +1144,19 @@ impl NodeManager {
         // holds the sender, so "call a sink under the lock" has no path.
         let on_state: StateSink = Arc::new(on_state);
         let on_persist: PersistSink = Arc::new(on_persist);
+        let on_policy_plane: PolicySink = Arc::new(on_policy_plane);
+        let on_peers_plane: PeersSink = Arc::new(on_peers_plane);
+        let on_proposals: ProposalsSink = Arc::new(on_proposals);
+        let on_listeners: ListenersSink = Arc::new(on_listeners);
         rt.spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
                     ManagerEvent::State { id, state } => on_state(&id, &state),
                     ManagerEvent::Persist { entries } => on_persist(&entries),
+                    ManagerEvent::PolicyPlane { id, plane } => on_policy_plane(&id, &plane),
+                    ManagerEvent::PeersPlane { id, plane } => on_peers_plane(&id, &plane),
+                    ManagerEvent::Proposals { id, receipts } => on_proposals(&id, &receipts),
+                    ManagerEvent::Listeners { id, faces } => on_listeners(&id, &faces),
                     ManagerEvent::Settled { ack } => {
                         let _ = ack.send(());
                     }
@@ -1235,6 +1491,7 @@ impl NodeManager {
                 .get_mut(id)
                 .ok_or_else(|| "unknown node".to_string())?;
             entry.spec.kind = NodeKind::classify(&installed);
+            let pack_mesh = mesh_rules_from_pack(&installed);
             entry.spec.name = installed.metadata.node;
             entry.spec.principal = Some(source_principal);
             entry.spec.generation = generation_to;
@@ -1248,7 +1505,7 @@ impl NodeManager {
                     default_address: s.address.clone(),
                 })
                 .collect();
-            entry.spec.pack_mesh.clone_from(&installed.node_config.mesh);
+            entry.spec.pack_mesh = pack_mesh;
             entry
                 .spec
                 .pack_listen
@@ -1312,6 +1569,122 @@ impl NodeManager {
     /// rotate paths call this so the next view reads the fresh pack).
     pub fn refresh_credential_health(&self) {
         refresh_health_cache(&self.inner, &self.credential_health);
+    }
+
+    /// The policy-plane face for one node (mesh agents only — the surface
+    /// is "policy health", and only mesh agents carry a policy watcher). A
+    /// running agent reports its watcher's live values (no disk IO); a
+    /// stopped agent falls back to the same authoritative pack load the
+    /// start path uses, so the stopped view equals what a restart would
+    /// run. `None` = no node / not a mesh agent / pack unreadable.
+    pub fn policy_plane(&self, id: &str) -> Option<PolicyPlane> {
+        let (kind, pack_dir, live) = {
+            let inner = self.lock();
+            let entry = inner.nodes.get(id)?;
+            let live = match entry.engine.as_ref() {
+                Some(Engine::Agent { handle }) => {
+                    handle.policy_state().map(|state| state.snapshot())
+                }
+                _ => None,
+            };
+            (entry.spec.kind, entry.spec.pack_dir.clone(), live)
+        };
+        if kind != NodeKind::MeshAgent {
+            return None;
+        }
+        if let Some(snapshot) = live {
+            return Some(PolicyPlane::live(snapshot));
+        }
+        let pack = CredentialPack::load_runtime(&pack_dir).ok()?;
+        Some(PolicyPlane {
+            generation: pack.policy.generation,
+            source: if pack.policy_from_state_channel {
+                PolicySource::StatePolicy
+            } else {
+                PolicySource::Pack
+            },
+            hub_generation: None,
+            pull: None,
+        })
+    }
+
+    /// The peer-plane face for one node (mesh agents only). A running
+    /// agent reports its watcher's live reading; a stopped agent has no
+    /// live presence reading to show — `None` (deliberately no stale
+    /// last-known display: presence is meaningless without the session
+    /// that observed it).
+    pub fn peers_plane(&self, id: &str) -> Option<PeersPlane> {
+        let inner = self.lock();
+        let entry = inner.nodes.get(id)?;
+        if entry.spec.kind != NodeKind::MeshAgent {
+            return None;
+        }
+        match entry.engine.as_ref() {
+            Some(Engine::Agent { handle }) => {
+                Some(PeersPlane::live(handle.peer_state().snapshot()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Submits one self-service stream proposal through the running
+    /// agent's current session (the kube-CSR face). Requires the node to
+    /// be a RUNNING mesh agent.
+    pub async fn submit_stream_proposal(
+        &self,
+        id: &str,
+        request: &interflow_core::tunnel::transport::StreamProposalRequest,
+    ) -> Result<interflow_core::tunnel::transport::ProposalSubmitOutcome, String> {
+        let tunnel = {
+            let inner = self.lock();
+            let entry = inner
+                .nodes
+                .get(id)
+                .ok_or_else(|| "unknown node".to_string())?;
+            match entry.engine.as_ref() {
+                Some(Engine::Agent { handle }) if entry.spec.kind == NodeKind::MeshAgent => {
+                    handle.control_tunnel()
+                }
+                _ => return Err("node is not a running mesh agent".to_string()),
+            }
+        };
+        tunnel
+            .submit_stream_proposal(request)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The proposal receipts face for one node (running mesh agents only).
+    pub fn proposals_plane(
+        &self,
+        id: &str,
+    ) -> Option<Vec<interflow_core::tunnel::transport::ProposalReceipt>> {
+        let inner = self.lock();
+        let entry = inner.nodes.get(id)?;
+        if entry.spec.kind != NodeKind::MeshAgent {
+            return None;
+        }
+        match entry.engine.as_ref() {
+            Some(Engine::Agent { handle }) => Some(handle.proposal_state().snapshot()),
+            _ => None,
+        }
+    }
+
+    /// The ingress-listeners actual-state face for one node (running mesh
+    /// agents only). A stopped agent has no listeners serving — `None`
+    /// (same no-stale-display discipline as [`Self::peers_plane`]).
+    pub fn listeners_plane(&self, id: &str) -> Option<Vec<ListenerStatusFace>> {
+        let inner = self.lock();
+        let entry = inner.nodes.get(id)?;
+        if entry.spec.kind != NodeKind::MeshAgent {
+            return None;
+        }
+        match entry.engine.as_ref() {
+            Some(Engine::Agent { handle }) => Some(ListenerStatusFace::live(
+                handle.ingress_listeners_snapshot(),
+            )),
+            _ => None,
+        }
     }
 
     pub fn state(&self, id: &str) -> Option<NodeState> {
@@ -1399,43 +1772,52 @@ impl NodeManager {
                 self.clone()
                     .spawn_agent_listener(id, generation, handle.subscribe_state());
                 entry.state = handle.state().into();
-                entry.engine = Some(Engine::Agent {
-                    handle,
-                    policy_watcher: None,
-                });
+                entry.engine = Some(Engine::Agent { handle });
             }
-            Prepared::Mesh { config, pack_dir } => {
-                let client = AgentClient::new(config).map_err(|e| format!("cannot start: {e}"))?;
-                let handle = client.clone().start();
-                // Hot reload rides the same watcher the CLI binary uses
-                // (file channel + hub pull); a watcher that fails to start
-                // degrades to restart-on-update (warned) instead of
-                // blocking the node.
-                let policy_watcher = match interflow_mesh::pack::spawn_policy_reload(
-                    &pack_dir,
-                    client,
-                    Some(handle.tunnel()),
-                ) {
-                    Ok(watcher) => Some(watcher),
-                    Err(e) => {
-                        tracing::warn!("signed-policy hot reload unavailable for this node: {e}");
-                        None
-                    }
-                };
+            Prepared::Mesh { config, .. } => {
+                let handle = AgentClient::new(config)
+                    .map_err(|e| format!("cannot start: {e}"))?
+                    .start();
+                // The signed-policy watcher is the engine's own (the config
+                // carries the policy plane) — same path the CLI binary and
+                // every e2e take; there is no GUI-side wiring to drift. The
+                // subscription is taken while the Arc is still borrowed and
+                // dropped immediately after: the forwarder must hold only
+                // the receiver, or it would keep the watch sender (and the
+                // watcher's state) alive past the engine's shutdown.
+                let policy_rx = handle.policy_state().map(|state| state.subscribe());
+                if let Some(rx) = policy_rx {
+                    self.clone().spawn_policy_forwarder(id, rx);
+                }
+                // The peer watcher is likewise the engine's own (every mesh
+                // agent has one — the agents control plane needs no pack).
+                // Same subscription-taken-early contract as the policy
+                // forwarder above.
+                let peers_rx = handle.peer_state().subscribe();
+                self.clone().spawn_peers_forwarder(id, peers_rx);
+                // The proposal receipts face rides the same task; its
+                // forwarder mirrors the peers one.
+                let proposals_rx = handle.proposal_state().subscribe();
+                self.clone().spawn_proposals_forwarder(id, proposals_rx);
+                // The ingress-listener actual-state face (what is really
+                // listening) — the 2026-10-09 honesty axis. Same
+                // hold-only-the-subscription contract.
+                let listeners_rx = handle.subscribe_ingress_listeners();
+                self.clone().spawn_listeners_forwarder(id, listeners_rx);
                 self.clone()
                     .spawn_agent_listener(id, generation, handle.subscribe_state());
                 entry.state = handle.state().into();
-                entry.engine = Some(Engine::Agent {
-                    handle,
-                    policy_watcher,
-                });
+                entry.engine = Some(Engine::Agent { handle });
             }
-            Prepared::Hub(config) => {
+            Prepared::Hub { config } => {
+                // The ACL hot-swap watcher rides the hub's run future (the
+                // config's policy plane names the pack) — same path the hub
+                // binary takes.
                 let handle = HubHandle::spawn(config).map_err(|e| format!("cannot start: {e}"))?;
                 self.clone()
                     .spawn_hub_listener(id, generation, handle.subscribe_state());
                 entry.state = handle.state().into();
-                entry.engine = Some(Engine::Hub(handle));
+                entry.engine = Some(Engine::Hub { handle });
             }
             Prepared::Ingress(config) => {
                 let engine = FutureEngine::spawn_ingress(config, &self.rt);
@@ -1588,6 +1970,107 @@ impl NodeManager {
         }
         entry.state = state.clone();
         self.record_state(id, &state);
+    }
+
+    /// Mesh agents: forwards the engine watcher's policy telemetry into
+    /// the event queue (→ [`PolicySink`] → the GUI's policy health panel,
+    /// which otherwise only samples at `list_nodes` time and reads a
+    /// converged system as frozen). The task holds only the subscription:
+    /// when the engine shuts down and the watcher's state — and with it the
+    /// watch sender — is dropped, `changed()` errors and the forwarder
+    /// rides out with the engine it mirrors, no separate token involved.
+    fn spawn_policy_forwarder(
+        self,
+        id: &str,
+        mut rx: tokio::sync::watch::Receiver<interflow_mesh::agent::PolicyWatchSnapshot>,
+    ) {
+        let rt = self.rt.clone();
+        let manager = self;
+        let id = id.to_string();
+        rt.spawn(async move {
+            while rx.changed().await.is_ok() {
+                let plane = PolicyPlane::live(*rx.borrow_and_update());
+                let _ = manager.events.send(ManagerEvent::PolicyPlane {
+                    id: id.clone(),
+                    plane,
+                });
+            }
+        });
+    }
+
+    /// Mesh agents: forwards the engine peer watcher's telemetry into the
+    /// event queue (→ [`PeersSink`] → the GUI's Peers section). Same
+    /// hold-only-the-subscription contract as
+    /// [`Self::spawn_policy_forwarder`].
+    fn spawn_peers_forwarder(
+        self,
+        id: &str,
+        mut rx: tokio::sync::watch::Receiver<interflow_mesh::agent::PeerWatchSnapshot>,
+    ) {
+        let rt = self.rt.clone();
+        let manager = self;
+        let id = id.to_string();
+        rt.spawn(async move {
+            while rx.changed().await.is_ok() {
+                let plane = PeersPlane::live(rx.borrow_and_update().clone());
+                let _ = manager.events.send(ManagerEvent::PeersPlane {
+                    id: id.clone(),
+                    plane,
+                });
+            }
+        });
+    }
+
+    /// Mesh agents: forwards the engine's proposal receipts into the event
+    /// queue (→ [`ProposalsSink`] → the GUI's "Requested streams" face).
+    /// Same hold-only-the-subscription contract as
+    /// [`Self::spawn_policy_forwarder`].
+    fn spawn_proposals_forwarder(
+        self,
+        id: &str,
+        mut rx: tokio::sync::watch::Receiver<
+            Vec<interflow_core::tunnel::transport::ProposalReceipt>,
+        >,
+    ) {
+        let rt = self.rt.clone();
+        let manager = self;
+        let id = id.to_string();
+        rt.spawn(async move {
+            while rx.changed().await.is_ok() {
+                let receipts = rx.borrow_and_update().clone();
+                let _ = manager.events.send(ManagerEvent::Proposals {
+                    id: id.clone(),
+                    receipts,
+                });
+            }
+        });
+    }
+
+    /// Mesh agents: forwards the engine's ingress-listener actual state
+    /// into the event queue (→ [`ListenersSink`] → the GUI's listeners
+    /// face). The watch carries the full table on every mutation, so this
+    /// is exactly the peers/policy forwarder shape — hold only the
+    /// subscription; when the agent handle drops, the sender goes with it,
+    /// `changed()` errors, and the task rides down with the engine.
+    fn spawn_listeners_forwarder(
+        self,
+        id: &str,
+        mut rx: tokio::sync::watch::Receiver<
+            std::sync::Arc<HashMap<String, interflow_mesh::agent::ListenerStatus>>,
+        >,
+    ) {
+        let rt = self.rt.clone();
+        let manager = self;
+        let id = id.to_string();
+        rt.spawn(async move {
+            while rx.changed().await.is_ok() {
+                let faces = ListenerStatusFace::live((**rx.borrow_and_update()).clone());
+                let _ = manager.events.send(ManagerEvent::Listeners {
+                    id: id.clone(),
+                    faces,
+                });
+            }
+        });
     }
 
     /// Agent engines: rich state stream + healthy-streak accounting + dead
@@ -2002,9 +2485,10 @@ fn spec_from_profile(persisted: crate::profile::NodeEntry) -> SpecWithIntent {
                     default_address: s.address.clone(),
                 })
                 .collect();
-            let mesh = pack.node_config.mesh.clone();
+            let mesh = mesh_rules_from_pack(&pack);
             let listen = pack.node_config.listen.clone();
-            let transport = pack.node_config.transport.clone();
+            let transport = (!pack.node_config.transport.is_empty())
+                .then(|| pack.node_config.transport.clone());
             (
                 NodeKind::classify(&pack),
                 pack.metadata.node,
@@ -2165,10 +2649,27 @@ target_addr = "127.0.0.1:1"
         manager: NodeManager,
         events: Arc<StdMutex<Vec<(NodeId, NodeState)>>>,
         persisted: Arc<StdMutex<Vec<crate::profile::NodeEntry>>>,
+        /// Every policy-plane event the sink delivered — the GUI event
+        /// face's recording (what `emit_policy_plane` would push to the
+        /// panel).
+        policy_events: Arc<StdMutex<Vec<(NodeId, PolicyPlane)>>>,
+        /// Every peers-plane event the sink delivered — the recording for
+        /// the `mesh-peers` event face. No assertion reads it yet (the
+        /// face is wired through the sink seam above); the expectation
+        /// un-fulfills the moment one does.
+        #[expect(dead_code)]
+        peers_events: Arc<StdMutex<Vec<(NodeId, PeersPlane)>>>,
         hub_id: NodeId,
         lan_a_id: NodeId,
         lan_b_id: NodeId,
         listen_port: u16,
+        /// The signed-policy test needs re-signing authority: the stack's
+        /// issuer (policy key + realm root) plus the ports a gen-2
+        /// manifest re-signs.
+        issuer: IssuerStore,
+        hub_port: u16,
+        echo_port: u16,
+        lan_a_pack: std::path::PathBuf,
     }
 
     /// Never-completes renewal (the scheduler's steady state between 50%-TTL
@@ -2257,6 +2758,16 @@ target_addr = "127.0.0.1:{echo_port}"
         let events: Arc<StdMutex<Vec<(NodeId, NodeState)>>> = Arc::new(StdMutex::new(Vec::new()));
         let persisted: Arc<StdMutex<Vec<crate::profile::NodeEntry>>> =
             Arc::new(StdMutex::new(Vec::new()));
+        let policy_events: Arc<StdMutex<Vec<(NodeId, PolicyPlane)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let peers_events: Arc<StdMutex<Vec<(NodeId, PeersPlane)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        type ProposalSinkEvents = Vec<(
+            NodeId,
+            Vec<interflow_core::tunnel::transport::ProposalReceipt>,
+        )>;
+        let proposal_events: Arc<StdMutex<ProposalSinkEvents>> =
+            Arc::new(StdMutex::new(Vec::new()));
         // Hostile-sink seam: the GUI's sinks read the manager back
         // (emit_node_state → tray::refresh → snapshots), so these do too —
         // every lifecycle test below is a sentinel for any regression
@@ -2267,6 +2778,9 @@ target_addr = "127.0.0.1:{echo_port}"
         let slot_events = manager_slot.clone();
         let sink_persist = persisted.clone();
         let slot_persist = manager_slot.clone();
+        let sink_policy = policy_events.clone();
+        let sink_peers = peers_events.clone();
+        let sink_proposals = proposal_events;
         let manager = NodeManager::with_renewal(
             tokio::runtime::Handle::current(),
             move |id, state| {
@@ -2292,6 +2806,25 @@ target_addr = "127.0.0.1:{echo_port}"
                     let _ = manager.snapshots();
                 }
             },
+            move |id, plane| {
+                sink_policy
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((id.to_string(), plane.clone()));
+            },
+            move |id, plane| {
+                sink_peers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((id.to_string(), plane.clone()));
+            },
+            move |id, receipts| {
+                sink_proposals
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((id.to_string(), receipts.to_vec()));
+            },
+            |_, _| {}, // no listeners assertion in this stack
             renewal,
         );
         *manager_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(manager.clone());
@@ -2318,17 +2851,23 @@ target_addr = "127.0.0.1:{echo_port}"
                 .expect("add node")
         };
         let node_hub = add(&manager, hub_dir);
-        let node_a = add(&manager, dir_a);
+        let node_a = add(&manager, dir_a.clone());
         let node_b = add(&manager, dir_b);
 
         TestStack {
             manager,
             events,
             persisted,
+            policy_events,
+            peers_events,
             hub_id: node_hub,
             lan_a_id: node_a,
             lan_b_id: node_b,
             listen_port,
+            issuer,
+            hub_port,
+            echo_port,
+            lan_a_pack: dir_a,
         }
     }
 
@@ -2479,6 +3018,15 @@ target_addr = "127.0.0.1:{echo_port}"
     /// unique per stack, so cross-test events in the shared sink are
     /// inert.
     type RecordedEvents = Arc<StdMutex<Vec<(Option<String>, String)>>>;
+    /// Class-level attribution guard sink: (target, node, message). The
+    /// (node, message) shape above cannot answer "which module emitted a
+    /// bare line", so the mesh-agent zero-bare-lines invariant asserts
+    /// against this triple sink instead.
+    type AttributionEvents = Arc<StdMutex<Vec<(&'static str, Option<String>, String)>>>;
+    /// Shared home of the attribution sink handle: filled by the same
+    /// OnceLock init that installs the global test registry (one install,
+    /// two recorders).
+    static ATTRIBUTED_SINK: OnceLock<AttributionEvents> = OnceLock::new();
 
     struct RecordingLayer(RecordedEvents);
 
@@ -2500,20 +3048,59 @@ target_addr = "127.0.0.1:{echo_port}"
         }
     }
 
+    struct AttributionLayer(AttributionEvents);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AttributionLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = crate::tracing_capture::MessageVisitor::new();
+            event.record(&mut visitor);
+            if visitor.message.is_empty() {
+                return;
+            }
+            self.0.lock().unwrap_or_else(PoisonError::into_inner).push((
+                event.metadata().target(),
+                visitor.node,
+                visitor.message,
+            ));
+        }
+    }
+
     fn tracing_recorder() -> RecordedEvents {
         use tracing_subscriber::layer::SubscriberExt as _;
         static RECORDER: OnceLock<RecordedEvents> = OnceLock::new();
         RECORDER
             .get_or_init(|| {
                 let sink: RecordedEvents = Arc::new(StdMutex::new(Vec::new()));
+                let attributed: AttributionEvents = Arc::new(StdMutex::new(Vec::new()));
                 // Process-lifetime global (set_global_default never resets);
                 // a second call would Err, but the OnceLock guarantees one.
+                // Both layers install in the one registry this OnceLock
+                // guards, so either recorder implies the other.
                 tracing::subscriber::set_global_default(
-                    tracing_subscriber::registry().with(RecordingLayer(sink.clone())),
+                    tracing_subscriber::registry()
+                        .with(AttributionLayer(attributed.clone()))
+                        .with(RecordingLayer(sink.clone())),
                 )
                 .expect("no other global subscriber in this test binary");
+                ATTRIBUTED_SINK
+                    .set(attributed)
+                    .expect("set once beside RECORDER");
                 sink
             })
+            .clone()
+    }
+
+    /// The (target, node, message) sink — installed together with
+    /// [`tracing_recorder`]'s registry (see above).
+    fn attribution_recorder() -> AttributionEvents {
+        let _ = tracing_recorder();
+        ATTRIBUTED_SINK
+            .get()
+            .expect("attribution sink installs with the tracing recorder")
             .clone()
     }
 
@@ -2528,6 +3115,23 @@ target_addr = "127.0.0.1:{echo_port}"
                 .unwrap_or_else(PoisonError::into_inner)
                 .iter()
                 .any(|(n, m)| n.as_deref() == Some(node) && m == message);
+            if hit || std::time::Instant::now() > deadline {
+                return hit;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Same polling shape as [`wait_for_line`], for messages whose dynamic
+    /// parts (peer ports, stream ids) rule out an exact match.
+    async fn wait_for_line_starting(recorded: &RecordedEvents, node: &str, prefix: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let hit = recorded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|(n, m)| n.as_deref() == Some(node) && m.starts_with(prefix));
             if hit || std::time::Instant::now() > deadline {
                 return hit;
             }
@@ -2783,6 +3387,153 @@ target_addr = "127.0.0.1:{echo_port}"
         );
     }
 
+    /// Mesh-agent attribution (2026-10-09 bug, class-level fix): the
+    /// steady-state lines — the 15s `Ingress reconciled` heartbeat,
+    /// per-connection `Connection accepted` / `Backend connection
+    /// established` — must carry the node attribution injected at prepare,
+    /// and NO line from any `interflow_mesh::agent::*` module may go bare
+    /// (the gap this test machine-locks: a new bare log line anywhere in
+    /// the agent modules fails here, in CI).
+    ///
+    /// Dual-path redundancy per the bug file: the recorded `node` value is
+    /// compared byte-for-byte against `node_infos`' `NodeInfo.attribution`
+    /// — the exact input the frontend "This node" filter matches on — and
+    /// the sink reuses the GUI production `MessageVisitor`, so the field
+    /// shapes match what the filter sees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::similar_names)] // lan_a_attr / lan_b_attr: the two agents under assertion
+    async fn mesh_agent_lines_carry_node_attribution() {
+        let recorded = tracing_recorder();
+        let attributed = attribution_recorder();
+
+        let stack = stack_with_mesh_site(pending_renewal()).await;
+        let manager = &stack.manager;
+        manager.start(&stack.hub_id).expect("hub start");
+        wait_for(
+            manager,
+            &stack.hub_id,
+            |s| matches!(s, NodeState::Running),
+            "Running",
+        )
+        .await;
+        manager.start(&stack.lan_b_id).expect("lan-b start");
+        manager.start(&stack.lan_a_id).expect("lan-a start");
+        connected(manager, &stack.lan_b_id).await;
+        connected(manager, &stack.lan_a_id).await;
+
+        let attribution = |id: &str| {
+            manager
+                .snapshots()
+                .into_iter()
+                .find(|n| n.spec.id == id)
+                .map(|n| log_attribution(&n.spec))
+                .expect("node snapshot")
+        };
+        let lan_a_attr = attribution(&stack.lan_a_id);
+        let lan_b_attr = attribution(&stack.lan_b_id);
+
+        // Dual-path lock: the GUI's own attribution face (`node_infos`) and
+        // the snapshot-derived value must agree byte-for-byte — they are
+        // the two sources of the frontend filter input.
+        {
+            let infos = crate::commands::node_infos(manager);
+            let find = |id: &str| {
+                infos
+                    .iter()
+                    .find(|i| i.id == id)
+                    .map(|i| i.attribution.clone())
+                    .unwrap_or_default()
+            };
+            assert_eq!(find(&stack.lan_a_id), lan_a_attr);
+            assert_eq!(find(&stack.lan_b_id), lan_b_attr);
+        }
+
+        // Business flow through the tunnel: produces the per-connection
+        // steady-state lines the bug file lists (§6.4).
+        let payload = b"ping-into-the-node-view";
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", stack.listen_port))
+            .await
+            .expect("dial lan-a listener");
+        sock.write_all(payload).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf))
+            .await
+            .expect("echo within 10s")
+            .expect("read");
+        assert_eq!(&buf[..n], payload);
+        drop(sock);
+
+        // Deterministic steady-state lines, exact-match (the report's §6.2
+        // checklist, distilled): the heartbeat summary and both handler
+        // starts land in the right node's view.
+        assert!(
+            wait_for_line(&recorded, &lan_a_attr, "Ingress reconciled: +1 ~0 -0 !0").await,
+            "the reconcile heartbeat line must be attributed to lan-a; captured: {:?}",
+            recorded.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+        assert!(
+            wait_for_line(
+                &recorded,
+                &lan_b_attr,
+                "Egress handler started, agent_id=lan-b"
+            )
+            .await,
+            "the egress start line must be attributed to lan-b; captured: {:?}",
+            recorded.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+
+        // Business lines with dynamic parts (peer port / stream id),
+        // prefix-matched: the flow must be traceable inside each node's
+        // own view, without leaving for the machine-wide view.
+        assert!(
+            wait_for_line_starting(&recorded, &lan_a_attr, "Connection accepted: ").await,
+            "the accepted-connection line must be attributed to lan-a; captured: {:?}",
+            recorded.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+        assert!(
+            wait_for_line_starting(&recorded, &lan_b_attr, "Backend connection established: ")
+                .await,
+            "the backend-connection line must be attributed to lan-b; captured: {:?}",
+            recorded.lock().unwrap_or_else(PoisonError::into_inner)
+        );
+
+        // The class-level lock: every line from every mesh-agent module
+        // carries one of the stack's node attributions — a bare (or
+        // foreign-valued) `node` field anywhere fails here. This is the
+        // machine-enforced half of the fix: per-line annotation discipline
+        // is no longer a convention but an invariant under test.
+        let offenders = attributed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(target, ..)| target.starts_with("interflow_mesh::agent"))
+            .filter(|(_, node, _)| {
+                node.as_deref() != Some(lan_a_attr.as_str())
+                    && node.as_deref() != Some(lan_b_attr.as_str())
+            })
+            .map(|(target, node, message)| (*target, node.clone(), message.clone()))
+            .collect::<Vec<_>>();
+        // Non-vacuity: the assertion below only means something if the
+        // sink actually observed mesh-agent lines (startup + the driven
+        // business flow must have produced dozens).
+        let agent_lines = attributed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(target, ..)| target.starts_with("interflow_mesh::agent"))
+            .count();
+        assert!(
+            agent_lines >= 10,
+            "the attribution sink must have observed mesh-agent lines (got {agent_lines}); \
+             otherwise the class-level assertion below is vacuous"
+        );
+        assert!(
+            offenders.is_empty(),
+            "every interflow_mesh::agent::* line must carry one of the node attributions \
+             ({lan_a_attr} / {lan_b_attr}); bare or misattributed lines: {offenders:?}"
+        );
+    }
+
     /// The full-stack acceptance: hub + two mesh agents run side by side
     /// under the manager, TCP traffic flows through the tunnel, and
     /// stop_all lands every node in Stopped.
@@ -2863,6 +3614,550 @@ target_addr = "127.0.0.1:{echo_port}"
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             assert!(persisted.iter().all(|e| !e.desired_running));
+        }
+    }
+
+    /// The 2026-10-07 bug, machine-locked: a policy PUBLISHED at the hub
+    /// reaches a GUI-managed agent with zero touches — no restart, no
+    /// Stop→Start, no manual state injection. The whole distribution plane
+    /// (hub serve cache → agent pull → verify → persist → apply) rides
+    /// paths `NodeManager::start` actually builds; before the engine
+    /// absorbed the watcher, the e2e suites wired it by hand and the GUI
+    /// wiring had no test at all
+    #[tokio::test]
+    async fn published_policy_reaches_gui_managed_agents_without_restart() {
+        let stack = stack_with_mesh_site(pending_renewal()).await;
+        let manager = &stack.manager;
+        manager.start(&stack.hub_id).expect("hub start");
+        wait_for(
+            manager,
+            &stack.hub_id,
+            |s| matches!(s, NodeState::Running),
+            "Running",
+        )
+        .await;
+        manager.start(&stack.lan_b_id).expect("lan-b start");
+        manager.start(&stack.lan_a_id).expect("lan-a start");
+        connected(manager, &stack.lan_b_id).await;
+        connected(manager, &stack.lan_a_id).await;
+
+        // The policy face is live before any publish: the watcher exists
+        // (this is the assertion the old wiring could never make from the
+        // GUI side) and its pull channel has completed at least one poll.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let plane = manager.policy_plane(&stack.lan_a_id).expect("policy plane");
+            if plane.pull.is_some_and(|h| h.last_ok_unix > 0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "GUI agent's policy watcher never completed a control-plane pull"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Publish generation 2: same mesh, one NEW listener port on lan-a.
+        let listen_v2 = crate::test_util::free_port();
+        let manifest_v2 = Manifest::parse(&format!(
+            r#"
+[realm]
+id = "gui-test"
+[registrar]
+endpoint = "https://registrar.example.com"
+[mesh.hub.central]
+listen = "127.0.0.1:{hub_port}"
+endpoint = "127.0.0.1:{hub_port}"
+[workspace.alpha]
+[workspace.beta]
+[agent.lan-a]
+workspace = "alpha"
+[[agent.lan-a.mesh_ingress]]
+name = "svc"
+listen = "127.0.0.1:{listen_v2}"
+target_agent = "lan-b"
+remote_addr = "127.0.0.1:{echo_port}"
+[agent.lan-b]
+workspace = "beta"
+[[agent.lan-b.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:{echo_port}"
+"#,
+            hub_port = stack.hub_port,
+            echo_port = stack.echo_port,
+        ))
+        .unwrap();
+        let policy_v2 = interflow_identity::policy::RuntimePolicy::from_manifest(&manifest_v2, 2);
+        let (bytes_v2, sig_v2) = policy_v2
+            .signed(&stack.issuer.policy_signer().unwrap())
+            .unwrap();
+        let creds = tempfile::tempdir().unwrap();
+        let material = stack
+            .issuer
+            .issue_hub_member_with_ttl(
+                "gui-test",
+                "publish",
+                interflow_identity::issuance::LeafTtl::default_ttl(),
+            )
+            .unwrap();
+        let (ca, cert, key) = (
+            creds.path().join("ca.crt"),
+            creds.path().join("client.crt"),
+            creds.path().join("client.key"),
+        );
+        std::fs::write(&ca, stack.issuer.realm_issuer().unwrap().cert_pem()).unwrap();
+        std::fs::write(&cert, &material.chain_pem).unwrap();
+        std::fs::write(&key, &material.key_pem).unwrap();
+        let outcome = interflow_mesh::hub::policy::publish_policy(
+            &format!("127.0.0.1:{}", stack.hub_port),
+            &ca,
+            &cert,
+            &key,
+            &bytes_v2,
+            &sig_v2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            interflow_mesh::hub::policy::PublishOutcome::Published { generation: 2 }
+        );
+
+        // The EXACT frozen-state observable from the incident: the agent's
+        // state/policy files advance (mtime moves, generation lands) — plus
+        // the live faces: the new listener answers and the policy plane
+        // reports the converged watermark with a healthy pull channel.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let state_toml = stack.lan_a_pack.join("state/policy/policy.toml");
+        loop {
+            let converged = std::fs::read_to_string(&state_toml)
+                .is_ok_and(|body| body.contains("generation = 2"))
+                && tokio::net::TcpStream::connect(("127.0.0.1", listen_v2))
+                    .await
+                    .is_ok();
+            if converged {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "published gen 2 never reached the GUI-managed agent (state file: {:?})",
+                std::fs::read_to_string(&state_toml).ok()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let plane = manager.policy_plane(&stack.lan_a_id).expect("policy plane");
+        assert_eq!(plane.generation, 2, "applied watermark converges");
+        assert_eq!(plane.hub_generation, Some(2), "hub generation converges");
+        let pull = plane.pull.expect("running watcher reports pull health");
+        assert!(pull.last_ok_unix > 0, "pull channel completed polls");
+
+        // The 2026-10-07 stale-panel bug lived past this point: the domain
+        // query converged here while the GUI's own two legs never heard
+        // about it. Leg 1 — the event face: the forwarder must have pushed
+        // the converged plane through the sink (what `emit_policy_plane`
+        // delivers to the panel).
+        {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let converged = stack.policy_events.lock().unwrap().iter().any(|(id, p)| {
+                    id == &stack.lan_a_id
+                        && p.generation == 2
+                        && p.pull.is_some_and(|h| h.last_ok_unix > 0)
+                });
+                if converged {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "policy-plane events never carried the converged watermark to the GUI face"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        // Leg 2 — the command face: what `list_nodes` composes for the GUI
+        // (the on-demand twin of the event stream; same composition either
+        // way). The DTO must carry the live values, not the start-time seed.
+        let gui = crate::commands::node_infos(manager)
+            .into_iter()
+            .find(|n| n.id == stack.lan_a_id)
+            .expect("lan-a in the GUI node list");
+        let policy = gui.policy.expect("policy face present");
+        assert_eq!(policy.generation, 2, "GUI DTO carries the live watermark");
+        assert_eq!(
+            policy.source,
+            crate::contract::PolicySourceDto::StatePolicy,
+            "GUI DTO names the state/policy channel"
+        );
+        assert_eq!(policy.hub_generation, Some(2));
+        assert!(
+            policy.pull.expect("pull health in DTO").last_ok_unix > 0,
+            "GUI DTO reports a completed pull, not the never-pulled seed"
+        );
+
+        manager.stop_all().await;
+        for id in [&stack.hub_id, &stack.lan_a_id, &stack.lan_b_id] {
+            wait_for(manager, id, |s| *s == NodeState::Stopped, "Stopped").await;
+        }
+    }
+
+    /// The 2026-10-08 peer-observability face, machine-locked from the GUI
+    /// side: a running mesh agent's peer watcher must surface the fleet
+    /// through BOTH consumption legs (the `mesh-peers` event stream and
+    /// the `list_nodes` composition). Tenant semantics ride along: the
+    /// listing is workspace-tenant scoped (THREAT_MODEL §6.5 — one root
+    /// per workspace anchors the client chains), so same-workspace lan-b
+    /// is visible to lan-a and other-workspace lan-x is not. Stopping the
+    /// node drops the face (presence has no meaningful stale display).
+    ///
+    /// Own minimal fixture rather than `stack_with_mesh_site`: the shared
+    /// stack splits lan-a/lan-b across the alpha/beta workspaces (two
+    /// tenants), which would make the POSITIVE visibility leg untestable —
+    /// here lan-a and lan-b share one workspace and lan-x sits in another.
+    #[tokio::test]
+    async fn peer_plane_flows_to_gui_events_and_node_infos() {
+        let hub_port = crate::test_util::free_port();
+        let dead_port = crate::test_util::free_port(); // rules point here; no traffic flows
+
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = IssuerStore::open(dir.path().join("issuer"));
+        issuer.ensure_realm().unwrap();
+        issuer.ensure_workspace("main").unwrap();
+        issuer.ensure_workspace("other").unwrap();
+        issuer.ensure_policy_key().unwrap();
+
+        let manifest = Manifest::parse(&format!(
+            r#"
+[realm]
+id = "gui-peers"
+[registrar]
+endpoint = "https://registrar.example.com"
+[mesh.hub.central]
+listen = "127.0.0.1:{hub_port}"
+endpoint = "127.0.0.1:{hub_port}"
+[workspace.main]
+[workspace.other]
+[agent.lan-a]
+workspace = "main"
+[[agent.lan-a.mesh_ingress]]
+name = "svc"
+listen = "127.0.0.1:{dead_port}"
+target_agent = "lan-b"
+remote_addr = "127.0.0.1:{dead_port}"
+[agent.lan-b]
+workspace = "main"
+[[agent.lan-b.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:{dead_port}"
+[agent.lan-x]
+workspace = "other"
+[[agent.lan-x.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:{dead_port}"
+"#
+        ))
+        .unwrap();
+
+        let hub_dir = dir.path().join("packs/hub-central");
+        HubCredentialPack::render(&issuer, &manifest, "central", 1, &hub_dir).unwrap();
+        let dir_a = dir.path().join("packs/agent-lan-a");
+        AgentCredentialPack::render(&issuer, &manifest, "lan-a", 1, &dir_a).unwrap();
+        let dir_b = dir.path().join("packs/agent-lan-b");
+        AgentCredentialPack::render(&issuer, &manifest, "lan-b", 1, &dir_b).unwrap();
+        let dir_x = dir.path().join("packs/agent-lan-x");
+        AgentCredentialPack::render(&issuer, &manifest, "lan-x", 1, &dir_x).unwrap();
+        // Packs must outlive `dir` (the manager reads them at every start).
+        std::mem::forget(dir);
+
+        let peers_events: Arc<StdMutex<Vec<(NodeId, PeersPlane)>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink_peers = peers_events.clone();
+        let manager = NodeManager::with_renewal(
+            tokio::runtime::Handle::current(),
+            |_, _| {},
+            |_| {},
+            |_, _| {},
+            move |id, plane| {
+                sink_peers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((id.to_string(), plane.clone()));
+            },
+            |_, _| {},
+            |_, _| {},
+            pending_renewal(),
+        );
+
+        let add = |dir: std::path::PathBuf| {
+            let info = inspect_pack(&dir).expect("pack inspects clean");
+            manager
+                .add(NodeSpec {
+                    generation: info.generation,
+                    pack_digest: info.digest.clone(),
+                    id: String::new(),
+                    kind: info.kind,
+                    name: info.name,
+                    principal: Some(info.principal),
+                    pack_dir: dir,
+                    transport: None,
+                    hub_quic_addr: None,
+                    pack_services: info.services,
+                    pack_mesh: info.mesh,
+                    pack_listen: info.listen,
+                    pack_transport: info.transport,
+                    service_addresses: Default::default(),
+                })
+                .expect("add node")
+        };
+        let hub_id = add(hub_dir);
+        let lan_a = add(dir_a);
+        let lan_b = add(dir_b);
+        let lan_x = add(dir_x);
+
+        manager.start(&hub_id).expect("hub start");
+        wait_for(
+            &manager,
+            &hub_id,
+            |s| matches!(s, NodeState::Running),
+            "Running",
+        )
+        .await;
+        manager.start(&lan_b).expect("lan-b start");
+        manager.start(&lan_a).expect("lan-a start");
+        manager.start(&lan_x).expect("lan-x start");
+        connected(&manager, &lan_b).await;
+        connected(&manager, &lan_a).await;
+        connected(&manager, &lan_x).await;
+
+        // Leg 1 — the event face: the forwarder pushed a snapshot naming
+        // lan-b as a peer of lan-a (online, self excluded, the
+        // other-workspace agent never present).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        loop {
+            let converged = peers_events.lock().unwrap().iter().any(|(id, p)| {
+                *id == lan_a
+                    && p.peers.len() == 1
+                    && p.peers[0].agent.ends_with("/lan-b")
+                    && p.peers[0].online
+                    && p.last_ok_unix > 0
+            });
+            if converged {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "mesh-peers events never carried lan-b to lan-a's GUI face"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Leg 2 — the command face: `list_nodes` composes the same live
+        // reading; the hub carries no peer face; the other-workspace agent
+        // sees an empty fleet from its side (tenant isolation, §6.5).
+        let infos = crate::commands::node_infos(&manager);
+        let gui_a = infos
+            .iter()
+            .find(|n| n.id == lan_a)
+            .expect("lan-a in the GUI node list");
+        let peers = gui_a
+            .peers
+            .clone()
+            .expect("peers face present while running");
+        assert_eq!(peers.peers.len(), 1, "self excluded, one peer: {peers:?}");
+        assert!(peers.peers[0].agent.ends_with("/lan-b"));
+        assert!(peers.peers[0].online, "lan-b reads online: {peers:?}");
+        assert!(
+            infos
+                .iter()
+                .find(|n| n.id == hub_id)
+                .is_none_or(|n| n.peers.is_none()),
+            "the hub is not a mesh agent"
+        );
+        let gui_x = infos
+            .iter()
+            .find(|n| n.id == lan_x)
+            .expect("lan-x in the GUI node list");
+        let peers_x = gui_x.peers.clone().expect("lan-x peers face present");
+        assert!(
+            peers_x.peers.is_empty(),
+            "other-workspace agents must not observe the main tenant: {peers_x:?}"
+        );
+
+        // Stopping the agent drops the face — presence without the session
+        // that observed it must not linger as stale display.
+        manager.stop(&lan_a).await.expect("lan-a stop");
+        wait_for(&manager, &lan_a, |s| *s == NodeState::Stopped, "Stopped").await;
+        assert!(
+            manager.peers_plane(&lan_a).is_none(),
+            "a stopped node carries no peer reading"
+        );
+
+        manager.stop_all().await;
+        for id in [&hub_id, &lan_a, &lan_b, &lan_x] {
+            wait_for(&manager, id, |s| *s == NodeState::Stopped, "Stopped").await;
+        }
+    }
+
+    /// The 2026-10-07 hot-reapply incident, machine-locked from the GUI
+    /// face: a policy PUBLISHED at the hub that only touches a
+    /// connection-level knob of an EXISTING stream (same name, SAME listen
+    /// port, only `idle_timeout_secs` added) must reach the GUI-managed
+    /// agent with the listener never moving — the incident's shape lost
+    /// 9091 silently while state said gen 8 and the health panel stayed
+    /// green.
+    /// The sibling test above covers the add-stream shape; this one locks
+    /// modify-stream.
+    #[tokio::test]
+    async fn published_policy_param_change_keeps_listener_alive_without_restart() {
+        let stack = stack_with_mesh_site(pending_renewal()).await;
+        let manager = &stack.manager;
+        manager.start(&stack.hub_id).expect("hub start");
+        wait_for(
+            manager,
+            &stack.hub_id,
+            |s| matches!(s, NodeState::Running),
+            "Running",
+        )
+        .await;
+        manager.start(&stack.lan_b_id).expect("lan-b start");
+        manager.start(&stack.lan_a_id).expect("lan-a start");
+        connected(manager, &stack.lan_b_id).await;
+        connected(manager, &stack.lan_a_id).await;
+
+        // The incident's own observable, strengthened: not just "the port
+        // accepts a TCP connect" but a full round-trip through the tunnel
+        // (lan-a ingress → hub → lan-b egress → echo), on the SAME port,
+        // before AND after the change.
+        let round_trip = |payload: &'static [u8]| async move {
+            let mut client =
+                tokio::net::TcpStream::connect(("127.0.0.1", stack.listen_port)).await?;
+            client.write_all(payload).await?;
+            let mut echoed = vec![0u8; payload.len()];
+            client.read_exact(&mut echoed).await?;
+            Ok::<Vec<u8>, std::io::Error>(echoed)
+        };
+        let (baseline, after) = (b"via-v1".to_vec(), b"via-v2".to_vec());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(Ok(got)) =
+                tokio::time::timeout(Duration::from_secs(5), round_trip(b"via-v1")).await
+                && got == b"via-v1".to_vec()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "v1 listener never came up on {}",
+                stack.listen_port
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Publish generation 2: the SAME stream, only the idle knob added.
+        let manifest_v2 = Manifest::parse(&format!(
+            r#"
+[realm]
+id = "gui-test"
+[registrar]
+endpoint = "https://registrar.example.com"
+[mesh.hub.central]
+listen = "127.0.0.1:{hub_port}"
+endpoint = "127.0.0.1:{hub_port}"
+[workspace.alpha]
+[workspace.beta]
+[agent.lan-a]
+workspace = "alpha"
+[[agent.lan-a.mesh_ingress]]
+name = "svc"
+listen = "127.0.0.1:{listen_port}"
+target_agent = "lan-b"
+remote_addr = "127.0.0.1:{echo_port}"
+idle_timeout_secs = 1800
+[agent.lan-b]
+workspace = "beta"
+[[agent.lan-b.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:{echo_port}"
+"#,
+            hub_port = stack.hub_port,
+            echo_port = stack.echo_port,
+            listen_port = stack.listen_port,
+        ))
+        .unwrap();
+        let policy_v2 = interflow_identity::policy::RuntimePolicy::from_manifest(&manifest_v2, 2);
+        let (bytes_v2, sig_v2) = policy_v2
+            .signed(&stack.issuer.policy_signer().unwrap())
+            .unwrap();
+        let creds = tempfile::tempdir().unwrap();
+        let material = stack
+            .issuer
+            .issue_hub_member_with_ttl(
+                "gui-test",
+                "publish",
+                interflow_identity::issuance::LeafTtl::default_ttl(),
+            )
+            .unwrap();
+        let (ca, cert, key) = (
+            creds.path().join("ca.crt"),
+            creds.path().join("client.crt"),
+            creds.path().join("client.key"),
+        );
+        std::fs::write(&ca, stack.issuer.realm_issuer().unwrap().cert_pem()).unwrap();
+        std::fs::write(&cert, &material.chain_pem).unwrap();
+        std::fs::write(&key, &material.key_pem).unwrap();
+        let outcome = interflow_mesh::hub::policy::publish_policy(
+            &format!("127.0.0.1:{}", stack.hub_port),
+            &ca,
+            &cert,
+            &key,
+            &bytes_v2,
+            &sig_v2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            interflow_mesh::hub::policy::PublishOutcome::Published { generation: 2 }
+        );
+
+        // Convergence, incident-shaped: the state file advances AND the
+        // very same listener keeps round-tripping — state face and
+        // listener face must NOT split (the incident had gen 8 in state
+        // with 9091 gone).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let state_toml = stack.lan_a_pack.join("state/policy/policy.toml");
+        loop {
+            let converged = std::fs::read_to_string(&state_toml)
+                .is_ok_and(|body| body.contains("generation = 2"))
+                && matches!(
+                    tokio::time::timeout(Duration::from_secs(5), round_trip(b"via-v2")).await,
+                    Ok(Ok(got)) if got == after
+                );
+            if converged {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "param-only gen 2 never reached the GUI-managed agent with the listener alive \
+                 (state file: {:?})",
+                std::fs::read_to_string(&state_toml).ok()
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let plane = manager.policy_plane(&stack.lan_a_id).expect("policy plane");
+        assert_eq!(plane.generation, 2, "applied watermark converges");
+        assert_eq!(plane.hub_generation, Some(2), "hub generation converges");
+        assert!(
+            plane.pull.is_some_and(|h| h.last_ok_unix > 0),
+            "pull channel completed polls"
+        );
+        // The baseline proof too: the port that served v1 is the port that
+        // serves v2 (no restart, no rebind hole).
+        assert_eq!(baseline, b"via-v1".to_vec());
+
+        manager.stop_all().await;
+        for id in [&stack.hub_id, &stack.lan_a_id, &stack.lan_b_id] {
+            wait_for(manager, id, |s| *s == NodeState::Stopped, "Stopped").await;
         }
     }
 
@@ -3161,6 +4456,10 @@ service = "default/desktop/web"
                     *persisted.lock().unwrap_or_else(PoisonError::into_inner) = entries.to_vec();
                 }
             },
+            |_, _| {}, // this stack has no mesh agent; the policy face stays quiet
+            |_, _| {}, // ...and neither does the peers face
+            |_, _| {}, // ...nor the proposal receipts face
+            |_, _| {}, // ...nor the listeners face
             pending_renewal(),
         );
 

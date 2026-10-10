@@ -592,15 +592,18 @@ impl<S: KeySource> RegistrarService<S> {
         if pending.old_serial != "bootstrap" {
             let mut list = RevocationList::load(store.root_path())?;
             if !list.is_revoked(&pending.old_serial) {
-                list.entries
-                    .push(interflow_identity::revocation::RevocationEntry {
-                        serial: pending.old_serial,
-                        issuer: "control".to_owned(),
-                        reason: "superseded".to_owned(),
-                        revoked_at: rfc3339(OffsetDateTime::now_utc())?,
-                        pack_digest: None,
-                    });
+                list.record(interflow_identity::revocation::RevocationEntry {
+                    serial: pending.old_serial,
+                    issuer: "control".to_owned(),
+                    reason: "superseded".to_owned(),
+                    revoked_at: rfc3339(OffsetDateTime::now_utc())?,
+                    pack_digest: None,
+                });
                 list.save(store.root_path())?;
+                // Best-effort: an emergency rotation must not block on
+                // backup health — the failure is loud in logs and doctor
+                // flags the stale backup.
+                store.checkpoint_best_effort();
             }
         }
         audit(store.root_path(), "rotation_succeeded", target, new_serial);
@@ -649,15 +652,17 @@ impl<S: KeySource> RegistrarService<S> {
         drop(state);
         let mut list = RevocationList::load(store.root_path())?;
         if !list.is_revoked(&pending.old_serial) {
-            list.entries
-                .push(interflow_identity::revocation::RevocationEntry {
-                    serial: pending.old_serial,
-                    issuer: issuer_name(&peer.principal),
-                    reason: "superseded".to_owned(),
-                    revoked_at: rfc3339(OffsetDateTime::now_utc())?,
-                    pack_digest: None,
-                });
+            list.record(interflow_identity::revocation::RevocationEntry {
+                serial: pending.old_serial,
+                issuer: issuer_name(&peer.principal),
+                reason: "superseded".to_owned(),
+                revoked_at: rfc3339(OffsetDateTime::now_utc())?,
+                pack_digest: None,
+            });
             list.save(store.root_path())?;
+            // Best-effort (see the control-confirm path): loud on failure,
+            // never blocks an emergency rotation.
+            store.checkpoint_best_effort();
         }
         audit(
             store.root_path(),

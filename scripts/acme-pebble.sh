@@ -113,7 +113,7 @@ run)
   # routing) against a self-managed pebble.
   trap cmd_down EXIT
   eval "$(cmd_up)"
-  cargo test -p interflow-expose --test acme_runtime -- --nocapture
+  cargo nextest run -p interflow-expose --test acme_runtime --nocapture
   ;;
 *)
   echo "usage: $0 [up|down|ca|run]" >&2

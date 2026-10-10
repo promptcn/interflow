@@ -546,6 +546,10 @@ const SYNTHETIC_PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOS
 struct ProtoState {
     endpoint: quinn_proto::Endpoint,
     outbound: mpsc::Sender<Bytes>,
+    /// Monotonic count of packets enqueued toward the output pump (the
+    /// flush-barrier enqueue side; the pump's own count is the completion
+    /// side). Guarded by the state mutex like every other field here.
+    enqueued: u64,
     handle: Option<quinn_proto::ConnectionHandle>,
     connection: Option<quinn_proto::Connection>,
     connected: bool,
@@ -559,6 +563,10 @@ struct SharedProto {
     state: std::sync::Mutex<ProtoState>,
     notify: tokio::sync::Notify,
     shutdown: std::sync::atomic::AtomicBool,
+    /// The output pump's progress signal: the number of packets it has
+    /// handed to the tunnel's ordered stream-write path so far. The
+    /// [`InnerQuicCarrier::close_drained`] flush barrier waits on this.
+    pumped: tokio::sync::watch::Sender<u64>,
 }
 
 type PeerCertificateSlot =
@@ -977,6 +985,65 @@ impl InnerQuicCarrier {
         self.shared.notify.notify_one();
     }
 
+    /// Closes the association and waits until every packet enqueued at
+    /// close time — the CONNECTION_CLOSE included — has been handed to the
+    /// tunnel's ordered stream-write path.
+    ///
+    /// The event-driven replacement for the former `sleep(100ms)` race in
+    /// the egress teardown: both the inner packets and the outer Close
+    /// frame ride the same ordered stream-write channel, so once the pump
+    /// has flushed everything queued before the barrier, an outer Close
+    /// sent afterwards can never overtake the CONNECTION_CLOSE on the wire.
+    /// The enqueue snapshot and the close+drive share the state mutex, so
+    /// the target count is exact for everything enqueued before the
+    /// barrier (late drain-state retransmits are best-effort extras).
+    ///
+    /// Bounded by `barrier_timeout`: under a wedged tunnel send the outer
+    /// termination still takes priority — the timeout warns and returns,
+    /// never hangs (the pathological case the blind sleep could not
+    /// guarantee at all).
+    pub async fn close_drained(&self, barrier_timeout: Duration) {
+        // Subscribe before the snapshot: every pump progress update from
+        // here on wakes this wait.
+        let mut pumped = self.shared.pumped.subscribe();
+        let target = {
+            let Ok(mut guard) = self.shared.state.lock() else {
+                return;
+            };
+            if let Some(conn) = guard.connection.as_mut() {
+                conn.close(
+                    std::time::Instant::now(),
+                    quinn_proto::VarInt::from_u32(0),
+                    Bytes::from_static(b"inner udp closed"),
+                );
+                let _ = guard.drive();
+            }
+            let target = guard.enqueued;
+            drop(guard);
+            self.shared.shutdown.store(true, Ordering::Relaxed);
+            self.shared.notify.notify_one();
+            target
+        };
+        let deadline = tokio::time::Instant::now() + barrier_timeout;
+        while *pumped.borrow() < target {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero()
+                || tokio::time::timeout(remaining, pumped.changed())
+                    .await
+                    .is_err()
+            {
+                let sent = *pumped.borrow();
+                tracing::warn!(
+                    sent,
+                    target,
+                    "inner QUIC close flush barrier timed out — outer Close proceeds \
+                     (a wedged tunnel send outranks the CONNECTION_CLOSE delivery)"
+                );
+                return;
+            }
+        }
+    }
+
     fn lock_state(&self) -> StateGuard<'_> {
         StateGuard {
             guard: self
@@ -1077,6 +1144,7 @@ impl ProtoState {
         Self {
             endpoint,
             outbound,
+            enqueued: 0,
             handle: None,
             connection: None,
             connected: false,
@@ -1147,9 +1215,10 @@ impl ProtoState {
         self.drive()
     }
 
-    fn send_packet(&self, packet: Bytes) -> std::result::Result<(), InnerQuicError> {
+    fn send_packet(&mut self, packet: Bytes) -> std::result::Result<(), InnerQuicError> {
         metrics::counter!("interflow_inner_quic_carrier_bytes_total")
             .increment(packet.len() as u64);
+        self.enqueued = self.enqueued.saturating_add(1);
         match self.outbound.try_send(packet) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -1249,12 +1318,16 @@ async fn output_pump(
     stream_id: crate::protocol::StreamId,
     direction: CarrierDirection,
     mut rx: mpsc::Receiver<Bytes>,
+    pumped: tokio::sync::watch::Sender<u64>,
 ) {
+    let mut sent: u64 = 0;
     while let Some(packet) = rx.recv().await {
         let result = match direction {
             CarrierDirection::Ingress => tunnel.send_data(stream_id, packet).await,
             CarrierDirection::Egress => tunnel.send_data_response(stream_id, packet).await,
         };
+        sent = sent.saturating_add(1);
+        pumped.send_replace(sent);
         if result.is_err() {
             break;
         }
@@ -1315,16 +1388,24 @@ fn spawn_carrier(
     direction: CarrierDirection,
 ) -> InnerQuicCarrier {
     let (outbound_tx, outbound_rx) = mpsc::channel(CARRIER_QUEUE_CAPACITY);
+    let (pumped_tx, _) = tokio::sync::watch::channel(0_u64);
     let shared = Arc::new(SharedProto {
         state: std::sync::Mutex::new(ProtoState::new(endpoint, outbound_tx)),
         notify: tokio::sync::Notify::new(),
         shutdown: std::sync::atomic::AtomicBool::new(false),
+        pumped: pumped_tx.clone(),
     });
     let carrier = InnerQuicCarrier {
         shared,
         peer_certificates: None,
     };
-    tokio::spawn(output_pump(tunnel, stream_id, direction, outbound_rx));
+    tokio::spawn(output_pump(
+        tunnel,
+        stream_id,
+        direction,
+        outbound_rx,
+        pumped_tx,
+    ));
     tokio::spawn(input_pump(frames, carrier.clone()));
     tokio::spawn(timer_pump(carrier.clone()));
     carrier

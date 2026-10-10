@@ -1,9 +1,8 @@
 //! Coherence checks for the shipped generic example: the manifest must
 //! parse and fully validate, and the helper scripts must stay on the
 //! Credential-Pack path (no token auth, no raw certificate arguments).
-//! (The promptcn deployment counterpart lives in
-//! `private_promptcn_deployment.rs` — it reads the private `deployments/`
-//! tree and never enters the public export.)
+//! (Real deployments' manifests live outside the repo — validate them
+//! at their deployment home with `interflow-cli plan validate`.)
 
 #![allow(
     clippy::all,
@@ -12,9 +11,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 
 mod common;

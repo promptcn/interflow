@@ -120,10 +120,46 @@ pub struct IngressConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quic_listen: Option<String>,
     /// Public-listener governance overrides (rendered into the ingress
-    /// node config's `[edge]` section; absent = engine defaults for the
-    /// deployment's topology).
+    /// node config's `[edge]` section; absent fields = topology defaults
+    /// resolved at render time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edge: Option<crate::pack::NodeEdgeConfig>,
+    pub edge: Option<EdgeOverrides>,
+}
+
+/// Human-authored `[ingress.<node>] [edge]` overrides. The manifest is a
+/// person-owned artifact: partial input is the norm, so every field stays
+/// optional and the whole section may be absent — the pack renderer resolves
+/// the gaps into the canonical, all-concrete
+/// [`crate::pack::NodeEdgeConfig`] at render time. (The two structs were one
+/// type until 2026-10-10; splitting them keeps the manifest's partial-input
+/// discipline from leaking into the pack's canonical-form discipline, and
+/// vice versa.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeOverrides {
+    /// Per-IP new-connection limit per minute on the public listener
+    /// (0 = unlimited). Absent = topology default (fronted 600 / direct 30
+    /// — a front proxy opens one new connection per proxied request, so its
+    /// budget must scale with request rate, not browser behavior).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_conn_rate_per_ip_per_minute: Option<u32>,
+    /// Public-listener `X-Forwarded-For` mode: `"off"` / `"on"` /
+    /// `"required"`. Absent = topology default (fronted `required` —
+    /// nothing but the front may talk to the listener; direct `off`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_forwarded_for: Option<String>,
+    /// Control-listener PROXY protocol mode: `"on"` / `"off"`. Absent =
+    /// topology default (fronted `on` — the front's SNI map emits the
+    /// preamble on every target including the mTLS-passthrough control
+    /// leg; direct `off`). Loopback trust stays engine-fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_proxy_protocol: Option<String>,
+    /// ACME HTTP-01 challenge listener (`host:port`). Absent = the
+    /// `0.0.0.0:80` default the ACME protocol practically requires
+    /// (port-80 reachability); an explicit value moves the challenge
+    /// listener behind a forward or onto another interface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_http_listen: Option<String>,
 }
 
 fn default_public_listen() -> String {
@@ -729,6 +765,37 @@ impl Manifest {
                         )));
                     }
                     Ok(_) => {}
+                }
+            }
+
+            // The `[edge]` override section: string-valued modes and the
+            // ACME HTTP-01 listener are validated here so a typo dies at
+            // `plan apply`, not at node start (the resolver's fail-loud
+            // parse stays as the digest-covered tripwire behind it).
+            if let Some(edge) = &ingress.edge {
+                if let Some(mode) = &edge.x_forwarded_for
+                    && !matches!(mode.as_str(), "off" | "on" | "required")
+                {
+                    return Err(Error::manifest(format!(
+                        "ingress '{node}' [edge] x_forwarded_for = {mode:?} is not one \
+                         of \"off\" | \"on\" | \"required\"",
+                    )));
+                }
+                if let Some(mode) = &edge.control_proxy_protocol
+                    && !matches!(mode.as_str(), "on" | "off")
+                {
+                    return Err(Error::manifest(format!(
+                        "ingress '{node}' [edge] control_proxy_protocol = {mode:?} is \
+                         not one of \"on\" | \"off\"",
+                    )));
+                }
+                if let Some(raw) = &edge.acme_http_listen
+                    && raw.parse::<SocketAddr>().is_err()
+                {
+                    return Err(Error::manifest(format!(
+                        "ingress '{node}' [edge] acme_http_listen {raw:?} is not a \
+                         valid socket address — expected <ip>:<port> (e.g. 0.0.0.0:80)",
+                    )));
                 }
             }
         }

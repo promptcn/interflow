@@ -24,8 +24,10 @@ use tracing::{error, info, warn};
 use super::listener::{ConnAdmission, gate_connection, write_deny_response};
 use super::{HOST_MAX_LEN, HTTP_HEAD_MAX_BYTES, is_valid_host};
 
-/// The default public-HTTPS ACME directory (Let's Encrypt production).
-pub const LETS_ENCRYPT_PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/directory";
+// The default public-HTTPS ACME directory: single-sourced in interflow-util
+// (the pack renderer writes it into node.toml when the manifest leaves the
+// directory unset, so the two sides must never drift).
+pub use interflow_util::defaults::LETS_ENCRYPT_PRODUCTION;
 
 /// ACME runtime options (from the signed manifest via the pack).
 #[derive(Debug, Clone)]

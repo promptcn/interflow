@@ -3,6 +3,7 @@
 //! the tunnel, across two workspaces.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use interflow_core::security::AuditSink;
 use interflow_identity::credentials::ActiveCredentialSet;
 use interflow_identity::issuance::IssuerStore;
 use interflow_identity::manifest::Manifest;
@@ -120,7 +121,8 @@ target_addr = "127.0.0.1:{echo_port}"
     let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
     let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
     let hub_config = build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap();
-    let hub = HubServer::new(hub_config).unwrap();
+    let audit = AuditSink::spawn(&hub_config.audit);
+    let hub = HubServer::new(hub_config, audit).unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
@@ -329,7 +331,8 @@ target_cidr = "127.0.0.0/8"
     let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
     let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
     let hub_config = build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap();
-    let hub = HubServer::new(hub_config).unwrap();
+    let audit = AuditSink::spawn(&hub_config.audit);
+    let hub = HubServer::new(hub_config, audit).unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
@@ -552,7 +555,8 @@ target_addr = "127.0.0.1:{delayed_port}"
     let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
     let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
     let hub_config = build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap();
-    let hub = HubServer::new(hub_config).unwrap();
+    let audit = AuditSink::spawn(&hub_config.audit);
+    let hub = HubServer::new(hub_config, audit).unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
@@ -713,27 +717,30 @@ target_addr = "127.0.0.1:{remote_port}"
     let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
     let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
     let hub_config = build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap();
-    let hub = HubServer::new(hub_config).unwrap();
+    let audit = AuditSink::spawn(&hub_config.audit);
+    let hub = HubServer::new(hub_config, audit).unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
     ready_rx.await.unwrap();
 
-    // Agents WITH their policy watchers — the production wiring.
+    // The REAL start path: the engine arms the policy watcher from the
+    // config's policy plane — the same path the CLI binary and the GUI
+    // take (no test-local wiring left to drift from production).
     let start = |pack_dir: &Path| {
         let pack = CredentialPack::load_runtime(pack_dir).unwrap();
         let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
         let config = build_agent_config(&pack, &active, pack_dir).unwrap();
-        let client = AgentClient::new(config).unwrap();
-        let agent = client.clone().start();
-        let watcher =
-            interflow_mesh::pack::spawn_policy_reload(pack_dir, client, Some(agent.tunnel()))
-                .unwrap();
-        (agent, watcher)
+        let agent = AgentClient::new(config).unwrap().start();
+        assert!(
+            agent.policy_state().is_some(),
+            "a pack-built config arms the policy watcher at start"
+        );
+        agent
     };
-    let (agent_b, watcher_b) = start(&pack_dir_b);
+    let agent_b = start(&pack_dir_b);
     wait_connected(&agent_b).await;
-    let (agent_a, watcher_a) = start(&pack_dir_a);
+    let agent_a = start(&pack_dir_a);
     wait_connected(&agent_a).await;
 
     // Baseline: svc-a forwards.
@@ -825,8 +832,7 @@ target_addr = "127.0.0.1:{remote_port}"
             .is_err()
     );
 
-    watcher_a.abort();
-    watcher_b.abort();
+    // The watchers ride the agents' own task groups — agent shutdown ends them.
     let _ = agent_a.shutdown_graceful().await;
     let _ = agent_b.shutdown_graceful().await;
     shutdown.cancel();
@@ -834,6 +840,212 @@ target_addr = "127.0.0.1:{remote_port}"
     for task in backends {
         task.abort();
     }
+}
+
+/// The 2026-10-07 hot-reapply incident, machine-locked: a policy update
+/// that only touches a CONNECTION-level knob of an EXISTING stream
+/// (`idle_timeout_secs`, same name/listen/target) must hot-apply without
+/// the listener ever moving — the old whole-struct diff treated this as a
+/// replace and its close-then-rebind order could silently drop the
+/// listener.
+/// The new knob must also actually reach new connections (a silent no-op
+/// would pass a mere "listener survived" check).
+#[tokio::test]
+async fn policy_param_change_hot_applies_without_listener_restart() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let hub_port = free_port();
+    let echo_port = free_port();
+    let listen_port = free_port();
+
+    // The service behind lan-b: a plain TCP echo server.
+    let echo = tokio::net::TcpListener::bind(("127.0.0.1", echo_port))
+        .await
+        .unwrap();
+    let backend = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = echo.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = IssuerStore::open(dir.path().join("issuer"));
+    issuer.ensure_realm().unwrap();
+    issuer.ensure_workspace("main").unwrap();
+    issuer.ensure_policy_key().unwrap();
+
+    // Same shape for both generations — v2 differs ONLY in the knob.
+    let manifest_text = |idle: Option<u64>| {
+        let idle_line = match idle {
+            Some(secs) => format!("idle_timeout_secs = {secs}"),
+            None => String::new(),
+        };
+        format!(
+            r#"
+[realm]
+id = "test"
+[registrar]
+endpoint = "https://registrar.example.com"
+[mesh.hub.central]
+listen = "127.0.0.1:{hub_port}"
+endpoint = "127.0.0.1:{hub_port}"
+[workspace.main]
+[agent.lan-a]
+workspace = "main"
+[[agent.lan-a.mesh_ingress]]
+name = "svc"
+listen = "127.0.0.1:{listen_port}"
+target_agent = "lan-b"
+remote_addr = "127.0.0.1:{echo_port}"
+{idle_line}
+[agent.lan-b]
+workspace = "main"
+[[agent.lan-b.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:{echo_port}"
+"#
+        )
+    };
+    let manifest_v1 = Manifest::parse(&manifest_text(None)).unwrap();
+    // The incident's exact shape: connection-level param only. 2s so the
+    // assertion can observe it (the tcp default is 300s).
+    let manifest_v2 = Manifest::parse(&manifest_text(Some(2))).unwrap();
+
+    let hub_dir = dir.path().join("packs/hub-central");
+    HubCredentialPack::render(&issuer, &manifest_v1, "central", 1, &hub_dir).unwrap();
+    let pack_dir_a = dir.path().join("packs/agent-lan-a");
+    AgentCredentialPack::render(&issuer, &manifest_v1, "lan-a", 1, &pack_dir_a).unwrap();
+    let pack_dir_b = dir.path().join("packs/agent-lan-b");
+    AgentCredentialPack::render(&issuer, &manifest_v1, "lan-b", 1, &pack_dir_b).unwrap();
+
+    let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
+    let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
+    let hub_config = build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap();
+    let audit = AuditSink::spawn(&hub_config.audit);
+    let hub = HubServer::new(hub_config, audit).unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
+    ready_rx.await.unwrap();
+
+    let start = |pack_dir: &Path| {
+        let pack = CredentialPack::load_runtime(pack_dir).unwrap();
+        let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
+        let config = build_agent_config(&pack, &active, pack_dir).unwrap();
+        AgentClient::new(config).unwrap().start()
+    };
+    let agent_b = start(&pack_dir_b);
+    wait_connected(&agent_b).await;
+    let agent_a = start(&pack_dir_a);
+    wait_connected(&agent_a).await;
+
+    let round_trip = |port: u16, payload: &[u8]| {
+        let payload = payload.to_vec();
+        async move {
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+            client.write_all(&payload).await?;
+            let mut echoed = vec![0u8; payload.len()];
+            client.read_exact(&mut echoed).await?;
+            Ok::<(tokio::net::TcpStream, Vec<u8>), std::io::Error>((client, echoed))
+        }
+    };
+
+    // Baseline: the listener serves v1.
+    let (_, echoed) =
+        tokio::time::timeout(Duration::from_secs(30), round_trip(listen_port, b"via-v1"))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(echoed, b"via-v1");
+
+    // The signed update: generation 2, param-only change on the SAME
+    // stream (the watcher polls every 10s; allow generous margin).
+    drop_policy_update(&issuer, &pack_dir_a, 2, &manifest_v2);
+    drop_policy_update(&issuer, &pack_dir_b, 2, &manifest_v2);
+    let state_toml = pack_dir_a.join("state/policy/policy.toml");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let applied =
+            std::fs::read_to_string(&state_toml).is_ok_and(|body| body.contains("generation = 2"));
+        if applied {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "param-only policy update never applied (state file: {:?})",
+            std::fs::read_to_string(&state_toml).ok()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // The listener never moved: the SAME port still round-trips (this is
+    // the assertion the incident failed — state said gen 8 while 9091 was
+    // gone), and the actual-state face reports the rule bound.
+    let (_, echoed) =
+        tokio::time::timeout(Duration::from_secs(10), round_trip(listen_port, b"via-v2"))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(echoed, b"via-v2");
+    let status = agent_a.ingress_listener_status("svc").expect("status face");
+    assert_eq!(
+        status.bound_addr,
+        Some(format!("127.0.0.1:{listen_port}").parse().unwrap())
+    );
+    assert_eq!(status.last_error, None);
+
+    // And the knob must actually reach connections opened after the
+    // change — poll with FRESH connections (the state file lands a moment
+    // before the runtime face moves; a connection opened in that gap
+    // serves the old budget). Under v2's 2s idle budget a silent post-echo
+    // connection closes fast; v1's 300s default never does — a silent
+    // no-op "keep the listener" fix passes everything above and fails
+    // exactly here.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut knob_live = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok((mut probe, echoed))) = tokio::time::timeout(
+            Duration::from_secs(5),
+            round_trip(listen_port, b"idle-probe"),
+        )
+        .await
+            && echoed == b"idle-probe"
+        {
+            let mut buf = [0u8; 8];
+            if tokio::time::timeout(Duration::from_secs(6), probe.read(&mut buf))
+                .await
+                .is_ok()
+            {
+                knob_live = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        knob_live,
+        "hot-applied 2s idle timeout never reached new connections"
+    );
+
+    let _ = agent_a.shutdown_graceful().await;
+    let _ = agent_b.shutdown_graceful().await;
+    shutdown.cancel();
+    let _ = hub_task.await;
+    backend.abort();
 }
 
 /// One raw one-shot mTLS request against the hub (test-side transport for
@@ -968,7 +1180,8 @@ target_addr = "127.0.0.1:{remote_port}"
     assert!(hub_config.policy.verifier_key_hex.is_some());
     assert_eq!(hub_config.policy.generation, 1);
     assert_eq!(hub_config.auth.tenants.len(), 2, "main + control");
-    let hub = HubServer::new(hub_config).unwrap();
+    let audit = AuditSink::spawn(&hub_config.audit);
+    let hub = HubServer::new(hub_config, audit).unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
@@ -1025,10 +1238,12 @@ target_addr = "127.0.0.1:{remote_port}"
         }
     );
 
-    // A tampered signature → rejected with a named error.
+    // A tampered signature → rejected with a named error. A refusal is an
+    // OUTCOME (not a transport error): retrying the same bytes cannot
+    // succeed and the reason travels with the result.
     let mut tampered = bytes_v2.clone();
     tampered[0] ^= 0xff;
-    let err = interflow_mesh::hub::policy::publish_policy(
+    let outcome = interflow_mesh::hub::policy::publish_policy(
         &format!("127.0.0.1:{hub_port}"),
         &ca,
         &cert,
@@ -1037,20 +1252,47 @@ target_addr = "127.0.0.1:{remote_port}"
         &sig_v2,
     )
     .await
-    .unwrap_err();
+    .unwrap();
     assert!(
-        err.to_string().contains("400"),
-        "tampered policy must be rejected: {err}"
+        matches!(
+            &outcome,
+            interflow_mesh::hub::policy::PublishOutcome::Rejected { status: 400, .. }
+        ),
+        "tampered policy must be rejected as a 400 refusal: {outcome:?}"
+    );
+
+    // The floor query: the control-plane watermark the next mint must
+    // clear — 2 after the accepted publish above. Same mTLS dial as the
+    // publisher. `serving` must report the same generation: the accepted
+    // publish is what the hub serves right now (the floor/serving pair is
+    // the no-op gate's split detector — a divergence here is the
+    // lineage-loss signature).
+    let watermarks = interflow_mesh::hub::policy::query_policy_floor(
+        &format!("127.0.0.1:{hub_port}"),
+        &ca,
+        &cert,
+        &key,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        watermarks.floor, 2,
+        "the floor must name the accepted generation"
+    );
+    assert_eq!(
+        watermarks.serving,
+        Some(2),
+        "the hub must report the generation it actually serves"
     );
 
     // A workspace principal (an agent's own credential — straight from its
     // pack) must not publish: a compromised agent box cannot widen its own
-    // authorization.
+    // authorization. Nor may it read the floor (control-plane face).
     let home_dir = dir.path().join("packs/agent-home");
     AgentCredentialPack::render(&issuer, &manifest_v1, "home", 1, &home_dir).unwrap();
     let agent_cert = home_dir.join("identity/agent-main.crt");
     let agent_key = home_dir.join("identity/agent-main.key");
-    let err = interflow_mesh::hub::policy::publish_policy(
+    let outcome = interflow_mesh::hub::policy::publish_policy(
         &format!("127.0.0.1:{hub_port}"),
         &ca,
         &agent_cert,
@@ -1059,10 +1301,25 @@ target_addr = "127.0.0.1:{remote_port}"
         &sig_v2,
     )
     .await
+    .unwrap();
+    assert!(
+        matches!(
+            &outcome,
+            interflow_mesh::hub::policy::PublishOutcome::Rejected { status: 403, .. }
+        ),
+        "an agent principal must not publish policy: {outcome:?}"
+    );
+    let err = interflow_mesh::hub::policy::query_policy_floor(
+        &format!("127.0.0.1:{hub_port}"),
+        &ca,
+        &agent_cert,
+        &agent_key,
+    )
+    .await
     .unwrap_err();
     assert!(
         err.to_string().contains("403"),
-        "an agent principal must not publish policy: {err}"
+        "an agent principal must not query the floor: {err}"
     );
 
     shutdown.cancel();
@@ -1155,7 +1412,8 @@ target_addr = "127.0.0.1:{remote_port}"
     let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
     let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
     let hub_config = build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap();
-    let hub = HubServer::new(hub_config).unwrap();
+    let audit = AuditSink::spawn(&hub_config.audit);
+    let hub = HubServer::new(hub_config, audit).unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let shutdown = tokio_util::sync::CancellationToken::new();
     let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
@@ -1165,21 +1423,20 @@ target_addr = "127.0.0.1:{remote_port}"
         let pack = CredentialPack::load_runtime(pack_dir).unwrap();
         let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
         let config = build_agent_config(&pack, &active, pack_dir).unwrap();
-        let client = AgentClient::new(config).unwrap();
-        let agent = client.clone().start();
-        let watcher =
-            interflow_mesh::pack::spawn_policy_reload(pack_dir, client, Some(agent.tunnel()))
-                .unwrap();
-        (agent, watcher)
+        let agent = AgentClient::new(config).unwrap().start();
+        let watch_state = agent
+            .policy_state()
+            .expect("a pack-built config arms the policy watcher at start");
+        (agent, watch_state)
     };
     // lan-b starts "offline" — it comes up only AFTER the publish below.
-    let (agent_a, watcher_a) = start(&pack_dir_a);
+    let (agent_a, watch_state_a) = start(&pack_dir_a);
     wait_connected(&agent_a).await;
 
     // Baseline through lan-b? Not yet online — start it for the baseline,
     // then take it down conceptually: the catch-up story is that a FRESH
     // lan-b (restarted, embedded generation 1) converges via pull.
-    let (agent_b, watcher_b) = start(&pack_dir_b);
+    let (agent_b, _) = start(&pack_dir_b);
     wait_connected(&agent_b).await;
 
     let round_trip = |port: u16, payload: &[u8]| {
@@ -1259,12 +1516,11 @@ target_addr = "127.0.0.1:{remote_port}"
     // Offline catch-up: a FRESH lan-b (embedded generation 1, pack never
     // touched) converges to the latest generation through its first
     // connected ticks — the "skipped intermediate versions" contract.
-    watcher_b.abort();
     let _ = agent_b.shutdown_graceful().await;
     // Give the hub a moment to age the old registration out; the fresh
     // session re-registers anyway.
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let (agent_b2, watcher_b2) = start(&pack_dir_b);
+    let (agent_b2, _watch_state_b2) = start(&pack_dir_b);
     wait_connected(&agent_b2).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     let mut caught_up = false;
@@ -1346,10 +1602,41 @@ target_addr = "127.0.0.1:{remote_port}"
             .any(|v| v.get("kind").and_then(|k| k.as_str()) == Some("policy_published"))
     );
 
+    // The operator overview (the GUI Apply-result/convergence card's data
+    // source): the same control-credential floor query's full view — both
+    // agents present, ONLINE (session presence, not just registration),
+    // and their pulled watermarks at the served generation 2. This is the
+    // "did every node receive generation N" answer rendered end to end.
+    let overview = interflow_mesh::hub::policy::query_hub_overview(
+        &format!("127.0.0.1:{hub_port}"),
+        &ca,
+        &cert,
+        &key,
+    )
+    .await
+    .unwrap();
+    assert_eq!(overview.floor, 2, "overview floor mirrors the floor query");
+    assert_eq!(overview.serving, Some(2));
+    for expected in ["main/lan-a", "main/lan-b"] {
+        let row = overview
+            .agents
+            .iter()
+            .find(|a| a.agent == expected)
+            .unwrap_or_else(|| panic!("overview must list {expected}: {:?}", overview.agents));
+        assert!(row.online, "{expected} must read online: {row:?}");
+        assert_eq!(
+            row.seen,
+            Some(2),
+            "{expected} must have pulled gen 2: {row:?}"
+        );
+    }
+
     // Steady state across a full watch interval (10s): zero new
     // policy_pulled records — the conditional request answers 304, and
     // even a same-generation re-serve dedupes in the ledger. Either way:
-    // silence.
+    // silence. The 304's x-policy-generation header still lands in the
+    // watcher telemetry (the h2 client keeps it): hub == local == 2, the
+    // healthy steady state.
     tokio::time::sleep(Duration::from_secs(12)).await;
     let steady = policy_pull_pairs(&read_audit());
     assert_eq!(
@@ -1357,11 +1644,22 @@ target_addr = "127.0.0.1:{remote_port}"
         2,
         "steady state must add zero policy_pulled records: {steady:?}"
     );
+    assert_eq!(
+        (
+            watch_state_a
+                .seen
+                .load(std::sync::atomic::Ordering::Acquire),
+            watch_state_a
+                .hub_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+        ),
+        (2, 2),
+        "the 304 header must reach the watcher telemetry"
+    );
 
     // Offline catch-up with a NEW generation while lan-a is down (the
     // acceptance path: a node that missed a publish lands exactly ONE
     // policy_pulled on its first connected pull of the new generation).
-    watcher_a.abort();
     let _ = agent_a.shutdown_graceful().await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let policy_v3 = interflow_identity::policy::RuntimePolicy::from_manifest(&manifest_v2, 3);
@@ -1400,7 +1698,7 @@ target_addr = "127.0.0.1:{remote_port}"
     // lan-a comes back: its local channel holds gen 2, the hub serves 3 —
     // one catch-up record, and the catch-up actually applies (the service
     // answers).
-    let (agent_a_back, watcher_a_back) = start(&pack_dir_a);
+    let (agent_a_back, _watch_state_a_back) = start(&pack_dir_a);
     wait_connected(&agent_a_back).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -1452,8 +1750,6 @@ target_addr = "127.0.0.1:{remote_port}"
         .count();
     assert_eq!(published, 2, "gen 2 + gen 3, nothing else");
 
-    watcher_a_back.abort();
-    watcher_b2.abort();
     let _ = agent_a_back.shutdown_graceful().await;
     let _ = agent_b2.shutdown_graceful().await;
     shutdown.cancel();

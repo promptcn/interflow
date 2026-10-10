@@ -39,13 +39,23 @@ pub struct WorkspaceTrust {
 pub struct IngressIdentity {
     principals: HashMap<String, IngressPrincipal>,
     trust: HashMap<String, PathBuf>,
+    /// The deployment's identity tier pins the CRL source for the inner
+    /// plane (offline: the pack-embedded `trust/crls` snapshot; registrar:
+    /// the live-refreshed `state/crls`). Mirrors
+    /// `interflow_identity::pack::crl_path_for` — the engine crate does not
+    /// depend on the identity crate.
+    identity_offline: bool,
     cache: Mutex<HashMap<String, (u64, Arc<interflow_core::tls::InnerTlsMaterial>)>>,
 }
 
 impl IngressIdentity {
     /// Builds the identity source. Duplicate workspaces (in either the
     /// principal or the trust list) are a configuration error.
-    pub fn new(principals: Vec<IngressPrincipal>, trust: Vec<WorkspaceTrust>) -> Result<Self> {
+    pub fn new(
+        principals: Vec<IngressPrincipal>,
+        trust: Vec<WorkspaceTrust>,
+        identity_offline: bool,
+    ) -> Result<Self> {
         let mut principal_map = HashMap::with_capacity(principals.len());
         for principal in principals {
             let workspace = principal.workspace.clone();
@@ -76,6 +86,7 @@ impl IngressIdentity {
         Ok(Self {
             principals: principal_map,
             trust: trust_map,
+            identity_offline,
             cache: Mutex::new(HashMap::new()),
         })
     }
@@ -138,16 +149,10 @@ impl IngressIdentity {
         let ca = ca_path.to_string_lossy();
         let cert = cert.to_string_lossy();
         let key = key.to_string_lossy();
-        let crl_path = workspace_crl(ca_path);
-        let crls = if crl_path
-            .as_deref()
-            .is_some_and(|path| Path::new(path).is_file())
-        {
-            vec![interflow_core::tls::load_crl(
-                crl_path.as_deref().unwrap_or_default(),
-            )?]
-        } else {
-            Vec::new()
+        let crl_path = workspace_crl(ca_path, self.identity_offline)?;
+        let crls = match crl_path.as_deref() {
+            Some(path) => vec![interflow_core::tls::load_crl(path)?],
+            None => Vec::new(),
         };
         let material = interflow_core::tls::InnerTlsMaterial::from_paths_with_crls(
             &[ca.as_ref()],
@@ -194,12 +199,34 @@ fn credentials_root(cert: &Path) -> Option<&Path> {
     }
 }
 
-fn workspace_crl(anchor: &Path) -> Option<String> {
-    let pack_root = anchor.parent()?.parent()?;
-    let stem = anchor.file_stem()?;
-    let path = pack_root
-        .join("state")
-        .join("crls")
-        .join(format!("{}.crl.pem", stem.to_string_lossy()));
-    path.is_file().then(|| path.display().to_string())
+fn workspace_crl(anchor: &Path, offline: bool) -> Result<Option<String>> {
+    // The identity tier statically pins the CRL source directory — mirrors
+    // interflow_identity::pack::crl_path_for (the engine crate deliberately
+    // does not depend on the identity crate). Offline: the pack-embedded
+    // snapshot (absent = render defect, fail loud — before this mirror only
+    // probed state/crls, silently leaving the offline inner plane without
+    // any CRL). Registrar: the node-local live refresh (absent = not
+    // refreshed yet).
+    let Some(pack_root) = anchor.parent().and_then(Path::parent) else {
+        return Ok(None);
+    };
+    let Some(stem) = anchor.file_stem() else {
+        return Ok(None);
+    };
+    let file = format!("{}.crl.pem", stem.to_string_lossy());
+    if offline {
+        let embedded = pack_root.join("trust").join("crls").join(&file);
+        if embedded.is_file() {
+            Ok(Some(embedded.display().to_string()))
+        } else {
+            Err(InterflowError::config(format!(
+                "offline pack carries no embedded CRL snapshot for issuer {:?} in trust/crls \
+                 — a render defect; re-apply or rotate the pack",
+                stem.to_string_lossy()
+            )))
+        }
+    } else {
+        let live = pack_root.join("state").join("crls").join(&file);
+        Ok(live.is_file().then(|| live.display().to_string()))
+    }
 }

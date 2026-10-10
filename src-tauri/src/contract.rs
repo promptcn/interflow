@@ -254,6 +254,167 @@ impl From<crate::node::CredentialHealth> for CredentialHealthDto {
     }
 }
 
+/// The policy plane's live face for one mesh agent node — "which policy
+/// generation is this node actually running, from which channel, and is
+/// the hub ahead or behind it" (the policy-health surface; a
+/// `hub_generation` below `generation` is the lineage-deadlock signature
+/// and surfaces color-code it amber).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct PolicyPlaneDto {
+    /// The generation this node currently runs.
+    pub generation: u32,
+    /// Which face the live policy came from.
+    pub source: PolicySourceDto,
+    /// The hub's serving generation as of the watcher's last poll;
+    /// `None` = never polled / the hub did not report / node not running.
+    pub hub_generation: Option<u32>,
+    /// The control-plane pull channel's own health while the node runs;
+    /// `None` = the node is stopped.
+    pub pull: Option<PullHealthDto>,
+}
+
+/// The distribution plane's liveness face — distinct from whichever
+/// generation it delivered: `last_ok_unix == 0` on a connected agent is a
+/// channel that has never completed a pull (the 2026-10-07 frozen-mesh
+/// signature), and `last_tick_unix` frozen in the past is a dead watcher
+/// task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct PullHealthDto {
+    /// Unix seconds of the last completed pull; `0` = never.
+    pub last_ok_unix: u32,
+    /// Total failed pull attempts since the node started.
+    pub failures_total: u32,
+    /// Unix seconds of the watcher's most recent wake.
+    pub last_tick_unix: u32,
+}
+
+/// Which distribution face a node's live policy came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicySourceDto {
+    /// The pack's embedded snapshot.
+    Pack,
+    /// The node-local update channel (`state/policy`) — hub pulls and
+    /// manual injections land here.
+    StatePolicy,
+}
+
+impl From<crate::node::PolicyPlane> for PolicyPlaneDto {
+    fn from(p: crate::node::PolicyPlane) -> Self {
+        Self {
+            generation: u32::try_from(p.generation).unwrap_or(u32::MAX),
+            source: match p.source {
+                crate::node::PolicySource::Pack => PolicySourceDto::Pack,
+                crate::node::PolicySource::StatePolicy => PolicySourceDto::StatePolicy,
+            },
+            hub_generation: p.hub_generation.and_then(|g| u32::try_from(g).ok()),
+            pull: p.pull.map(|h| PullHealthDto {
+                last_ok_unix: u32::try_from(h.last_ok_unix).unwrap_or(u32::MAX),
+                failures_total: u32::try_from(h.failures_total).unwrap_or(u32::MAX),
+                last_tick_unix: u32::try_from(h.last_tick_unix).unwrap_or(u32::MAX),
+            }),
+        }
+    }
+}
+
+/// The peer plane's live face for one mesh agent node — the tenant's other
+/// agents with presence and leaf health (the 2026-10-08
+/// peer-observability surface; the first local answer to "is the far end
+/// up"). Information-minimal: name, presence, leaf phase.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct PeersPlaneDto {
+    /// The tenant's registered agents, self excluded.
+    pub peers: Vec<PeerStatusDto>,
+    /// Unix seconds of the last successful fetch; `0` = never.
+    pub last_ok_unix: u32,
+    /// Failed fetches since the node started.
+    pub failures_total: u32,
+}
+
+/// One peer as the node's peer watcher reads it.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct PeerStatusDto {
+    /// Qualified peer id (`tenant/agent`).
+    pub agent: String,
+    /// Presence (`registered ≠ reachable`): a QUIC relay session in place,
+    /// or an h2 poll body in place / within reconnect grace.
+    pub online: bool,
+    /// The peer's leaf-health phase (`None` = its leaf did not parse).
+    /// Color-code like the node's own credential face: warn = amber,
+    /// critical = red.
+    pub leaf_phase: Option<LeafPhaseDto>,
+    /// Seconds of leaf validity remaining (`0` with phase `None`).
+    pub leaf_remaining_secs: i32,
+    /// The leaf's `notAfter` unix seconds (`0` with phase `None`; capped
+    /// at u32 — unix seconds stay inside it until 2106).
+    pub leaf_not_after_unix: u32,
+}
+
+/// The leaf-health phase spelling (snake_case on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum LeafPhaseDto {
+    Healthy,
+    Warn,
+    Critical,
+}
+
+/// One ingress rule's listener actual state — where it is really serving,
+/// or why it is not (the actual-state counterpart of the rule store; the
+/// 2026-10-09 honesty axis: a green session card plus a gone listener
+/// surfaces as exactly that).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct ListenerStatusDto {
+    /// The ingress rule the listener serves.
+    pub rule: String,
+    /// The actually-bound address, port materialized (`:0` picks show the
+    /// real port) — `null` = no listener is up for the rule.
+    pub bound_addr: Option<String>,
+    /// The last bind failure (`null` = healthy).
+    pub last_error: Option<String>,
+}
+
+impl From<crate::node::ListenerStatusFace> for ListenerStatusDto {
+    fn from(f: crate::node::ListenerStatusFace) -> Self {
+        Self {
+            rule: f.rule,
+            bound_addr: f.bound_addr,
+            last_error: f.last_error,
+        }
+    }
+}
+
+impl From<crate::node::PeersPlane> for PeersPlaneDto {
+    fn from(p: crate::node::PeersPlane) -> Self {
+        Self {
+            peers: p
+                .peers
+                .into_iter()
+                .map(|s| PeerStatusDto {
+                    agent: s.agent,
+                    online: s.online,
+                    leaf_phase: s.leaf_phase.map(|phase| match phase {
+                        interflow_core::tunnel::transport::PeerLeafPhase::Healthy => {
+                            LeafPhaseDto::Healthy
+                        }
+                        interflow_core::tunnel::transport::PeerLeafPhase::Warn => {
+                            LeafPhaseDto::Warn
+                        }
+                        interflow_core::tunnel::transport::PeerLeafPhase::Critical => {
+                            LeafPhaseDto::Critical
+                        }
+                    }),
+                    leaf_remaining_secs: i32::try_from(s.leaf_remaining_secs).unwrap_or(i32::MAX),
+                    leaf_not_after_unix: u32::try_from(s.leaf_not_after_unix.max(0))
+                        .unwrap_or(u32::MAX),
+                })
+                .collect(),
+            last_ok_unix: u32::try_from(p.last_ok_unix).unwrap_or(u32::MAX),
+            failures_total: u32::try_from(p.failures_total).unwrap_or(u32::MAX),
+        }
+    }
+}
+
 /// One managed node (list rows, detail panes).
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct NodeInfo {
@@ -304,6 +465,20 @@ pub struct NodeInfo {
     /// when the pack has no active credential set. Color-code `phase`:
     /// warn = amber, critical = red (the dirty-build visual language).
     pub credential: Option<CredentialHealthDto>,
+    /// The policy plane's live face (mesh agents only). `None` for other
+    /// kinds or an unreadable pack.
+    pub policy: Option<PolicyPlaneDto>,
+    /// The peer plane's live face (mesh agents only, running). `None` for
+    /// other kinds or a stopped node — presence has no meaningful stale
+    /// display.
+    pub peers: Option<PeersPlaneDto>,
+    /// This node's stream-proposal receipts (mesh agents only, running) —
+    /// `None` for other kinds or a stopped node.
+    pub proposals: Option<Vec<ProposalReceiptDto>>,
+    /// Every ingress rule's listener actual state (mesh agents only,
+    /// running) — `None` for other kinds or a stopped node. This is what
+    /// is REALLY listening, not what the policy wants.
+    pub listeners: Option<Vec<ListenerStatusDto>>,
 }
 
 impl From<NodeSnapshot> for NodeInfo {
@@ -367,6 +542,19 @@ impl From<NodeSnapshot> for NodeInfo {
             // Merged by the command layer from the manager's health cache
             // (the snapshot is pure node state).
             credential: None,
+            // Merged by the command layer from the manager's policy-plane
+            // view (live watcher state or the authoritative pack load).
+            policy: None,
+            // Merged by the command layer from the manager's peers-plane
+            // view (live watcher state; stopped nodes carry no reading).
+            peers: None,
+            // Merged by the command layer from the manager's proposal
+            // receipts view (same contract).
+            proposals: None,
+            // Merged by the command layer from the manager's
+            // listeners-plane view (live reconciler table; stopped nodes
+            // carry no reading).
+            listeners: None,
         }
     }
 }
@@ -456,6 +644,262 @@ pub struct NodePrefs {
     /// the pack default for that service id; an empty list reverts every
     /// service to its default.
     pub service_addresses: Vec<ServiceAddressPrefDto>,
+}
+
+/// One apply's structured outcome — the report lines (what the CLI prints
+/// verbatim) plus the generation it landed on. The Deploy overview's
+/// Apply-result card renders both.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct ApplyReportDto {
+    pub lines: Vec<String>,
+    /// The policy generation this apply minted — or, on a no-op, the live
+    /// generation it confirmed.
+    pub generation: u32,
+}
+
+/// The bookkeeping-level "would apply do anything" pre-check (no minting,
+/// no hub dial): the "unapplied changes" badge and the next-steps face.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChangeStateDto {
+    /// No applied state in this issuer store — the first apply performs a
+    /// full render.
+    NeverApplied,
+    /// The manifest matches the applied state exactly.
+    Applied { generation: u32 },
+    /// Only the policy face moved (mesh rules, idle budgets) — the next
+    /// apply takes the policy-only fast path (hot, ≤10s to the fleet).
+    PolicyEditsPending,
+    /// The identity/trust/dial face changed — the next apply re-renders
+    /// every pack.
+    IdentityEditsPending,
+}
+
+/// The running hub's operator overview: watermarks plus the fleet's
+/// presence and pull convergence (from the control-credential
+/// `GET /policy/floor` — all facts the hub already holds).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct HubOverviewDto {
+    /// The anti-rollback floor (includes absorbed node watermarks).
+    pub floor: u32,
+    /// What the hub actually serves; `None` = this hub cannot report it.
+    pub serving: Option<u32>,
+    /// Every registered fleet member with presence and last-pulled
+    /// watermark.
+    pub agents: Vec<HubAgentRowDto>,
+}
+
+/// One fleet member's row in a [`HubOverviewDto`].
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct HubAgentRowDto {
+    /// Qualified agent id (`tenant/agent`).
+    pub agent: String,
+    /// Presence (`registered ≠ reachable`).
+    pub online: bool,
+    /// The generation this agent last pulled; `None` = no completed pull
+    /// since the hub process started.
+    pub seen: Option<u32>,
+}
+
+/// One stream-proposal request (the requester's form = the validator's
+/// fields, verbatim).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct StreamProposalRequestDto {
+    pub name: String,
+    pub listen: String,
+    /// tcp / udp.
+    pub protocol: MeshProtocolDto,
+    pub target_agent: String,
+    pub remote_addr: String,
+    pub idle_timeout_secs: Option<u32>,
+}
+
+/// A proposal's decision state (wire shape mirrors the hub record's).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ProposalStatusDto {
+    Pending,
+    Approved { generation: u32 },
+    Rejected { reason: String },
+}
+
+/// One queue entry as the operator's Deploy face shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct ControlProposalDto {
+    pub id: String,
+    /// The requesting agent's qualified id.
+    pub requester: String,
+    pub rule: StreamProposalRequestDto,
+    pub submitted_at_unix: u32,
+    pub expires_at_unix: u32,
+    pub status: ProposalStatusDto,
+}
+
+/// The hub's answer to one submission (queued / idempotent duplicate /
+/// denied with the funnel's readable reason).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ProposalSubmitOutcomeDto {
+    Queued { id: String, expires_at_unix: u32 },
+    Duplicate { id: String, expires_at_unix: u32 },
+    Denied { reason: String },
+}
+
+/// One of this node's own proposals (the receipts face).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct ProposalReceiptDto {
+    pub id: String,
+    pub rule: StreamProposalRequestDto,
+    pub submitted_at_unix: u32,
+    pub expires_at_unix: u32,
+    pub status: ProposalStatusDto,
+}
+
+impl From<interflow_mesh::hub::proposals::ControlProposal> for ControlProposalDto {
+    fn from(p: interflow_mesh::hub::proposals::ControlProposal) -> Self {
+        Self {
+            id: p.id,
+            requester: p.requester,
+            rule: proposal_rule_dto(p.rule),
+            submitted_at_unix: u32::try_from(p.submitted_at_unix).unwrap_or(u32::MAX),
+            expires_at_unix: u32::try_from(p.expires_at_unix).unwrap_or(u32::MAX),
+            status: proposal_status_dto(p.status),
+        }
+    }
+}
+
+impl From<interflow_core::tunnel::transport::ProposalReceipt> for ProposalReceiptDto {
+    fn from(r: interflow_core::tunnel::transport::ProposalReceipt) -> Self {
+        Self {
+            id: r.id,
+            rule: proposal_rule_dto(r.rule),
+            submitted_at_unix: u32::try_from(r.submitted_at_unix).unwrap_or(u32::MAX),
+            expires_at_unix: u32::try_from(r.expires_at_unix).unwrap_or(u32::MAX),
+            status: match r.status {
+                interflow_core::tunnel::transport::ProposalStatusWire::Pending => {
+                    ProposalStatusDto::Pending
+                }
+                interflow_core::tunnel::transport::ProposalStatusWire::Approved { generation } => {
+                    ProposalStatusDto::Approved {
+                        generation: u32::try_from(generation).unwrap_or(u32::MAX),
+                    }
+                }
+                interflow_core::tunnel::transport::ProposalStatusWire::Rejected { reason } => {
+                    ProposalStatusDto::Rejected { reason }
+                }
+            },
+        }
+    }
+}
+
+fn proposal_rule_dto(
+    rule: interflow_core::tunnel::transport::StreamProposalRequest,
+) -> StreamProposalRequestDto {
+    StreamProposalRequestDto {
+        name: rule.name,
+        listen: rule.listen,
+        protocol: match rule.protocol {
+            interflow_core::tunnel::transport::StreamProtoWire::Tcp => MeshProtocolDto::Tcp,
+            interflow_core::tunnel::transport::StreamProtoWire::Udp => MeshProtocolDto::Udp,
+        },
+        target_agent: rule.target_agent,
+        remote_addr: rule.remote_addr,
+        idle_timeout_secs: rule.idle_timeout_secs.and_then(|s| u32::try_from(s).ok()),
+    }
+}
+
+fn proposal_status_dto(status: interflow_mesh::hub::proposals::StoredStatus) -> ProposalStatusDto {
+    match status {
+        interflow_mesh::hub::proposals::StoredStatus::Pending => ProposalStatusDto::Pending,
+        interflow_mesh::hub::proposals::StoredStatus::Approved { generation } => {
+            ProposalStatusDto::Approved {
+                generation: u32::try_from(generation).unwrap_or(u32::MAX),
+            }
+        }
+        interflow_mesh::hub::proposals::StoredStatus::Rejected { reason } => {
+            ProposalStatusDto::Rejected { reason }
+        }
+    }
+}
+
+impl From<interflow_core::tunnel::transport::ProposalSubmitOutcome> for ProposalSubmitOutcomeDto {
+    fn from(o: interflow_core::tunnel::transport::ProposalSubmitOutcome) -> Self {
+        match o {
+            interflow_core::tunnel::transport::ProposalSubmitOutcome::Queued {
+                id,
+                expires_at_unix,
+            } => Self::Queued {
+                id,
+                expires_at_unix: u32::try_from(expires_at_unix).unwrap_or(u32::MAX),
+            },
+            interflow_core::tunnel::transport::ProposalSubmitOutcome::Duplicate {
+                id,
+                expires_at_unix,
+            } => Self::Duplicate {
+                id,
+                expires_at_unix: u32::try_from(expires_at_unix).unwrap_or(u32::MAX),
+            },
+            interflow_core::tunnel::transport::ProposalSubmitOutcome::Denied { reason } => {
+                Self::Denied { reason }
+            }
+        }
+    }
+}
+
+impl From<StreamProposalRequestDto> for interflow_core::tunnel::transport::StreamProposalRequest {
+    fn from(r: StreamProposalRequestDto) -> Self {
+        Self {
+            name: r.name,
+            listen: r.listen,
+            protocol: match r.protocol {
+                MeshProtocolDto::Tcp => interflow_core::tunnel::transport::StreamProtoWire::Tcp,
+                MeshProtocolDto::Udp => interflow_core::tunnel::transport::StreamProtoWire::Udp,
+            },
+            target_agent: r.target_agent,
+            remote_addr: r.remote_addr,
+            idle_timeout_secs: r.idle_timeout_secs.map(u64::from),
+        }
+    }
+}
+
+impl From<interflow_cli::plan::ApplyReport> for ApplyReportDto {
+    fn from(r: interflow_cli::plan::ApplyReport) -> Self {
+        Self {
+            lines: r.lines,
+            generation: u32::try_from(r.generation).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+impl From<interflow_cli::plan::ChangeState> for ChangeStateDto {
+    fn from(s: interflow_cli::plan::ChangeState) -> Self {
+        match s {
+            interflow_cli::plan::ChangeState::NeverApplied => Self::NeverApplied,
+            interflow_cli::plan::ChangeState::Applied { generation } => Self::Applied {
+                generation: u32::try_from(generation).unwrap_or(u32::MAX),
+            },
+            interflow_cli::plan::ChangeState::PolicyEditsPending => Self::PolicyEditsPending,
+            interflow_cli::plan::ChangeState::IdentityEditsPending => Self::IdentityEditsPending,
+        }
+    }
+}
+
+impl From<interflow_mesh::hub::policy::HubOverview> for HubOverviewDto {
+    fn from(o: interflow_mesh::hub::policy::HubOverview) -> Self {
+        Self {
+            floor: u32::try_from(o.floor).unwrap_or(u32::MAX),
+            serving: o.serving.and_then(|g| u32::try_from(g).ok()),
+            agents: o
+                .agents
+                .into_iter()
+                .map(|row| HubAgentRowDto {
+                    agent: row.agent,
+                    online: row.online,
+                    seen: row.seen.and_then(|g| u32::try_from(g).ok()),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// One rendered pack in a `plan apply` output tree (deploy page cards).
@@ -1286,6 +1730,15 @@ pub struct DeployContextDto {
     pub out: String,
 }
 
+/// `deploy_defaults` payload: the deployments root — one deployment = one
+/// realm-named folder under it, with the fixed inner layout
+/// `interflow.toml` / `issuer/` / `dist/`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct DeployDefaultsDto {
+    /// Absolute deployments root (home-based, e.g. `~/interflow-deployments`).
+    pub root: String,
+}
+
 /// `deploy_prefs_load/save` payload: the recent deployment contexts, most
 /// recent first.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
@@ -1311,12 +1764,94 @@ pub struct VersionInfo {
     pub dirty: bool,
 }
 
+/// The GUI's interface language (wire form of `gui_prefs::Lang`; English
+/// is the default, Chinese is opt-in from the header switch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum GuiLanguageDto {
+    En,
+    Zh,
+}
+
+impl From<crate::gui_prefs::Lang> for GuiLanguageDto {
+    fn from(lang: crate::gui_prefs::Lang) -> Self {
+        match lang {
+            crate::gui_prefs::Lang::En => Self::En,
+            crate::gui_prefs::Lang::Zh => Self::Zh,
+        }
+    }
+}
+
+impl From<GuiLanguageDto> for crate::gui_prefs::Lang {
+    fn from(lang: GuiLanguageDto) -> Self {
+        match lang {
+            GuiLanguageDto::En => Self::En,
+            GuiLanguageDto::Zh => Self::Zh,
+        }
+    }
+}
+
+/// `gui_prefs_load` payload: GUI-wide preferences. The language is shared
+/// with the Rust-rendered surfaces (tray, user-facing command errors), so
+/// one switch flips every surface at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct GuiPrefsDto {
+    pub language: GuiLanguageDto,
+}
+
 /// `node-state` event payload: which node transitioned to what.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
 #[tauri_specta(event_name = "node-state")]
 pub struct NodeStateEvent {
     pub id: String,
     pub state: NodeStateDto,
+}
+
+/// `policy-plane` event payload: a running mesh agent's policy telemetry
+/// moved (engine watcher → manager forwarder → here). The health panel
+/// patches its node's `policy` field from these, so it tracks the engine's
+/// live watermark and pull health instead of freezing on whatever
+/// `list_nodes` happened to return at node start
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "policy-plane")]
+pub struct PolicyPlaneEvent {
+    pub id: String,
+    pub plane: PolicyPlaneDto,
+}
+
+/// `mesh-peers` event payload: a running mesh agent's peer telemetry moved
+/// (engine peer watcher → manager forwarder → here). The node detail's
+/// Peers section patches its node's `peers` field from these — same
+/// push-not-poll contract as [`PolicyPlaneEvent`].
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "mesh-peers")]
+pub struct MeshPeersEvent {
+    pub id: String,
+    pub peers: PeersPlaneDto,
+}
+
+/// `mesh-proposals` event payload: a running mesh agent's proposal
+/// receipts moved (engine watcher → manager forwarder → here). The node
+/// detail's "Requested streams" section patches its node's `proposals`
+/// from these.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "mesh-proposals")]
+pub struct MeshProposalsEvent {
+    pub id: String,
+    pub proposals: Vec<ProposalReceiptDto>,
+}
+
+/// `mesh-listeners` event payload: a running mesh agent's ingress-listener
+/// actual state moved (engine reconciler → manager forwarder → here). The
+/// node card's listener badge and the detail's Health section patch their
+/// node's `listeners` from these — a bind failure mid-flight surfaces
+/// immediately, not at the next `list_nodes` (same push-not-poll contract
+/// as [`MeshPeersEvent`]; the 2026-10-09 honesty axis).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "mesh-listeners")]
+pub struct MeshListenersEvent {
+    pub id: String,
+    pub listeners: Vec<ListenerStatusDto>,
 }
 
 /// `log` event payload (tracing capture pump → frontend log panel).

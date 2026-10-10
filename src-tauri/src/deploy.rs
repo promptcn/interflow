@@ -169,12 +169,23 @@ mod tests {
 
         let issuer = dir.path().join("issuer").display().to_string();
         let out = dir.path().join("dist").display().to_string();
-        let apply_lines =
-            interflow_cli::plan::apply(&manifest, Path::new(&issuer), Path::new(&out), false)
-                .expect("applies");
+        let apply_report = interflow_cli::plan::apply(
+            &manifest,
+            Path::new(&issuer),
+            Path::new(&out),
+            false,
+            // Throwaway test store: no backup setup.
+            &interflow_cli::plan::BackupInitOptions {
+                skip: true,
+                ..Default::default()
+            },
+        )
+        .expect("applies");
+        assert_eq!(apply_report.generation, 1);
         assert!(
-            apply_lines.iter().any(|l| l.contains("✔ applied")),
-            "{apply_lines:?}"
+            apply_report.lines.iter().any(|l| l.contains("✔ applied")),
+            "{:?}",
+            apply_report.lines
         );
 
         let packs = list_packs(Path::new(&out)).expect("lists");
@@ -203,7 +214,18 @@ mod tests {
         .expect("write manifest");
         let issuer = dir.path().join("issuer");
         let out = dir.path().join("dist");
-        interflow_cli::plan::apply(&manifest, &issuer, &out, false).expect("apply");
+        interflow_cli::plan::apply(
+            &manifest,
+            &issuer,
+            &out,
+            false,
+            // Throwaway test store: no backup setup.
+            &interflow_cli::plan::BackupInitOptions {
+                skip: true,
+                ..Default::default()
+            },
+        )
+        .expect("apply");
 
         let sealed = dir.path().join("agent.iflowpack");
         seal_pack(&out.join("packs/agent-desktop"), &sealed, "open sesame").expect("seals");
@@ -241,7 +263,18 @@ mod tests {
         .expect("write manifest");
         let issuer = dir.path().join("issuer");
         let out = dir.path().join("dist");
-        interflow_cli::plan::apply(&manifest, &issuer, &out, false).expect("apply");
+        interflow_cli::plan::apply(
+            &manifest,
+            &issuer,
+            &out,
+            false,
+            // Throwaway test store: no backup setup.
+            &interflow_cli::plan::BackupInitOptions {
+                skip: true,
+                ..Default::default()
+            },
+        )
+        .expect("apply");
 
         // The primary dist shape.
         let dist = list_packs(&out).expect("lists dist tree");

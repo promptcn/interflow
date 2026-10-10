@@ -31,6 +31,28 @@ use tracing::{debug, error, warn};
 /// Maximum agent_id length (128B), character allowlist `[A-Za-z0-9_.-]`.
 pub(crate) const MAX_AGENT_ID_LEN: usize = 128;
 
+/// A frame-level stream rejection: the wire reason code plus the
+/// hub-internal diagnostic.
+///
+/// Constructing a rejection picks its [`CloseReason`] at the source — the
+/// former string→code matching layer (`close_reason_of`) is gone, so a new
+/// rejection site cannot silently fall into the ordinary-close fallback.
+/// The diagnostic never rides the wire (logs / metrics attribution only).
+#[derive(Debug, Clone)]
+pub(crate) struct StreamReject {
+    /// The Close reason code delivered to the sender.
+    pub code: CloseReason,
+    /// The hub-internal diagnostic text.
+    pub diagnostic: &'static str,
+}
+
+impl StreamReject {
+    /// Builds a rejection from its parts.
+    pub(crate) const fn new(code: CloseReason, diagnostic: &'static str) -> Self {
+        Self { code, diagnostic }
+    }
+}
+
 /// Frame direction (determined at the wire layer by `FLAG_RESPONSE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
@@ -51,10 +73,10 @@ impl Direction {
 }
 
 pub(crate) fn valid_agent_id(s: &str) -> bool {
-    // Forbid the _ prefix: the wire layer reserves sentinels (_response_
-    // etc.) that reuse the source-circuit field
-    !s.starts_with('_')
-        && s.len() <= MAX_AGENT_ID_LEN
+    // The historical `_`-prefix ban was a guard for the deleted wire-layer
+    // sentinel strings (`_response_` etc., retired with the flags-carried
+    // origin rework) — the rationale is gone, so the allowlist is uniform.
+    s.len() <= MAX_AGENT_ID_LEN
         && !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
@@ -324,11 +346,11 @@ impl HubService {
     /// Frame-level Open handling (called by the `/stream/up` reader;
     /// metadata comes from the wire frame rather than HTTP headers).
     ///
-    /// `Err(reason)` = rejected (ACL / stream limits / target unreachable;
+    /// `Err(reject)` = rejected (ACL / stream limits / target unreachable;
     /// metrics and audit already recorded); the caller informs the sender
-    /// via an `_close_` frame on poll. `Ok(())` = stream established (or an
-    /// empty target does not count as an active stream — the count is
-    /// rolled back per existing semantics).
+    /// via a hub-origin Close notification on poll. `Ok(())` = stream
+    /// established (or an empty target does not count as an active stream —
+    /// the count is rolled back per existing semantics).
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn frame_open(
         &self,
@@ -339,7 +361,7 @@ impl HubService {
         route: RouteToken,
         proto: StreamProto,
         e2e: bool,
-    ) -> std::result::Result<(), &'static str> {
+    ) -> std::result::Result<(), StreamReject> {
         // Tenant isolation policy (RFC §4). Both endpoints arrive
         // tenant-qualified (`"{tenant}/{agent}"`); a bare target is
         // qualified with the source's own tenant (same-tenant shorthand on
@@ -347,20 +369,31 @@ impl HubService {
         // intra-tenant anyway).
         let Some((_source_tenant, _source_bare)) = PeerIdentity::split_qualified(source_agent)
         else {
-            return Err("Invalid source identity");
+            return Err(StreamReject::new(
+                CloseReason::SecurityDenied,
+                "Invalid source identity",
+            ));
         };
         let qualified_target = {
             let session = source_state.read().await;
             if session.circuit != source_circuit {
-                return Err("Source circuit not registered");
+                return Err(StreamReject::new(
+                    CloseReason::SecurityDenied,
+                    "Source circuit not registered",
+                ));
             }
             drop(session);
             self.state.route_leases.read().await.get(&route).cloned()
         }
-        .ok_or("Unknown route token")?;
+        .ok_or_else(|| StreamReject::new(CloseReason::NoTarget, "Unknown route token"))?;
         let qualified_target = match qualified_target {
             lease if lease.1 == source_agent => lease.2,
-            _ => return Err("Unknown route token"),
+            _ => {
+                return Err(StreamReject::new(
+                    CloseReason::NoTarget,
+                    "Unknown route token",
+                ));
+            }
         };
 
         match admit_stream(
@@ -374,9 +407,24 @@ impl HubService {
         .await
         {
             StreamAdmission::Admitted => {}
-            StreamAdmission::TenantDenied => return Err("Access denied by tenant policy"),
-            StreamAdmission::GlobalStreamLimit => return Err("Global stream limit reached"),
-            StreamAdmission::PerAgentStreamLimit => return Err("Per-agent stream limit reached"),
+            StreamAdmission::TenantDenied => {
+                return Err(StreamReject::new(
+                    CloseReason::SecurityDenied,
+                    "Access denied by tenant policy",
+                ));
+            }
+            StreamAdmission::GlobalStreamLimit => {
+                return Err(StreamReject::new(
+                    CloseReason::LocalLimit,
+                    "Global stream limit reached",
+                ));
+            }
+            StreamAdmission::PerAgentStreamLimit => {
+                return Err(StreamReject::new(
+                    CloseReason::LocalLimit,
+                    "Per-agent stream limit reached",
+                ));
+            }
         }
         let target_agent = qualified_target.as_str();
 
@@ -432,7 +480,9 @@ impl HubService {
                 }
                 None => (
                     None,
-                    CircuitToken::random().map_err(|_| "Circuit token unavailable")?,
+                    CircuitToken::random().map_err(|_| {
+                        StreamReject::new(CloseReason::CloseFrame, "Circuit token unavailable")
+                    })?,
                 ),
             }
         };
@@ -480,7 +530,7 @@ impl HubService {
 
         // Notify the target agent (outside the lock). Failure must propagate:
         // roll back the inserted stream state so the sender fails fast via
-        // the _close_ notification. Never allow "stream opened but the peer
+        // the Close notification. Never allow "stream opened but the peer
         // doesn't know" — that leaves half the stream state alive in a black
         // hole, permanently occupying slots (one of the root causes of the
         // 2026-09-11 incident).
@@ -488,12 +538,13 @@ impl HubService {
         // (open_relay_stream writes the Open frame internally)
         //
         // Open goes through the **control channel** (2026-09-14 channel
-        // separation): same-channel FIFO with a subsequent `_close_` of the
-        // same stream (the poll pump's control priority does not reorder
-        // Open/Close of the same stream), and it is no longer constrained by
-        // data channel capacity — during bursty stream establishment, Open
-        // notifications are not delayed or dropped by data backlog.
-        let notify_result: std::result::Result<(), &'static str> = if target_face.is_relay() {
+        // separation): same-channel FIFO with a subsequent Close
+        // notification of the same stream (the poll pump's control priority
+        // does not reorder Open/Close of the same stream), and it is no
+        // longer constrained by data channel capacity — during bursty stream
+        // establishment, Open notifications are not delayed or dropped by
+        // data backlog.
+        let notify_result: std::result::Result<(), StreamReject> = if target_face.is_relay() {
             Ok(())
         } else {
             // The requester's circuit rides the header field (the former
@@ -516,7 +567,10 @@ impl HubService {
                 // Not registered / a QUIC session (the poll plane is
                 // ineffective for it) / session already ended
                 error!("Failed to send Open notification: stream_id={stream_id}");
-                Err("Target agent not registered")
+                Err(StreamReject::new(
+                    CloseReason::NoTarget,
+                    "Target agent not registered",
+                ))
             }
         };
 
@@ -545,11 +599,11 @@ impl HubService {
     }
 
     /// Frame-level Data handling. Direction is given by [`Direction`]
-    /// (determined at the frame layer via the `"_response_"` sentinel);
+    /// (determined at the frame layer via `FLAG_RESPONSE`);
     /// authorization: request direction must be the stream's source,
     /// response direction must be the stream's target.
     ///
-    /// `Err(reason)` = dispatch failed (the caller informs the sender that
+    /// `Err(reject)` = dispatch failed (the caller informs the sender that
     /// the stream is unusable); stream-not-found / forged frames are handled
     /// per the existing convention (notify or drop) and return `Ok` — a
     /// single anomalous frame does not tear down the upload.
@@ -560,7 +614,7 @@ impl HubService {
         stream_id: StreamId,
         direction: Direction,
         data: Bytes,
-    ) -> std::result::Result<(), &'static str> {
+    ) -> std::result::Result<(), StreamReject> {
         debug!(
             "Data frame received: stream_id={}, source={circuit}",
             stream_id
@@ -620,8 +674,12 @@ impl HubService {
             DataRoute::Missing => {
                 // Stream does not exist (late frame / already swept): notify
                 // the sender so it disconnects the local connection
-                self.notify_sender_close(agent_id, stream_id, "Stream not found")
-                    .await;
+                self.notify_sender_close(
+                    agent_id,
+                    stream_id,
+                    &StreamReject::new(CloseReason::NoTarget, "Stream not found"),
+                )
+                .await;
                 return Ok(());
             }
             DataRoute::Forged => return Ok(()),
@@ -662,17 +720,26 @@ impl HubService {
                 }
                 Ok(Err(_)) => {
                     error!("QUIC relay channel closed");
-                    Err("Target agent channel closed")
+                    Err(StreamReject::new(
+                        CloseReason::BackendClosed,
+                        "Target agent channel closed",
+                    ))
                 }
                 Err(_) => {
                     error!("QUIC relay send timed out (>{send_timeout:?})");
-                    Err("Target agent stalled")
+                    Err(StreamReject::new(
+                        CloseReason::DispatchPoison,
+                        "Target agent stalled",
+                    ))
                 }
             }
         } else {
             let Some(tx) = self.lookup_tx(&recipient).await else {
                 error!("Receiving endpoint has no data channel");
-                return Err("Target agent not registered");
+                return Err(StreamReject::new(
+                    CloseReason::NoTarget,
+                    "Target agent not registered",
+                ));
             };
             let send_timeout = Duration::from_secs(
                 self.state
@@ -690,7 +757,10 @@ impl HubService {
                     // re-registered. Fail honestly so upstream disconnects;
                     // never fake success and throw data into a black hole.
                     error!("Failed to send data (channel closed): {e}");
-                    Err("Target agent channel closed")
+                    Err(StreamReject::new(
+                        CloseReason::BackendClosed,
+                        "Target agent channel closed",
+                    ))
                 }
                 Err(_) => {
                     // Timeout = the receiving end has had no consumer for a
@@ -702,7 +772,10 @@ impl HubService {
                         "Send data timed out (>{send_timeout:?}): channel has no consumer, evicting the endpoint"
                     );
                     self.evict_agent_by_id(&recipient, "send_timeout").await;
-                    Err("Target agent stalled")
+                    Err(StreamReject::new(
+                        CloseReason::DispatchPoison,
+                        "Target agent stalled",
+                    ))
                 }
             }
         }
@@ -710,7 +783,7 @@ impl HubService {
 
     /// Frame-level Close handling: notify the peer, remove the active
     /// stream, release the slot. `reason` (from the agent's Close payload)
-    /// is forwarded to the peer's `_close_` notification so the far end can
+    /// is forwarded to the peer's Close notification so the far end can
     /// react to backend failures (edge route-level negative caching,
     /// 2026-09-16).
     pub(crate) async fn frame_close(
@@ -795,12 +868,13 @@ impl HubService {
         }
     }
 
-    /// Sends a `_close_` close/rejection notification back to `agent_id`
+    /// Sends a hub-origin Close rejection notification back to `agent_id`
     /// via the **control channel** (guaranteed delivery).
     ///
-    /// The payload convention is `CLOSE:{sid}:{reason}` (empty reason means
-    /// an ordinary close); the pump side tears down the stream via the
-    /// existing Close path.
+    /// The wire payload is the single u8 reason code from
+    /// [`StreamReject::code`]; the reject's diagnostic stays in logs and
+    /// metrics. The pump side tears down the stream via the existing Close
+    /// path.
     ///
     /// Before 2026-09-14 this function used `try_send` into the data
     /// channel: a full channel meant a **silent drop**, the egress
@@ -819,14 +893,17 @@ impl HubService {
         &self,
         agent_id: &str,
         stream_id: StreamId,
-        reason: &str,
+        reject: &StreamReject,
     ) {
-        let code = crate::hub::control::close_reason_of(reason);
+        debug!(
+            "close notification: stream_id={stream_id}, code={}, diagnostic={}",
+            reject.code, reject.diagnostic
+        );
         let _ = crate::hub::control::deliver_close_via_control(
             &self.state.agents,
             agent_id,
             stream_id,
-            code,
+            reject.code.clone(),
         )
         .await;
     }
@@ -850,6 +927,13 @@ mod tests {
     fn agent_id_validation_allows_dot() {
         assert!(valid_agent_id("agent-1.local"));
         assert!(!valid_agent_id("agent 1"));
+    }
+
+    #[test]
+    fn agent_id_validation_allows_leading_underscore() {
+        // The wire-layer sentinel strings are gone (flags-carried origin);
+        // no reservation keeps the `_` prefix out of the agent namespace.
+        assert!(valid_agent_id("_internal"));
     }
 
     fn make_counts() -> SharedStreamCounts {

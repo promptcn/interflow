@@ -325,8 +325,11 @@ pub struct AppliedState {
     /// the identity/trust/dial face. Unchanged + policy changed = the
     /// policy-only fast path.
     pub stripped_manifest_digest: String,
-    /// The live policy generation (embedded at full render, incremented per
-    /// policy-only update).
+    /// The live policy generation — CONTINUED at full render (minted above
+    /// every observable watermark: this counter, the dist tree's signed
+    /// artifacts, and the running hub's floor) and incremented per
+    /// policy-only update. It never resets: a fresh lineage is a new issuer
+    /// store, not a lower number.
     pub policy_generation: Generation,
     /// sha256 of the live policy's canonical bytes (at `policy_generation`).
     pub policy_digest: String,
@@ -387,11 +390,15 @@ impl StoreBinding {
 ///   realm-issuer.crt|.key      # signs control endpoint identities
 ///   policy-signing.key|.pub    # ed25519 runtime-policy signer
 ///   binding.json               # the one-realm / one-manifest contract
+///   backup.json                # automatic-backup configuration (public)
 ///   workspaces/<ws>-issuer.crt|.key
 /// ```
 ///
 /// The whole directory is operator-secret. Distribute only Trust Bundles and
-/// Credential Packs rendered from it.
+/// Credential Packs rendered from it. Every mutation through this store
+/// checkpoints an encrypted, versioned backup automatically
+/// ([`crate::backup`]) — the operator's one job is keeping the offline
+/// recovery identity.
 #[derive(Debug, Clone)]
 pub struct IssuerStore {
     root: PathBuf,
@@ -409,6 +416,26 @@ impl IssuerStore {
     #[must_use]
     pub fn root_path(&self) -> &Path {
         &self.root
+    }
+
+    /// Checkpoints the store per its backup configuration. No-op for
+    /// unconfigured stores. Failing checkpoints return an error whose
+    /// message spells the recovery: the store itself is intact, fix the
+    /// backup target and re-run — the rerun retries the backup.
+    pub fn checkpoint(&self) -> Result<()> {
+        crate::backup::checkpoint(&self.root).map(|_| ())
+    }
+
+    /// Checkpoint for paths that must not block on backup health (a pure
+    /// validation read, or an emergency revocation): logs loudly on failure
+    /// instead of erroring. Dedup keeps the common case write-free.
+    pub fn checkpoint_best_effort(&self) {
+        if let Err(e) = self.checkpoint() {
+            tracing::error!(
+                "issuer store backup checkpoint failed (store intact at {}): {e}",
+                self.root.display()
+            );
+        }
     }
 
     fn read(&self, rel: &str) -> Result<String> {
@@ -451,12 +478,16 @@ impl IssuerStore {
 
     /// Ensures the realm issuer CA and the policy signing key exist.
     /// Idempotent: existing material is loaded, never silently replaced.
+    /// New material is only reported as created once the automatic backup
+    /// has captured it — an unbacked CA is exactly the loss the backup
+    /// system exists to prevent.
     pub fn ensure_realm(&self) -> Result<()> {
         let cert = self.root.join("realm-issuer.crt");
         let key = self.root.join("realm-issuer.key");
         match (cert.exists(), key.exists()) {
             (true, true) => {
                 Self::load_issuer_at(&cert, &key)?;
+                self.checkpoint_best_effort();
                 Ok(())
             }
             (false, false) => {
@@ -472,6 +503,7 @@ impl IssuerStore {
                         source: e,
                     },
                 )?;
+                self.checkpoint()?;
                 Ok(())
             }
             (a, b) => Err(Error::issuance(format!(
@@ -491,6 +523,7 @@ impl IssuerStore {
         match (cert.exists(), key.exists()) {
             (true, true) => {
                 Self::load_issuer_at(&cert, &key)?;
+                self.checkpoint_best_effort();
                 Ok(())
             }
             (false, false) => {
@@ -504,6 +537,7 @@ impl IssuerStore {
                     path: cert.display().to_string(),
                     source: e,
                 })?;
+                self.checkpoint()?;
                 Ok(())
             }
             (a, b) => Err(Error::issuance(format!(
@@ -519,6 +553,7 @@ impl IssuerStore {
         let public = self.root.join("policy-signing.pub");
         if secret.exists() && public.exists() {
             self.policy_signer()?;
+            self.checkpoint_best_effort();
             return Ok(());
         }
         if secret.exists() || public.exists() {
@@ -539,6 +574,7 @@ impl IssuerStore {
                 source: e,
             }
         })?;
+        self.checkpoint()?;
         Ok(())
     }
 
@@ -594,7 +630,9 @@ impl IssuerStore {
         std::fs::rename(&tmp, &final_path).map_err(|e| Error::Io {
             path: final_path.display().to_string(),
             source: e,
-        })
+        })?;
+        self.checkpoint()?;
+        Ok(())
     }
 
     /// What `plan apply` last put into the world (the diff base for the
@@ -638,7 +676,9 @@ impl IssuerStore {
         std::fs::rename(&tmp, &final_path).map_err(|e| Error::Io {
             path: final_path.display().to_string(),
             source: e,
-        })
+        })?;
+        self.checkpoint()?;
+        Ok(())
     }
 
     /// Loads one workspace's issuer.

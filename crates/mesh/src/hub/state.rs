@@ -16,7 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -251,6 +251,46 @@ pub(crate) fn should_record_policy_pull(
 pub type SharedExpiryLedger =
     Arc<std::sync::Mutex<HashMap<String, interflow_identity::expiry::LeafPhase>>>;
 
+/// Qualified agent -> the hub-serving generation whose **inverted pull**
+/// has already been logged.
+///
+/// An inverted pull = the agent's reported watermark above what this hub
+/// serves — the lineage-deadlock signature: every future policy below that
+/// watermark is dead on arrival at that node. The SAME state-transfer
+/// accounting discipline as
+/// [`SharedPolicyPullLedger`]: an inverted pull is news once per
+/// (agent, serving generation) — a crossing, not a heartbeat. The agent
+/// keeps 304-ing every watch tick while the inversion persists and those
+/// repeats are not news (the
+/// `interflow_hub_policy_stale_watermark_total` counter keeps full
+/// granularity). In-memory for the same reasons as the pull ledger: after a
+/// hub restart the first inverted pull re-fires once (a fresh process
+/// attesting to what it sees — bounded, not noise), and entries are bounded
+/// by the registered-agent set.
+pub type SharedStaleWatermarkLedger = Arc<std::sync::Mutex<HashMap<String, u64>>>;
+
+/// Check-and-set for one stale-watermark ledger entry: returns `true` (and
+/// advances the table) only when this agent's inversion against
+/// `generation` has not been logged yet; `false` when it is a repeat of the
+/// already-reported crossing. Same lock discipline as
+/// [`should_record_policy_pull`] (held only for the CAS, never across an
+/// await).
+pub(crate) fn should_report_stale_watermark(
+    ledger: &SharedStaleWatermarkLedger,
+    agent: &str,
+    generation: u64,
+) -> bool {
+    let mut map = ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map.get(agent).is_some_and(|&g| g == generation) {
+        false
+    } else {
+        map.insert(agent.to_owned(), generation);
+        true
+    }
+}
+
 /// One observed phase crossing (the heartbeat tick's expiry check output).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExpiryTransition {
@@ -305,12 +345,25 @@ pub(crate) fn expiry_transition(
 /// exactly what is on disk. Turns the steady-state pull path (one request
 /// per agent per watch interval) into two `stat` calls instead of a file
 /// read + ed25519 verification.
+/// One policy channel face's fingerprint (mtime+len of both files).
+pub type PolicyFaceFingerprint = Option<(std::time::SystemTime, u64, std::time::SystemTime, u64)>;
+
+/// BOTH faces' fingerprints (published dir, embedded snapshot) — the
+/// serve-cache key.
+pub type PolicyFacesFingerprint = (PolicyFaceFingerprint, PolicyFaceFingerprint);
+
 pub struct CachedPolicy {
     /// The channel directory the bytes were loaded from (`dir` or
     /// `embedded_dir`).
     pub dir: std::path::PathBuf,
-    /// Fingerprint of `dir` at load time.
-    pub fingerprint: Option<(std::time::SystemTime, u64, std::time::SystemTime, u64)>,
+    /// BOTH faces' fingerprints at load time — the published dir
+    /// (`state/policy`) AND the embedded snapshot. Keying the cache on the
+    /// pair is what lets a publish invalidate an entry that was loaded
+    /// from the embedded fallback: a watcher that pulled before the first
+    /// publish caches the embedded bytes, and without the second face in
+    /// the key that entry would hit forever (the embedded dir never
+    /// changes on publish).
+    pub fingerprint: PolicyFacesFingerprint,
     /// The canonical policy TOML bytes.
     pub body: Bytes,
     /// The detached signature.
@@ -374,6 +427,14 @@ pub struct HubState {
     /// Audit dedup table for policy servings (see
     /// [`SharedPolicyPullLedger`]).
     pub policy_pull_ledger: SharedPolicyPullLedger,
+    /// The stream-proposal queue (the kube-CSR-shaped self-service face);
+    /// `None` when the hub carries no policy channel — proposals need a
+    /// serving policy to validate against.
+    pub proposals: Option<Arc<crate::hub::proposals::ProposalStore>>,
+    /// Per-agent inverted-watermark logging state (see
+    /// [`SharedStaleWatermarkLedger`]) — the lineage-deadlock detection
+    /// face of policy pulls.
+    pub stale_watermark_ledger: SharedStaleWatermarkLedger,
     /// Per-agent credential-expiry phase already recorded (see
     /// [`SharedExpiryLedger`]) — the symmetric-transfer accounting state
     /// for `credential_expiry` events.
@@ -409,7 +470,7 @@ pub struct AgentSession {
     /// when full the sender waits in a bounded fashion, propagating
     /// backpressure upstream).
     pub tx: mpsc::Sender<TunnelData>,
-    /// Control-plane sender — Open / `_close_` lifecycle notifications
+    /// Control-plane sender — Open / Close lifecycle notifications
     /// (unbounded: delivery while online; a full data channel never drops a
     /// close notification, see [`crate::hub::control`]).
     pub ctrl_tx: mpsc::UnboundedSender<TunnelData>,
@@ -467,6 +528,12 @@ pub struct AgentSession {
     /// (traffic streams go through the relay rather than /poll). Set back
     /// to `None` when an h2 re-registration replaces the channel in place.
     pub quic: Option<Arc<QuicAgentConn>>,
+    /// The registering binary's self-declared build tag (`None` = an older
+    /// agent or an implicit re-registration — unknown, not wrong). The
+    /// fleet-version face: stale nodes become a table lookup instead of
+    /// per-host log forensics. The register sites overwrite it (like
+    /// `leaf_validity_unix`, `install_channels` keeps the previous value).
+    pub build: Option<String>,
     /// The registration certificate's validity window `(not_before,
     /// not_after)` in unix seconds — the hub-side input to credential
     /// expiry phasing (see [`SharedExpiryLedger`]). Refreshed at every
@@ -474,6 +541,48 @@ pub struct AgentSession {
     /// `install_channels` keeps the previous value, the register sites
     /// overwrite it).
     pub leaf_validity_unix: Option<(i64, i64)>,
+    /// When the last `/poll` body ended (the RxStream returned or discarded
+    /// its receiver). The h2 half of [`AgentSession::online`]: a live agent
+    /// re-polls within the reconnect backoff (topping out at 5s), so a
+    /// recently-ended poll must not read as offline — this timestamp exists
+    /// to cover exactly that sub-second window. Refreshed at registration
+    /// alongside `last_pong` (the first poll follows immediately).
+    pub last_poll_end: Instant,
+}
+
+/// How long after a poll body ends the session still counts as online
+/// (the h2 half of [`AgentSession::online`]).
+///
+/// A healthy agent's poll reconnect backoff tops out at 5s, and this grace
+/// is deliberately not above it: without it, the sub-second reconnect
+/// window would flicker "offline" in the peer face; with it larger than the
+/// backoff, a dead agent's offline transition would lag. Kept strictly
+/// below the peer watch cadence (10s) so death detection still converges
+/// within one watch cycle.
+pub const POLL_RECONNECT_GRACE: Duration = Duration::from_secs(5);
+
+impl AgentSession {
+    /// The `GET /agents` online reading — `registered ≠ reachable`, so
+    /// presence in the registry alone is not enough:
+    ///
+    /// - QUIC sessions: the relay connection handle is presence (`Some` =
+    ///   online; the connection-lost watcher removes the registration on
+    ///   death, so a stale handle cannot linger).
+    /// - h2 sessions: the poll body holding `rx` (`rx == None`) is online;
+    ///   right after a poll body ends — including the ordinary reconnect
+    ///   window — [`POLL_RECONNECT_GRACE`] keeps the reading online until
+    ///   the agent re-polls or the grace lapses.
+    ///
+    /// Pong freshness is deliberately **not** consulted: QUIC agents skip
+    /// the h2 heartbeat entirely (`ping=0` in an all-QUIC fleet), so a
+    /// pong-based rule would read every QUIC peer as offline — the
+    /// mirror-image of the 2026-10-07 stale-green-card bug.
+    pub fn online(&self) -> bool {
+        if self.quic.is_some() {
+            return true;
+        }
+        self.rx.is_none() || self.last_poll_end.elapsed() < POLL_RECONNECT_GRACE
+    }
 }
 
 impl AgentSession {
@@ -501,7 +610,9 @@ impl AgentSession {
             poll_waker: Arc::new(std::sync::Mutex::new(None)),
             up_lease: None,
             quic,
+            build: None,
             leaf_validity_unix,
+            last_poll_end: Instant::now(),
         }
     }
 
@@ -528,6 +639,7 @@ impl AgentSession {
         self.ctrl_backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         self.generation += 1;
         self.last_pong = Instant::now();
+        self.last_poll_end = Instant::now();
         self.quic = quic;
         self.wake_poll();
         if let Some(lease) = self.up_lease.take() {
@@ -728,6 +840,12 @@ impl Drop for RxStream {
             handle.spawn(async move {
                 {
                     let mut st = state.write().await;
+                    // The poll body ended — the h2 liveness clock for
+                    // [`AgentSession::online`] starts here regardless of
+                    // whether this receiver is returned or discarded (a
+                    // generation mismatch means a newer channel is already
+                    // serving, which carries its own timestamp).
+                    st.last_poll_end = Instant::now();
                     if st.generation == generation && st.rx.is_none() {
                         if let Some(rx) = rx {
                             st.rx = Some(rx);
@@ -796,9 +914,9 @@ impl futures::Stream for RxStream {
         }
 
         // Control plane takes priority: lifecycle notifications (Open /
-        // `_close_`) must not be delayed by data-plane backlog. The ordering
+        // Close) must not be delayed by data-plane backlog. The ordering
         // contract is in the `hub::control` module docs — a stream's Open
-        // precedes its Close (same-channel FIFO); `_close_` may overtake
+        // precedes its Close (same-channel FIFO); a Close may overtake
         // request-direction tail data queued in the data channel; a
         // response-direction Close already preserved FIFO through the data
         // channel on the hub side before falling back to this channel.
@@ -889,6 +1007,41 @@ impl RxStream {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The `/agents` online reading across both transport forms. The
+    /// contract: registered ≠ reachable — presence in the registry is not
+    /// enough; the QUIC relay handle is, and on h2 so is a poll body in
+    /// place or a recently ended one (the reconnect window must not
+    /// flicker offline; 2026-10-08 peer-observability backlog).
+    #[test]
+    fn online_semantics_covers_both_transports() {
+        let circuit = CircuitToken::random().unwrap();
+
+        // h2 form: fresh registration is inside the reconnect grace (the
+        // first poll follows immediately) — online.
+        let mut s = AgentSession::new(circuit, None, None);
+        assert!(s.online(), "a fresh registration is online by the grace");
+
+        // A poll body in place: online by connection presence.
+        let rx = s.rx.take().unwrap();
+        assert!(s.online(), "a poll body holding rx is online");
+
+        // The poll body just ended (rx returned): still online — the
+        // healthy agent's reconnect backoff tops out at 5s, well inside
+        // the grace; this is the anti-flicker window.
+        s.rx = Some(rx);
+        s.last_poll_end = Instant::now();
+        assert!(
+            s.online(),
+            "within the reconnect grace an idle rx stays online"
+        );
+
+        // Beyond the grace with rx still idle: nobody re-polled — offline.
+        s.last_poll_end = Instant::now()
+            .checked_sub(POLL_RECONNECT_GRACE + Duration::from_secs(1))
+            .expect("test host has been up longer than the grace");
+        assert!(!s.online(), "past the grace with rx idle is offline");
+    }
 
     #[test]
     fn policy_pull_ledger_dedups_by_agent_and_generation() {

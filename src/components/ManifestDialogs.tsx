@@ -1,5 +1,7 @@
 import { useState, type ReactNode } from "react";
-import { Modal, SegmentedControl } from "./ui";
+import { X } from "lucide-react";
+import { useT } from "../i18n";
+import { Button, DialogFooter, DialogTitle, Hint, Input, Modal, SegmentedControl, Select } from "./ui";
 import type {
   HubDto,
   IngressNodeDto,
@@ -23,11 +25,12 @@ function field(
   value: string,
   set: (v: string) => void,
   placeholder: string,
-  width?: string,
+  widthClass?: string,
 ): ReactNode {
   return (
-    <input
-      style={width ? { width } : undefined}
+    <Input
+      aria-label={placeholder}
+      className={widthClass}
       value={value}
       placeholder={placeholder}
       onChange={(e) => set(e.target.value)}
@@ -44,10 +47,16 @@ function protocolSelect(
   set: (v: MeshProtocolDto) => void,
 ): ReactNode {
   return (
-    <select value={value} onChange={(e) => set(e.target.value as MeshProtocolDto)}>
-      <option value="tcp">tcp</option>
-      <option value="udp">udp</option>
-    </select>
+    <Select
+      ariaLabel="protocol"
+      value={value}
+      onValueChange={(v) => set(v as MeshProtocolDto)}
+      options={[
+        { value: "tcp", label: "tcp" },
+        { value: "udp", label: "udp" },
+      ]}
+      className="w-[92px]"
+    />
   );
 }
 
@@ -56,7 +65,7 @@ function DialogFrame({
   onClose,
   busy,
   onConfirm,
-  confirmLabel = "Apply",
+  confirmLabel,
   children,
 }: {
   title: string;
@@ -66,20 +75,21 @@ function DialogFrame({
   confirmLabel?: string;
   children: ReactNode;
 }) {
+  const { t } = useT();
   return (
     <Modal onClose={onClose} wide>
-      <h2>{title}</h2>
-      <div className="rule-editor" style={{ gap: 8 }}>
+      <DialogTitle>{title}</DialogTitle>
+      <div className="flex flex-col gap-2 rounded-lg border border-dashed border-line p-2.5">
         {children}
       </div>
-      <div className="dialog-actions">
-        <button disabled={busy} onClick={onClose}>
-          Cancel
-        </button>
-        <button className="primary" disabled={busy} onClick={onConfirm}>
-          {confirmLabel}
-        </button>
-      </div>
+      <DialogFooter>
+        <Button disabled={busy} onClick={onClose}>
+          {t("common.cancel")}
+        </Button>
+        <Button variant="primary" disabled={busy} onClick={onConfirm}>
+          {confirmLabel ?? t("common.apply")}
+        </Button>
+      </DialogFooter>
     </Modal>
   );
 }
@@ -100,18 +110,21 @@ export function ServiceDialog({
 }) {
   const [id, setId] = useState(initial?.id ?? "");
   const [address, setAddress] = useState(initial?.address ?? "");
+  const { t } = useT();
   return (
     <DialogFrame
-      title={initial ? `Service ${initial.id} — ${agent}` : `New service — ${agent}`}
+      title={
+        initial ? t("dialogs.serviceTitle", { id: initial.id, agent }) : t("dialogs.newServiceTitle", { agent })
+      }
       onClose={onClose}
       busy={busy}
       onConfirm={() => onConfirm({ id: id.trim(), address: address.trim() })}
     >
-      <div className="rule-row">
-        {field(id, setId, "asr", "110px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        {field(id, setId, "asr", "w-[110px]")}
         {field(address, setAddress, "127.0.0.1:8080")}
       </div>
-      <p className="hint">id + the manifest-issued default dial address (strict ip:port).</p>
+      <p className="m-0 text-small text-fg-3">{t("dialogs.serviceHint")}</p>
     </DialogFrame>
   );
 }
@@ -147,9 +160,14 @@ export function MeshIngressRuleDialog({
     initial?.idle_timeout_secs != null ? String(initial.idle_timeout_secs) : "",
   );
   const idleNum = idle.trim() === "" ? null : Number(idle.trim());
+  const { t } = useT();
   return (
     <DialogFrame
-      title={initial ? `Rule ${initial.name} — ${agent}` : `New mesh ingress rule — ${agent}`}
+      title={
+        initial
+          ? t("dialogs.ruleTitle", { name: initial.name, agent })
+          : t("dialogs.newIngressRuleTitle", { agent })
+      }
       onClose={onClose}
       busy={busy}
       onConfirm={() =>
@@ -166,21 +184,18 @@ export function MeshIngressRuleDialog({
         })
       }
     >
-      <div className="rule-row">
-        {field(name, setName, "ollama", "110px")}
-        {field(listen, setListen, "listen 127.0.0.1:11434", "190px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        {field(name, setName, "ollama", "w-[110px]")}
+        {field(listen, setListen, t("dialogs.phListen"), "w-[190px]")}
         {protocolSelect(protocol, setProtocol)}
-        {field(targetAgent, setTargetAgent, "→ agent", "110px")}
-        {field(remoteAddr, setRemoteAddr, "remote 127.0.0.1:11434", "190px")}
+        {field(targetAgent, setTargetAgent, t("dialogs.phToAgent"), "w-[110px]")}
+        {field(remoteAddr, setRemoteAddr, t("dialogs.phRemote"), "w-[190px]")}
       </div>
-      <div className="rule-row">
-        <label className="hint">idle timeout (s)</label>
-        {field(idle, setIdle, "blank = default (tcp 300 / udp 60)", "220px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <label className="text-small text-fg-3">{t("dialogs.idleTimeoutLabel")}</label>
+        {field(idle, setIdle, t("dialogs.idlePh"), "w-[220px]")}
       </div>
-      <p className="hint">
-        The peer must offer the remote address (exact or inside an authorized range); the
-        validator refuses unmatched pairs. Idle budget bounds: 1–86400.
-      </p>
+      <p className="m-0 text-small text-fg-3">{t("dialogs.ingressRuleHint")}</p>
     </DialogFrame>
   );
 }
@@ -212,9 +227,14 @@ export function MeshEgressRuleDialog({
     initial?.udp_idle_timeout_secs != null ? String(initial.udp_idle_timeout_secs) : "",
   );
   const idleNum = idle.trim() === "" ? null : Number(idle.trim());
+  const { t } = useT();
   return (
     <DialogFrame
-      title={initial ? `Rule ${initial.name} — ${agent}` : `New mesh egress rule — ${agent}`}
+      title={
+        initial
+          ? t("dialogs.ruleTitle", { name: initial.name, agent })
+          : t("dialogs.newEgressRuleTitle", { agent })
+      }
       onClose={onClose}
       busy={busy}
       onConfirm={() =>
@@ -229,19 +249,16 @@ export function MeshEgressRuleDialog({
         })
       }
     >
-      <div className="rule-row">
-        {field(name, setName, "loopback-services", "160px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        {field(name, setName, "loopback-services", "w-[160px]")}
         {protocolSelect(protocol, setProtocol)}
-        {field(target, setTarget, "127.0.0.1:8080 (one service) or 127.0.0.0/8 (a range)")}
+        {field(target, setTarget, t("dialogs.phEgressTarget"))}
       </div>
-      <div className="rule-row">
-        <label className="hint">udp idle timeout (s)</label>
-        {field(idle, setIdle, "blank = default 60", "160px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <label className="text-small text-fg-3">{t("dialogs.udpIdleLabel")}</label>
+        {field(idle, setIdle, t("dialogs.udpIdlePh"), "w-[160px]")}
       </div>
-      <p className="hint">
-        A `/` makes it a range authorization (any port) — a wider range grows the blast
-        radius of this pack's leak; declare the narrowest that covers what you serve.
-      </p>
+      <p className="m-0 text-small text-fg-3">{t("dialogs.egressRuleHint")}</p>
     </DialogFrame>
   );
 }
@@ -260,22 +277,20 @@ export function RouteDialog({
 }) {
   const [host, setHost] = useState(initial?.host ?? "");
   const [service, setService] = useState(initial?.service ?? "");
+  const { t } = useT();
   return (
     <DialogFrame
-      title={initial ? `Route ${initial.host}` : "New route"}
+      title={initial ? t("dialogs.routeTitle", { host: initial.host }) : t("dialogs.newRouteTitle")}
       onClose={onClose}
       busy={busy}
       onConfirm={() => onConfirm({ host: host.trim(), service: service.trim() })}
     >
-      <div className="rule-row">
-        {field(host, setHost, "app.example.com", "220px")}
-        <span className="hint">→</span>
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        {field(host, setHost, "app.example.com", "w-[220px]")}
+        <span className="text-small text-fg-3">→</span>
         {field(service, setService, "workspace/agent/service")}
       </div>
-      <p className="hint">
-        The service reference is an identity, never an address; the control endpoint's
-        host cannot double as a route host.
-      </p>
+      <p className="m-0 text-small text-fg-3">{t("dialogs.routeHint")}</p>
     </DialogFrame>
   );
 }
@@ -304,9 +319,10 @@ export function HubDialog({
     initial && initial.listen !== "0.0.0.0:6666" ? initial.listen : "",
   );
   const [quicListen, setQuicListen] = useState(initial?.quic_listen ?? "");
+  const { t } = useT();
   return (
     <DialogFrame
-      title={initial ? `Hub ${initial.name}` : "New mesh hub"}
+      title={initial ? t("dialogs.hubTitle", { name: initial.name }) : t("dialogs.newHubTitle")}
       onClose={onClose}
       busy={busy}
       onConfirm={() =>
@@ -319,31 +335,26 @@ export function HubDialog({
       }
     >
       {initial ? (
-        <div className="row">
-          <label>Name</label>
-          <input value={name} readOnly />
+        <div className="flex items-center gap-2">
+          <label className="w-[140px] shrink-0 text-base text-fg-2">{t("dialogs.nameLabel")}</label>
+          <Input value={name} readOnly />
         </div>
       ) : (
-        <div className="rule-row">
-          {field(name, setName, "hub name", "140px")}
-          {field(endpoint, setEndpoint, "endpoint mesh.example.com:6666")}
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          {field(name, setName, t("dialogs.phHubName"), "w-[140px]")}
+          {field(endpoint, setEndpoint, t("dialogs.phHubEndpoint"))}
         </div>
       )}
       {initial && (
-        <div className="rule-row">{field(endpoint, setEndpoint, "mesh.example.com:6666")}</div>
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">{field(endpoint, setEndpoint, "mesh.example.com:6666")}</div>
       )}
-      <div className="rule-row">
-        <label className="hint">listen</label>
-        {field(listen, setListen, "blank = 0.0.0.0:6666", "220px")}
-        <label className="hint">QUIC listen</label>
-        {field(quicListen, setQuicListen, "blank = QUIC off (e.g. 0.0.0.0:6666)", "260px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <label className="text-small text-fg-3">{t("dialogs.listenLabel")}</label>
+        {field(listen, setListen, t("dialogs.phBlankHubListen"), "w-[220px]")}
+        <label className="text-small text-fg-3">{t("dialogs.quicListenLabel")}</label>
+        {field(quicListen, setQuicListen, t("dialogs.phBlankQuicHub"), "w-[260px]")}
       </div>
-      <p className="hint">
-        The endpoint is the address agents dial and the SAN source of the hub's server
-        credential — a hostname that resolves directly to this machine. The QUIC listen is the
-        hub's UDP face (conventionally the same port as listen); agents opt in per node with
-        transport = quic. v1 allows one hub per realm.
-      </p>
+      <p className="m-0 text-small text-fg-3">{t("dialogs.hubHint")}</p>
     </DialogFrame>
   );
 }
@@ -382,9 +393,12 @@ export function IngressNodeDialog({
       : "",
   );
   const rateNum = edgeRate.trim() === "" ? null : Number(edgeRate.trim());
+  const { t } = useT();
   return (
     <DialogFrame
-      title={initial ? `Ingress ${initial.node}` : "New ingress node"}
+      title={
+        initial ? t("dialogs.ingressTitle", { node: initial.node }) : t("dialogs.newIngressTitle")
+      }
       onClose={onClose}
       busy={busy}
       onConfirm={() =>
@@ -404,23 +418,23 @@ export function IngressNodeDialog({
         })
       }
     >
-      <div className="rule-row">
-        {field(node, setNode, "edge", "120px")}
-        {field(workspaces, setWorkspaces, "workspaces, comma-separated (default)")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        {field(node, setNode, "edge", "w-[120px]")}
+        {field(workspaces, setWorkspaces, t("dialogs.phWorkspacesDefault"))}
       </div>
-      <div className="rule-row">
-        <label className="hint">public listen</label>
-        {field(listen, setListen, "blank = 0.0.0.0:443", "200px")}
-        <label className="hint">control listen</label>
-        {field(controlListen, setControlListen, "blank = 127.0.0.1:16666", "200px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <label className="text-small text-fg-3">{t("dialogs.publicListen")}</label>
+        {field(listen, setListen, t("dialogs.phBlank443"), "w-[200px]")}
+        <label className="text-small text-fg-3">{t("dialogs.controlListen")}</label>
+        {field(controlListen, setControlListen, t("dialogs.phBlankControl"), "w-[200px]")}
       </div>
-      <div className="rule-row">
-        <label className="hint">QUIC listen</label>
-        {field(quicListen, setQuicListen, "blank = QUIC off (e.g. 0.0.0.0:16666)", "260px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <label className="text-small text-fg-3">{t("dialogs.quicListenLabel")}</label>
+        {field(quicListen, setQuicListen, t("dialogs.phBlankQuicIngress"), "w-[260px]")}
       </div>
-      <div className="rule-row">
-        <label className="hint">per-IP new-conn/min</label>
-        {field(edgeRate, setEdgeRate, "blank = engine default (fronted 600 / direct 30)", "260px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <label className="text-small text-fg-3">{t("dialogs.rateLabel")}</label>
+        {field(edgeRate, setEdgeRate, t("dialogs.phRate"), "w-[260px]")}
       </div>
     </DialogFrame>
   );
@@ -455,6 +469,7 @@ export function CreateNodeDialog({
   const [meshEgress, setMeshEgress] = useState<IssueMeshEgressDto[]>([]);
   const [ingressWorkspaces, setIngressWorkspaces] = useState("");
   const [hubEndpoint, setHubEndpoint] = useState("");
+  const { t } = useT();
 
   const kinds: [IssueNodeKindDto, string][] = [
     ["agent_mesh", "Mesh agent"],
@@ -465,10 +480,10 @@ export function CreateNodeDialog({
 
   return (
     <DialogFrame
-      title="Add node to the manifest"
+      title={t("dialogs.addNodeTitle")}
       onClose={onClose}
       busy={busy}
-      confirmLabel="Add"
+      confirmLabel={t("dialogs.addConfirm")}
       onConfirm={() =>
         onConfirm({
           kind,
@@ -490,25 +505,25 @@ export function CreateNodeDialog({
         options={kinds.map(([value, label]) => ({ value, label }))}
         onChange={setKind}
       />
-      <div className="rule-row">
-        {field(node, setNode, "node name", "140px")}
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        {field(node, setNode, t("dialogs.phNodeName"), "w-[140px]")}
         {(kind === "agent_mesh" || kind === "agent_expose") &&
-          field(workspace, setWorkspace, "workspace (blank = sole/default)")}
+          field(workspace, setWorkspace, t("dialogs.phWorkspace"))}
         {kind === "hub" && field(hubEndpoint, setHubEndpoint, "mesh.example.com:6666")}
         {kind === "ingress" &&
-          field(ingressWorkspaces, setIngressWorkspaces, "workspaces, comma-separated")}
+          field(ingressWorkspaces, setIngressWorkspaces, t("dialogs.phWorkspaces"))}
       </div>
 
       {kind === "agent_expose" && (
-        <div className="rule-editor">
-          <div className="rule-editor-head">
-            <span>Services</span>
-            <button className="sm" onClick={() => setServices([...services, { id: "", address: "" }])}>
-              + service
-            </button>
+        <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
+          <div className="flex items-center justify-between gap-2 text-small text-fg-3">
+            <span>{t("issue.services")}</span>
+            <Button size="sm" onClick={() => setServices([...services, { id: "", address: "" }])}>
+              {t("common.addService")}
+            </Button>
           </div>
           {services.map((s, i) => (
-            <div className="rule-row" key={i}>
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5" key={i}>
               {field(
                 s.id,
                 (v) => setServices(services.map((r, j) => (j === i ? { ...r, id: v } : r))),
@@ -520,12 +535,17 @@ export function CreateNodeDialog({
                 (v) => setServices(services.map((r, j) => (j === i ? { ...r, address: v } : r))),
                 "127.0.0.1:8080",
               )}
-              <button
-                className="rule-remove sm"
-                onClick={() => setServices(services.filter((_, j) => j !== i))}
-              >
-                ×
-              </button>
+              <Hint text={t("common.remove")}>
+                <Button
+                  variant="link"
+                  size="icon-sm"
+                  aria-label={t("common.remove")}
+                  onClick={() => setServices(services.filter((_, j) => j !== i))}
+                  className="text-fg-3 hover:text-critical"
+                >
+                  <X className="size-3.5" />
+                </Button>
+              </Hint>
             </div>
           ))}
         </div>
@@ -533,10 +553,11 @@ export function CreateNodeDialog({
 
       {kind === "agent_mesh" && (
         <>
-          <div className="rule-editor">
-            <div className="rule-editor-head">
-              <span>Mesh ingress — forward a local listener to a peer</span>
-              <button className="sm"
+          <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
+            <div className="flex items-center justify-between gap-2 text-small text-fg-3">
+              <span>{t("form.meshIngressTitle")}</span>
+              <Button
+                size="sm"
                 onClick={() =>
                   setMeshIngress([
                     ...meshIngress,
@@ -544,32 +565,37 @@ export function CreateNodeDialog({
                   ])
                 }
               >
-                + rule
-              </button>
+                {t("common.addRule")}
+              </Button>
             </div>
             {meshIngress.map((r, i) => {
               const patch = (p: Partial<IssueMeshIngressDto>) =>
                 setMeshIngress(meshIngress.map((row, j) => (j === i ? { ...row, ...p } : row)));
               return (
-                <div className="rule-row" key={i}>
-                  {field(r.name, (v) => patch({ name: v }), "ollama", "100px")}
-                  {field(r.listen, (v) => patch({ listen: v }), "127.0.0.1:11434", "160px")}
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5" key={i}>
+                  {field(r.name, (v) => patch({ name: v }), "ollama", "w-[100px]")}
+                  {field(r.listen, (v) => patch({ listen: v }), "127.0.0.1:11434", "w-[160px]")}
                   {protocolSelect(r.protocol, (p) => patch({ protocol: p }))}
-                  {field(r.target_agent, (v) => patch({ target_agent: v }), "→ agent", "100px")}
-                  {field(r.remote_addr, (v) => patch({ remote_addr: v }), "127.0.0.1:11434", "160px")}
-                  <button
-                    className="rule-remove sm"
-                    onClick={() => setMeshIngress(meshIngress.filter((_, j) => j !== i))}
-                  >
-                    ×
-                  </button>
+                  {field(r.target_agent, (v) => patch({ target_agent: v }), t("dialogs.phToAgent"), "w-[100px]")}
+                  {field(r.remote_addr, (v) => patch({ remote_addr: v }), "127.0.0.1:11434", "w-[160px]")}
+                  <Hint text={t("common.remove")}>
+                    <Button
+                      variant="link"
+                      size="icon-sm"
+                      aria-label={t("common.remove")}
+                      onClick={() => setMeshIngress(meshIngress.filter((_, j) => j !== i))}
+                      className="text-fg-3 hover:text-critical"
+                    >
+                      <X className="size-3.5" />
+                    </Button>
+                  </Hint>
                 </div>
               );
             })}
           </div>
-          <div className="rule-editor">
-            <div className="rule-editor-head">
-              <span>Mesh egress — what this agent dials for peers</span>
+          <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
+            <div className="flex items-center justify-between gap-2 text-small text-fg-3">
+              <span>{t("form.meshEgressTitle")}</span>
               <button className="sm"
                 onClick={() =>
                   setMeshEgress([
@@ -578,15 +604,15 @@ export function CreateNodeDialog({
                   ])
                 }
               >
-                + rule
+                {t("common.addRule")}
               </button>
             </div>
             {meshEgress.map((r, i) => {
               const patch = (p: Partial<IssueMeshEgressDto>) =>
                 setMeshEgress(meshEgress.map((row, j) => (j === i ? { ...row, ...p } : row)));
               return (
-                <div className="rule-row" key={i}>
-                  {field(r.name, (v) => patch({ name: v }), "loopback", "120px")}
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5" key={i}>
+                  {field(r.name, (v) => patch({ name: v }), "loopback", "w-[120px]")}
                   {protocolSelect(r.protocol, (p) => patch({ protocol: p }))}
                   {field(
                     r.target ?? r.target_cidr ?? "",
@@ -598,25 +624,28 @@ export function CreateNodeDialog({
                       ),
                     "127.0.0.1:8080 or 127.0.0.0/8",
                   )}
-                  <button
-                    className="rule-remove sm"
-                    onClick={() => setMeshEgress(meshEgress.filter((_, j) => j !== i))}
-                  >
-                    ×
-                  </button>
+                  <Hint text={t("common.remove")}>
+                    <Button
+                      variant="link"
+                      size="icon-sm"
+                      aria-label={t("common.remove")}
+                      onClick={() => setMeshEgress(meshEgress.filter((_, j) => j !== i))}
+                      className="text-fg-3 hover:text-critical"
+                    >
+                      <X className="size-3.5" />
+                    </Button>
+                  </Hint>
                 </div>
               );
             })}
-            <p className="hint">
-              The peer's egress must already authorize the remote address (protocol
-              included); the validator refuses unmatched pairs.
-            </p>
+            <p className="m-0 text-small text-fg-3">{t("dialogs.peerAuthHint")}</p>
           </div>
         </>
       )}
-      <p className="hint">
-        An agent declares services <em>or</em> mesh rules — one pack, one role. The edit
-        lands in the document (nothing is issued until Apply).
+      <p className="m-0 text-small text-fg-3">
+        {t("dialogs.onePackOneRoleA")}
+        <em>{t("common.or")}</em>
+        {t("dialogs.onePackOneRoleB")}
       </p>
     </DialogFrame>
   );

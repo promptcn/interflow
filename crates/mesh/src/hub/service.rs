@@ -189,14 +189,30 @@ impl Service<Request<Incoming>> for HubService {
             match (req.method(), path.as_str()) {
                 (&Method::POST, "/register") => {
                     let agent_id = agent_id_of(&req)?.to_string();
-                    svc.handle_register(agent_id).await
+                    let build = agent_build_of(&req);
+                    svc.handle_register(agent_id, build).await
                 }
                 (&Method::POST, "/route") => svc.handle_route(req).await,
                 (&Method::POST, "/stream/up") => svc.handle_stream_up(req).await,
                 (&Method::GET, "/poll") => svc.handle_poll(req).await,
+                (&Method::GET, "/ping") => svc.handle_ping().await,
                 (&Method::GET, "/agents") => svc.handle_list_agents().await,
                 (&Method::PUT, "/policy") => svc.handle_policy_publish(req).await,
                 (&Method::GET, "/policy") => svc.handle_policy_pull(req).await,
+                (&Method::GET, "/policy/floor") => svc.handle_policy_floor().await,
+                (&Method::POST, "/proposals") => svc.handle_proposal_submit(req).await,
+                (&Method::GET, "/proposals/mine") => svc.handle_proposals_mine().await,
+                (&Method::GET, "/proposals") => svc.handle_proposals_list().await,
+                (&Method::POST, path) if path.starts_with("/proposals/") => {
+                    // `/proposals/{id}/approve|reject` — the operator's
+                    // decision endpoints (control-principal gated inside).
+                    let rest = path.trim_start_matches("/proposals/");
+                    match (rest.rsplit_once('/'), rest.ends_with("/approve")) {
+                        (Some((id, "approve")), true) => svc.handle_proposal_approve(req, id).await,
+                        (Some((id, "reject")), false) => svc.handle_proposal_reject(req, id).await,
+                        _ => Ok(text_response(StatusCode::NOT_FOUND, "Not Found")),
+                    }
+                }
                 _ => Ok(text_response(StatusCode::NOT_FOUND, "Not Found")),
             }
         })
@@ -210,6 +226,18 @@ pub(crate) fn agent_id_of(req: &Request<Incoming>) -> interflow_core::error::Res
         .get("x-agent-id")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| InterflowError::protocol("missing agent-id".to_string()))
+}
+
+/// Extracts the optional `x-agent-build` self-declaration (the running
+/// binary's build tag). Absent on older agents — unknown, never a failure;
+/// over-long values degrade the same way rather than allocating unbounded.
+pub(crate) fn agent_build_of(req: &Request<Incoming>) -> Option<String> {
+    req.headers()
+        .get("x-agent-build")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .filter(|v| v.len() <= interflow_core::tunnel::negotiation::HELLO_BUILD_MAX)
+        .map(str::to_owned)
 }
 
 /// Extracts the opaque h2 data-plane circuit header. Unlike registration's

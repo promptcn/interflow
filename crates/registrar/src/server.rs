@@ -10,7 +10,7 @@ use hyper_util::rt::TokioIo;
 use interflow_identity::PrincipalPath;
 use interflow_identity::Result;
 use interflow_identity::issuance::LeafTtl;
-use interflow_identity::revocation::{RevocationList, build_crl};
+use interflow_identity::revocation::{RevocationEntry, RevocationList, build_crl};
 use interflow_identity::{pem_certs, uri_san_from_cert_der};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -601,12 +601,12 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 fn crls(state: &RegistrarService<FileKeySource>) -> Result<BTreeMap<String, String>> {
     let store = state.source().issuer_store()?;
     let list = RevocationList::load(store.root_path())?;
-    let mut by_issuer: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut by_issuer: BTreeMap<String, Vec<RevocationEntry>> = BTreeMap::new();
     for entry in &list.entries {
         by_issuer
             .entry(entry.issuer.clone())
             .or_default()
-            .push(entry.serial.clone());
+            .push(entry.clone());
     }
     let mut out = BTreeMap::new();
     let mut issuers = BTreeSet::from(["control".to_owned()]);
@@ -617,15 +617,17 @@ fn crls(state: &RegistrarService<FileKeySource>) -> Result<BTreeMap<String, Stri
             .map(|workspace| format!("workspace/{workspace}")),
     );
     issuers.extend(by_issuer.keys().cloned());
+    // Read-only: the poll never mutates the deny list, so an unchanged list
+    // keeps its CRL number (consumers can treat a repeat as "no change").
+    let number = list.next_crl_number;
     for issuer_name in issuers {
         let issuer = match issuer_name.as_str() {
             "control" => store.realm_issuer()?,
             workspace => store.workspace_issuer(workspace.trim_start_matches("workspace/"))?,
         };
-        let serials = by_issuer.get(&issuer_name).cloned().unwrap_or_default();
-        let number = list.entries.len() as u64 + 1;
+        let entries = by_issuer.get(&issuer_name).cloned().unwrap_or_default();
         let fingerprint = issuer.fingerprint()?.chars().take(16).collect::<String>();
-        let crl = build_crl(&issuer, &serials, number)?;
+        let crl = build_crl(&issuer, &entries, number)?;
         out.insert(format!("{issuer_name}-{fingerprint}"), crl);
     }
     Ok(out)

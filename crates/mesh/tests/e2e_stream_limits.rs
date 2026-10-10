@@ -4,10 +4,10 @@
 //! Uses `AgentClient::connect_and_register` to obtain an HTTP/2
 //! `SendRequest` and builds an `AgentTunnel` that sends `send_open` directly
 //! over the streaming upload. After the 2026-09-12 upload streaming refactor,
-//! rejections no longer carry a synchronous HTTP status; instead a `_close_`
+//! rejections no longer carry a synchronous HTTP status; instead a hub-origin Close
 //! frame returns via `/poll` (`CLOSE:{sid}:{reason}`) — acceptance is taken
 //! from the target agent receiving the request-direction new-stream event,
-//! and rejection from the sender's stream channel receiving a `_close_`
+//! and rejection from the sender's stream channel receiving a Close
 //! frame.
 
 #![allow(
@@ -17,9 +17,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_core::protocol::{FrameType, StreamProto};
 use interflow_core::tunnel::AgentTunnel;
@@ -78,7 +76,7 @@ async fn connect_tunnel(
 }
 
 /// Register a real target agent (opening to an unregistered target now
-/// receives a `_close_` rejection frame instead of a "black-hole stream" —
+/// receives a Close rejection frame instead of a "black-hole stream" —
 /// see the 2026-09-11 failure fix and the 2026-09-12 upload streaming
 /// refactor).
 async fn register_target(hub_port: u16, id: &str) -> (AgentTunnel, tokio::task::JoinHandle<()>) {

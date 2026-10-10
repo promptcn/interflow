@@ -17,9 +17,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_mesh::config::{EgressRule, HeartbeatConfig, HubSecurityConfig, IngressRule};

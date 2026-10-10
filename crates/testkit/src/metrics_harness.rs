@@ -4,17 +4,31 @@
 //! helpers: tests assert on counter deltas (`counter_value` matches the
 //! metric family exactly, summing label variants) instead of holding
 //! recorder handles. `init_tracing` wires test output to `RUST_LOG` when
-//! set (silent otherwise).
+//! set (silent otherwise) and installs the metrics recorder up front.
+//!
+//! Recorder-installation discipline: emissions that happen BEFORE the
+//! global recorder is installed are silently routed to a no-op recorder —
+//! they can never be recovered by a later snapshot. Every test that asserts
+//! on counters must therefore install the recorder before any product code
+//! can emit; calling `init_tracing()` first thing (the established test
+//! convention) does exactly that. Under libtest the recorder was often
+//! installed early "by accident" through a sibling test in the same binary;
+//! cargo-nextest runs each test in its own process, where a late install
+//! reads as a permanent zero (found as `edge_pregate_hardening` failing
+//! only under nextest).
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use metrics_exporter_prometheus::PrometheusHandle;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Installs a test tracing subscriber honoring `RUST_LOG` (no-op without
-/// it, so plain `cargo test` output stays clean).
+/// Installs the shared test harness for every e2e test: the tracing
+/// subscriber (honoring `RUST_LOG`, no-op without it, so plain `cargo test`
+/// output stays clean) and, critically, the global metrics recorder —
+/// emissions before installation are invisible to every later
+/// `counter_value` snapshot (see the module docs).
 pub fn init_tracing() {
-    static ONCE: OnceLock<()> = OnceLock::new();
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
         if std::env::var("RUST_LOG").is_ok() {
             let _ = tracing_subscriber::fmt()
@@ -22,6 +36,10 @@ pub fn init_tracing() {
                 .with_test_writer()
                 .try_init();
         }
+        // Idempotent; same OnceLock as metrics_handle(), but calling it here
+        // guarantees ordering: recorder installed before the test body (and
+        // any product code it spawns) can emit.
+        let _ = metrics_handle();
     });
 }
 

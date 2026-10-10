@@ -149,11 +149,12 @@ fn announce_first_hide_to_tray(app: &AppHandle) {
         return;
     }
     use tauri_plugin_notification::NotificationExt;
+    let s = crate::i18n::current();
     let _ = app
         .notification()
         .builder()
-        .title("Interflow is still running")
-        .body("The window was tucked into the system tray — click the tray icon to bring it back.")
+        .title(s.toast_title)
+        .body(s.toast_body)
         .show();
 }
 
@@ -166,6 +167,7 @@ const fn announce_first_hide_to_tray(_app: &AppHandle) {}
 /// opening the window.
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let manager = manager(app);
+    let s = crate::i18n::current();
     let mut items: Vec<tauri::menu::MenuItem<tauri::Wry>> = Vec::new();
     for snapshot in manager.snapshots() {
         let glyph = state_glyph(&snapshot.state);
@@ -194,7 +196,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         items.push(MenuItem::with_id(
             app,
             "stop-all",
-            "Stop all",
+            s.tray_stop_all,
             true,
             None::<&str>,
         )?);
@@ -202,11 +204,17 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     items.push(MenuItem::with_id(
         app,
         "show",
-        "Show main window",
+        s.tray_show,
         true,
         None::<&str>,
     )?);
-    items.push(MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?);
+    items.push(MenuItem::with_id(
+        app,
+        "quit",
+        s.tray_quit,
+        true,
+        None::<&str>,
+    )?);
     let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = items
         .iter()
         .map(|item| item as &dyn tauri::menu::IsMenuItem<tauri::Wry>)
@@ -284,11 +292,18 @@ pub fn refresh(app: &AppHandle, tray: &TrayIcon) {
         gethostname::gethostname().to_string_lossy()
     );
     if let Some((name, remaining, phase)) = most_urgent {
-        let line = format!(
-            "\n{name}: leaf {} left ({})",
-            interflow_identity::expiry::format_remaining(remaining),
-            phase.as_str()
+        let line = crate::i18n::render(
+            crate::i18n::current().tray_leaf_left,
+            &[
+                ("name", &name),
+                (
+                    "remaining",
+                    &interflow_identity::expiry::format_remaining(remaining),
+                ),
+                ("phase", phase.as_str()),
+            ],
         );
+        tooltip.push('\n');
         tooltip.push_str(&line);
     }
     tray.set_tooltip(Some(tooltip)).ok();

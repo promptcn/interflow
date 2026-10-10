@@ -1,47 +1,97 @@
-import { useEffect, useState } from "react";
-import { api, effectiveTransport, formatRemainingSecs, isRunning, leafPhaseClass, stateText, type LogLine, type NodeInfo, type Transport } from "../api";
+import { useState } from "react";
+import { ArrowLeft } from "lucide-react";
+import {
+  formatRemainingSecs,
+  leafPhase,
+  policyInverted,
+  type LogLine,
+  type NodeInfo,
+} from "../api";
+import { useT } from "../i18n";
 import LogView from "./LogView";
-import { KindBadge, SectionPanel, SegmentedControl, StateDot } from "./ui";
+import NodeConfigView from "./NodeConfigView";
+import NodeStatusView from "./NodeStatusView";
+import ProposalDialog from "./ProposalDialog";
+import {
+  Badge,
+  Button,
+  Hint,
+  Kbd,
+  KindBadge,
+  SectionPanel,
+  SegmentedControl,
+  StateDot,
+} from "./ui";
+
+export type DetailView = "status" | "config" | "logs";
 
 interface Props {
   node: NodeInfo;
+  // View state lives in App (the DeployFace precedent): Esc climbs
+  // view → overview, and opening a node always lands on Status — the
+  // monitoring view is never polluted by the previous browse path.
+  view: DetailView;
+  onViewChange: (view: DetailView) => void;
   onBack: () => void;
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
-  // Log pane (moved in from the old split layout): the detail page owns its
-  // placement, App still owns the buffer and the scope preference.
+  // Log pane: the detail page owns its placement, App still owns the
+  // buffer and the scope preference.
   logs: LogLine[];
   logScope: "node" | "machine";
   onLogScopeChange: (scope: "node" | "machine") => void;
   onClearLogs: () => void;
 }
 
-/// Strict loopback `<ip>:<port>` parse (127.x.x.x:port or [::1]:port) —
-/// the same shape the engine's default-deny policy will dial; the backend
-/// re-validates, this is the fail-fast hint.
-function parseLoopbackAddr(value: string): string | null {
-  const t = value.trim();
-  let m = /^\[([0-9a-fA-F:]+)\]:(\d+)$/.exec(t);
-  if (m) {
-    if (m[1].toLowerCase() !== "::1") return null;
-    const port = Number(m[2]);
-    return port >= 1 && port <= 65535 ? `[::1]:${port}` : null;
-  }
-  m = /^(127\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)$/.exec(t);
-  if (m) {
-    const port = Number(m[2]);
-    return port >= 1 && port <= 65535 ? `${m[1]}:${port}` : null;
-  }
-  return null;
+/// A badge that jumps to the view owning its exception — the cross-view
+/// rule made clickable (quiet by default; when it speaks, it navigates).
+function ViewBadge({
+  view,
+  tone,
+  text,
+  title,
+  onViewChange,
+}: {
+  view: DetailView;
+  tone: "warn" | "critical" | "accent";
+  text: string;
+  title?: string;
+  onViewChange: (view: DetailView) => void;
+}) {
+  const badge = (
+    <Badge
+      tone={tone}
+      className="cursor-pointer"
+      role="button"
+      tabIndex={0}
+      onClick={() => onViewChange(view)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onViewChange(view);
+        }
+      }}
+    >
+      {text}
+    </Badge>
+  );
+  return title ? <Hint text={title}>{badge}</Hint> : badge;
 }
 
-/// The detail page: one node, one level below the overview cards. Sections
-/// carry one concern each (status/actions, identity, preferences, pack
-/// truth, logs) — the hierarchy the old single-form pane lacked. Only the
-/// preferences section is editable, and only while stopped: what is shown
-/// elsewhere is what runs.
+/// The detail page shell: a shared header (back, state dot, name, kind)
+/// over three in-page views — Status (default) / Config / Logs
+/// (2026-10-09 frequency layering). The monitoring glance, the reference
+/// truth, and the incident pane each get their own scroll axis instead of
+/// sharing one; Logs finally owns the full page height. Section budget:
+/// a new surface must first answer "which view, and does it need a
+/// badge" — appending sections to a shared scroll axis is how this page
+/// rotted twice before. Exceptions are never buried in a view: policy
+/// inversion, credential tiers, reconnecting, and pending proposals hang
+/// as badges on the view chrome and jump to the owning view.
 export default function NodeDetail({
   node,
+  view,
+  onViewChange,
   onBack,
   onChanged,
   onError,
@@ -50,350 +100,115 @@ export default function NodeDetail({
   onLogScopeChange,
   onClearLogs,
 }: Props) {
-  const running = isRunning(node.state);
-  const isAgent = node.kind === "expose_agent" || node.kind === "mesh_agent";
-  const services = node.services ?? [];
+  const { t } = useT();
+  // The requester's stream-proposal dialog (mesh agent, running) — opened
+  // from the Status view, lives above all views.
+  const [proposalOpen, setProposalOpen] = useState(false);
+
+  // Cross-view exception badges, non-zero/abnormal only — silence when
+  // everything is fine.
+  const stale = policyInverted(node.policy);
+  const leaf = leafPhase(node.credential);
   const reconnecting =
     typeof node.state === "object" && node.state !== null && "Reconnecting" in node.state;
-  // The hub's registration receipt rides with the Connected state — the
-  // egress address the hub observed plus the registration moment.
-  const receipt =
-    typeof node.state === "object" && node.state !== null && node.state.Connected
-      ? node.state.Connected.hub_receipt
-      : null;
-  // The agent's own QUIC-timeout reason carries the "switch to h2" hint in
-  // its text; surface the actionable short form instead of burying it in
-  // the state line (the full reason still shows there).
-  const quicDialTimeout =
-    typeof node.state === "object" &&
-    node.state !== null &&
-    node.state.Reconnecting?.reason.includes("QUIC connect") === true;
-
-  // The toggle shows the *effective* transport: local preference, else the
-  // pack's signed manifest default, else h2. Saving always writes the local
-  // preference (untouched = inherited).
-  const [transport, setTransport] = useState<Transport>(
-    node.transport ?? node.pack_transport ?? "h2",
-  );
-  const [hubQuicAddr, setHubQuicAddr] = useState(node.hub_quic_addr ?? "");
-  // Per-service address inputs: "" = no preference (pack default runs).
-  const [addresses, setAddresses] = useState<Record<string, string>>({});
-  const [savedFlash, setSavedFlash] = useState(false);
-
-  // Current override state from the node snapshot (id → overridden address).
-  const overrides: Record<string, string> = Object.fromEntries(
-    services.filter((s) => s.overridden).map((s) => [s.id, s.effective_address]),
-  );
-
-  // Reset the form when switching nodes (the page is one component).
-  useEffect(() => {
-    setTransport(node.transport ?? node.pack_transport ?? "h2");
-    setHubQuicAddr(node.hub_quic_addr ?? "");
-    setAddresses(
-      Object.fromEntries(
-        (node.services ?? [])
-          .filter((s) => s.overridden)
-          .map((s) => [s.id, s.effective_address]),
-      ),
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [node.id, node.transport, node.pack_transport, node.hub_quic_addr, node.services]);
-
-  const addressError = (id: string): string | null => {
-    const value = (addresses[id] ?? "").trim();
-    if (value === "") return null; // empty = default, always fine
-    return parseLoopbackAddr(value) === null
-      ? "Must be loopback <ip>:<port>, e.g. 127.0.0.1:5173"
-      : null;
-  };
-  const anyAddressError = services.some((s) => addressError(s.id) !== null);
-
-  const addressesDirty = services.some(
-    (s) => (addresses[s.id] ?? "").trim() !== (overrides[s.id] ?? "").trim(),
-  );
-
-  const dirty =
-    isAgent &&
-    (transport !== (node.transport ?? node.pack_transport ?? "h2") ||
-      hubQuicAddr.trim() !== (node.hub_quic_addr ?? "") ||
-      addressesDirty);
-
-  const savePrefs = async () => {
-    try {
-      await api.updateNodePrefs(node.id, {
-        transport,
-        hub_quic_addr: transport === "quic" && hubQuicAddr.trim() !== "" ? hubQuicAddr.trim() : null,
-        service_addresses: services
-          .filter((s) => (addresses[s.id] ?? "").trim() !== "")
-          .map((s) => ({ id: s.id, address: addresses[s.id].trim() })),
-      });
-      await onChanged();
-      setSavedFlash(true);
-      setTimeout(() => setSavedFlash(false), 1500);
-    } catch (e) {
-      onError(`Preferences not saved: ${e}`);
-    }
-  };
-
-  const start = async () => {
-    try {
-      await api.startNode(node.id);
-      await onChanged();
-    } catch (e) {
-      onError(`Start failed: ${e}`);
-    }
-  };
-
-  const stop = async () => {
-    try {
-      await api.stopNode(node.id);
-      await onChanged();
-    } catch (e) {
-      onError(`Stop failed: ${e}`);
-    }
-  };
-
-  const remove = async () => {
-    try {
-      await api.removeNode(node.id);
-      onBack();
-      await onChanged();
-    } catch (e) {
-      onError(`Remove failed: ${e}`);
-    }
-  };
-
-  const hasMeshRules =
-    node.kind === "mesh_agent" &&
-    (node.mesh_ingress_rules.length > 0 || node.mesh_egress_rules.length > 0);
+  const pendingCount =
+    node.proposals?.filter((p) => p.status.status === "pending").length ?? 0;
 
   return (
-    <div className="detail-page">
-      <div className="detail-topbar">
-        <button onClick={onBack} title="Esc">
-          ← All nodes
-        </button>
-        <StateDot state={node.state} size={12} />
-        <h2>{node.name}</h2>
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2.5">
+        <Button variant="link" size="sm" onClick={onBack}>
+          <ArrowLeft className="size-4" />
+          {t("nodeDetail.allNodes")}
+          <Kbd>Esc</Kbd>
+        </Button>
+        <StateDot state={node.state} size="md" />
+        <h2 className="m-0 text-xl font-semibold">{node.name}</h2>
         <KindBadge kind={node.kind} />
       </div>
 
-      <div className="detail-body">
-        <SectionPanel
-          title="Status"
-          actions={
-            <>
-              <button className="primary" disabled={running} onClick={start}>
-                Start
-              </button>
-              <button disabled={!running} onClick={stop}>
-                Stop
-              </button>
-              <button
-                className="danger"
-                disabled={running}
-                onClick={remove}
-                title="the pack directory is untouched"
-              >
-                Remove
-              </button>
-            </>
-          }
-        >
-          <span>{stateText(node.state)}</span>
-          {receipt && (
-            <span className="hint">
-              connected via {effectiveTransport(node) === "quic" ? "QUIC" : "h2"} — hub confirmed
-              {receipt.egress_ip ? ` · egress ${receipt.egress_ip}` : ""}
-              {` · registered ${new Date(receipt.registered_at_unix * 1000).toLocaleTimeString()}`}
-            </span>
-          )}
-          {quicDialTimeout && (
-            <span className="hint">
-              QUIC dial keeps timing out — check UDP egress / the hub security group; switching
-              this node's transport to h2 restores connectivity
-            </span>
-          )}
-          {reconnecting && !quicDialTimeout && (
-            <span className="hint">
-              Will reconnect automatically once the network recovers
-            </span>
-          )}
-        </SectionPanel>
-
-        <SectionPanel title="Identity">
-          {node.principal && (
-            <div className="row">
-              <label>Identity</label>
-              <input value={node.principal} readOnly />
-            </div>
-          )}
-          <div className="row">
-            <label>Credential Pack</label>
-            <input value={node.pack_dir} readOnly title={node.pack_dir} />
-          </div>
-          {node.generation > 0 && (
-            <div className="row">
-              <label>Generation</label>
-              <span className="hint">{node.generation}</span>
-            </div>
-          )}
-          {node.credential && (
-            <div className="row">
-              <label>Credentials expire</label>
-              <span
-                className={`hint ${leafPhaseClass(node.credential)}`}
-                title="When this node's leaf credentials stop working — rotate before then"
-              >
-                {node.credential.not_after} ·{" "}
-                {formatRemainingSecs(node.credential.remaining_secs)} left
-              </span>
-            </div>
-          )}
-        </SectionPanel>
-
-        {hasMeshRules && (
-          <SectionPanel title="Mesh rules">
-            {node.mesh_ingress_rules.length > 0 && (
-              <div className="mesh-rule-group">
-                <div className="mesh-rule-group-title">Ingress</div>
-                {node.mesh_ingress_rules.map((rule) => (
-                  <div className="mesh-rule" key={rule.name}>
-                    <span className="mono">{rule.listen}</span>
-                    <span className="mesh-rule-proto">{rule.protocol}</span>
-                    <span>→ {rule.remote_addr}</span>
-                    <span className="hint">at {rule.target_agent}</span>
-                    <span className="mesh-rule-name hint" title={rule.name}>
-                      {rule.name}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-            {node.mesh_egress_rules.length > 0 && (
-              <div className="mesh-rule-group">
-                <div className="mesh-rule-group-title">Egress</div>
-                {node.mesh_egress_rules.map((rule) => (
-                  <div className="mesh-rule" key={rule.name}>
-                    <span className="mesh-rule-proto">{rule.protocol}</span>
-                    <span>{rule.target}</span>
-                    <span className="mesh-rule-name hint" title={rule.name}>
-                      {rule.name}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </SectionPanel>
+      <div className="flex flex-wrap items-center gap-2.5">
+        <SegmentedControl
+          value={view}
+          options={[
+            { value: "status", label: t("nodeDetail.status") },
+            { value: "config", label: t("nodeDetail.viewConfig") },
+            { value: "logs", label: t("nodeDetail.logs") },
+          ]}
+          onChange={onViewChange}
+        />
+        {stale && (
+          <ViewBadge
+            view="status"
+            tone="warn"
+            text={t("nodeCard.policyStale")}
+            title={t("nodeDetail.policyStaleTitle")}
+            onViewChange={onViewChange}
+          />
         )}
-
-        {isAgent && (
-          <SectionPanel
-            title="Runtime preferences"
-            hint={running ? "stop the node to edit" : undefined}
-          >
-            <div className="row">
-              <label>Transport</label>
-              {node.transport == null && node.pack_transport === "quic" && (
-                <span className="hint">QUIC inherited from the pack default</span>
-              )}
-              <SegmentedControl
-                value={transport}
-                options={[
-                  { value: "h2", label: "h2" },
-                  { value: "quic", label: "QUIC" },
-                ]}
-                onChange={setTransport}
-                disabled={running}
-              />
-            </div>
-            {transport === "quic" && (
-              <div className="row">
-                <label>Hub QUIC address</label>
-                <input
-                  disabled={running}
-                  value={hubQuicAddr}
-                  onChange={(e) => setHubQuicAddr(e.target.value)}
-                  placeholder={
-                    node.pack_hub_quic_addr
-                      ? `blank = derived from the pack (${node.pack_hub_quic_addr})`
-                      : "(optional) host:port — derived if empty"
-                  }
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                  spellCheck={false}
-                  autoComplete="off"
-                />
-              </div>
-            )}
-            {services.length > 0 && (
-              <>
-                <div className="row">
-                  <label>Service addresses</label>
-                  <span className="hint">empty = pack default</span>
-                </div>
-                {services.map((service) => {
-                  const err = addressError(service.id);
-                  return (
-                    <div className="row" key={service.id}>
-                      <label className="mono">{service.id}</label>
-                      <div className="address-edit">
-                        <input
-                          className={err ? "invalid" : ""}
-                          disabled={running}
-                          value={addresses[service.id] ?? ""}
-                          onChange={(e) =>
-                            setAddresses((prev) => ({
-                              ...prev,
-                              [service.id]: e.target.value,
-                            }))
-                          }
-                          placeholder={service.default_address}
-                          title={
-                            service.overridden
-                              ? `Pack default: ${service.default_address}`
-                              : undefined
-                          }
-                          autoCapitalize="none"
-                          autoCorrect="off"
-                          spellCheck={false}
-                          autoComplete="off"
-                        />
-                        <button
-                          className="link"
-                          disabled={running || (addresses[service.id] ?? "") === ""}
-                          onClick={() =>
-                            setAddresses((prev) => ({ ...prev, [service.id]: "" }))
-                          }
-                          title="Revert to pack default"
-                        >
-                          reset
-                        </button>
-                      </div>
-                      {err && <span className="field-error">{err}</span>}
-                    </div>
-                  );
-                })}
-              </>
-            )}
-            <div className="row">
-              <label />
-              <button disabled={running || !dirty || anyAddressError} onClick={savePrefs}>
-                {savedFlash ? "Saved ✓" : "Save preferences"}
-              </button>
-            </div>
-          </SectionPanel>
+        {leaf && node.credential && (
+          <ViewBadge
+            view="status"
+            tone={leaf}
+            text={`leaf ${formatRemainingSecs(node.credential.remaining_secs)}`}
+            title={t("nodeDetail.credentialsExpireTitle")}
+            onViewChange={onViewChange}
+          />
         )}
+        {reconnecting && (
+          <ViewBadge
+            view="status"
+            tone="warn"
+            text={t("nodeCard.reconnecting")}
+            onViewChange={onViewChange}
+          />
+        )}
+        {pendingCount > 0 && (
+          <ViewBadge
+            view="config"
+            tone="accent"
+            text={t("proposal.pendingCount", { n: String(pendingCount) })}
+            onViewChange={onViewChange}
+          />
+        )}
+      </div>
 
+      {/* All three views stay mounted and merely hide (the App face-switch
+          precedent): switching preserves the preferences form state and
+          each view's scroll position, and the engine-pushed
+          peers/proposals planes keep rendering into their view. Each
+          view owns its scroll container — Logs instead lets LogView's
+          internal pane own the full page height. */}
+      <div
+        className={
+          view === "status" ? "flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto" : "hidden"
+        }
+      >
+        <NodeStatusView
+          node={node}
+          onChanged={onChanged}
+          onError={onError}
+          onRemoved={onBack}
+          onRequestStream={() => setProposalOpen(true)}
+        />
+      </div>
+      <div
+        className={
+          view === "config" ? "flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto" : "hidden"
+        }
+      >
+        <NodeConfigView node={node} onChanged={onChanged} onError={onError} />
+      </div>
+      <div className={view === "logs" ? "flex min-h-0 flex-1 flex-col gap-3" : "hidden"}>
         <SectionPanel
-          title="Logs"
+          title={t("nodeDetail.logs")}
           grow
           actions={
             <SegmentedControl
               value={logScope}
               options={[
-                { value: "node", label: "This node" },
-                { value: "machine", label: "This machine" },
+                { value: "node", label: t("nodeDetail.thisNode") },
+                { value: "machine", label: t("nodeDetail.thisMachine") },
               ]}
               onChange={onLogScopeChange}
             />
@@ -402,6 +217,10 @@ export default function NodeDetail({
           <LogView logs={logs} showNodeColumn={logScope === "machine"} onClear={onClearLogs} />
         </SectionPanel>
       </div>
+
+      {proposalOpen && (
+        <ProposalDialog node={node} onClose={() => setProposalOpen(false)} onError={onError} />
+      )}
     </div>
   );
 }

@@ -12,6 +12,13 @@
 #     No service container there: the script starts its own pebble via
 #     scripts/acme-pebble.sh (requires Docker).
 #
+# Runner: cargo-nextest (per-test process isolation + cross-binary
+# parallelism — the e2e suite is wall-clock-bound on real timers, measured
+# ~4.6x faster than sequential libtest). Doc tests stay on libtest in their
+# own stage: nextest does not run doctests. cargo-nextest must be installed
+# on every machine that runs this script (checked up front; ci.yml installs
+# it via taiki-e/install-action).
+#
 # Run from the tree under test (cwd = workspace root). Stage output goes
 # straight through locally; under GitHub Actions each stage tees to a log
 # and failures surface as ::error:: annotations (the anonymous-log-reader
@@ -23,6 +30,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # Mirror the workflow job environment.
 export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
+
+command -v cargo-nextest >/dev/null 2>&1 \
+  || { echo "FAIL: cargo-nextest is required to run the test stages (brew install cargo-nextest / cargo install cargo-nextest --locked)" >&2; exit 1; }
 
 SELF_STARTED_PEBBLE=0
 cleanup() {
@@ -45,35 +55,50 @@ fi
 
 # One test stage. Local: banner + direct output. GitHub: quiet log + error
 # annotations (kept byte-compatible with the former per-step workflow form:
-# `::error::<label>: <line>`).
-run_stage() {
+# `::error::<label>: <line>`). The grep pattern covers BOTH runners' failure
+# vocabulary: libtest's `FAILED` / `failures:` blocks and nextest's
+# `FAIL [ ... ]` result lines — both print `panicked at` from the test
+# thread.
+_stage_impl() {
   local label="$1"
   shift
   if [ -z "${GITHUB_ACTIONS:-}" ]; then
     echo "==> ${label}"
-    cargo test "$@"
+    "$@"
     return
   fi
   set +e
-  cargo test "$@" >/tmp/t.log 2>&1
+  "$@" >/tmp/t.log 2>&1
   local rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
-    grep -E 'FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' |
+    grep -E 'FAIL |FAILED|panicked at|^failures:' -A2 /tmp/t.log | head -12 | sed 's/^ *//' |
       while read -r l; do [ -n "$l" ] && echo "::error::${label}: $l"; done
   fi
   return "$rc"
 }
 
-run_stage "unit tests (lib)" \
-  --workspace --exclude interflow-gui --all-features --no-fail-fast --lib
-run_stage "unit tests (bins)" \
-  --workspace --exclude interflow-gui --all-features --no-fail-fast --bins
+run_stage() { # libtest runner (doc tests)
+  local label="$1"
+  shift
+  _stage_impl "$label" cargo test "$@"
+}
+
+run_stage_next() { # cargo-nextest runner (everything else)
+  local label="$1"
+  shift
+  _stage_impl "$label" cargo nextest run "$@"
+}
+
+run_stage_next "unit tests (lib)" \
+  --workspace --exclude interflow-gui --all-features --lib
+run_stage_next "unit tests (bins)" \
+  --workspace --exclude interflow-gui --all-features --bins
 run_stage "unit tests (doc)" \
   --workspace --exclude interflow-gui --all-features --no-fail-fast --doc
-run_stage "e2e tests (mesh)" \
-  -p interflow-mesh --all-features --no-fail-fast --test '*'
-run_stage "e2e tests (rest)" \
-  --workspace --exclude interflow-gui --exclude interflow-mesh --all-features --no-fail-fast --test '*'
+run_stage_next "e2e tests (mesh)" \
+  -p interflow-mesh --all-features --test '*'
+run_stage_next "e2e tests (rest)" \
+  --workspace --exclude interflow-gui --exclude interflow-mesh --all-features --test '*'
 
 echo "==> all test stages passed"

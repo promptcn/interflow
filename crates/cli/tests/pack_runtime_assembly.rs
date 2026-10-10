@@ -88,18 +88,14 @@ fn agent_pack_carries_the_signed_transport_default() {
     let pack = CredentialPack::load(&out).unwrap();
     let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
     // Headless form: no profile, no preference — the pack default runs.
-    let transport =
-        resolve_effective_transport(None, pack.node_config.transport.as_deref()).unwrap();
+    let transport = resolve_effective_transport(None, pack.node_config.transport.as_str()).unwrap();
     let args = build_agent_args(&pack, &active, &out, transport, None, &BTreeMap::new()).unwrap();
     assert_eq!(args.transport, TransportKind::Quic);
 
     // GUI form: a local h2 preference beats the pack's quic default.
     assert_eq!(
-        resolve_effective_transport(
-            Some(TransportKind::H2),
-            pack.node_config.transport.as_deref()
-        )
-        .unwrap(),
+        resolve_effective_transport(Some(TransportKind::H2), pack.node_config.transport.as_str())
+            .unwrap(),
         TransportKind::H2
     );
 }
@@ -139,8 +135,7 @@ fn quic_free_manifests_stay_h2_and_off() {
     .unwrap();
     let pack = CredentialPack::load(&agent_out).unwrap();
     let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
-    let transport =
-        resolve_effective_transport(None, pack.node_config.transport.as_deref()).unwrap();
+    let transport = resolve_effective_transport(None, pack.node_config.transport.as_str()).unwrap();
     let args = build_agent_args(
         &pack,
         &active,

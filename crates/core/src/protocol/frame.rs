@@ -23,19 +23,34 @@
 //! all-zero marker. The type × field contract below is enforced by the codec
 //! on **both** sides — the table *is* the protocol:
 //!
-//! | type          | stream_id | circuit                          | flags                    |
-//! |---------------|-----------|----------------------------------|--------------------------|
-//! | Open          | stream    | requester circuit                | UDP/E2E allowed          |
-//! | Data          | stream    | requester circuit / zero (resp)  | RESPONSE allowed         |
-//! | Close         | stream    | requester circuit / zero         | RESPONSE, HUB_ORIGIN     |
-//! | Hello         | zero      | zero                             | —                        |
-//! | HelloAck      | zero      | zero                             | HUB_ORIGIN required      |
-//! | Ping          | zero      | zero                             | HUB_ORIGIN required      |
-//! | Pong          | zero      | sender circuit                   | —                        |
-//! | OpenAck       | stream    | zero                             | HUB_ORIGIN required      |
-//! | RouteRequest  | corr id   | zero                             | —                        |
-//! | RouteAck      | corr id   | zero                             | HUB_ORIGIN required      |
-//! | Error         | zero      | zero                             | HUB_ORIGIN required      |
+//! Type-byte allocation (renumbered 2026-10-10, epoch redefined in place):
+//! `0x01–0x0F` data plane, `0x10–0x1F` session/handshake/heartbeat,
+//! `0x20–0x2F` control-plane request/response pairs (request even, response
+//! odd), `0xFF` the terminal Error sentinel.
+//!
+//! | type (byte)              | stream_id | circuit                          | flags                    |
+//! |--------------------------|-----------|----------------------------------|--------------------------|
+//! | Open (0x01)              | stream    | requester circuit                | UDP/E2E allowed          |
+//! | Data (0x02)              | stream    | requester circuit / zero (resp)  | RESPONSE allowed         |
+//! | Close (0x03)             | stream    | requester circuit / zero         | RESPONSE, HUB_ORIGIN     |
+//! | Hello (0x10)             | zero      | zero                             | —                        |
+//! | HelloAck (0x11)          | zero      | zero                             | HUB_ORIGIN required      |
+//! | Ping (0x12)              | zero      | zero                             | HUB_ORIGIN required      |
+//! | Pong (0x13)              | zero      | sender circuit                   | —                        |
+//! | OpenAck (0x14)           | stream    | zero                             | HUB_ORIGIN required      |
+//! | RouteRequest (0x15)      | corr id   | zero                             | —                        |
+//! | RouteAck (0x16)          | corr id   | zero                             | HUB_ORIGIN required      |
+//! | PolicyPullRequest (0x20)     | corr id | zero                          | —                        |
+//! | PolicyPullResponse (0x21)    | corr id | zero                          | HUB_ORIGIN required      |
+//! | PeerListRequest (0x22)       | corr id | zero                          | —                        |
+//! | PeerListResponse (0x23)      | corr id | zero                          | HUB_ORIGIN required      |
+//! | ProposalSubmitRequest (0x24) | corr id | zero                          | —                        |
+//! | ProposalSubmitResponse (0x25)| corr id | zero                          | HUB_ORIGIN required      |
+//! | ProposalMineRequest (0x26)   | corr id | zero                          | —                        |
+//! | ProposalMineResponse (0x27)  | corr id | zero                          | HUB_ORIGIN required      |
+//! | LivenessPing (0x28)     | corr id   | zero                             | —                        |
+//! | LivenessPong (0x29)     | corr id   | zero                             | HUB_ORIGIN required      |
+//! | Error (0xFF)            | zero      | zero                             | HUB_ORIGIN required      |
 
 use bytes::{BufMut, Bytes, BytesMut};
 use interflow_contract::FORMAT_VERSION;
@@ -141,10 +156,61 @@ pub enum FrameType {
     RouteRequest,
     /// Control-plane route lease response (payload is a route token).
     RouteAck,
+    /// Control-plane signed-policy pull request (QUIC): the agent's
+    /// conditional fetch of the hub's current policy bundle. Payload is the
+    /// generation the caller already holds (fixed layout, see
+    /// `tunnel/negotiation.rs`); the requester is the connection's registered
+    /// agent — the circuit field stays zero.
+    PolicyPullRequest,
+    /// Control-plane signed-policy pull response (QUIC): the hub's answer to
+    /// [`FrameType::PolicyPullRequest`] — an update bundle, an "unchanged"
+    /// (caller's watermark ≥ the serving generation), or "no policy face".
+    /// Fixed layout payload, see `tunnel/negotiation.rs`.
+    PolicyPullResponse,
+    /// Control-plane peer-list request (QUIC): the agent's fetch of the
+    /// tenant's registered agents (presence + leaf health) — the QUIC face
+    /// of the h2 `GET /agents`. Empty payload; the requester is the
+    /// connection's registered agent, so the circuit field stays zero.
+    PeerListRequest,
+    /// Control-plane peer-list response (QUIC): the hub's answer to
+    /// [`FrameType::PeerListRequest`]. Payload is the same JSON array of
+    /// entries the h2 `GET /agents` serves (see `tunnel/transport::PeerInfo`).
+    PeerListResponse,
+    /// Control-plane stream-proposal submission (QUIC): a node's
+    /// self-service request for one more mesh stream. Payload is the JSON
+    /// [`StreamProposalRequest`](crate::tunnel::transport::StreamProposalRequest);
+    /// the requester is the connection's registered agent.
+    ProposalSubmitRequest,
+    /// Control-plane proposal submission answer (QUIC): queued / duplicate
+    /// / denied-with-reason, as JSON
+    /// [`ProposalSubmitOutcome`](crate::tunnel::transport::ProposalSubmitOutcome).
+    ProposalSubmitResponse,
+    /// Control-plane proposal receipts query (QUIC): this node's own
+    /// proposals and their decision state. Empty payload.
+    ProposalMineRequest,
+    /// Control-plane proposal receipts answer (QUIC): a JSON array of
+    /// [`ProposalReceipt`](crate::tunnel::transport::ProposalReceipt).
+    ProposalMineResponse,
+    /// Control-plane demanding liveness roundtrip request (QUIC): the
+    /// supervisor's out-of-tree probe asking a question that MUST be
+    /// answered — success of the roundtrip is the only accepted proof that
+    /// the path carries our traffic in both directions (the 2026-10-09
+    /// one-way-blackhole fix; the transport-layer PING cannot serve: quinn
+    /// resets its idle timer only on *received* packets, so a session fed
+    /// by the still-working reverse direction looks alive forever). Empty
+    /// payload; correlation id in the stream_id, like every request on
+    /// this carriage.
+    LivenessPing,
+    /// Control-plane demanding liveness roundtrip answer (QUIC): the hub's
+    /// echo of [`FrameType::LivenessPing`] on the same stream. Empty
+    /// payload; correlation id echoed.
+    LivenessPong,
 }
 
 impl FrameType {
-    /// Serializes to the type byte.
+    /// Serializes to the type byte. Allocation: `0x01–0x0F` data plane,
+    /// `0x10–0x1F` session/handshake/heartbeat, `0x20–0x2F` control-plane
+    /// request/response pairs (request even, response odd), `0xFF` Error.
     pub const fn as_byte(self) -> u8 {
         match self {
             Self::Open => 0x01,
@@ -155,9 +221,19 @@ impl FrameType {
             Self::Ping => 0x12,
             Self::Pong => 0x13,
             Self::OpenAck => 0x14,
-            Self::Error => 0x20,
             Self::RouteRequest => 0x15,
             Self::RouteAck => 0x16,
+            Self::PolicyPullRequest => 0x20,
+            Self::PolicyPullResponse => 0x21,
+            Self::PeerListRequest => 0x22,
+            Self::PeerListResponse => 0x23,
+            Self::ProposalSubmitRequest => 0x24,
+            Self::ProposalSubmitResponse => 0x25,
+            Self::ProposalMineRequest => 0x26,
+            Self::ProposalMineResponse => 0x27,
+            Self::LivenessPing => 0x28,
+            Self::LivenessPong => 0x29,
+            Self::Error => 0xFF,
         }
     }
 
@@ -172,20 +248,41 @@ impl FrameType {
             0x12 => Some(Self::Ping),
             0x13 => Some(Self::Pong),
             0x14 => Some(Self::OpenAck),
-            0x20 => Some(Self::Error),
             0x15 => Some(Self::RouteRequest),
             0x16 => Some(Self::RouteAck),
+            0x20 => Some(Self::PolicyPullRequest),
+            0x21 => Some(Self::PolicyPullResponse),
+            0x22 => Some(Self::PeerListRequest),
+            0x23 => Some(Self::PeerListResponse),
+            0x24 => Some(Self::ProposalSubmitRequest),
+            0x25 => Some(Self::ProposalSubmitResponse),
+            0x26 => Some(Self::ProposalMineRequest),
+            0x27 => Some(Self::ProposalMineResponse),
+            0x28 => Some(Self::LivenessPing),
+            0x29 => Some(Self::LivenessPong),
+            0xFF => Some(Self::Error),
             _ => None,
         }
     }
 
     /// Whether only the hub may author this frame type (the codec requires
     /// `FLAG_HUB_ORIGIN` on these, which closes the agent-impersonates-hub
-    /// window the former sentinels left open).
-    const fn is_hub_only(self) -> bool {
+    /// window the former sentinels left open). The single authority every
+    /// uplink rejection path (h2 upload, QUIC control stream) must consult —
+    /// never re-enumerate the members locally.
+    pub const fn is_hub_only(self) -> bool {
         matches!(
             self,
-            Self::HelloAck | Self::Ping | Self::OpenAck | Self::RouteAck | Self::Error
+            Self::HelloAck
+                | Self::Ping
+                | Self::OpenAck
+                | Self::RouteAck
+                | Self::PolicyPullResponse
+                | Self::PeerListResponse
+                | Self::ProposalSubmitResponse
+                | Self::ProposalMineResponse
+                | Self::LivenessPong
+                | Self::Error
         )
     }
 }
@@ -239,8 +336,8 @@ const fn contract_ok(ft: FrameType, flags: u8, sid: StreamId, circuit: CircuitTo
     }
 
     // Per-type field requiredness. `sid` names a stream on the traffic types
-    // and a correlation id on the route types; the connection-level types
-    // carry the zero marker.
+    // and a correlation id on the route/policy request-response types; the
+    // connection-level types carry the zero marker.
     match ft {
         // Open carries both ids; Data/Close carry the circuit exactly when
         // neither origin flag is set; Pong re-identifies the sender.
@@ -250,9 +347,19 @@ const fn contract_ok(ft: FrameType, flags: u8, sid: StreamId, circuit: CircuitTo
         FrameType::Hello | FrameType::HelloAck | FrameType::Ping | FrameType::Error => {
             sid_zero && circuit_zero
         }
-        FrameType::OpenAck | FrameType::RouteRequest | FrameType::RouteAck => {
-            !sid_zero && circuit_zero
-        }
+        FrameType::OpenAck
+        | FrameType::RouteRequest
+        | FrameType::RouteAck
+        | FrameType::PolicyPullRequest
+        | FrameType::PolicyPullResponse
+        | FrameType::PeerListRequest
+        | FrameType::PeerListResponse
+        | FrameType::ProposalSubmitRequest
+        | FrameType::ProposalSubmitResponse
+        | FrameType::ProposalMineRequest
+        | FrameType::ProposalMineResponse
+        | FrameType::LivenessPing
+        | FrameType::LivenessPong => !sid_zero && circuit_zero,
     }
 }
 
@@ -491,6 +598,14 @@ mod tests {
             (FrameType::OpenAck, FLAG_HUB_ORIGIN),
             (FrameType::RouteRequest, 0),
             (FrameType::RouteAck, FLAG_HUB_ORIGIN),
+            (FrameType::PolicyPullRequest, 0),
+            (FrameType::PolicyPullResponse, FLAG_HUB_ORIGIN),
+            (FrameType::PeerListRequest, 0),
+            (FrameType::PeerListResponse, FLAG_HUB_ORIGIN),
+            (FrameType::ProposalSubmitRequest, 0),
+            (FrameType::ProposalSubmitResponse, FLAG_HUB_ORIGIN),
+            (FrameType::ProposalMineRequest, 0),
+            (FrameType::ProposalMineResponse, FLAG_HUB_ORIGIN),
             (FrameType::Error, FLAG_HUB_ORIGIN),
         ]
     }
@@ -655,6 +770,27 @@ mod tests {
                 StreamId::ZERO,
                 CircuitToken::ZERO,
                 "Ping must be hub-origin",
+            ),
+            (
+                FrameType::PolicyPullResponse,
+                0,
+                sid_v,
+                CircuitToken::ZERO,
+                "PolicyPullResponse must be hub-origin",
+            ),
+            (
+                FrameType::PolicyPullRequest,
+                0,
+                StreamId::ZERO,
+                CircuitToken::ZERO,
+                "PolicyPullRequest needs a correlation id",
+            ),
+            (
+                FrameType::PolicyPullRequest,
+                0,
+                sid_v,
+                c_v,
+                "PolicyPullRequest is connection-identified (zero circuit)",
             ),
         ];
         for (ft, flags, stream_id, circuit, why) in violations {

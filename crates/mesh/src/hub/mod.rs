@@ -7,7 +7,7 @@
 //! - [`service`]   — `HubService` (hyper `Service` implementation + request routing)
 //! - [`registration`] — `/register` handling (agent registration + identity binding + implicit re-registration)
 //! - [`routing`]   — frame-level stream routing (Open/Data/Close ACL checks + direction checks + dispatch)
-//! - [`control`]   — control-plane dispatch (guaranteed-delivery channel for Open / `_close_` lifecycle notifications)
+//! - [`control`]   — control-plane dispatch (guaranteed-delivery channel for Open / Close lifecycle notifications)
 //! - [`upload`]    — `/stream/up` handling (streamed upload, mirror of /poll)
 //! - [`poll`]      — `/poll` handling (streamed download + RxStream adapter)
 //! - [`heartbeat`] — agent lifecycle (eviction primitive + Ping/Pong heartbeat + `/pong`)
@@ -24,6 +24,7 @@ pub mod heartbeat;
 pub mod http;
 pub mod policy;
 pub mod poll;
+pub mod proposals;
 pub mod quic;
 pub mod registration;
 pub mod route;

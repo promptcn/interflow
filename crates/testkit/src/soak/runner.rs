@@ -1030,7 +1030,14 @@ async fn run_scenario(
         match TcpImpairProxy::spawn(hub_addr, impair_cfg.clone()).await {
             Ok(p) => Some(p),
             Err(e) => {
-                return failed_result(name, args, format!("failed to start TCP impair proxy: {e}"));
+                let tails = log_tails(&procs).await;
+                teardown_procs(&procs).await;
+                backend_task.abort();
+                return failed_result(
+                    name,
+                    args,
+                    format!("failed to start TCP impair proxy: {e}\n{tails}"),
+                );
             }
         }
     } else {
@@ -1040,7 +1047,14 @@ async fn run_scenario(
         match UdpImpairProxy::spawn(hub_addr, impair_cfg).await {
             Ok(p) => Some(p),
             Err(e) => {
-                return failed_result(name, args, format!("failed to start UDP impair proxy: {e}"));
+                let tails = log_tails(&procs).await;
+                teardown_procs(&procs).await;
+                backend_task.abort();
+                return failed_result(
+                    name,
+                    args,
+                    format!("failed to start UDP impair proxy: {e}\n{tails}"),
+                );
             }
         }
     } else {

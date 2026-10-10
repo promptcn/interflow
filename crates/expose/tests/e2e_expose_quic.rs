@@ -16,9 +16,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_expose::client::{ExposeArgs, LocalService};
 use interflow_expose::edge::{
@@ -136,6 +134,8 @@ async fn run_quic_round_trip(derived_addr: bool) {
         } else {
             Some(edge.control_quic_addr().expect("quic face").to_string())
         },
+
+        identity_offline: false,
     };
     let mut client_handle = interflow_expose::client::start(&client_args).expect("client start");
     wait_for_session(&mut client_handle).await;

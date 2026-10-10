@@ -3,6 +3,7 @@ use crate::agent::egress::EgressHandler;
 use crate::agent::handle::{AgentHandle, AgentState, EventSink, backoff_duration};
 use crate::agent::ingress::IngressHandler;
 use crate::agent::ingress_addrs::IngressAddrs;
+use crate::agent::ingress_listeners::IngressListeners;
 use crate::agent::rules::RuleStore;
 use crate::config::{AgentConfig, TransportKind};
 use http::Uri;
@@ -19,20 +20,21 @@ use interflow_core::tunnel::quic::QuicEndpointParams;
 use interflow_core::tunnel::session_tasks::{
     SessionExitGuard, SessionTasks, TaskExit, TaskExitReason,
 };
+use interflow_core::tunnel::transport::{SteadyStateLiveness, unix_millis_now};
 use interflow_core::tunnel::{
     AgentTunnel, DEFAULT_REQUEST_ESTABLISH_TIMEOUT, H2Liveness, H2RequestBody, SessionSlot,
     empty_request_body,
 };
 use rustls::pki_types::ServerName;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 use tokio_rustls::TlsConnector;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // The session wind-down trio is single-sourced in core
 // `config::params::ShutdownBudget` (bounded by construction: wind-down may
@@ -76,10 +78,11 @@ pub struct AgentClient {
     /// Open without a session rebuild.
     security_tx: tokio::sync::watch::Sender<crate::config::SecurityConfig>,
     /// Senders into the CURRENT session's rule command channels (always
-    /// created, not only when the control API is enabled — the signed-policy
-    /// reload path uses them too). Re-installed by every session rebuild;
-    /// `None` between sessions (a reload then only updates the store + the
-    /// security watch, and the next session seeds from them).
+    /// created, not only when the control API is enabled — they carry the
+    /// Add/Remove/List surface). Re-installed by every session rebuild;
+    /// `None` between sessions (rule changes then only update the store,
+    /// and the next session's handlers reconcile from it — the store's
+    /// change notification, not a message, drives convergence).
     session_commands: Arc<tokio::sync::RwLock<Option<SessionRuleSenders>>>,
     /// Egress flood-line runtime (agent-scoped): concurrency counters and
     /// rate buckets are shared across sessions and not reset on session
@@ -97,10 +100,21 @@ pub struct AgentClient {
     /// a `:0` listen port pins across session rebuilds and stays observable
     /// from the [`AgentHandle`](crate::agent::AgentHandle).
     ingress_addrs: std::sync::Arc<IngressAddrs>,
+    /// Ingress listener health face (actually-bound addresses + bind
+    /// errors), shared across sessions and observable from the
+    /// [`AgentHandle`](crate::agent::AgentHandle) — the actual-state
+    /// counterpart of the rule store, so "the listener is gone" is a
+    /// queryable state, not archaeology.
+    ingress_listeners: std::sync::Arc<IngressListeners>,
 }
 
-/// The current session's rule command senders (ingress listeners + egress
-/// snapshot reconciliation).
+/// The current session's rule command channels (ingress listeners + egress
+/// snapshot reconciliation). Held for the session's lifetime — dropping
+/// them at teardown closes the channel, the handler loop's exit signal.
+/// The fields are never READ: with the control API enabled the
+/// ControlServer holds its own clones, and with it disabled this struct is
+/// the only thing keeping the channels open.
+#[expect(dead_code)] // kept alive for Drop timing, not read
 #[derive(Clone)]
 struct SessionRuleSenders {
     ingress: mpsc::Sender<crate::agent::control::IngressCommand>,
@@ -174,14 +188,18 @@ impl AgentClient {
             e2e_runtime,
             ingress_ready: tokio::sync::watch::channel(false).0,
             ingress_addrs: std::sync::Arc::new(IngressAddrs::new()),
+            ingress_listeners: std::sync::Arc::new(IngressListeners::new()),
         })
     }
 
     /// Applies a verified signed-policy reload atomically: the live egress
-    /// allowlist, the cross-session rule store, and — when a session is
-    /// alive — its listeners and matching snapshots all move to the new
-    /// face. Established streams are never torn down; a narrower allowlist
-    /// rejects new flows and lets old ones drain.
+    /// allowlist and the cross-session rule store move to the new face.
+    /// The handlers reconcile from the store level-triggered (its change
+    /// notification wakes them; a periodic tick retries and heals), so
+    /// there is no snapshot to push and no best-effort send whose loss
+    /// could silently split desired from actual state. Established
+    /// streams are never torn down; a narrower allowlist rejects new flows
+    /// and lets old ones drain.
     ///
     /// The caller has already verified the policy's signature and
     /// generation; this method only moves the derived rules in.
@@ -197,20 +215,6 @@ impl AgentClient {
         });
         self.rule_store.replace_ingress(ingress).await;
         self.rule_store.replace_egress(egress).await;
-        let senders = self.session_commands.read().await.clone();
-        if let Some(SessionRuleSenders { ingress, egress }) = senders {
-            let ingress_rules = self.rule_store.ingress_snapshot().await;
-            let egress_rules = self.rule_store.egress_snapshot().await;
-            // Best-effort: a full channel (32 pending commands) means the
-            // session is mid-teardown or wedged — the store is already the
-            // truth and the next session reconciles from it.
-            let _ = ingress
-                .send(crate::agent::control::IngressCommand::Sync(ingress_rules))
-                .await;
-            let _ = egress
-                .send(crate::agent::control::EgressCommand::Sync(egress_rules))
-                .await;
-        }
         metrics::counter!("interflow_agent_config_reload_total").increment(1);
     }
 
@@ -265,6 +269,24 @@ impl AgentClient {
         let (state_tx, state_rx) = tokio::sync::watch::channel(AgentState::Connecting);
         let (event_tx, event_rx) = mpsc::channel(64);
         let established = Arc::new(AtomicU64::new(0));
+
+        // The intrinsic policy plane: config-derived, not embedder wiring —
+        // a pack-built config runs the signed-policy watcher, an in-memory
+        // one runs none, and no surface can forget the spawn
+        // Extracted before `self` moves into the supervisor.
+        let policy_plane = self.config.policy.clone();
+        let policy_transport = self.config.agent.transport;
+        let policy_log_name = self.config.agent.effective_log_name().to_string();
+        let policy_client = self.clone();
+        let policy_state_rx = state_rx.clone();
+        let policy_shutdown = shutdown.clone();
+        let policy_tracker = tracker.clone();
+        let peer_agent_id = self.config.agent.id.clone();
+        let peer_log_name = self.config.agent.effective_log_name().to_string();
+        let peer_state_rx = state_rx.clone();
+        let peer_shutdown = shutdown.clone();
+        let peer_tracker = tracker.clone();
+
         let sink = EventSink {
             state_tx,
             event_tx,
@@ -273,6 +295,7 @@ impl AgentClient {
 
         let ingress_ready_rx = self.ingress_ready.subscribe();
         let ingress_addrs = std::sync::Arc::clone(&self.ingress_addrs);
+        let ingress_listeners = std::sync::Arc::clone(&self.ingress_listeners);
         let join = {
             let shutdown = shutdown.clone();
             let tracker = tracker.clone();
@@ -282,6 +305,33 @@ impl AgentClient {
                     .await
             })
         };
+
+        let policy_state = policy_plane.map(|plane| {
+            crate::agent::policy_watch::spawn(
+                plane.pack_dir,
+                policy_client,
+                slot.tunnel(),
+                policy_state_rx,
+                &policy_shutdown,
+                &policy_tracker,
+                policy_transport,
+                policy_log_name,
+            )
+        });
+
+        // The intrinsic peer plane: the hub agents control plane needs no
+        // pack, so every mesh agent gets the watcher — same tunnel slot,
+        // same lifecycle, no embedder wiring to forget (the 2026-10-07
+        // lesson applied from day one). Inputs extracted before `self`
+        // moves into the supervisor, like the policy plane above.
+        let (peer_state, proposal_state) = crate::agent::peer_watch::spawn(
+            peer_agent_id,
+            peer_log_name,
+            slot.tunnel(),
+            peer_state_rx,
+            &peer_shutdown,
+            &peer_tracker,
+        );
 
         AgentHandle::new(
             state_rx,
@@ -293,6 +343,10 @@ impl AgentClient {
             established,
             ingress_ready_rx,
             ingress_addrs,
+            ingress_listeners,
+            policy_state,
+            peer_state,
+            proposal_state,
         )
     }
 
@@ -331,22 +385,56 @@ impl AgentClient {
             // awaited through its JoinHandle — a panic anywhere inside
             // becomes a JoinError here and takes the ordinary retry path,
             // instead of un winding into this loop and killing the
-            // supervisor (the 2026-09-16 gap A shape). Still a DIRECT await:
-            // run_session itself responds to cancellation (including the
-            // unified wind-down: session_token.cancel -> tunnel.shutdown ->
-            // bounded tracker close-out); no outer select, otherwise shutdown
-            // would drop the future and skip the wind-down.
-            let attempt_session = {
+            // supervisor (the 2026-09-16 gap A shape). The await sits behind
+            // a select with the OUT-OF-TREE silence probe (P2: no unbounded
+            // bare await — a wedged session tree would otherwise park this
+            // loop forever, the 2026-10-07 zero-attribution zombie); on a
+            // probe verdict the attempt token is cancelled and the handle is
+            // STILL awaited to completion so the unified wind-down inside
+            // run_session (cancel → withdraw → tunnel shutdown → bounded
+            // tracker close-out) is never skipped by dropping the future.
+            let attempt_token = shutdown.child_token();
+            let death_note = Arc::new(AttemptDeathNote::default());
+            let mut attempt_session = {
                 let this = self.clone();
                 let sink = sink.clone();
-                let shutdown = shutdown.clone();
+                let user_token = shutdown.clone();
+                let token = attempt_token.clone();
+                let attempt_note = Arc::clone(&death_note);
                 let slot = slot.clone();
-                tracker.spawn(async move { this.run_session(&sink, &shutdown, &slot).await })
+                tracker.spawn(async move {
+                    this.run_session(&sink, &token, &user_token, &attempt_note, &slot)
+                        .await
+                })
             };
-            let outcome = match attempt_session.await {
-                Ok(outcome) => outcome,
-                Err(join_err) => Err(InterflowError::JoinError(join_err)),
+            enum Waited {
+                Done(std::result::Result<Result<SessionOutcome>, InterflowError>),
+                ProbeFired,
+            }
+            let waited = tokio::select! {
+                r = &mut attempt_session => Waited::Done(r.map_err(InterflowError::JoinError)),
+                () = out_of_tree_liveness_probe(
+                    slot.clone(),
+                    attempt_token.clone(),
+                    Arc::clone(&death_note),
+                    OUT_OF_TREE_PROBE,
+                    node.clone(),
+                ) => Waited::ProbeFired,
             };
+            // Both arms yield `Result<Result<SessionOutcome>, InterflowError>`
+            // (join-result of a future that itself returns Result); flatten.
+            let outcome = match waited {
+                Waited::Done(r) => r,
+                Waited::ProbeFired => {
+                    // The probe already recorded its attribution note and
+                    // cancelled the attempt token; the cancel cascades into
+                    // run_session's ended-by attribution and unified
+                    // wind-down, so this join completes with the Ended
+                    // outcome (bounded by the wind-down's own budgets).
+                    attempt_session.await.map_err(InterflowError::JoinError)
+                }
+            }
+            .flatten();
 
             let (reason, established) = match outcome {
                 Ok(SessionOutcome::Shutdown) => break,
@@ -409,18 +497,27 @@ impl AgentClient {
     /// the session-level tracker + session token for cooperative
     /// cancellation; the teardown sequence closes out boundedly (see the
     /// wind-down notes below).
+    ///
+    /// Token hierarchy (three levels): `user_token` (the agent-level user
+    /// intent) → `attempt_token` (one supervisor iteration; the out-of-tree
+    /// silence probe cancels THIS level) → the session token (derived below;
+    /// in-tree sensors cancel this level). `death_note` carries the probe's
+    /// verdict across the tree boundary for first-class attribution.
     async fn run_session(
         &self,
         sink: &EventSink,
-        shutdown: &CancellationToken,
+        attempt_token: &CancellationToken,
+        user_token: &CancellationToken,
+        death_note: &AttemptDeathNote,
         slot: &SessionSlot,
     ) -> Result<SessionOutcome> {
         // Log attribution (see supervise): defaults to the agent id (the
         // pack's node name); overridable per-slot via `log_name`.
         let node = self.config.agent.effective_log_name().to_string();
-        // Session-level token: when the session ends (disconnect or user
-        // shutdown alike), cancels all child tasks of this session.
-        let session_token = shutdown.child_token();
+        // Session-level token: when the session ends (disconnect, probe
+        // verdict, or user shutdown alike — the first two cascade through
+        // the attempt token), cancels all child tasks of this session.
+        let session_token = attempt_token.child_token();
 
         // Panic containment, last-resort layer: ANY exit from this frame —
         // including a panic unwind (dropping a child token does NOT cancel
@@ -434,10 +531,10 @@ impl AgentClient {
         let mut task_exits = tasks.exits().await;
 
         // Connect + register (branch by transport: h2 = HTTP/2 + /register;
-        // quic = control-stream Hello)
-        // Every transport yields a connection watcher; only h2 yields the
-        // request sender for the control proxy (`None` on QUIC — the proxy
-        // is a plain h2 pass-through).
+        // quic = control-stream Hello). Both transports yield the same
+        // parts — the tunnel facade carries the control-plane face for
+        // both (policy pull, agents list), so no transport-specific
+        // request sender is threaded out anymore.
         //
         // The stop arm watches the PARENT token, not the session token:
         // session construction spawns the transport loops (poll/upload
@@ -451,9 +548,9 @@ impl AgentClient {
         // that death to Shutdown, and the supervisor exited without
         // reconnecting (observed as a ~1%-of-runs flake in the
         // self-heal panic e2e, load-sensitive: 2026-09-30).
-        let (agent_id, tunnel, mut connection_handle, mut hub_client_for_control, negotiated) = tokio::select! {
+        let (agent_id, tunnel, mut connection_handle, negotiated) = tokio::select! {
             r = self.establish_tunnel(&tasks) => r?.into_parts(),
-            () = shutdown.cancelled() => return Ok(SessionOutcome::Shutdown),
+            () = user_token.cancelled() => return Ok(SessionOutcome::Shutdown),
         };
 
         // Fault injection: panic in run_session's own frame right after
@@ -497,15 +594,16 @@ impl AgentClient {
             egress: egress_tx.clone(),
         });
 
-        // Start Control Server (in QUIC mode the hub-proxy feature has no h2
-        // sender for now; pass None to degrade)
+        // Start Control Server (the `/agents` proxy rides the session
+        // tunnel — works for both transports).
         let mut control_handle = if self.config.control.enabled {
             let control_addr = self.config.control.listen_addr;
             let ingress_tx_clone = Some(ingress_tx.clone());
             let egress_tx_clone = Some(egress_tx.clone());
-            let hub_client = hub_client_for_control.take();
+            let control_tunnel = tunnel.clone();
             let auth_token = self.config.control.auth_token.clone();
             let token = session_token.clone();
+            let control_node = node.clone();
 
             Some(session_tracker.spawn(async move {
                 tokio::select! {
@@ -513,13 +611,14 @@ impl AgentClient {
                     r = async {
                         let server = ControlServer::new(
                             control_addr,
+                            control_node.clone(),
                             ingress_tx_clone,
                             egress_tx_clone,
-                            hub_client,
+                            control_tunnel,
                             auth_token,
                         );
                         if let Err(e) = server.run().await {
-                            error!("Control Server Error: {}", e);
+                            error!(node = %control_node, "Control Server Error: {}", e);
                         }
                     } => r,
                 }
@@ -540,6 +639,7 @@ impl AgentClient {
         let handler_node = node.clone();
         let handler_ingress_ready = self.ingress_ready.clone();
         let handler_ingress_addrs = std::sync::Arc::clone(&self.ingress_addrs);
+        let handler_ingress_listeners = std::sync::Arc::clone(&self.ingress_listeners);
         let mut handler_task = session_tracker.spawn(async move {
             info!(node = %handler_node, "Starting agent services (ingress & egress)");
 
@@ -554,12 +654,14 @@ impl AgentClient {
             // Create Ingress Handler
             let ingress = IngressHandler::new_with_tunnel(
                 agent_id.clone(),
+                handler_node.clone(),
                 tunnel.clone(),
                 rule_store.clone(),
                 handler_token.clone(),
                 handler_tracker.clone(),
                 Some(ingress_rx),
                 handler_ingress_addrs,
+                handler_ingress_listeners,
                 Arc::clone(&e2e_runtime),
                 handler_ingress_ready,
             );
@@ -573,6 +675,7 @@ impl AgentClient {
                 incoming,
                 crate::agent::egress::EgressSession {
                     tunnel,
+                    node: handler_node,
                     security: security_config,
                     policy: egress_policy,
                     runtime: egress_runtime,
@@ -608,18 +711,13 @@ impl AgentClient {
                 Some(exit) => SessionEnd::CriticalTask(exit),
                 None => SessionEnd::Watchdog,
             },
-            // The session token has many cancellation sources: user shutdown
-            // (parent cascade), the poll receive-side watchdog, or the
-            // SessionExitGuard. Distinguish the user shutdown by the parent
-            // token — it must take the Stopped path; every internal death
-            // signal takes the reconnect path (mistaking one for Shutdown
-            // would leave the agent zombied in Stopped).
+            // The session token has many cancellation sources: the user
+            // shutdown and the out-of-tree silence probe (both cascading
+            // through the attempt token), the poll receive-side watchdog,
+            // or the SessionExitGuard — see cancellation_attribution for
+            // the precedence.
             () = session_token.cancelled() => {
-                if shutdown.is_cancelled() {
-                    SessionEnd::Shutdown
-                } else {
-                    SessionEnd::Watchdog
-                }
+                cancellation_attribution(death_note, user_token)
             }
             // h2 session: the hyper connection future ending = disconnect.
             // QUIC: the closed-watcher (a critical task) plays this role —
@@ -661,7 +759,7 @@ impl AgentClient {
         }
         connection_handle.abort();
         if let Some(mut control_handle) = control_handle.take() {
-            join_or_abort(&mut control_handle, HANDLER_JOIN_GRACE, "control").await;
+            join_or_abort(&mut control_handle, HANDLER_JOIN_GRACE, "control", &node).await;
         }
         // Bounded close-out of every session child (critical wrappers,
         // stall monitors, handlers, listeners, forwarders). Reaching the
@@ -679,16 +777,16 @@ impl AgentClient {
             // allowed to park run_session (and with it the supervisor's
             // reconnect loop) forever.
             SessionEnd::Shutdown => {
-                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
+                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler", &node).await;
                 Ok(SessionOutcome::Shutdown)
             }
             SessionEnd::Disconnected => {
-                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
+                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler", &node).await;
                 error!(node = %node, "Hub connection lost");
                 Ok(SessionOutcome::Ended("Hub connection lost".into()))
             }
             SessionEnd::Watchdog => {
-                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
+                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler", &node).await;
                 warn!(
                     node = %node,
                     "internal death signal (watchdog / exit guard) cancelled the session, rebuilding"
@@ -697,8 +795,42 @@ impl AgentClient {
                     "poll data-plane stall (watchdog)".into(),
                 ))
             }
+            SessionEnd::SteadyStateSilence {
+                silent_ms,
+                budget_ms,
+            } => {
+                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler", &node).await;
+                metrics::counter!("interflow_agent_steady_state_silence_total").increment(1);
+                warn!(
+                    node = %node,
+                    silent_ms,
+                    budget_ms,
+                    "steady-state transport silence — no inbound frame within the out-of-tree \
+                     budget, rebuilding session (in-tree sensors blind: wedged/dead session \
+                     task tree)"
+                );
+                Ok(SessionOutcome::Ended(format!(
+                    "steady-state transport silence ({silent_ms}ms without inbound frames, \
+                     budget {budget_ms}ms)"
+                )))
+            }
+            SessionEnd::ProbeUnanswered { strikes, silent_ms } => {
+                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler", &node).await;
+                metrics::counter!("interflow_agent_probe_unanswered_total").increment(1);
+                warn!(
+                    node = %node,
+                    strikes,
+                    silent_ms,
+                    "hub stopped answering demanding liveness roundtrips — the path cannot carry \
+                     our questions back while the session object stayed alive, rebuilding \
+                     session (the 2026-10-09 one-way-blackhole form)"
+                );
+                Ok(SessionOutcome::Ended(format!(
+                    "liveness roundtrips unanswered ×{strikes} (path dead, session object alive)"
+                )))
+            }
             SessionEnd::CriticalTask(exit) => {
-                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler").await;
+                join_or_abort(&mut handler_task, HANDLER_JOIN_GRACE, "handler", &node).await;
                 warn!(
                     node = %node,
                     "session-critical task '{}' exited ({:?}), rebuilding session",
@@ -772,7 +904,6 @@ impl AgentClient {
                     agent_id: conn.agent_id,
                     tunnel,
                     conn_handle: conn.conn_handle,
-                    hub_client: conn.send_request,
                     negotiated,
                 })
             }
@@ -974,7 +1105,8 @@ impl AgentClient {
         });
 
         let addr = format!("{host}:{port}");
-        info!(node = %self.config.agent.effective_log_name(), "Connecting to hub: {}", addr);
+        let node = self.config.agent.effective_log_name().to_string();
+        info!(node = %node, "Connecting to hub: {}", addr);
 
         // Prepare the connection builder
         let mut http_builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
@@ -1011,6 +1143,7 @@ impl AgentClient {
                     pin_hex,
                     tls_config.client_cert_path.as_deref(),
                     tls_config.client_key_path.as_deref(),
+                    node.clone(),
                 )
                 .await?
             } else {
@@ -1039,9 +1172,10 @@ impl AgentClient {
                 let (send_request, connection) =
                     http_builder.handshake(TokioIo::new(tls_stream)).await?;
 
+                let node = node.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(e) = connection.await {
-                        error!("Hub connection error (TLS): {}", e);
+                        error!(node = %node, "Hub connection error (TLS): {}", e);
                     }
                 });
                 (send_request, handle)
@@ -1053,7 +1187,7 @@ impl AgentClient {
                     "URL is HTTPS but TLS is not configured".to_string(),
                 ));
             }
-            Self::connect_tcp(&addr, http_builder).await?
+            Self::connect_tcp(&addr, http_builder, node).await?
         };
 
         // Register the agent + read the capability declaration
@@ -1071,13 +1205,14 @@ impl AgentClient {
     async fn connect_tcp(
         addr: &str,
         builder: hyper::client::conn::http2::Builder<TokioExecutor>,
+        node: String,
     ) -> Result<(SendRequest<H2RequestBody>, tokio::task::JoinHandle<()>)> {
         let stream = TcpStream::connect(addr).await?;
         let (send_request, connection) = builder.handshake(TokioIo::new(stream)).await?;
 
         let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
-                error!("Hub connection error (TCP): {}", e);
+                error!(node = %node, "Hub connection error (TCP): {}", e);
             }
         });
 
@@ -1093,6 +1228,7 @@ impl AgentClient {
         pin_hex: &str,
         client_cert_path: Option<&str>,
         client_key_path: Option<&str>,
+        node: String,
     ) -> Result<(SendRequest<H2RequestBody>, tokio::task::JoinHandle<()>)> {
         let config = build_client_config(
             Some(pin_hex),
@@ -1113,7 +1249,7 @@ impl AgentClient {
         let (send_request, connection) = builder.handshake(TokioIo::new(tls_stream)).await?;
         let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
-                error!("Hub connection error (TLS+pin): {}", e);
+                error!(node = %node, "Hub connection error (TLS+pin): {}", e);
             }
         });
         Ok((send_request, handle))
@@ -1124,14 +1260,11 @@ impl AgentClient {
 /// encoded in the type rather than implicitly expressed via `Option` tuple
 /// fields (aligned with [`crate::hub::state::StreamFace`]).
 enum EstablishedSession {
-    /// h2: tunnel facade + the connection future's handle + the request
-    /// sender (reused by the control server's `/agents` proxy when
-    /// `[control]` is enabled).
+    /// h2: tunnel facade + the connection future's handle.
     H2 {
         agent_id: String,
         tunnel: AgentTunnel,
         conn_handle: tokio::task::JoinHandle<()>,
-        hub_client: SendRequest<H2RequestBody>,
         negotiated: RegisterResponse,
     },
     /// QUIC: tunnel facade + the connection-death watcher.
@@ -1150,7 +1283,6 @@ impl EstablishedSession {
         String,
         AgentTunnel,
         tokio::task::JoinHandle<()>,
-        Option<SendRequest<H2RequestBody>>,
         RegisterResponse,
     ) {
         match self {
@@ -1158,15 +1290,14 @@ impl EstablishedSession {
                 agent_id,
                 tunnel,
                 conn_handle,
-                hub_client,
                 negotiated,
-            } => (agent_id, tunnel, conn_handle, Some(hub_client), negotiated),
+            } => (agent_id, tunnel, conn_handle, negotiated),
             Self::Quic {
                 agent_id,
                 tunnel,
                 closed_watcher,
                 negotiated,
-            } => (agent_id, tunnel, closed_watcher, None, negotiated),
+            } => (agent_id, tunnel, closed_watcher, negotiated),
         }
     }
 }
@@ -1186,10 +1317,306 @@ enum SessionEnd {
     /// critical-task wrapper, or the exit guard. Semantically equivalent to
     /// Disconnected's reconnect behavior.
     Watchdog,
+    /// The out-of-tree silence probe cancelled the attempt: the session
+    /// backend's task-independent receive-liveness ledger went longer than
+    /// its budget without any inbound byte — every in-tree sensor shares
+    /// fate with the session task tree, so this verdict can only come from
+    /// outside it (the 2026-10-07 zero-attribution session-death form).
+    SteadyStateSilence {
+        silent_ms: u64,
+        budget_ms: u64,
+    },
+    /// The out-of-tree demanding probe cancelled the attempt: N consecutive
+    /// answer-required liveness roundtrips went unanswered within their hard
+    /// deadlines — the path cannot carry our questions back while the
+    /// session object (and possibly its quinn connection) stayed alive (the
+    /// 2026-10-09 one-way-blackhole form: hub evicted, transport fed by the
+    /// still-working reverse direction, agent silent for 9 minutes).
+    ProbeUnanswered {
+        strikes: u32,
+        silent_ms: u64,
+    },
     /// A session-critical task exited (returned / panicked / aborted) — the
     /// death contract's attributed form; see [`SessionTasks`].
     CriticalTask(TaskExit),
     Handler(std::result::Result<Result<()>, tokio::task::JoinError>),
+}
+
+/// Attempt-scoped death note — the out-of-tree probe's attribution channel.
+///
+/// The probe runs OUTSIDE the session task tree, so it cannot reach the
+/// in-tree exit channel ([`SessionTasks::exits`]); instead it records its
+/// verdict here BEFORE cancelling the attempt token, and the session's
+/// ended-by attribution consumes it when the (cascaded) session-token
+/// cancellation arm fires. Plain atomics, no tasks involved: readable
+/// regardless of any task's fate.
+#[derive(Default)]
+struct AttemptDeathNote {
+    /// 0 = no verdict, 1 = silence, 2 = unanswered demands (see
+    /// [`DeathCause`]); the take-once discriminator.
+    kind: AtomicU8,
+    silent_ms: AtomicU64,
+    /// The silence-tier budget (kind 1); unused by kind 2.
+    budget_ms: AtomicU64,
+    /// The demanding-tier strike count (kind 2); unused by kind 1.
+    strikes: AtomicU32,
+}
+
+/// The out-of-tree probe's recorded verdict, in the shape the session's
+/// attribution consumes.
+#[derive(Debug, PartialEq, Eq)]
+enum DeathCause {
+    /// The receive ledger went silent beyond its budget (the passive tier).
+    Silence { silent_ms: u64, budget_ms: u64 },
+    /// Consecutive demanding roundtrips went unanswered (the demanding
+    /// tier — the 2026-10-09 one-way-blackhole form).
+    Unanswered { strikes: u32, silent_ms: u64 },
+}
+
+impl AttemptDeathNote {
+    fn record_silence(&self, silent_ms: u64, budget_ms: u64) {
+        self.silent_ms.store(silent_ms, Ordering::Relaxed);
+        self.budget_ms.store(budget_ms, Ordering::Relaxed);
+        self.kind.store(1, Ordering::Release);
+    }
+
+    fn record_unanswered(&self, strikes: u32, silent_ms: u64) {
+        self.silent_ms.store(silent_ms, Ordering::Relaxed);
+        self.strikes.store(strikes, Ordering::Relaxed);
+        self.kind.store(2, Ordering::Release);
+    }
+
+    /// Takes (and clears) the recorded verdict, if any.
+    fn take(&self) -> Option<DeathCause> {
+        match self.kind.swap(0, Ordering::AcqRel) {
+            1 => Some(DeathCause::Silence {
+                silent_ms: self.silent_ms.load(Ordering::Relaxed),
+                budget_ms: self.budget_ms.load(Ordering::Relaxed),
+            }),
+            2 => Some(DeathCause::Unanswered {
+                strikes: self.strikes.load(Ordering::Relaxed),
+                silent_ms: self.silent_ms.load(Ordering::Relaxed),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Attribution for a session-token cancellation (the ended-by cancelled
+/// arm), in precedence order:
+///
+/// 1. the out-of-tree probe's death note (it records BEFORE cancelling —
+///    first-class attribution, never the generic watchdog wording);
+/// 2. the user-level token — a genuine user stop, which must take the
+///    Stopped path (mistaking an internal death for Shutdown would leave
+///    the agent zombied in Stopped);
+/// 3. anything else — an in-tree internal death signal (poll watchdog,
+///    critical-task wrapper, exit guard): reconnect path.
+fn cancellation_attribution(
+    death_note: &AttemptDeathNote,
+    user_token: &CancellationToken,
+) -> SessionEnd {
+    match death_note.take() {
+        Some(DeathCause::Silence {
+            silent_ms,
+            budget_ms,
+        }) => SessionEnd::SteadyStateSilence {
+            silent_ms,
+            budget_ms,
+        },
+        Some(DeathCause::Unanswered { strikes, silent_ms }) => {
+            SessionEnd::ProbeUnanswered { strikes, silent_ms }
+        }
+        None if user_token.is_cancelled() => SessionEnd::Shutdown,
+        None => SessionEnd::Watchdog,
+    }
+}
+
+/// Tuning of the out-of-tree liveness probe. Production runs
+/// [`OUT_OF_TREE_PROBE`]; tests construct millisecond-scale instances so
+/// the verdict cascades run fast without sleeping.
+#[derive(Debug, Clone, Copy)]
+struct ProbeParams {
+    /// Passive-tier tick: aligned with the default heartbeat interval, so a
+    /// healthy connection's receive ledger advances between consecutive
+    /// checks and the worst-case detection latency is `budget + one tick`.
+    tick: Duration,
+    /// Demanding-tier cadence: one answer-required roundtrip on this
+    /// monotonic (tokio) clock, ALWAYS ON — deliberately not gated on the
+    /// silence ledger. The 2026-10-09 case file left an unexplained residual
+    /// (the 90s-budget passive tier should have fired at ~16:52 and did not
+    /// for 9 minutes; candidate explanations all involve the ledger or the
+    /// wall clock), so the demanding tier trusts neither: it asks on its own
+    /// cadence and believes only its own roundtrips' outcomes.
+    demand_every: Duration,
+    /// Hard deadline for one demanding roundtrip — independent of quinn's
+    /// timers and of the backend's internal roundtrip deadline (the
+    /// transport-independent belt over the backend's braces).
+    demand_deadline: Duration,
+    /// Consecutive unanswered demands before the verdict. Worst-case
+    /// detection ≈ `demand_every + strikes × (tick + demand_deadline)` ≈
+    /// 105–135s at production values — the same order as the h2 poll
+    /// watchdog (105s) and above the in-tree 75s stall line, keeping the
+    /// out-of-tree probe a pure backstop rather than a racing sensor.
+    demand_strikes: u32,
+}
+
+/// Production probe tuning: 15s passive tick / 30s demanding cadence / 15s
+/// hard deadline / 3 strikes.
+const OUT_OF_TREE_PROBE: ProbeParams = ProbeParams {
+    tick: Duration::from_secs(15),
+    demand_every: Duration::from_secs(30),
+    demand_deadline: Duration::from_secs(15),
+    demand_strikes: 3,
+};
+
+/// One out-of-tree silence check: pure arithmetic over the transport
+/// backend's ledger (task-independent by construction, see
+/// [`SteadyStateLiveness`]).
+#[derive(Debug, PartialEq, Eq)]
+enum SteadyStateVerdict {
+    /// Ledger fresh within budget (or unreadable-but-present) — keep watching.
+    Observe,
+    /// No inbound byte for longer than the budget: the connection (or the
+    /// task tree that should be receiving) is dead.
+    Dead { silent_ms: u64 },
+}
+
+fn steady_state_silence_verdict(
+    now_unix_ms: u64,
+    liveness: &SteadyStateLiveness,
+) -> SteadyStateVerdict {
+    let budget_ms = duration_to_ms(liveness.silence_budget);
+    let silent_ms = now_unix_ms.saturating_sub(liveness.last_rx_unix_millis);
+    if silent_ms > budget_ms {
+        SteadyStateVerdict::Dead { silent_ms }
+    } else {
+        SteadyStateVerdict::Observe
+    }
+}
+
+/// Milliseconds as `u64`, saturating at `u64::MAX` (a duration that large
+/// is indistinguishable from "forever" to every consumer here).
+fn duration_to_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The out-of-tree liveness probe — the last line of death detection (P1:
+/// the monitor must not share fate with the monitored).
+///
+/// Every in-tree sensor (critical tasks, stall monitors, connection
+/// watchers, the h2 poll watchdog) is a member of the session's own task
+/// tree; when the tree wedges as a whole they all go blind together, and a
+/// supervisor merely awaiting the session sees nothing — the zero-
+/// attribution zombie of 2026-10-07. This probe instead runs in the
+/// supervisor's frame on two independent tiers:
+///
+/// - **Passive** (2026-10-07): reads the current backend's task-independent
+///   receive ledger through the [`SessionSlot`] on a fixed tick; a wedged
+///   tree shows up as a frozen ledger.
+/// - **Demanding** (2026-10-09): periodically asks the hub a question that
+///   MUST be answered ([`AgentTunnel::liveness_roundtrip`]) on its own
+///   monotonic cadence — always on, never gated on the ledger. A one-way
+///   blackhole leaves every passive and transport-layer sensor content
+///   (quinn's idle timer resets only on *received* packets; its keep-alive
+///   is send-only), and the incident's unexplained residual suggests even
+///   the ledger cannot be trusted to freeze; only our own roundtrip's
+///   outcome is believed. Strikes accumulate on unanswered demands and
+///   reset on nothing but an answered one.
+///
+/// `None` liveness (empty slot: establishment/backoff phases, or a backend
+/// without a death-decidable silence form) parks both tiers — those phases
+/// are bounded by their own timeouts. On a dead verdict (either tier):
+/// record the attribution note, cancel the attempt token (which cascades
+/// into the session's unified wind-down inside `run_session`), and return
+/// so the supervisor can await the session future to completion.
+async fn out_of_tree_liveness_probe(
+    slot: SessionSlot,
+    attempt_token: CancellationToken,
+    note: std::sync::Arc<AttemptDeathNote>,
+    params: ProbeParams,
+    log_name: String,
+) {
+    let mut tick = tokio::time::interval(params.tick);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_demand_at = tokio::time::Instant::now();
+    let mut strikes: u32 = 0;
+    loop {
+        tick.tick().await;
+        let Some(liveness) = slot.steady_state_liveness() else {
+            continue;
+        };
+        let now_unix_ms = unix_millis_now();
+        if let SteadyStateVerdict::Dead { silent_ms } =
+            steady_state_silence_verdict(now_unix_ms, &liveness)
+        {
+            note.record_silence(silent_ms, duration_to_ms(liveness.silence_budget));
+            attempt_token.cancel();
+            return;
+        }
+        // Demanding tier: one answer-required roundtrip per cadence. The
+        // deadline is enforced HERE (tokio monotonic clock) — a backend
+        // hang, a wedged write path, or a blackholed path all surface as
+        // the same strike.
+        let now = tokio::time::Instant::now();
+        if now.duration_since(last_demand_at) < params.demand_every {
+            continue;
+        }
+        last_demand_at = now;
+        let demand =
+            tokio::time::timeout(params.demand_deadline, slot.tunnel().liveness_roundtrip()).await;
+        // `Err` (the probe-level deadline elapsed) and `Ok(Err(_))` (the
+        // backend's own refusal/error) are the same verdict to the strike
+        // counter — both mean "no answer arrived in time".
+        let unanswered = match demand {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e),
+            Err(_) => Some(InterflowError::connection(
+                "probe deadline elapsed".to_string(),
+            )),
+        };
+        match unanswered {
+            None => strikes = 0,
+            Some(e) => {
+                strikes = strikes.saturating_add(1);
+                // Investigation instrumentation for the 2026-10-09
+                // "unexplained residual": a strike while the receive ledger
+                // still reads fresh is exactly the anomaly's signature —
+                // the ledger claims inbound traffic while no answer ever
+                // arrives. Surfaced at warn level so the next occurrence is
+                // attributable from logs alone (root cause still open; the
+                // demanding tier stays the compensation layer until it is
+                // filed).
+                let silent_ms = now_unix_ms.saturating_sub(liveness.last_rx_unix_millis);
+                let budget_ms = duration_to_ms(liveness.silence_budget);
+                if silent_ms < budget_ms {
+                    tracing::warn!(
+                        node = %log_name,
+                        strikes,
+                        silent_ms,
+                        budget_ms,
+                        error = %interflow_util::format_chain(&e),
+                        "demanding liveness unanswered while the receive ledger stays fresh \
+                         — the 2026-10-09 unexplained-residual signature (root cause open)"
+                    );
+                } else {
+                    debug!(
+                        node = %log_name,
+                        strikes,
+                        silent_ms,
+                        error = %interflow_util::format_chain(&e),
+                        "demanding liveness roundtrip unanswered"
+                    );
+                }
+                if strikes >= params.demand_strikes {
+                    let silent_ms = now_unix_ms.saturating_sub(liveness.last_rx_unix_millis);
+                    note.record_unanswered(strikes, silent_ms);
+                    attempt_token.cancel();
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Bounded final join for a session child-task handle.
@@ -1204,11 +1631,13 @@ async fn join_or_abort<T>(
     handle: &mut tokio::task::JoinHandle<T>,
     grace: Duration,
     task: &'static str,
+    node: &str,
 ) {
     if tokio::time::timeout(grace, &mut *handle).await.is_err() {
         metrics::counter!("interflow_agent_session_join_timeout_total", "task" => task)
             .increment(1);
         error!(
+            node = %node,
             "{task} task did not exit within {grace:?} of session cancellation — \
              aborting (structural defect: the task ignores the cancellation token)"
         );
@@ -1227,7 +1656,11 @@ impl AgentClient {
         let builder = Request::builder()
             .method("POST")
             .uri("/register")
-            .header("x-agent-id", &self.config.agent.id);
+            .header("x-agent-id", &self.config.agent.id)
+            // The running build tag: the hub keeps a fleet view of which
+            // binary each node runs (an absent header = an older agent,
+            // recorded as unknown — never a registration failure).
+            .header("x-agent-build", interflow_buildinfo::BUILD_TAG);
 
         let register_req = builder.body(empty_request_body()).unwrap();
 
@@ -1246,6 +1679,7 @@ impl AgentClient {
         let collected = BodyExt::collect(body).await?;
         let negotiated = RegisterResponse::parse(&collected.to_bytes())?;
         info!(
+            node = %self.config.agent.effective_log_name(),
             "Agent registered: {} (hub heartbeat: {:?})",
             self.config.agent.id, negotiated.heartbeat
         );
@@ -1285,8 +1719,10 @@ fn quic_server_name(quic_addr: &str) -> Result<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     /// The bounded-join contract (mechanism A hardening,
     /// (internal design notes)): a task
@@ -1297,7 +1733,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let started = std::time::Instant::now();
-        join_or_abort(&mut handle, Duration::from_millis(100), "test").await;
+        join_or_abort(&mut handle, Duration::from_millis(100), "test", "test-node").await;
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "join_or_abort must be bounded, took {:?}",
@@ -1310,7 +1746,7 @@ mod tests {
     #[tokio::test]
     async fn join_or_abort_passes_through_a_well_behaved_task() {
         let mut handle = tokio::spawn(async { 7_u32 });
-        join_or_abort(&mut handle, Duration::from_secs(5), "test").await;
+        join_or_abort(&mut handle, Duration::from_secs(5), "test", "test-node").await;
         assert!(handle.is_finished());
     }
 
@@ -1450,5 +1886,368 @@ mod tests {
             }
         };
         assert!(AgentClient::new(plain).is_err());
+    }
+
+    // ---- out-of-tree silence probe (the 2026-10-07 zero-attribution fix) ----
+
+    use interflow_core::tunnel::{IncomingStream, TunnelData};
+
+    fn liveness(last_rx: u64, budget_ms: u64) -> SteadyStateLiveness {
+        SteadyStateLiveness {
+            last_rx_unix_millis: last_rx,
+            silence_budget: Duration::from_millis(budget_ms),
+        }
+    }
+
+    /// The verdict table: fresh within budget → Observe; exactly at the
+    /// budget → still Observe (strictly-greater semantics — the budget is a
+    /// floor, not a tripwire); over the budget → Dead with the silent
+    /// duration; a ledger ahead of "now" (clock skew) saturates to Observe.
+    #[test]
+    fn silence_verdict_table() {
+        let now = 1_000_000;
+        assert_eq!(
+            steady_state_silence_verdict(now, &liveness(now, 90_000)),
+            SteadyStateVerdict::Observe,
+            "a fresh ledger is alive"
+        );
+        assert_eq!(
+            steady_state_silence_verdict(now, &liveness(now - 90_000, 90_000)),
+            SteadyStateVerdict::Observe,
+            "exactly at the budget is not yet dead"
+        );
+        let over = now - 90_001;
+        assert_eq!(
+            steady_state_silence_verdict(now, &liveness(over, 90_000)),
+            SteadyStateVerdict::Dead { silent_ms: 90_001 },
+            "one millisecond over the budget is dead"
+        );
+        assert_eq!(
+            steady_state_silence_verdict(now, &liveness(now + 5_000, 90_000)),
+            SteadyStateVerdict::Observe,
+            "a ledger ahead of now (clock skew) must not trip the probe"
+        );
+    }
+
+    /// Death-note semantics: take() returns the recorded verdict exactly
+    /// once (second take is empty) — the attribution is consumed by the
+    /// session that acted on it. Both verdict kinds round-trip.
+    #[test]
+    fn death_note_is_take_once() {
+        let note = AttemptDeathNote::default();
+        assert_eq!(note.take(), None, "fresh note is empty");
+        note.record_silence(123_456, 90_000);
+        assert_eq!(
+            note.take(),
+            Some(DeathCause::Silence {
+                silent_ms: 123_456,
+                budget_ms: 90_000
+            })
+        );
+        assert_eq!(note.take(), None, "the note is consumed exactly once");
+        note.record_unanswered(3, 456_789);
+        assert_eq!(
+            note.take(),
+            Some(DeathCause::Unanswered {
+                strikes: 3,
+                silent_ms: 456_789
+            })
+        );
+        assert_eq!(note.take(), None);
+    }
+
+    /// Cancellation-attribution precedence: probe note first (either kind),
+    /// then user shutdown, then in-tree internal death.
+    #[test]
+    fn cancellation_attribution_precedence() {
+        let note = AttemptDeathNote::default();
+        let user = CancellationToken::new();
+        assert!(matches!(
+            cancellation_attribution(&note, &user),
+            SessionEnd::Watchdog
+        ));
+        user.cancel();
+        assert!(matches!(
+            cancellation_attribution(&note, &user),
+            SessionEnd::Shutdown
+        ));
+        note.record_silence(1, 2);
+        assert!(matches!(
+            cancellation_attribution(&note, &user),
+            SessionEnd::SteadyStateSilence {
+                silent_ms: 1,
+                budget_ms: 2
+            }
+        ));
+        note.record_unanswered(3, 4);
+        assert!(matches!(
+            cancellation_attribution(&note, &user),
+            SessionEnd::ProbeUnanswered {
+                strikes: 3,
+                silent_ms: 4
+            }
+        ));
+    }
+
+    /// One scripted demanding-roundtrip outcome for [`ProbeBackend`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProbeAnswer {
+        /// The hub answered: the roundtrip resolves `Ok`.
+        Ok,
+        /// The roundtrip resolves `Err` (connection-class refusal).
+        Err,
+        /// The roundtrip never resolves (the blackholed/wedged shape — only
+        /// the probe-level deadline can end it).
+        Hang,
+    }
+
+    /// A transport backend whose behavior the probe tests script directly:
+    /// the ledger face (passive tier) plus a per-demand answer plan
+    /// (demanding tier) consumed front-to-back and repeating the last
+    /// entry. Every data-plane method is unreachable in these tests.
+    struct ProbeBackend {
+        liveness: Option<SteadyStateLiveness>,
+        answers: std::sync::Mutex<VecDeque<ProbeAnswer>>,
+    }
+
+    #[async_trait::async_trait]
+    impl interflow_core::tunnel::TunnelTransport for ProbeBackend {
+        async fn send_open_with(
+            &self,
+            _: interflow_core::protocol::StreamId,
+            _: &str,
+            _: interflow_core::protocol::StreamProto,
+            _: bool,
+        ) -> Result<()> {
+            unreachable!("data-plane methods are not exercised by the probe test")
+        }
+        async fn send_data(
+            &self,
+            _: interflow_core::protocol::StreamId,
+            _: bytes::Bytes,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn send_data_response(
+            &self,
+            _: interflow_core::protocol::StreamId,
+            _: bytes::Bytes,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn send_close(&self, _: interflow_core::protocol::StreamId) -> Result<()> {
+            unreachable!()
+        }
+        async fn send_close_response(
+            &self,
+            _: interflow_core::protocol::StreamId,
+            _: interflow_core::protocol::CloseReason,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn register_stream(
+            &self,
+            _: interflow_core::protocol::StreamId,
+        ) -> mpsc::Receiver<TunnelData> {
+            unreachable!()
+        }
+        async fn unregister_stream(&self, _: interflow_core::protocol::StreamId) {}
+        async fn take_incoming_streams(&self) -> Option<mpsc::Receiver<IncomingStream>> {
+            unreachable!()
+        }
+        async fn unregister_incoming_stream(&self, _: interflow_core::protocol::StreamId) {}
+        async fn shutdown(&self) {}
+        async fn liveness_roundtrip(&self) -> Result<()> {
+            let answer = {
+                let mut plan = self.answers.lock().expect("probe plan lock poisoned");
+                match plan.pop_front() {
+                    Some(a) if !plan.is_empty() => a,
+                    Some(last) => {
+                        plan.push_back(last);
+                        last
+                    }
+                    None => ProbeAnswer::Ok,
+                }
+            };
+            match answer {
+                ProbeAnswer::Ok => Ok(()),
+                ProbeAnswer::Err => Err(InterflowError::connection(
+                    "scripted probe refusal".to_string(),
+                )),
+                ProbeAnswer::Hang => std::future::pending().await,
+            }
+        }
+        fn steady_state_liveness(&self) -> Option<SteadyStateLiveness> {
+            self.liveness
+        }
+    }
+
+    /// Millisecond-scale probe params for the unit cascade.
+    fn fast_probe() -> ProbeParams {
+        ProbeParams {
+            tick: Duration::from_millis(10),
+            demand_every: Duration::from_millis(10),
+            demand_deadline: Duration::from_millis(30),
+            demand_strikes: 3,
+        }
+    }
+
+    /// The passive-tier cascade, end to end at the unit level: a frozen
+    /// ledger behind the slot → the probe records the note, cancels the
+    /// attempt token, and returns — entirely without any session task's
+    /// help. (The backend's scripted answers are irrelevant here: the
+    /// silence verdict fires before any demand cadence elapses.)
+    #[tokio::test]
+    async fn probe_cancels_the_attempt_token_on_a_frozen_ledger() {
+        let slot = SessionSlot::new();
+        let attempt_token = CancellationToken::new();
+        let note = Arc::new(AttemptDeathNote::default());
+        slot.install(Arc::new(ProbeBackend {
+            liveness: Some(liveness(unix_millis_now() - 60_000, 30_000)),
+            answers: std::sync::Mutex::new(VecDeque::from(vec![ProbeAnswer::Ok])),
+        }))
+        .await;
+
+        out_of_tree_liveness_probe(
+            slot.clone(),
+            attempt_token.clone(),
+            Arc::clone(&note),
+            fast_probe(),
+            "test-node".to_string(),
+        )
+        .await;
+
+        assert!(attempt_token.is_cancelled());
+        match note.take() {
+            Some(DeathCause::Silence {
+                silent_ms,
+                budget_ms,
+            }) => {
+                // The wall clock advances during the test — range, not exact.
+                assert!(silent_ms >= 60_000, "silent {silent_ms}ms");
+                assert_eq!(budget_ms, 30_000);
+            }
+            other => panic!("expected the silence attribution, got {other:?}"),
+        }
+    }
+
+    /// The demanding tier's decisive case (the 2026-10-09 incident shape,
+    /// modeled): the ledger stays FRESH — exactly the unexplained residual
+    /// that blinded the passive tier for 9 minutes — while every demanding
+    /// roundtrip never resolves (the blackholed/wedged shape: only the
+    /// probe-level deadline can end it). Three consecutive strikes → the
+    /// probe cancels with the `Unanswered` attribution, without any help
+    /// from the silence budget. A silence-gated demanding tier would never
+    /// fire here.
+    #[tokio::test(start_paused = true)]
+    async fn demanding_probe_kills_a_fresh_ledger_session_when_answers_never_arrive() {
+        let slot = SessionSlot::new();
+        let attempt_token = CancellationToken::new();
+        let note = Arc::new(AttemptDeathNote::default());
+        slot.install(Arc::new(ProbeBackend {
+            // Fresh forever (the wall clock is real; the budget is huge):
+            // the passive tier can never fire in this test.
+            liveness: Some(liveness(unix_millis_now(), 3_600_000)),
+            answers: std::sync::Mutex::new(VecDeque::from(vec![ProbeAnswer::Hang])),
+        }))
+        .await;
+
+        let probe = tokio::spawn(out_of_tree_liveness_probe(
+            slot.clone(),
+            attempt_token.clone(),
+            Arc::clone(&note),
+            fast_probe(),
+            "test-node".to_string(),
+        ));
+        // Paused clock auto-advances through the ticks, demands and their
+        // deadlines; three strikes ≈ 3×(10+30)ms of virtual time.
+        let verdict = tokio::time::timeout(Duration::from_secs(5), probe).await;
+        assert!(
+            verdict.is_ok(),
+            "the demanding tier must reach its verdict (3 unanswered roundtrips)"
+        );
+
+        assert!(attempt_token.is_cancelled());
+        match note.take() {
+            // The ledger was installed at test start: the diagnostic
+            // silence is wall-clock jitter, only its smallness matters.
+            Some(DeathCause::Unanswered { strikes, silent_ms }) => {
+                assert_eq!(strikes, 3);
+                assert!(silent_ms < 5_000, "silent {silent_ms}ms");
+            }
+            other => panic!("expected the unanswered-demand attribution, got {other:?}"),
+        }
+    }
+
+    /// Strike reset semantics: strikes reset on NOTHING but an answered
+    /// roundtrip. A repeating plan of Err,Err,Ok never reaches three
+    /// consecutive strikes, so the probe must not cancel no matter how
+    /// many demands elapse — proof that a flapping-but-alive path (answers
+    /// interspersed) is not torn down.
+    #[tokio::test(start_paused = true)]
+    async fn demanding_probe_resets_strikes_on_an_answered_roundtrip() {
+        let slot = SessionSlot::new();
+        let attempt_token = CancellationToken::new();
+        let note = Arc::new(AttemptDeathNote::default());
+        slot.install(Arc::new(ProbeBackend {
+            liveness: Some(liveness(unix_millis_now(), 3_600_000)),
+            answers: std::sync::Mutex::new(VecDeque::from(vec![
+                ProbeAnswer::Err,
+                ProbeAnswer::Err,
+                ProbeAnswer::Ok,
+            ])),
+        }))
+        .await;
+
+        let probe = tokio::spawn(out_of_tree_liveness_probe(
+            slot,
+            attempt_token.clone(),
+            Arc::clone(&note),
+            fast_probe(),
+            "test-node".to_string(),
+        ));
+        // Give the loop far more virtual time than three strike cycles.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !attempt_token.is_cancelled(),
+            "interspersed answers must keep the session alive"
+        );
+        assert_eq!(note.take(), None);
+        probe.abort();
+    }
+
+    /// An empty slot (establishment/backoff) and a no-signal backend park
+    /// BOTH tiers of the probe: no cancellation, no verdict, and no demands
+    /// fired against a backend that opted out of decidability.
+    #[tokio::test]
+    async fn probe_stays_out_of_the_way_without_a_dead_decidable_signal() {
+        // Empty slot
+        let slot = SessionSlot::new();
+        let token = CancellationToken::new();
+        let note = Arc::new(AttemptDeathNote::default());
+        let probe = tokio::spawn(out_of_tree_liveness_probe(
+            slot.clone(),
+            token.clone(),
+            Arc::clone(&note),
+            fast_probe(),
+            "test-node".to_string(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!token.is_cancelled(), "empty slot must not trip the probe");
+        assert_eq!(note.take(), None);
+
+        // Backend without a death-decidable silence form (None liveness)
+        slot.install(Arc::new(ProbeBackend {
+            liveness: None,
+            answers: std::sync::Mutex::new(VecDeque::from(vec![ProbeAnswer::Err])),
+        }))
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !token.is_cancelled(),
+            "a None-liveness backend must not trip the probe"
+        );
+        assert_eq!(note.take(), None);
+        probe.abort();
     }
 }

@@ -83,6 +83,7 @@ ENGINEERING_TERMS = tuple(t for t in RETIRED_TERMS if t != "interflow-expose")
 ENGINEERING_TARGETS: tuple[tuple[Path, tuple[str, ...]], ...] = (
     (Path("SECURITY.md"), ENGINEERING_TERMS),
     (Path("THREAT_MODEL.md"), ENGINEERING_TERMS),
+    (Path("CLAUDE.md"), ENGINEERING_TERMS),
 )
 
 

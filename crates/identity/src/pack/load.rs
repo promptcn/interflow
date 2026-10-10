@@ -58,15 +58,14 @@ impl CredentialPack {
             })?,
         )
         .map_err(|e| Error::pack("node.toml parse".to_string()).with_source(e))?;
-        // Pre-separation packs carry the mesh rules in node.toml. Parsed
-        // (serde-known) only so this fails with the migration instruction
-        // instead of a bare unknown-field error.
-        if let Some(mesh) = &node_config.mesh
-            && (!mesh.ingress.is_empty() || !mesh.egress.is_empty())
-        {
+        // Canonical per-kind shape: an ingress pack always carries a fully
+        // resolved [edge] section. Its absence is a pre-canonical (or
+        // mis-rendered) pack — fail closed with the recovery action instead
+        // of guessing topology defaults at boot.
+        if node_config.kind == PackKind::Ingress && node_config.edge.is_none() {
             return Err(Error::pack(
-                "this pack carries its mesh rules in node.toml — it predates the \
-                 signed-policy rule face; re-render it with `plan apply` and reinstall"
+                "ingress pack node.toml carries no [edge] section — re-render the pack \
+                 (interflow-cli plan apply); boot-time topology defaults are retired"
                     .to_owned(),
             ));
         }
@@ -83,16 +82,16 @@ impl CredentialPack {
         // embedded snapshot. The embedded generation is the rollback floor;
         // a bundle that fails verification or rolls back is rejected with a
         // warning and the embedded snapshot keeps serving (fail-keep).
-        let (policy, policy_signature) =
+        let (policy, policy_signature, policy_from_state_channel) =
             match Self::load_policy_override(dir, &verifier, signed.policy.generation) {
-                Ok(Some(update)) => (update.policy, update.signature),
-                Ok(None) => (signed.policy, signed.signature),
+                Ok(Some(update)) => (update.policy, update.signature, true),
+                Ok(None) => (signed.policy, signed.signature, false),
                 Err(e) => {
                     tracing::warn!(
                         "rejecting policy update in state/policy (keeping the embedded \
                          snapshot): {e}"
                     );
-                    (signed.policy, signed.signature)
+                    (signed.policy, signed.signature, false)
                 }
             };
 
@@ -169,6 +168,7 @@ impl CredentialPack {
             trust,
             policy,
             policy_signature,
+            policy_from_state_channel,
             node_config,
             pack_digest: digests_file_digest(dir)?,
         };

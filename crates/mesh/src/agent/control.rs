@@ -2,12 +2,10 @@ use crate::agent::rules::{EgressRuleView, IngressRuleView, RuleChangeError};
 use crate::config::{EgressRule, IngressRule};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::client::conn::http2::SendRequest;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use interflow_core::tunnel::H2RequestBody;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -46,12 +44,11 @@ pub enum RuleCommand<R, V> {
     Remove(String, oneshot::Sender<Result<(), ControlOpError>>),
     /// List rules (with origin annotations).
     List(oneshot::Sender<Vec<V>>),
-    /// Wholesale reconciliation of the live session against a new signed
-    /// policy (the reload path). The rule truth (the store) has already been
-    /// replaced by the reloader; the handler reconciles its runtime face —
-    /// listeners for ingress, the per-session rules snapshot for egress —
-    /// to match `rules`. Fire-and-forget: the reloader owns the audit log.
-    Sync(Vec<R>),
+    // There is deliberately no Sync/push variant: the rule store is the
+    // desired-state truth and the handlers reconcile from it level-triggered
+    // (subscribing to the store's change notification + a periodic tick).
+    // A pushed snapshot was a best-effort edge whose loss silently split
+    // desired from actual state until the next session rebuild
 }
 
 /// The ingress plane's command shape (typed alias — consumers match on it
@@ -62,36 +59,43 @@ pub type EgressCommand = RuleCommand<EgressRule, EgressRuleView>;
 
 pub struct ControlServer {
     listen_addr: SocketAddr,
+    /// Log attribution (`AgentInfo::effective_log_name`): every control-API
+    /// line carries it, so operator actions are visible in the GUI "This
+    /// node" view of the node they targeted.
+    node: String,
     ingress_tx: Option<mpsc::Sender<IngressCommand>>,
     egress_tx: Option<mpsc::Sender<EgressCommand>>,
-    hub_client: Option<SendRequest<H2RequestBody>>,
+    tunnel: interflow_core::tunnel::AgentTunnel,
     auth_token: Option<String>,
 }
 
 impl ControlServer {
     pub const fn new(
         listen_addr: SocketAddr,
+        node: String,
         ingress_tx: Option<mpsc::Sender<IngressCommand>>,
         egress_tx: Option<mpsc::Sender<EgressCommand>>,
-        hub_client: Option<SendRequest<H2RequestBody>>,
+        tunnel: interflow_core::tunnel::AgentTunnel,
         auth_token: Option<String>,
     ) -> Self {
         Self {
             listen_addr,
+            node,
             ingress_tx,
             egress_tx,
-            hub_client,
+            tunnel,
             auth_token,
         }
     }
 
     pub async fn run(self) -> Result<(), interflow_core::error::InterflowError> {
         let listener = TcpListener::bind(self.listen_addr).await?;
-        info!("Control API listening on: {}", self.listen_addr);
+        info!(node = %self.node, "Control API listening on: {}", self.listen_addr);
 
+        let node = self.node;
         let ingress_tx = self.ingress_tx.clone();
         let egress_tx = self.egress_tx.clone();
-        let hub_client = self.hub_client.clone();
+        let tunnel = self.tunnel.clone();
         let auth_token = self.auth_token.clone();
 
         loop {
@@ -99,26 +103,29 @@ impl ControlServer {
             let io = TokioIo::new(stream);
             let ingress_tx = ingress_tx.clone();
             let egress_tx = egress_tx.clone();
-            let hub_client = hub_client.clone();
+            let tunnel = tunnel.clone();
             let auth_token = auth_token.clone();
+            let node = node.clone();
 
             tokio::task::spawn(async move {
+                let log_node = node.clone();
                 if let Err(err) = http1::Builder::new()
                     .serve_connection(
                         io,
                         service_fn(move |req| {
                             handle_request(
                                 req,
+                                node.clone(),
                                 ingress_tx.clone(),
                                 egress_tx.clone(),
-                                hub_client.clone(),
+                                tunnel.clone(),
                                 auth_token.clone(),
                             )
                         }),
                     )
                     .await
                 {
-                    error!("Error serving connection: {:?}", err);
+                    error!(node = %log_node, "Error serving connection: {:?}", err);
                 }
             });
         }
@@ -127,9 +134,10 @@ impl ControlServer {
 
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
+    node: String,
     ingress_tx: Option<mpsc::Sender<IngressCommand>>,
     egress_tx: Option<mpsc::Sender<EgressCommand>>,
-    hub_client: Option<SendRequest<H2RequestBody>>,
+    tunnel: interflow_core::tunnel::AgentTunnel,
     auth_token: Option<String>,
 ) -> std::result::Result<Response<Full<Bytes>>, hyper::Error> {
     let (parts, body) = req.into_parts();
@@ -165,61 +173,35 @@ async fn handle_request(
     // Control-port request body cap (defined at the top of the module)
     match (method, path) {
         (Method::GET, "/agents") => {
-            if let Some(mut client) = hub_client {
-                // Check if client is ready
-                if let Err(e) = client.ready().await {
-                    error!("Hub connection not ready: {}", e);
-                    return Ok(response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!("Hub connection error: {e}"),
-                    ));
+            // The hub's agents control plane, read over this session's
+            // tunnel — the same trait method for both transports, so the
+            // local HTTP face works identically for h2 and QUIC agents
+            // (the former h2-only pass-through answered 501 on QUIC).
+            // Re-serialized from the transport-uniform type; the JSON shape
+            // is field-for-field what the hub serves.
+            match tunnel.list_agents().await {
+                Ok(list) => {
+                    let json = serde_json::to_vec(&list).unwrap_or_else(|_| b"[]".to_vec());
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(Full::new(Bytes::from(json)))
+                        .unwrap())
                 }
-
-                let mut builder = Request::builder().method("GET").uri("/agents");
-
-                if let Some(token) = &auth_token {
-                    builder = builder.header("Authorization", format!("Bearer {token}"));
-                }
-
-                let req = builder
-                    .body(interflow_core::tunnel::empty_request_body())
-                    .unwrap();
-
-                match client.send_request(req).await {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        match resp.collect().await {
-                            Ok(collected) => {
-                                let bytes = collected.to_bytes();
-                                Ok(Response::builder()
-                                    .status(status)
-                                    .header("content-type", "application/json")
-                                    .body(Full::new(bytes))
-                                    .unwrap())
-                            }
-                            Err(e) => Ok(response(
-                                StatusCode::BAD_GATEWAY,
-                                &format!("Failed to read response: {e}"),
-                            )),
-                        }
-                    }
-                    Err(e) => Ok(response(
+                Err(e) => {
+                    error!(node = %node, "Failed to fetch agents from hub: {}", e);
+                    Ok(response(
                         StatusCode::BAD_GATEWAY,
                         &format!("Failed to fetch agents from hub: {e}"),
-                    )),
+                    ))
                 }
-            } else {
-                Ok(response(
-                    StatusCode::NOT_IMPLEMENTED,
-                    "Not connected to hub",
-                ))
             }
         }
         (Method::GET, "/ingress") => {
             if let Some(tx) = ingress_tx {
                 let (resp_tx, resp_rx) = oneshot::channel();
                 if let Err(e) = tx.send(IngressCommand::List(resp_tx)).await {
-                    error!("Failed to send ingress command: {}", e);
+                    error!(node = %node, "Failed to send ingress command: {}", e);
                     return Ok(response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Internal Error",
@@ -227,7 +209,7 @@ async fn handle_request(
                 }
                 match resp_rx.await {
                     Ok(views) => {
-                        info!("Listing {} ingress rules", views.len());
+                        info!(node = %node, "Listing {} ingress rules", views.len());
                         let json =
                             serde_json::to_string(&views).unwrap_or_else(|_| "[]".to_string());
                         Ok(Response::builder()
@@ -237,7 +219,7 @@ async fn handle_request(
                             .unwrap())
                     }
                     Err(e) => {
-                        error!("Failed to receive ingress result: {}", e);
+                        error!(node = %node, "Failed to receive ingress result: {}", e);
                         Ok(response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Internal Error",
@@ -252,7 +234,7 @@ async fn handle_request(
             if let Some(tx) = egress_tx {
                 let (resp_tx, resp_rx) = oneshot::channel();
                 if let Err(e) = tx.send(EgressCommand::List(resp_tx)).await {
-                    error!("Failed to send egress command: {}", e);
+                    error!(node = %node, "Failed to send egress command: {}", e);
                     return Ok(response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Internal Error",
@@ -260,7 +242,7 @@ async fn handle_request(
                 }
                 match resp_rx.await {
                     Ok(views) => {
-                        info!("Listing {} egress rules", views.len());
+                        info!(node = %node, "Listing {} egress rules", views.len());
                         let json =
                             serde_json::to_string(&views).unwrap_or_else(|_| "[]".to_string());
                         Ok(Response::builder()
@@ -270,7 +252,7 @@ async fn handle_request(
                             .unwrap())
                     }
                     Err(e) => {
-                        error!("Failed to receive egress result: {}", e);
+                        error!(node = %node, "Failed to receive egress result: {}", e);
                         Ok(response(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Internal Error",
@@ -285,16 +267,16 @@ async fn handle_request(
             if let Some(tx) = ingress_tx {
                 match parse_body::<IngressRule>(body).await {
                     Ok(rule) => {
-                        info!("Received add ingress rule request: {}", rule.name);
+                        info!(node = %node, "Received add ingress rule request: {}", rule.name);
                         let (resp_tx, resp_rx) = oneshot::channel();
                         if let Err(e) = tx.send(IngressCommand::Add(rule, resp_tx)).await {
-                            error!("Failed to send ingress command: {}", e);
+                            error!(node = %node, "Failed to send ingress command: {}", e);
                             return Ok(response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 "Internal Error",
                             ));
                         }
-                        Ok(await_op(resp_rx.await, "Ingress rule added"))
+                        Ok(await_op(&node, resp_rx.await, "Ingress rule added"))
                     }
                     Err(e) => Ok(response(StatusCode::BAD_REQUEST, &e.to_string())),
                 }
@@ -306,16 +288,16 @@ async fn handle_request(
             if let Some(tx) = egress_tx {
                 match parse_body::<EgressRule>(body).await {
                     Ok(rule) => {
-                        info!("Received add egress rule request: {}", rule.name);
+                        info!(node = %node, "Received add egress rule request: {}", rule.name);
                         let (resp_tx, resp_rx) = oneshot::channel();
                         if let Err(e) = tx.send(EgressCommand::Add(rule, resp_tx)).await {
-                            error!("Failed to send egress command: {}", e);
+                            error!(node = %node, "Failed to send egress command: {}", e);
                             return Ok(response(
                                 StatusCode::INTERNAL_SERVER_ERROR,
                                 "Internal Error",
                             ));
                         }
-                        Ok(await_op(resp_rx.await, "Egress rule added"))
+                        Ok(await_op(&node, resp_rx.await, "Egress rule added"))
                     }
                     Err(e) => Ok(response(StatusCode::BAD_REQUEST, &e.to_string())),
                 }
@@ -326,16 +308,16 @@ async fn handle_request(
         (Method::DELETE, path) if path.starts_with("/ingress/") => {
             if let Some(tx) = ingress_tx {
                 let name = path.trim_start_matches("/ingress/").to_string();
-                info!("Received remove ingress rule request: {}", name);
+                info!(node = %node, "Received remove ingress rule request: {}", name);
                 let (resp_tx, resp_rx) = oneshot::channel();
                 if let Err(e) = tx.send(IngressCommand::Remove(name, resp_tx)).await {
-                    error!("Failed to send ingress command: {}", e);
+                    error!(node = %node, "Failed to send ingress command: {}", e);
                     return Ok(response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Internal Error",
                     ));
                 }
-                Ok(await_op(resp_rx.await, "Ingress rule removed"))
+                Ok(await_op(&node, resp_rx.await, "Ingress rule removed"))
             } else {
                 Ok(response(StatusCode::NOT_IMPLEMENTED, "Ingress not enabled"))
             }
@@ -343,16 +325,16 @@ async fn handle_request(
         (Method::DELETE, path) if path.starts_with("/egress/") => {
             if let Some(tx) = egress_tx {
                 let name = path.trim_start_matches("/egress/").to_string();
-                info!("Received remove egress rule request: {}", name);
+                info!(node = %node, "Received remove egress rule request: {}", name);
                 let (resp_tx, resp_rx) = oneshot::channel();
                 if let Err(e) = tx.send(EgressCommand::Remove(name, resp_tx)).await {
-                    error!("Failed to send egress command: {}", e);
+                    error!(node = %node, "Failed to send egress command: {}", e);
                     return Ok(response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "Internal Error",
                     ));
                 }
-                Ok(await_op(resp_rx.await, "Egress rule removed"))
+                Ok(await_op(&node, resp_rx.await, "Egress rule removed"))
             } else {
                 Ok(response(StatusCode::NOT_IMPLEMENTED, "Egress not enabled"))
             }
@@ -364,6 +346,7 @@ async fn handle_request(
 /// Await a change acknowledgment and map it to an HTTP response: Ok -> 200;
 /// Apply -> 400; NotFound -> 404; channel closed -> 500.
 fn await_op(
+    node: &str,
     receipt: std::result::Result<
         std::result::Result<(), ControlOpError>,
         oneshot::error::RecvError,
@@ -380,7 +363,7 @@ fn await_op(
             response(status, &interflow_util::format_chain(&e))
         }
         Err(e) => {
-            error!("Failed to receive rule change result: {}", e);
+            error!(node = %node, "Failed to receive rule change result: {}", e);
             response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error")
         }
     }

@@ -1,6 +1,8 @@
 import { useState } from "react";
-import { api, formatRemainingSecs, kindBlurb, leafPhaseClass, type AddNodeParams, type PackInspection, type Transport } from "../api";
-import { KindBadge, SegmentedControl } from "./ui";
+import { api, formatRemainingSecs, kindBlurb, leafPhase, type AddNodeParams, type PackInspection, type Transport } from "../api";
+import { useT } from "../i18n";
+import { cn } from "../lib/utils";
+import { Button, DialogFooter, DialogTitle, Field, Input, KindBadge, Modal, SegmentedControl } from "./ui";
 
 /// The add-a-node flow: pick a pack directory (or import a sealed
 /// `.iflowpack`), inspect it through the same funnel the start path uses,
@@ -25,6 +27,7 @@ export default function AddNodeDialog({
   // the same inspect → add flow as a directory.
   const [sealedPath, setSealedPath] = useState("");
   const [passphrase, setPassphrase] = useState("");
+  const { t } = useT();
 
   const isAgent =
     inspection?.kind === "expose_agent" || inspection?.kind === "mesh_agent";
@@ -32,7 +35,7 @@ export default function AddNodeDialog({
   const pickPackDir = async () => {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const dir = await open({
-      title: "Choose the Credential Pack directory",
+      title: t("addNode.choosePackDir"),
       directory: true,
     });
     if (typeof dir === "string") {
@@ -45,8 +48,8 @@ export default function AddNodeDialog({
   const pickSealed = async () => {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const file = await open({
-      title: "Choose a sealed .iflowpack",
-      filters: [{ name: "Interflow sealed pack", extensions: ["iflowpack"] }],
+      title: t("addNode.chooseSealed"),
+      filters: [{ name: t("addNode.sealedFilter"), extensions: ["iflowpack"] }],
     });
     if (typeof file === "string") {
       setSealedPath(file);
@@ -115,150 +118,181 @@ export default function AddNodeDialog({
   };
 
   return (
-    <div className="dialog-backdrop" onClick={(e) => e.target === e.currentTarget && onClose()}>
-      <div className="dialog">
-        <h2>Add a node</h2>
-        <div className="row">
-          <label>Credential Pack</label>
-          <input
-            value={packDir}
-            onChange={(e) => {
-              setPackDir(e.target.value);
-              setInspection(null);
-            }}
-            placeholder="Credential Pack directory"
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-            autoComplete="off"
-          />
-          <button onClick={pickPackDir}>Browse</button>
-          <button disabled={busy || packDir.trim() === ""} onClick={inspect}>
-            {busy ? "…" : "Inspect"}
-          </button>
-        </div>
-
-        <div className="import-sealed">
-          <div className="row">
-            <label>…or import a sealed pack</label>
-            <input
-              value={sealedPath}
+    <Modal onClose={onClose}>
+      <DialogTitle>{t("addNode.title")}</DialogTitle>
+      <Field label={t("addNode.credentialPack")}>
+        {(id) => (
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <Input
+              id={id}
+              value={packDir}
               onChange={(e) => {
-                setSealedPath(e.target.value);
+                setPackDir(e.target.value);
                 setInspection(null);
               }}
-              placeholder="path to a .iflowpack"
+              placeholder={t("addNode.packDirPlaceholder")}
               autoCapitalize="none"
               autoCorrect="off"
               spellCheck={false}
               autoComplete="off"
+              className="flex-1"
             />
-            <button onClick={pickSealed}>Browse</button>
+            <Button onClick={pickPackDir}>{t("common.browse")}</Button>
+            <Button variant="primary" disabled={busy || packDir.trim() === ""} onClick={inspect}>
+              {busy ? "…" : t("addNode.inspect")}
+            </Button>
           </div>
-          {sealedPath.trim() !== "" && (
-            <div className="row">
-              <label>Passphrase</label>
-              <input
-                type="password"
-                value={passphrase}
-                onChange={(e) => setPassphrase(e.target.value)}
+        )}
+      </Field>
+
+      <div className="flex flex-col gap-2 border-t border-dashed border-line pt-3">
+        <Field label={t("addNode.orImportSealed")}>
+          {(id) => (
+            <div className="flex min-w-0 flex-1 items-center gap-2">
+              <Input
+                id={id}
+                value={sealedPath}
+                onChange={(e) => {
+                  setSealedPath(e.target.value);
+                  setInspection(null);
+                }}
+                placeholder={t("addNode.sealedPlaceholder")}
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
                 autoComplete="off"
+                className="flex-1"
               />
-              <button
-                className="primary"
-                disabled={busy || passphrase === ""}
-                onClick={importSealed}
-              >
-                {busy ? "…" : "Import"}
-              </button>
+              <Button onClick={pickSealed}>{t("common.browse")}</Button>
             </div>
           )}
-        </div>
+        </Field>
+        {sealedPath.trim() !== "" && (
+          <Field label={t("common.passphrase")}>
+            {(id) => (
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <Input
+                  id={id}
+                  type="password"
+                  value={passphrase}
+                  onChange={(e) => setPassphrase(e.target.value)}
+                  autoComplete="off"
+                  className="flex-1"
+                />
+                <Button
+                  variant="primary"
+                  disabled={busy || passphrase === ""}
+                  onClick={importSealed}
+                >
+                  {busy ? "…" : t("addNode.import")}
+                </Button>
+              </div>
+            )}
+          </Field>
+        )}
+      </div>
 
-        {inspection && (
-          <div className="inspection">
-            <div className="inspection-title">
-              <KindBadge kind={inspection.kind} />
-              <strong>{inspection.name}</strong>
-              <span className="hint">— {kindBlurb(inspection.kind)}</span>
-            </div>
-            <dl>
-              <dt>Identity</dt>
-              <dd>{inspection.principal}</dd>
-              <dt>{inspection.kind === "hub" || inspection.kind === "ingress" ? "Listens on" : "Connects to"}</dt>
-              <dd>{inspection.listen ?? inspection.control_endpoint}</dd>
-              {inspection.services.length > 0 && (
-                <>
-                  <dt>Services</dt>
-                  <dd>{inspection.services.join(", ")}</dd>
-                </>
-              )}
-              {(inspection.mesh_ingress > 0 || inspection.mesh_egress > 0) && (
-                <>
-                  <dt>Mesh rules</dt>
-                  <dd>
-                    {inspection.mesh_ingress} ingress · {inspection.mesh_egress} egress
-                  </dd>
-                </>
-              )}
-              {inspection.credential && (
-                <>
-                  <dt>Credentials expire</dt>
-                  <dd className={leafPhaseClass(inspection.credential) || undefined}>
-                    {inspection.credential.not_after} ·{" "}
-                    {formatRemainingSecs(inspection.credential.remaining_secs)} left
-                  </dd>
-                </>
-              )}
-            </dl>
+      {inspection && (
+        <div className="flex flex-col gap-2.5 rounded-lg border border-line bg-bg-3 p-3">
+          <div className="flex items-center gap-2">
+            <KindBadge kind={inspection.kind} />
+            <strong>{inspection.name}</strong>
+            <span className="text-small text-fg-3">— {kindBlurb(inspection.kind, t)}</span>
+          </div>
+          <dl className="m-0 grid grid-cols-[130px_1fr] gap-x-2.5 gap-y-1 text-base">
+            <dt className="text-fg-3">{t("addNode.identity")}</dt>
+            <dd className="m-0 break-all">{inspection.principal}</dd>
+            <dt>
+              {inspection.kind === "hub" || inspection.kind === "ingress"
+                ? t("addNode.listensOn")
+                : t("addNode.connectsTo")}
+            </dt>
+            <dd className="m-0 break-all">{inspection.listen ?? inspection.control_endpoint}</dd>
+            {inspection.services.length > 0 && (
+              <>
+                <dt className="text-fg-3">{t("addNode.services")}</dt>
+                <dd className="m-0 break-all">{inspection.services.join(", ")}</dd>
+              </>
+            )}
+            {(inspection.mesh_ingress > 0 || inspection.mesh_egress > 0) && (
+              <>
+                <dt className="text-fg-3">{t("addNode.meshRules")}</dt>
+                <dd className="m-0">
+                  {t("nodeCard.meshRules", {
+                    in: inspection.mesh_ingress,
+                    out: inspection.mesh_egress,
+                  })}
+                </dd>
+              </>
+            )}
+            {inspection.credential && (
+              <>
+                <dt className="text-fg-3">{t("addNode.credentialsExpire")}</dt>
+                <dd
+                  className={cn(
+                    "m-0",
+                    leafPhase(inspection.credential) === "warn" && "text-warn",
+                    leafPhase(inspection.credential) === "critical" && "text-critical",
+                  )}
+                >
+                  {inspection.credential.not_after} ·{" "}
+                  {t("addNode.timeLeft", {
+                    time: formatRemainingSecs(inspection.credential.remaining_secs),
+                  })}
+                </dd>
+              </>
+            )}
+          </dl>
 
-            {isAgent && (
-              <div className="prefs">
-                <div className="row">
-                  <label>Transport</label>
-                  <SegmentedControl
-                    value={transport}
-                    options={[
-                      { value: "h2", label: "h2" },
-                      { value: "quic", label: "QUIC" },
-                    ]}
-                    onChange={setTransport}
-                  />
-                  <span
-                    className="hint"
-                    title="Only a choice different from the pack's signed default is persisted as this machine's preference; the default follows the pack on every future re-issue"
-                  >
-                    {`pack default: ${inspection.transport ?? "h2"}`}
-                  </span>
-                </div>
-                {transport === "quic" && (
-                  <div className="row">
-                    <label>Hub QUIC address</label>
-                    <input
+          {isAgent && (
+            <div className="flex flex-col gap-2 border-t border-line pt-2.5">
+              <div className="flex items-center gap-2">
+                <span className="w-[140px] shrink-0 text-base text-fg-2">
+                  {t("prefs.transport")}
+                </span>
+                <SegmentedControl
+                  value={transport}
+                  options={[
+                    { value: "h2", label: "h2" },
+                    { value: "quic", label: "QUIC" },
+                  ]}
+                  onChange={setTransport}
+                />
+                <span className="text-small text-fg-3" title={t("prefs.transportPersistTitle")}>
+                  {t("prefs.packDefaultHint", { value: inspection.transport ?? "h2" })}
+                </span>
+              </div>
+              {transport === "quic" && (
+                <Field label={t("prefs.hubQuicAddr")}>
+                  {(id) => (
+                    <Input
+                      id={id}
                       value={hubQuicAddr}
                       onChange={(e) => setHubQuicAddr(e.target.value)}
-                      placeholder="(optional) host:port — derived if empty"
+                      placeholder={t("prefs.hubQuicPlaceholder")}
                       autoCapitalize="none"
                       autoCorrect="off"
                       spellCheck={false}
                       autoComplete="off"
                     />
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-
-        {error && <div className="dialog-error">{error}</div>}
-
-        <div className="dialog-actions">
-          <button onClick={onClose}>Cancel</button>
-          <button className="primary" disabled={busy || !inspection} onClick={add}>
-            Add node
-          </button>
+                  )}
+                </Field>
+              )}
+            </div>
+          )}
         </div>
-      </div>
-    </div>
+      )}
+
+      {error && (
+        <div className="text-base whitespace-pre-wrap text-critical">{error}</div>
+      )}
+
+      <DialogFooter>
+        <Button onClick={onClose}>{t("common.cancel")}</Button>
+        <Button variant="primary" disabled={busy || !inspection} onClick={add}>
+          {t("addNode.addButton")}
+        </Button>
+      </DialogFooter>
+    </Modal>
   );
 }

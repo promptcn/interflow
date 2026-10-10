@@ -310,3 +310,70 @@ fn swap_pack_into_preserves_state_and_keeps_previous() {
     );
     assert!(!target.parent().unwrap().join(".staging-swap-0").exists());
 }
+
+/// `commit_staged` upgrade contract (the 2026-10-07 serving-lineage reset
+/// fix): `node install` re-runs pass `preserve_state = target.exists()` —
+/// an upgrade carries the node-local `state/` (the accepted-policy serving
+/// lineage among it) across the swap instead of burying it in `.previous`;
+/// the fresh-install path keeps the staged pack's own material untouched.
+#[test]
+fn commit_staged_upgrade_carries_the_state_lineage() {
+    let srv = tempfile::tempdir().expect("tempdir");
+
+    // An existing hub install whose accepted lineage sits at gen 8.
+    let target = srv.path().join("hub-cn");
+    std::fs::create_dir_all(target.join("state/policy")).unwrap();
+    std::fs::write(target.join("state/policy/policy.toml"), "generation = 8\n").unwrap();
+    std::fs::write(target.join("pack.toml"), b"old install").unwrap();
+
+    // A staged fresh render: embedded snapshot at gen 1, no state.
+    let staging = srv.path().join(".staging-install-1");
+    let staged = staging.join("pack");
+    std::fs::create_dir_all(staged.join("policy")).unwrap();
+    std::fs::write(staged.join("policy/policy.toml"), "generation = 1\n").unwrap();
+    std::fs::write(staged.join("pack.toml"), b"new install").unwrap();
+
+    // The upgrade path: `preserve_state = target.exists()` (what install()
+    // passes since the fix).
+    interflow_cli::node_install::commit_staged(&staging, &staged, &target, true)
+        .expect("upgrade swap");
+
+    assert_eq!(
+        std::fs::read(target.join("state/policy/policy.toml")).unwrap(),
+        b"generation = 8\n".as_slice(),
+        "the accepted serving lineage must survive the upgrade (this is the \
+         regression: it used to land in .previous and the hub came back at \
+         the embedded gen 1)"
+    );
+    assert_eq!(
+        std::fs::read(target.join("pack.toml")).unwrap(),
+        b"new install",
+        "the staged pack is what got swapped in"
+    );
+    assert!(
+        srv.path().join("hub-cn.previous/pack.toml").exists(),
+        "the previous install is kept for rollback"
+    );
+    assert!(
+        srv.path()
+            .join("hub-cn.previous/state/policy/policy.toml")
+            .exists(),
+        "the pre-upgrade lineage stays reachable in .previous as well"
+    );
+    assert!(!staging.exists(), "staging is cleaned up");
+
+    // The fresh-install path: no target, nothing to carry — the staged
+    // pack's own material lands verbatim.
+    let staging2 = srv.path().join(".staging-install-2");
+    let staged2 = staging2.join("pack");
+    std::fs::create_dir_all(&staged2).unwrap();
+    std::fs::write(staged2.join("pack.toml"), b"fresh").unwrap();
+    let fresh_target = srv.path().join("agent-fresh");
+    interflow_cli::node_install::commit_staged(&staging2, &staged2, &fresh_target, false)
+        .expect("fresh install");
+    assert_eq!(
+        std::fs::read(fresh_target.join("pack.toml")).unwrap(),
+        b"fresh"
+    );
+    assert!(!fresh_target.join("state").exists());
+}

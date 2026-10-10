@@ -4,14 +4,13 @@
 //! else is persisted.
 //!
 //! The on-disk shape is detected structurally (repo convention: local files
-//! carry no version counters). Current shape (2026-09-22, the unified node
+//! carry no version counters). The shape (2026-09-22, the unified node
 //! manager): a `[[nodes]]` list with per-node start-intent
 //! (`desired_running` — Start means "keep it on", Stop "keep it off"; the
-//! GUI restores the running set on launch). The earlier single-tunnel shape
-//! (a `pack_dir`/`transport`/`hub_quic_addr` triple) loads through an
-//! in-memory migration into one entry; the file itself is rewritten on the
-//! next mutation. Unknown top-level keys are rejected (`deny_unknown_fields`),
-//! so a shape this build does not understand fails loudly.
+//! GUI restores the running set on launch). Unknown top-level keys are
+//! rejected (`deny_unknown_fields`), so a shape this build does not
+//! understand fails loudly — the pre-2026-09-22 single-tunnel shape
+//! (`pack_dir`/`transport`/`hub_quic_addr` at top level) included.
 //!
 //! Paths:
 //! - Linux: `~/.config/interflow/profile.toml`
@@ -77,16 +76,6 @@ impl Profile {
     }
 }
 
-/// The earlier single-tunnel shape (2026-09-17..2026-09-22): read-only,
-/// migrated in memory into one entry of the current shape.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-struct ProfileV1 {
-    pack_dir: Option<String>,
-    transport: Option<TransportKind>,
-    hub_quic_addr: Option<String>,
-}
-
 /// Returns the profile file path (the parent directory is created on demand).
 pub fn profile_path() -> Result<PathBuf> {
     let base = dirs::config_dir()
@@ -101,9 +90,10 @@ pub fn load() -> Result<Profile> {
 }
 
 /// Loads a profile from an explicit path. A missing file yields an empty
-/// Profile. Legacy single-tunnel files migrate to one entry (fresh id,
-/// intent off). A relative `pack_dir` anchors to the profile file's
-/// directory.
+/// Profile. A relative `pack_dir` anchors to the profile file's directory.
+/// Anything that is not the `[[nodes]]` shape fails loudly: the struct's
+/// `deny_unknown_fields` names the offending key (this includes the
+/// pre-2026-09-22 single-tunnel shape).
 pub fn load_from(path: &Path) -> Result<Profile> {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -112,31 +102,10 @@ pub fn load_from(path: &Path) -> Result<Profile> {
         }
         Err(e) => return Err(e.into()),
     };
-    let value: toml::Value = toml::from_str(&raw)?;
-    let mut profile = if value.get("nodes").is_some() {
-        // The nodes-list shape (the deny_unknown_fields on Profile rejects
-        // mixed files, so a "nodes" key means this shape or a malformed
-        // file — the latter fails here with a pointed serde error).
-        value.try_into()?
-    } else if value.get("pack_dir").is_some()
-        || value.get("transport").is_some()
-        || value.get("hub_quic_addr").is_some()
-    {
-        // Legacy single-tunnel shape → nodes list in memory; rewritten in
-        // the current shape on the next mutation.
-        let v1: ProfileV1 = value.try_into()?;
-        Profile::new(vec![NodeEntry {
-            id: uuid::Uuid::new_v4().to_string(),
-            pack_dir: v1.pack_dir.unwrap_or_default(),
-            transport: v1.transport,
-            hub_quic_addr: v1.hub_quic_addr,
-            service_addresses: Vec::new(),
-            desired_running: false,
-        }])
-    } else {
-        // An empty file (or only comments) — same as missing.
-        Profile::new(Vec::new())
-    };
+    // deny_unknown_fields + the struct-level `default`: an empty (or
+    // comments-only) document deserializes to the empty profile; any other
+    // shape fails with its unknown fields named.
+    let mut profile: Profile = toml::from_str(&raw)?;
     let base = path
         .parent()
         .map_or_else(|| PathBuf::from("."), ToOwned::to_owned);
@@ -152,7 +121,7 @@ pub fn save(profile: &Profile) -> Result<()> {
     save_to(&profile_path()?, profile)
 }
 
-/// [`save`] at an explicit path (tests, migration tooling).
+/// [`save`] at an explicit path (tests).
 pub fn save_to(path: &Path, profile: &Profile) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -176,11 +145,11 @@ pub fn save_to(path: &Path, profile: &Profile) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A legacy single-tunnel file migrates to one entry with intent off;
-    /// ids are stable across a reload of the same file (persisted, not
-    /// re-minted).
+    /// The pre-2026-09-22 single-tunnel shape (top-level
+    /// `pack_dir`/`transport`/`hub_quic_addr`, retired with the unified node
+    /// manager) is rejected loudly — no in-memory migration path survives.
     #[test]
-    fn legacy_profile_migrates_to_one_entry() {
+    fn pre_unification_single_tunnel_shape_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profile.toml");
         std::fs::write(
@@ -192,16 +161,14 @@ hub_quic_addr = "hub.example.com:16666"
 "#,
         )
         .unwrap();
-        let profile = load_from(&path).unwrap();
-        assert_eq!(profile.nodes.len(), 1);
-        let node = &profile.nodes[0];
-        assert!(!node.desired_running);
-        assert_eq!(node.transport, Some(TransportKind::Quic));
-        assert_eq!(node.hub_quic_addr.as_deref(), Some("hub.example.com:16666"));
-        // Relative pack_dir anchored to the profile's directory.
-        assert_eq!(
-            node.pack_dir,
-            dir.path().join("packs/agent-desktop").display().to_string()
+        let err = load_from(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown field"), "wrong error: {msg}");
+        assert!(
+            ["pack_dir", "transport", "hub_quic_addr"]
+                .iter()
+                .any(|k| msg.contains(k)),
+            "wrong error: {msg}"
         );
     }
 
@@ -270,7 +237,7 @@ desired_running = true
         assert_eq!(
             load_from(&empty).unwrap(),
             Profile::new(Vec::new()),
-            "an empty file must not be treated as v1"
+            "an empty file is the empty profile"
         );
     }
 

@@ -1,5 +1,6 @@
 use crate::agent::control::{ControlOpError, IngressCommand};
 use crate::agent::ingress_addrs::IngressAddrs;
+use crate::agent::ingress_listeners::IngressListeners;
 use crate::agent::rules::RuleStore;
 use crate::config::IngressRule;
 use interflow_core::error::{InterflowError, Result};
@@ -11,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{error, info, warn};
@@ -31,12 +31,82 @@ const CLIENT_WRITE_STALL_TIMEOUT: Duration =
 /// and file descriptors.
 const MAX_CONCURRENT_CONNECTIONS: usize = 4096;
 
-struct ListenerGuard(HashMap<String, AbortHandle>);
+/// Catch-all reconcile cadence. Store-change notifications drive normal
+/// convergence; the tick is the level-triggered safety net that retries
+/// failed binds and heals any state a missed trigger could have left
+/// behind.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The rule a bound listener is serving — the actual-state cell. A
+/// param-level policy change writes this in place; the accept loops read
+/// it per connection/datagram, so new traffic picks up new idle budgets
+/// and targets without the socket ever being touched.
+pub(crate) type ServingRule = Arc<std::sync::RwLock<IngressRule>>;
+
+fn read_serving(cell: &ServingRule) -> std::sync::RwLockReadGuard<'_, IngressRule> {
+    cell.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_serving(cell: &ServingRule, rule: IngressRule) {
+    *cell
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = rule;
+}
+
+/// Listener identity: the fields that define the socket itself. Everything
+/// else in [`IngressRule`] is a live parameter served from the cell.
+const fn identity(rule: &IngressRule) -> (SocketAddr, StreamProto) {
+    (rule.listen_addr, rule.listen_protocol)
+}
+
+/// What one desired-vs-actual comparison asks the reconciler to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileAction {
+    /// The bound listener serves exactly the desired rule — nothing to do.
+    NoChange,
+    /// Socket identity unchanged: swap the serving rule in place; the
+    /// listener is never touched (no rebind, no race, no hole).
+    UpdateParams,
+    /// Identity changed: bind the new listener first, then stop the old.
+    Replace,
+}
+
+/// The reconcile decision for one rule. The whole-struct equality first
+/// arm is the fast path; the identity split below it is the 2026-10-07
+/// fix — before it, a connection-level knob change (`idle_timeout_secs`)
+/// was classified as a full replace, and the replace's close-then-rebind
+/// order could lose the listener silently.
+fn classify(current: &IngressRule, desired: &IngressRule) -> ReconcileAction {
+    if current == desired {
+        ReconcileAction::NoChange
+    } else if identity(current) == identity(desired) {
+        ReconcileAction::UpdateParams
+    } else {
+        ReconcileAction::Replace
+    }
+}
+
+/// Abort a listener task and reap it, so its socket is deterministically
+/// released before the call returns (`AbortHandle` alone cannot offer
+/// this — the release timing was the rebind race).
+async fn stop_and_reap(handle: tokio::task::JoinHandle<()>) {
+    handle.abort();
+    let _ = handle.await;
+}
+
+/// Listener teardown bookkeeping. Carries the log attribution so even the
+/// Drop path (session teardown) emits node-attributed lines — the steady
+/// state must never regress to bare lines (the 2026-10-09 bug shape).
+struct ListenerGuard {
+    node: String,
+    handles: HashMap<String, tokio::task::JoinHandle<()>>,
+}
 
 impl Drop for ListenerGuard {
     fn drop(&mut self) {
-        for (name, handle) in &self.0 {
-            info!("Stopping ingress listener (cleanup): {}", name);
+        for (name, handle) in &self.handles {
+            info!(node = %self.node, "Stopping ingress listener (cleanup): {}", name);
             handle.abort();
         }
     }
@@ -44,8 +114,13 @@ impl Drop for ListenerGuard {
 
 pub struct IngressHandler {
     agent_id: String,
+    /// Log attribution (`AgentInfo::effective_log_name`): every line the
+    /// handler and its spawned listeners/pumps emit carries it, so the GUI
+    /// "This node" view filters by node.
+    node: String,
     tunnel: AgentTunnel,
-    /// Cross-session rule truth (in-memory).
+    /// Cross-session rule truth — the DESIRED state and the only input
+    /// reconcile reads (level-triggered: never a pushed snapshot).
     store: Arc<RuleStore>,
     /// Session token: the lifecycle anchor of listeners and per-connection
     /// pumps — session end (watchdog/disconnect/shutdown) exits them all,
@@ -57,14 +132,16 @@ pub struct IngressHandler {
     tracker: TaskTracker,
     command_rx: Option<mpsc::Receiver<IngressCommand>>,
     guard: ListenerGuard,
-    /// The rule each currently-bound listener serves (the reconcile base for
-    /// signed-policy reloads: a same-name rule with different fields is a
-    /// replace, not a skip).
-    bound: HashMap<String, IngressRule>,
+    /// The serving-rule cell of each currently-bound listener (the
+    /// ACTUAL state; keys are kept in lockstep with `guard`).
+    bound: HashMap<String, ServingRule>,
     /// Agent-scoped table of actually-bound listener addresses: a `:0` port
     /// materializes here at bind and the next session rebuild re-binds the
     /// same concrete address (port pinning — see [`IngressAddrs`]).
     addrs: Arc<IngressAddrs>,
+    /// Agent-scoped listener health face: bound addresses and bind errors,
+    /// observable from the [`AgentHandle`](crate::agent::AgentHandle).
+    listeners: Arc<IngressListeners>,
     /// Mandatory inner-TLS runtime.
     e2e: Arc<crate::agent::e2e::E2eRuntime>,
     /// Readiness signal: set once a session has bound every rule in its
@@ -78,132 +155,201 @@ impl IngressHandler {
     #[allow(clippy::too_many_arguments)] // session wiring handles are passed explicitly one by one
     pub fn new_with_tunnel(
         agent_id: String,
+        log_name: String,
         tunnel: AgentTunnel,
         store: Arc<RuleStore>,
         session: CancellationToken,
         tracker: TaskTracker,
         command_rx: Option<mpsc::Receiver<IngressCommand>>,
         addrs: Arc<IngressAddrs>,
+        listeners: Arc<IngressListeners>,
         e2e: Arc<crate::agent::e2e::E2eRuntime>,
         ingress_ready: tokio::sync::watch::Sender<bool>,
     ) -> Self {
         Self {
             agent_id,
+            guard: ListenerGuard {
+                node: log_name.clone(),
+                handles: HashMap::new(),
+            },
+            node: log_name,
             tunnel,
             store,
             session,
             tracker,
             command_rx,
-            guard: ListenerGuard(HashMap::new()),
             bound: HashMap::new(),
             addrs,
+            listeners,
             e2e,
             ingress_ready,
         }
     }
 
     pub async fn run(mut self) -> Result<()> {
-        info!("Ingress handler started, agent_id={}", self.agent_id);
+        info!(node = %self.node, "Ingress handler started, agent_id={}", self.agent_id);
 
-        // At session establishment, take the current rule tables from the
-        // store (including API additions from the previous session)
-        let mut all_bound = true;
-        for rule in self.store.ingress_snapshot().await {
-            if let Err(e) = self.start_listener(rule.clone()).await {
-                error!("Failed to start ingress listener {}: {}", rule.name, e);
-                all_bound = false;
-            }
-        }
-        if all_bound {
+        // Level-triggered from the first instant: bind whatever the store
+        // says; readiness is decided by this pass.
+        let failed = self.reconcile().await;
+        if failed == 0 {
             // Idempotent across session rebuilds: the watch keeps the
             // latest value, and readiness only ever turns on.
             let _ = self.ingress_ready.send(true);
         }
 
-        if let Some(mut rx) = self.command_rx.take() {
-            while let Some(cmd) = rx.recv().await {
-                match cmd {
-                    IngressCommand::Add(rule, resp_tx) => {
+        // Reconcile triggers, level-triggered: rule-store changes (policy
+        // reload, control API), a periodic catch-all tick (retries failed
+        // binds, heals anything a missed wake-up could leave behind), and
+        // the command channel (Add/Remove/List + session teardown).
+        let mut version = self.store.version_rx();
+        let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut commands = self.command_rx.take();
+        loop {
+            let next_command = async {
+                match commands.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                cmd = next_command => match cmd {
+                    Some(IngressCommand::Add(rule, resp_tx)) => {
                         let _ = resp_tx.send(self.handle_add(rule).await);
                     }
-                    IngressCommand::Remove(name, resp_tx) => {
+                    Some(IngressCommand::Remove(name, resp_tx)) => {
                         let _ = resp_tx.send(self.handle_remove(&name).await);
                     }
-                    IngressCommand::List(resp_tx) => {
+                    Some(IngressCommand::List(resp_tx)) => {
                         let views = self.store.ingress_views().await;
-                        info!("Handled List command, returning {} rules", views.len());
+                        info!(node = %self.node, "Handled List command, returning {} rules", views.len());
                         let _ = resp_tx.send(views);
                     }
-                    IngressCommand::Sync(desired) => {
-                        self.handle_sync(desired).await;
+                    None => break, // senders dropped (session teardown)
+                },
+                changed = version.changed() => {
+                    if changed.is_ok() {
+                        self.reconcile().await;
                     }
                 }
+                _ = tick.tick() => {
+                    self.reconcile().await;
+                }
             }
-        } else {
-            std::future::pending::<()>().await;
         }
 
         Ok(())
     }
 
-    /// Signed-policy reload: reconcile the live listener set against the
-    /// new rule face. Added or changed rules bind (same-name change stops
-    /// the old listener first); removed rules stop. The store (rule truth)
-    /// has already been replaced by the reloader — this only reconciles the
-    /// runtime face, so a listener that fails to bind is loud but never
-    /// reverts the signed truth.
-    async fn handle_sync(&mut self, desired: Vec<IngressRule>) {
+    /// Drive the bound listener set toward the store's rule table. Pure
+    /// level-triggered control: every invocation re-derives the whole
+    /// diff, so a missed trigger only delays convergence to the next tick
+    /// — the store, not a message, is the desired-state truth.
+    ///
+    /// Ordering rules that make a reconcile never lose a healthy listener:
+    /// - param-level change: the serving cell is swapped in place; the
+    ///   socket is not touched at all;
+    /// - identity change: the new listener is bound BEFORE the old one
+    ///   stops (their addresses/protocols differ, so the binds cannot
+    ///   conflict), and the old task is reaped deterministically;
+    /// - a failed bind leaves the previous listener serving and is retried
+    ///   on the next reconcile — there is never a hole.
+    ///
+    /// Returns the number of rules that want a listener but do not have
+    /// one (bind failures pending retry).
+    async fn reconcile(&mut self) -> usize {
+        let desired = self.store.ingress_snapshot().await;
         let mut added = 0usize;
         let mut changed = 0usize;
         let mut removed = 0usize;
-        // Stop listeners whose rule is gone.
+        let mut failed = 0usize;
+
+        // Stop listeners whose rule is gone from the desired face.
         let names: Vec<String> = self.bound.keys().cloned().collect();
         for name in names {
-            if !desired.iter().any(|r| r.name == name) {
-                if let Some(handle) = self.guard.0.remove(&name) {
-                    info!("Policy reload stopped ingress listener: {name}");
-                    handle.abort();
-                }
-                self.addrs.remove(&name);
-                self.bound.remove(&name);
-                removed += 1;
-            }
-        }
-        // Bind new rules and replace changed ones.
-        for rule in desired {
-            let name = rule.name.clone();
-            let unchanged = self
-                .bound
-                .get(&name)
-                .is_some_and(|current| *current == rule);
-            if unchanged {
+            if desired.iter().any(|r| r.name == name) {
                 continue;
             }
-            let is_change = self.bound.contains_key(&name);
-            if let Some(old) = self.guard.0.remove(&name) {
-                info!("Policy reload replacing ingress listener: {name}");
-                old.abort();
+            if let Some(handle) = self.guard.handles.remove(&name) {
+                info!(node = %self.node, "Rule gone, stopping ingress listener: {name}");
+                stop_and_reap(handle).await;
             }
-            match self.start_listener(rule).await {
-                Ok(()) => {
-                    if is_change {
-                        changed += 1;
-                    } else {
-                        added += 1;
+            self.addrs.remove(&name);
+            self.bound.remove(&name);
+            self.listeners.remove(&name);
+            metrics::gauge!("interflow_agent_ingress_listener_bound", "rule" => name.clone())
+                .set(0.0);
+            removed += 1;
+        }
+
+        // Drive every desired rule to its listener.
+        for rule in desired {
+            let name = rule.name.clone();
+            let actual = self
+                .bound
+                .get(&name)
+                .map(|cell| (Arc::clone(cell), classify(&read_serving(cell), &rule)));
+            match actual {
+                Some((_, ReconcileAction::NoChange)) => {}
+                Some((cell, ReconcileAction::UpdateParams)) => {
+                    // Socket identity unchanged: hot-swap the serving rule;
+                    // the next accepted connection/datagram reads the new
+                    // params. The listener is never touched.
+                    write_serving(&cell, rule);
+                    if let Some(addr) = self.addrs.get(&name) {
+                        self.listeners.set_bound(&name, addr);
                     }
+                    changed += 1;
+                    info!(node = %self.node, "Policy change hot-applied to ingress listener params: {name}");
                 }
-                Err(e) => {
-                    error!("Policy reload failed to bind ingress listener {name}: {e}");
-                    self.bound.remove(&name);
+                _ => {
+                    // New rule, or identity change: bind first, stop old
+                    // only after the new listener is up.
+                    let old = self.guard.handles.remove(&name);
+                    match self.start_listener(rule).await {
+                        Ok(()) => {
+                            if let Some(handle) = old {
+                                info!(node = %self.node, "Identity change, replacing ingress listener: {name}");
+                                stop_and_reap(handle).await;
+                                changed += 1;
+                            } else {
+                                added += 1;
+                            }
+                        }
+                        Err(e) => {
+                            // The new bind failed: the previous listener
+                            // keeps serving (its guard/bound entries are
+                            // restored) and the next reconcile retries. A
+                            // replace must never trade a working listener
+                            // for a hole.
+                            error!(
+                                node = %self.node,
+                                "Ingress listener bind for {name} failed ({e}); \
+                                 keeping the previous listener serving, retry scheduled"
+                            );
+                            if let Some(handle) = old {
+                                self.guard.handles.insert(name.clone(), handle);
+                            }
+                            self.listeners.set_failed(&name, e.to_string());
+                            metrics::counter!(
+                                "interflow_agent_ingress_listener_bind_failures_total",
+                                "rule" => name.clone(),
+                            )
+                            .increment(1);
+                            failed += 1;
+                        }
+                    }
                 }
             }
         }
-        info!("Policy reload reconciled ingress listeners: +{added} ~{changed} -{removed}");
+        info!(node = %self.node, "Ingress reconciled: +{added} ~{changed} -{removed} !{failed}");
+        failed
     }
 
-    /// Add: start the listener first (the fallible runtime side effect), then
-    /// record the rule in the store. An Ok acknowledgment = the rule is in
-    /// effect.
+    /// Add (or replace by name): the store is the desired truth and the
+    /// reconcile applies it; Ok acknowledges the rule is in effect (the
+    /// listener is bound and serving exactly this rule).
     async fn handle_add(&mut self, rule: IngressRule) -> std::result::Result<(), ControlOpError> {
         let name = rule.name.clone();
         if !rule.listen_addr.ip().is_loopback() {
@@ -211,36 +357,38 @@ impl IngressHandler {
                 "ingress {name} rejected: listen_addr must be loopback"
             )));
         }
-        // Same-name replacement: stop the old listener first (the old
-        // implementation overwrote the map entry directly, leaking the
-        // listener task)
-        if let Some(old) = self.guard.0.remove(&name) {
-            info!(
-                "Same-name replacement, stopping old ingress listener: {}",
-                name
-            );
-            old.abort();
+        self.store
+            .add_ingress(rule.clone())
+            .await
+            .map_err(ControlOpError::from)?;
+        self.reconcile().await;
+        let serving = self
+            .bound
+            .get(&name)
+            .is_some_and(|cell| *read_serving(cell) == rule);
+        if serving {
+            Ok(())
+        } else {
+            let reason = self
+                .listeners
+                .get(&name)
+                .and_then(|status| status.last_error)
+                .unwrap_or_else(|| "listener did not come up".to_string());
+            Err(ControlOpError::Apply(format!(
+                "failed to start listener: {reason}"
+            )))
         }
-        if let Err(e) = self.start_listener(rule.clone()).await {
-            return Err(ControlOpError::Apply(format!(
-                "failed to start listener: {e}"
-            )));
-        }
-        self.store.add_ingress(rule).await.map_err(Into::into)
     }
 
-    /// Remove: stop the listener, then drop the rule from the store.
+    /// Remove: the store decides existence (NotFound comes from the rule
+    /// truth); the reconcile stops the listener.
     async fn handle_remove(&mut self, name: &str) -> std::result::Result<(), ControlOpError> {
-        let Some(handle) = self.guard.0.remove(name) else {
-            return Err(ControlOpError::NotFound(format!(
-                "ingress rule not found: {name}"
-            )));
-        };
-        info!("Stopping ingress listener: {}", name);
-        handle.abort();
-        self.addrs.remove(name);
-        self.bound.remove(name);
-        self.store.remove_ingress(name).await.map_err(Into::into)
+        self.store
+            .remove_ingress(name)
+            .await
+            .map_err(ControlOpError::from)?;
+        self.reconcile().await;
+        Ok(())
     }
 
     /// The address a rule's listener should bind: a `:0` config with a
@@ -263,16 +411,20 @@ impl IngressHandler {
             )));
         }
         let name = rule.name.clone();
-        match rule.listen_protocol {
-            StreamProto::Tcp => self.start_tcp_listener(rule.clone()).await,
-            StreamProto::Udp => self.start_udp_listener(rule.clone()),
-        }?;
-        self.bound.insert(name, rule);
+        let cell: ServingRule = Arc::new(std::sync::RwLock::new(rule));
+        let protocol = read_serving(&cell).listen_protocol;
+        match protocol {
+            StreamProto::Tcp => self.start_tcp_listener(Arc::clone(&cell)).await?,
+            StreamProto::Udp => self.start_udp_listener(Arc::clone(&cell))?,
+        }
+        self.bound.insert(name, cell);
         Ok(())
     }
 
-    fn start_udp_listener(&mut self, rule: IngressRule) -> Result<()> {
+    fn start_udp_listener(&mut self, cell: ServingRule) -> Result<()> {
+        let rule = read_serving(&cell).clone();
         info!(
+            node = %self.node,
             "Starting ingress (UDP) listener: {} -> {}",
             rule.listen_addr, rule.target_agent
         );
@@ -285,6 +437,7 @@ impl IngressHandler {
             // configured address and let the fresh bind re-record.
             Err(e) if target != rule.listen_addr => {
                 warn!(
+                    node = %self.node,
                     "pinned ingress addr rebind failed ({e}); falling back to {}",
                     rule.listen_addr
                 );
@@ -295,34 +448,42 @@ impl IngressHandler {
         };
         let actual = socket.local_addr().map_err(InterflowError::Io)?;
         self.addrs.set(&rule.name, actual);
+        self.listeners.set_bound(&rule.name, actual);
+        metrics::gauge!("interflow_agent_ingress_listener_bound", "rule" => rule.name.clone())
+            .set(1.0);
         info!(
+            node = %self.node,
             "Ingress (UDP) listener bound: {} -> {}",
             actual, rule.target_agent
         );
 
         let tunnel = self.tunnel.clone();
-        let rule_clone = rule.clone();
         let session = self.session.clone();
         let e2e = Arc::clone(&self.e2e);
+        let node = self.node.clone();
+        let name = rule.name;
         let handle = self.tracker.spawn(async move {
             // Stop on session end (the socket closes as the task drops)
             tokio::select! {
                 () = session.cancelled() => {}
                 () = crate::agent::ingress_udp::run_udp_listener(
                     socket,
-                    rule_clone,
+                    cell,
                     tunnel,
                     e2e,
+                    node,
                 ) => {}
             }
         });
 
-        self.guard.0.insert(rule.name, handle.abort_handle());
+        self.guard.handles.insert(name, handle);
         Ok(())
     }
 
-    async fn start_tcp_listener(&mut self, rule: IngressRule) -> Result<()> {
+    async fn start_tcp_listener(&mut self, cell: ServingRule) -> Result<()> {
+        let rule = read_serving(&cell).clone();
         info!(
+            node = %self.node,
             "Starting ingress listener: {} -> {}",
             rule.listen_addr, rule.target_agent
         );
@@ -333,6 +494,7 @@ impl IngressHandler {
             // Same pinned-rebind fallback as the UDP path above.
             Err(e) if target != rule.listen_addr => {
                 warn!(
+                    node = %self.node,
                     "pinned ingress addr rebind failed ({e}); falling back to {}",
                     rule.listen_addr
                 );
@@ -344,18 +506,23 @@ impl IngressHandler {
         };
         let actual = listener.local_addr().map_err(InterflowError::Io)?;
         self.addrs.set(&rule.name, actual);
+        self.listeners.set_bound(&rule.name, actual);
+        metrics::gauge!("interflow_agent_ingress_listener_bound", "rule" => rule.name.clone())
+            .set(1.0);
         info!(
+            node = %self.node,
             "Ingress listener bound: {} -> {}",
             actual, rule.target_agent
         );
 
+        let name = rule.name.clone();
         let agent_id = self.agent_id.clone();
         let tunnel = self.tunnel.clone();
-        let rule_clone = rule.clone();
         let session = self.session.clone();
         let conn_tracker = self.tracker.clone();
         let per_conn_tracker = self.tracker.clone();
         let e2e = self.e2e.clone();
+        let node = self.node.clone();
 
         // Global concurrency cap: guards against a connection flood
         // exhausting the scheduler and file descriptors (combined with
@@ -375,21 +542,26 @@ impl IngressHandler {
                         // Reserve one permit up front so concurrency is
                         // limited before accept
                         let Ok(permit) = sem.clone().acquire_owned().await else {
-                            error!("Concurrency-limit semaphore closed");
+                            error!(node = %node, "Concurrency-limit semaphore closed");
                             break;
                         };
 
                         match listener.accept().await {
                             Ok((socket, addr)) => {
-                                info!("Connection accepted: {} (rule: {})", addr, rule_clone.name);
+                                info!(node = %node, "Connection accepted: {} (rule: {})", addr, name);
                                 // TCP_NODELAY: disable Nagle to cut
                                 // small-packet latency
                                 let _ = socket.set_nodelay(true);
                                 let tunnel = tunnel.clone();
-                                let rule = rule_clone.clone();
+                                // The serving rule is read per connection:
+                                // a param-level policy change writes the
+                                // cell and the next connection serves the
+                                // new params without the socket moving.
+                                let rule = read_serving(&cell).clone();
                                 let agent_id = agent_id.clone();
                                 let session = session.clone();
                                 let e2e = e2e.clone();
+                                let node = node.clone();
 
                                 per_conn_tracker.spawn(async move {
                                     // _permit releases automatically when
@@ -397,16 +569,16 @@ impl IngressHandler {
                                     let _permit = permit;
                                     tokio::select! {
                                         () = session.cancelled() => {}
-                                        r = Self::handle_connection(socket, tunnel, rule, agent_id, e2e) => {
+                                        r = Self::handle_connection(socket, tunnel, rule, agent_id, e2e, &node) => {
                                             if let Err(e) = r {
-                                                error!("Connection handling error: {}", e);
+                                                error!(node = %node, "Connection handling error: {}", e);
                                             }
                                         }
                                     }
                                 });
                             }
                             Err(e) => {
-                                error!("Listener accept error: {}", e);
+                                error!(node = %node, "Listener accept error: {}", e);
                                 drop(permit);
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             }
@@ -415,7 +587,7 @@ impl IngressHandler {
                 } => {}
             }
         });
-        self.guard.0.insert(rule.name, handle.abort_handle());
+        self.guard.handles.insert(rule.name, handle);
         Ok(())
     }
 
@@ -425,6 +597,7 @@ impl IngressHandler {
         rule: IngressRule,
         agent_id: String,
         e2e: Arc<crate::agent::e2e::E2eRuntime>,
+        node: &str,
     ) -> Result<()> {
         // Stream idle timeout: close the stream when neither direction has
         // data for this long (default tcp 300s, configurable per rule)
@@ -465,6 +638,7 @@ impl IngressHandler {
                     "protocol",
                 );
                 warn!(
+                    node = %node,
                     "inner TLS connector build failed for {stream_id} -> {expected_peer}: {e}; closing stream"
                 );
                 tunnel.unregister_stream(stream_id).await;
@@ -526,6 +700,7 @@ impl IngressHandler {
                 if outcome.idle_expired {
                     let budget = idle_timeout.as_secs();
                     info!(
+                        node = %node,
                         "mesh ingress stream idle timeout: rule {} closed after {budget}s of \
                          total silence (stream {stream_id}) — for requests that legitimately \
                          stay silent (non-streaming LLM calls with long thinking), raise \
@@ -541,7 +716,7 @@ impl IngressHandler {
                     crate::agent::e2e::SIDE_INGRESS,
                     reason,
                 );
-                warn!("inner TLS handshake failed ({reason}: {error}), closing stream {stream_id}");
+                warn!(node = %node, "inner TLS handshake failed ({reason}: {error}), closing stream {stream_id}");
                 let _ = tunnel.send_close(stream_id).await;
                 tunnel.unregister_stream(stream_id).await;
                 Err(InterflowError::connection(format!(
@@ -549,5 +724,85 @@ impl IngressHandler {
                 )))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(name: &str, port: u16) -> IngressRule {
+        IngressRule {
+            name: name.into(),
+            listen_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            listen_protocol: StreamProto::Tcp,
+            target_agent: "remote".into(),
+            remote_addr: None,
+            idle_timeout_secs: None,
+            udp_per_ip_pps: 0,
+            udp_per_ip_bytes_per_sec: 0,
+            udp_egress_bytes_per_sec: 0,
+        }
+    }
+
+    /// The 2026-10-07 bug shape, machine-locked: a connection-level knob
+    /// change is an in-place param update, never a listener replace.
+    #[test]
+    fn classify_splits_param_changes_from_identity_changes() {
+        // Identical rules: nothing to do.
+        assert_eq!(
+            classify(&rule("svc", 1), &rule("svc", 1)),
+            ReconcileAction::NoChange
+        );
+
+        // The incident: only `idle_timeout_secs` changed (mes-portal gen
+        // 7→8). The old whole-struct diff called this a replace.
+        let mut idle = rule("svc", 1);
+        idle.idle_timeout_secs = Some(1800);
+        assert_eq!(
+            classify(&rule("svc", 1), &idle),
+            ReconcileAction::UpdateParams
+        );
+
+        // Every other non-identity field is a live param too.
+        let mut target = rule("svc", 1);
+        target.target_agent = "other".into();
+        let mut remote = rule("svc", 1);
+        remote.remote_addr = Some("127.0.0.1:9".into());
+        let mut pps = rule("svc", 1);
+        pps.udp_per_ip_pps = 100;
+        assert_eq!(
+            classify(&rule("svc", 1), &target),
+            ReconcileAction::UpdateParams
+        );
+        assert_eq!(
+            classify(&rule("svc", 1), &remote),
+            ReconcileAction::UpdateParams
+        );
+        assert_eq!(
+            classify(&rule("svc", 1), &pps),
+            ReconcileAction::UpdateParams
+        );
+
+        // Identity changes rebind: the listen address...
+        assert_eq!(
+            classify(&rule("svc", 1), &rule("svc", 2)),
+            ReconcileAction::Replace
+        );
+        // ...and the protocol (same address).
+        let mut udp = rule("svc", 1);
+        udp.listen_protocol = StreamProto::Udp;
+        assert_eq!(classify(&rule("svc", 1), &udp), ReconcileAction::Replace);
+
+        // A `:0` config keeps its identity across param changes (pinning
+        // must never turn a param change into a rebind).
+        let mut zero = rule("svc", 0);
+        zero.idle_timeout_secs = Some(9);
+        let mut zero_changed = zero.clone();
+        zero_changed.idle_timeout_secs = Some(10);
+        assert_eq!(
+            classify(&zero, &zero_changed),
+            ReconcileAction::UpdateParams
+        );
     }
 }

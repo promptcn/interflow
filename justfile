@@ -16,13 +16,20 @@ fmt-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Run all tests
+# Run all tests (cargo-nextest: per-test process isolation + cross-binary
+# parallelism — the e2e suite is wall-clock-bound on timers, measured ~4.6x
+# faster than a sequential libtest run. Install: brew install cargo-nextest
+# or `cargo install cargo-nextest --locked`. Doc tests stay on libtest
+# (nextest does not run them); --all-features matches the CI stages.)
 test:
-    cargo test --workspace --no-fail-fast
+    command -v cargo-nextest >/dev/null 2>&1 || { echo 'cargo-nextest missing: brew install cargo-nextest / cargo install cargo-nextest --locked'; exit 1; }
+    cargo nextest run --workspace --all-features
+    cargo test --workspace --all-features --doc --no-fail-fast
 
 # Run integration tests only
 test-e2e:
-    cargo test --workspace --test '*'
+    command -v cargo-nextest >/dev/null 2>&1 || { echo 'cargo-nextest missing: brew install cargo-nextest / cargo install cargo-nextest --locked'; exit 1; }
+    cargo nextest run --workspace --all-features --test '*'
 
 # QUIC vs h2 concurrent-stream loss comparison (scenario benchmark; see --help for options)
 bench-loss:
@@ -30,9 +37,9 @@ bench-loss:
 
 # soak long-run guardrail (real process topology: soak-node hub/agent processes + impairment proxy + six assertions;
 # run several rounds nightly / before releases. Smoke test: `just soak -- --quick`; see --help for options)
-soak:
+soak *args:
     cargo build --release -p interflow-testkit --features fault-injection --bin interflow-soak-node
-    cargo run --release -p interflow-testkit --bin soak
+    cargo run --release -p interflow-testkit --bin soak {{args}}
 
 # Unused-dependency gate (cargo-machete; install: cargo install cargo-machete --locked)
 machete:

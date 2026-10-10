@@ -132,6 +132,9 @@ pub enum BreakerDecision {
 /// [`super::egress::EgressRuntime`] next to the open-rate limiter.
 pub struct TargetBreakers {
     kind: BreakerKind,
+    /// Log attribution (`AgentInfo::effective_log_name`): trip/recovery
+    /// lines carry it so breaker activity lands in the GUI "This node" view.
+    node: String,
     cfg: BreakerPolicy,
     inner: Mutex<HashMap<String, BreakerEntry>>,
     /// Number of entries currently tripped (OPEN); feeds the
@@ -158,9 +161,10 @@ struct BreakerEntry {
 
 impl TargetBreakers {
     #[must_use]
-    pub fn new(kind: BreakerKind, cfg: BreakerPolicy) -> Self {
+    pub fn new(kind: BreakerKind, node: String, cfg: BreakerPolicy) -> Self {
         Self {
             kind,
+            node,
             cfg,
             inner: Mutex::new(HashMap::new()),
             tripped: AtomicUsize::new(0),
@@ -195,7 +199,7 @@ impl TargetBreakers {
         // the full cooldown.
         if now >= entry.last_probe + PROBE_INTERVAL {
             entry.last_probe = now;
-            debug!("{} admitting recovery probe: {target}", self.kind.label());
+            debug!(node = %self.node, "{} admitting recovery probe: {target}", self.kind.label());
             BreakerDecision::Probe
         } else {
             BreakerDecision::Reject
@@ -234,7 +238,7 @@ impl TargetBreakers {
                     // Direct failure reported by a probe (or an Open that
                     // raced the trip): re-arm the full cooldown.
                     entry.deadline = now + self.cfg.cooldown;
-                    debug!("{} re-armed: {target}", self.kind.label());
+                    debug!(node = %self.node, "{} re-armed: {target}", self.kind.label());
                 }
                 return;
             }
@@ -255,7 +259,7 @@ impl TargetBreakers {
             // Evicting a tripped entry: it simply stops being tracked;
             // fresh failures will re-trip it.
             self.tripped.fetch_sub(1, Ordering::Relaxed);
-            debug!("{} table full, evicting {}", self.kind.label(), victim);
+            debug!(node = %self.node, "{} table full, evicting {}", self.kind.label(), victim);
         }
         let mut entry = BreakerEntry {
             open: false,
@@ -289,6 +293,7 @@ impl TargetBreakers {
         self.tripped.fetch_sub(1, Ordering::Relaxed);
         metrics::counter!(self.kind.transitions_metric(), "state" => "closed").increment(1);
         info!(
+            node = %self.node,
             "{} recovered: {target} (probe succeeded)",
             self.kind.label()
         );
@@ -309,6 +314,7 @@ impl TargetBreakers {
         self.tripped.fetch_add(1, Ordering::Relaxed);
         metrics::counter!(self.kind.transitions_metric(), "state" => "open").increment(1);
         warn!(
+            node = %self.node,
             "{} tripped: {target} ({} connect failures within {:?}; rejecting pre-dial for {:?})",
             self.kind.label(),
             entry.failures.len(),
@@ -352,6 +358,7 @@ mod tests {
     fn table(threshold: u32, window: Duration, cooldown: Duration) -> TargetBreakers {
         TargetBreakers::new(
             BreakerKind::Egress,
+            "test-node".to_string(),
             BreakerPolicy {
                 failure_threshold: threshold,
                 failure_window: window,

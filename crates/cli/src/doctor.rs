@@ -41,6 +41,19 @@ pub enum DoctorCommand {
         #[arg(long)]
         pack: PathBuf,
     },
+    /// Diagnose the issuer store's backup health (operator machine): is it
+    /// configured, current, on a second medium — and, with the offline
+    /// identity, does the newest backup actually decrypt and parse?
+    Issuer {
+        /// Issuer store directory.
+        #[arg(long, default_value = "issuer")]
+        dir: PathBuf,
+        /// Path to the offline recovery identity (`-` for stdin): enables a
+        /// full trial-decrypt of the newest backup — the only way to know a
+        /// backup is real instead of presumed.
+        #[arg(long)]
+        identity: Option<String>,
+    },
 }
 
 impl DoctorCommand {
@@ -51,8 +64,108 @@ impl DoctorCommand {
             Self::Hub { pack } => check_node(&pack, PackKind::Hub),
             Self::Route { host, pack } => check_route(&host, &pack),
             Self::Trust { pack } => check_trust(&pack),
+            Self::Issuer { dir, identity } => check_issuer_backup(&dir, identity.as_deref()),
         }
     }
+}
+
+/// The issuer store's backup health: configuration → versions → currency →
+/// (optionally) a real trial-decrypt of the newest version. Every ✘ carries
+/// a fix; the same-device warning is the one disk-loss blind spot the
+/// default layout cannot fix by itself.
+fn check_issuer_backup(
+    dir: &std::path::Path,
+    identity: Option<&str>,
+) -> interflow_core::error::Result<()> {
+    use interflow_identity::backup as store_backup;
+    println!("Interflow doctor — issuer store backup");
+    let status = store_backup::status(dir).map_err(interflow_cli::runtime::pack_error)?;
+    let Some(cfg) = status.config else {
+        println!(
+            "✘ issuer store {} has no backup configuration",
+            dir.display()
+        );
+        println!("  every CA key in it exists in exactly one copy — losing the directory");
+        println!("  means re-issuing the entire mesh from a fresh root");
+        println!("Fix:");
+        println!(
+            "  interflow-cli issuer backup init --dir {} (or re-run plan apply)",
+            dir.display()
+        );
+        return Err(interflow_core::error::InterflowError::config(
+            "issuer store is not backed up",
+        ));
+    };
+    println!("✔ backup configured → {}", cfg.backup_dir.display());
+    if status.versions.is_empty() {
+        println!("✘ no backup version has landed yet");
+        println!(
+            "Fix: interflow-cli issuer backup now --dir {}",
+            dir.display()
+        );
+        return Err(interflow_core::error::InterflowError::config(
+            "issuer store backup is configured but empty",
+        ));
+    }
+    println!(
+        "✔ {} version(s) (newest: {})",
+        status.versions.len(),
+        status.versions.last().map_or_else(
+            || "-".to_owned(),
+            |p| p.file_name().map_or_else(
+                || p.display().to_string(),
+                |n| n.to_string_lossy().into_owned()
+            )
+        )
+    );
+    if status.same_device == Some(true) {
+        println!("· backup dir shares the disk with the store — one disk failure takes both;");
+        println!("  point `--backup-dir` at a second medium when you can");
+    }
+    if !status.newest_is_current {
+        println!("✘ the store changed since the last successful backup");
+        println!("  (a checkpoint failed, or backups were pruned past it)");
+        println!(
+            "Fix: interflow-cli issuer backup now --dir {}",
+            dir.display()
+        );
+        return Err(interflow_core::error::InterflowError::config(
+            "issuer store backup is stale",
+        ));
+    }
+    println!("✔ newest backup matches the current store content");
+    if let Some(identity_spec) = identity {
+        // Trial-decrypt: the Schrödinger's-backup check — a backup nobody
+        // has ever restored from is only presumed good.
+        let newest = status
+            .versions
+            .last()
+            .ok_or_else(|| interflow_core::error::InterflowError::config("no backup to drill"))?;
+        let identity = if identity_spec == "-" {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)?;
+            line.trim_end_matches(['\r', '\n']).to_owned()
+        } else {
+            std::fs::read_to_string(identity_spec).map_err(|e| {
+                interflow_core::error::InterflowError::config(format!(
+                    "cannot read recovery identity {identity_spec:?}"
+                ))
+                .with_source(e)
+            })?
+        };
+        let report =
+            store_backup::verify(newest, &identity).map_err(interflow_cli::runtime::pack_error)?;
+        println!(
+            "✔ drill: newest backup decrypts and parses — {} member(s), {} cert(s), {} key file(s)",
+            report.members.len(),
+            report.certs.len(),
+            report.key_files
+        );
+    } else {
+        println!("· drill: pass --identity <offline-key-file> to trial-decrypt the newest backup");
+    }
+    println!("All checks passed.");
+    Ok(())
 }
 
 fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core::error::Result<()> {
@@ -202,17 +315,33 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
             }
             if let Some(mesh) = &pack.node_config.mesh {
                 println!("  hub: {}", mesh.hub_endpoint);
-                for rule in &mesh.ingress {
+                // Rules display from the AUTHORITATIVE policy face —
+                // node.toml carries dial info only.
+                for rule in pack
+                    .policy
+                    .mesh
+                    .iter()
+                    .filter(|s| s.source_agent == pack.metadata.node)
+                {
                     println!(
                         "✔ Mesh forward {} listening {} → agent {} at {}",
                         rule.name, rule.listen, rule.target_agent, rule.remote_addr
                     );
                 }
-                for rule in &mesh.egress {
+                for offer in pack
+                    .policy
+                    .mesh_egress
+                    .iter()
+                    .filter(|o| o.agent == pack.metadata.node)
+                {
+                    let authorization = offer
+                        .target_cidr
+                        .as_deref()
+                        .or(offer.target_addr.as_deref())
+                        .unwrap_or("");
                     println!(
                         "✔ Mesh serve {} at {} (offered to peers)",
-                        rule.name,
-                        rule.authorization()
+                        offer.name, authorization
                     );
                 }
             }
@@ -585,8 +714,11 @@ fn check_route(host: &str, pack_dir: &std::path::Path) -> interflow_core::error:
         if let Some(email) = &pack.node_config.public_tls_email {
             println!("    - account contact: {email}");
         }
-        if let Some(directory) = &pack.node_config.public_tls_directory {
-            println!("    - directory override: {directory}");
+        if pack.node_config.public_tls_directory != interflow_util::LETS_ENCRYPT_PRODUCTION {
+            println!(
+                "    - directory override: {}",
+                pack.node_config.public_tls_directory
+            );
         }
     }
     println!();

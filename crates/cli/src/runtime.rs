@@ -1,65 +1,81 @@
 //! `interflow-cli ingress run --pack` / `interflow-cli agent run --pack` —
 //! Credential-Pack → runtime-engine bootstrap.
 //!
-//! The user-facing model never sees certificate paths: the pack supplies
-//! the identity, trust, and signed policy; this module maps it onto the
-//! relay engine **in memory** — no intermediate config files are rendered,
+//! The user-facing model never sees certificate paths: the pack supplies the
+//! identity, trust, and signed policy; this module maps it onto the relay
+//! engine **in memory** — no intermediate config files are rendered,
 //! so the bytes the issuer signed are the bytes the engine runs.
+//!
+//! The pack's node.toml is canonical (2026-10-10): every knob arrives
+//! concrete, resolved at render time. The resolvers below only parse those
+//! concrete values into engine types — the topology-default resolution that
+//! used to live here moved into the renderer.
 
 use interflow_core::error::{InterflowError, Result};
-use interflow_core::security::{ProxyProtocolConfig, ProxyProtocolMode};
+use interflow_core::security::{ProxyProtocolConfig, ProxyProtocolMode, XffMode};
 use interflow_expose::edge::{
-    AcmeOptions, ControlEndpointTls, DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE,
-    DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE, EdgeConfig, EdgeListenerPolicy, IngressPrincipal,
-    PublicTls, Route, WorkspaceTrust,
+    AcmeOptions, ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, PublicTls,
+    Route, WorkspaceTrust,
 };
 use interflow_identity::credentials::ActiveCredentialSet;
+use interflow_identity::manifest::IdentityMode;
 use interflow_identity::pack::{CredentialPack, NodeEdgeConfig, PackKind};
 use std::net::SocketAddr;
 use std::path::Path;
 
-/// Resolves the edge per-IP new-connection rate for an ingress pack.
+/// Parses the public listener's `X-Forwarded-For` mode from the pack's
+/// canonical `[edge]` section.
 ///
-/// An explicit `[edge]` override wins (0 = unlimited); otherwise the
-/// topology default — fronted 600 (a front proxy opens one new connection
-/// per proxied request, so the budget must scale with request rate, and
-/// 600/min matches the reference nginx `limit_req 10r/s`), direct 30
-/// (browser keepalive keeps new connections rare and no front shields the
-/// listener). The 30/min default behind a front broke normal single-user
-/// browsing into 502s once already — this split is the fix's load-bearing
-/// part.
-pub fn resolve_new_conn_rate(public_tls: &str, edge: Option<&NodeEdgeConfig>) -> u32 {
-    if let Some(rate) = edge.and_then(|config| config.new_conn_rate_per_ip_per_minute) {
-        return rate;
-    }
-    match public_tls {
-        "frontend-proxy" | "manual" => DEFAULT_FRONTED_NEW_CONN_RATE_PER_IP_PER_MINUTE,
-        _ => DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE,
+/// `"off"` / `"on"` / `"required"` — the renderer already resolved the
+/// topology default; an unrecognized value is a version-skew tripwire, not
+/// a user-facing path: node.toml rides the pack's SHA256SUMS digest.
+pub fn resolve_xff_mode(edge: &NodeEdgeConfig) -> Result<XffMode> {
+    match edge.x_forwarded_for.as_str() {
+        "off" => Ok(XffMode::Off),
+        "on" => Ok(XffMode::On),
+        "required" => Ok(XffMode::Required),
+        other => Err(InterflowError::config(format!(
+            "[edge] x_forwarded_for = {other:?} is not one of \"off\" | \"on\" | \"required\""
+        ))),
     }
 }
 
-/// Resolves the control listener's PROXY protocol negotiation for an
-/// ingress pack.
+/// Parses the control listener's PROXY protocol negotiation from the pack's
+/// canonical `[edge]` section (`"on"` / `"off"`).
 ///
-/// Topology-derived, same discipline as [`resolve_new_conn_rate`]: no
-/// manifest field, no pack re-signing. Fronted topologies sit behind the
-/// nginx stream fragment, which emits PROXY protocol (v1 on stock nginx)
-/// on every SNI-map target — including the mTLS-passthrough control leg —
-/// so the embedded hub must consume the preamble and re-key its per-IP
-/// admission on the real client IP. Mode `On` (not `Required`): the edge's
-/// internal workspace agents self-dial the control endpoint headerless
-/// over loopback, and `On` is also what makes the zero-downtime rollout
-/// order (new binaries first, nginx conf switch second) work — a headerless
-/// leg is a plain direct connection. Direct topologies (`acme`) keep the
-/// default (off): nothing fronts the control listener.
-pub fn resolve_control_proxy_protocol(public_tls: &str) -> ProxyProtocolConfig {
-    match public_tls {
-        "frontend-proxy" | "manual" => ProxyProtocolConfig {
+/// Mode `On` (not `Required`):
+/// the edge's internal workspace agents self-dial the control endpoint
+/// headerless over loopback, and `On` is also what makes the zero-downtime
+/// rollout order (new binaries first, nginx conf switch second) work — a
+/// headerless leg is a plain direct connection. Trusted proxies stay
+/// engine-fixed (loopback) — the front runs beside the edge.
+pub fn resolve_control_proxy_protocol(edge: &NodeEdgeConfig) -> Result<ProxyProtocolConfig> {
+    match edge.control_proxy_protocol.as_str() {
+        "on" => Ok(ProxyProtocolConfig {
             mode: ProxyProtocolMode::On,
             trusted_proxies: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
-        },
-        _ => ProxyProtocolConfig::default(),
+        }),
+        "off" => Ok(ProxyProtocolConfig::default()),
+        other => Err(InterflowError::config(format!(
+            "[edge] control_proxy_protocol = {other:?} is not one of \"on\" | \"off\""
+        ))),
     }
+}
+
+/// Parses the ACME HTTP-01 challenge listener from the pack's canonical
+/// `[edge]` section.
+///
+/// The renderer pinned the port-80 default the ACME protocol practically
+/// requires; an explicit value moves the challenge listener behind a
+/// forward or onto another interface.
+pub fn resolve_acme_http_listen(edge: &NodeEdgeConfig) -> Result<SocketAddr> {
+    edge.acme_http_listen.parse().map_err(|e| {
+        InterflowError::config(format!(
+            "acme http_listen address {:?} is invalid",
+            edge.acme_http_listen
+        ))
+        .with_source(e)
+    })
 }
 
 /// Resolves the control endpoint's QUIC (UDP) listen address for an
@@ -87,26 +103,27 @@ pub fn resolve_quic_listen(raw: Option<&str>) -> Result<Option<SocketAddr>> {
 }
 
 /// Resolves the dial transport an agent runs with: the machine-local
-/// preference wins, the pack's signed manifest default is the fallback,
-/// h2 is the floor.
+/// preference wins, the pack's render-time-resolved default is the fallback
+/// (`"h2"` / `"quic"`, never absent — canonical node.toml).
 ///
 /// Single resolution point for every caller — the headless
 /// `agent run --pack` path (no profile: local is `None`, the pack default
 /// *is* the config) and the GUI (profile preference over the pack
 /// default), mirroring how service dial targets resolve (pack default +
-/// machine-local override). An unexpected pack string fails loud instead
-/// of silently degrading to h2 — node.toml is digest-covered, so this is
+/// machine-local override). An unexpected pack string fails loud instead of
+/// silently degrading to h2 — node.toml is digest-covered, so this is
 /// a version-skew tripwire, not a user-facing path. The string semantics
 /// live on [`TransportKind::parse_dial`] (shared with the mesh pack
 /// path).
 pub fn resolve_effective_transport(
     local: Option<interflow_mesh::config::TransportKind>,
-    pack_default: Option<&str>,
+    pack_default: &str,
 ) -> Result<interflow_mesh::config::TransportKind> {
     if let Some(local) = local {
         return Ok(local);
     }
-    interflow_mesh::config::TransportKind::parse_dial(pack_default).map_err(InterflowError::config)
+    interflow_mesh::config::TransportKind::parse_dial(Some(pack_default))
+        .map_err(InterflowError::config)
 }
 
 /// Pack load/validation failures are configuration-class (unrecoverable at
@@ -154,8 +171,8 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
         // Headless run: no profile, so no machine-local preferences — the
         // pack's manifest-issued defaults are the whole config (every
         // service dials its pack default; the dial transport is the pack's
-        // `transport`, h2 when the manifest leaves it unset).
-        resolve_effective_transport(None, pack.node_config.transport.as_deref())?,
+        // render-time-resolved `transport`).
+        resolve_effective_transport(None, pack.node_config.transport.as_str())?,
         None,
         &std::collections::BTreeMap::new(),
     )?;
@@ -274,11 +291,19 @@ pub fn build_edge_config(
         });
     }
 
+    // The renderer always writes both listen addresses on an ingress pack;
+    // missing values are pre-2026-10 packs — fail loudly with the recovery
+    // action instead of silently binding default addresses.
     let listen: SocketAddr = pack
         .node_config
         .listen
         .as_deref()
-        .unwrap_or("0.0.0.0:8443")
+        .ok_or_else(|| {
+            InterflowError::config(
+                "ingress pack node.toml carries no listen address — re-render the pack \
+                 (interflow-cli plan apply); the silent 0.0.0.0:8443 fallback is retired",
+            )
+        })?
         .parse()
         .map_err(|e| {
             InterflowError::config(format!(
@@ -291,7 +316,13 @@ pub fn build_edge_config(
         .node_config
         .control_listen
         .as_deref()
-        .unwrap_or("127.0.0.1:16666")
+        .ok_or_else(|| {
+            InterflowError::config(
+                "ingress pack node.toml carries no control_listen address — re-render the \
+                 pack (interflow-cli plan apply); the silent 127.0.0.1:16666 fallback is \
+                 retired",
+            )
+        })?
         .parse()
         .map_err(|e| {
             InterflowError::config(format!(
@@ -305,10 +336,15 @@ pub fn build_edge_config(
     // Public-HTTPS termination: `acme` terminates TLS on the ingress itself
     // (HTTP-01 + TLS-ALPN-01 + renewal, state under the pack directory);
     // the fronted topologies keep the plain-TCP listener behind the proxy.
-    let fronted = matches!(
-        pack.node_config.public_tls.as_str(),
-        "frontend-proxy" | "manual"
-    );
+    // The [edge] section is canonical and always present on an ingress pack
+    // (the load path enforces it; the guard here is the same fail-loud for
+    // hand-loaded packs).
+    let edge = pack.node_config.edge.as_ref().ok_or_else(|| {
+        InterflowError::config(
+            "ingress pack node.toml carries no [edge] section — re-render the pack \
+             (interflow-cli plan apply); boot-time topology defaults are retired",
+        )
+    })?;
     let public_tls = if pack.node_config.public_tls == "acme" {
         let email = pack.node_config.public_tls_email.clone().ok_or_else(|| {
             InterflowError::config(
@@ -318,10 +354,13 @@ pub fn build_edge_config(
         PublicTls::Acme(AcmeOptions {
             hosts: Vec::new(), // filled from the resolved routes by the engine
             email,
-            directory: pack.node_config.public_tls_directory.clone(),
+            // Canonical node.toml always names the concrete directory (the
+            // renderer resolved an unset manifest to LE production); ""
+            // can only mean "no public-TLS face", impossible on this leg.
+            directory: Some(pack.node_config.public_tls_directory.clone()),
             directory_ca: None,
             cache_dir: pack_dir.join("state").join("acme"),
-            http_listen: "0.0.0.0:80".parse().expect("static addr"),
+            http_listen: resolve_acme_http_listen(edge)?,
         })
     } else {
         PublicTls::Fronted
@@ -340,26 +379,22 @@ pub fn build_edge_config(
                 .map_err(pack_error)?
                 .1,
         },
-        control_proxy_protocol: resolve_control_proxy_protocol(&pack.node_config.public_tls),
+        control_proxy_protocol: resolve_control_proxy_protocol(edge)?,
         workspace_trust,
         principals,
         routes,
         quic_listen,
         audit_path: Some(pack_dir.join("audit.jsonl")),
         listener: EdgeListenerPolicy {
-            x_forwarded_for: if fronted {
-                interflow_core::security::XffMode::Required
-            } else {
-                interflow_core::security::XffMode::Off
-            },
-            new_conn_rate_per_ip_per_minute: resolve_new_conn_rate(
-                &pack.node_config.public_tls,
-                pack.node_config.edge.as_ref(),
-            ),
+            x_forwarded_for: resolve_xff_mode(edge)?,
+            // Canonical node.toml carries the render-time-resolved rate
+            // (fronted 600 / direct 30)
+            new_conn_rate_per_ip_per_minute: edge.new_conn_rate_per_ip_per_minute,
             ..EdgeListenerPolicy::default()
         },
         public_tls,
         control_dispatch_host: pack.node_config.control_dispatch_host.clone(),
+        identity_offline: pack.metadata.identity_mode == IdentityMode::Offline,
         ..EdgeConfig::default()
     })
 }
@@ -408,6 +443,7 @@ pub fn build_agent_args(
         ingress_ca_path: Some(ingress_anchor.display().to_string()),
         transport,
         hub_quic_addr,
+        identity_offline: pack.metadata.identity_mode == IdentityMode::Offline,
     })
 }
 
@@ -483,10 +519,10 @@ pub fn normalize_endpoint(endpoint: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{
-        NodeEdgeConfig, resolve_control_proxy_protocol, resolve_effective_transport,
-        resolve_local_services, resolve_new_conn_rate, resolve_quic_listen,
+        NodeEdgeConfig, resolve_acme_http_listen, resolve_control_proxy_protocol,
+        resolve_effective_transport, resolve_local_services, resolve_quic_listen, resolve_xff_mode,
     };
-    use interflow_core::security::ProxyProtocolMode;
+    use interflow_core::security::{ProxyProtocolMode, XffMode};
     use interflow_identity::pack::NodeService;
     use std::collections::BTreeMap;
 
@@ -575,58 +611,79 @@ mod tests {
         assert_eq!(services[1].target_addr.port(), 8443);
     }
 
-    fn edge(rate: Option<u32>) -> NodeEdgeConfig {
+    /// A canonical [edge] section: the render-time-resolved values the
+    /// resolvers parse. Topology-default resolution moved into the renderer
+    /// (identity's resolve_edge) — these tests cover the parse-only leg.
+    fn edge_with(rate: u32, xff: &str, proxy: &str, acme_http_listen: &str) -> NodeEdgeConfig {
         NodeEdgeConfig {
             new_conn_rate_per_ip_per_minute: rate,
+            x_forwarded_for: xff.to_owned(),
+            control_proxy_protocol: proxy.to_owned(),
+            acme_http_listen: acme_http_listen.to_owned(),
         }
     }
 
-    /// Fronted topologies default to 600/min: the front proxy opens one new
-    /// connection per proxied request, so the direct-topology 30/min breaks
-    /// normal browsing. Direct (ACME) keeps 30.
+    /// PROXY protocol parses from the canonical value; a bad value fails
+    /// naming the field (node.toml is digest-covered — a version-skew
+    /// tripwire, not a user-facing path).
     #[test]
-    fn topology_defaults_fronted_600_direct_30() {
-        assert_eq!(resolve_new_conn_rate("frontend-proxy", None), 600);
-        assert_eq!(resolve_new_conn_rate("manual", None), 600);
-        assert_eq!(resolve_new_conn_rate("acme", None), 30);
-    }
-
-    /// An explicit `[edge]` override wins on every topology, including the
-    /// 0 = unlimited escape hatch.
-    #[test]
-    fn explicit_override_wins() {
-        assert_eq!(
-            resolve_new_conn_rate("frontend-proxy", Some(&edge(Some(120)))),
-            120
+    fn control_proxy_protocol_parses_or_fails_loud() {
+        let on = resolve_control_proxy_protocol(&edge_with(600, "required", "on", "0.0.0.0:80"))
+            .unwrap();
+        assert_eq!(on.mode, ProxyProtocolMode::On);
+        assert_eq!(on.trusted_proxies, vec!["127.0.0.1", "::1"]);
+        let off =
+            resolve_control_proxy_protocol(&edge_with(30, "off", "off", "0.0.0.0:80")).unwrap();
+        assert_eq!(off.mode, ProxyProtocolMode::Off);
+        let err = resolve_control_proxy_protocol(&edge_with(30, "off", "maybe", "0.0.0.0:80"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("control_proxy_protocol"),
+            "wrong error: {err}"
         );
-        assert_eq!(resolve_new_conn_rate("acme", Some(&edge(Some(120)))), 120);
-        assert_eq!(resolve_new_conn_rate("acme", Some(&edge(Some(0)))), 0);
     }
 
-    /// An `[edge]` section present but with the rate unset still means
-    /// "engine default for the topology" — the field is optional, not
-    /// required-once-present.
+    /// XFF mode parses from the canonical value; a bad value fails naming
+    /// the field.
     #[test]
-    fn empty_edge_section_falls_back_to_topology_default() {
+    fn xff_mode_parses_or_fails_loud() {
         assert_eq!(
-            resolve_new_conn_rate("frontend-proxy", Some(&edge(None))),
-            600
+            resolve_xff_mode(&edge_with(600, "required", "on", "0.0.0.0:80")).unwrap(),
+            XffMode::Required
         );
-        assert_eq!(resolve_new_conn_rate("acme", Some(&edge(None))), 30);
+        assert_eq!(
+            resolve_xff_mode(&edge_with(30, "off", "off", "0.0.0.0:80")).unwrap(),
+            XffMode::Off
+        );
+        assert_eq!(
+            resolve_xff_mode(&edge_with(30, "on", "off", "0.0.0.0:80")).unwrap(),
+            XffMode::On
+        );
+        let err = resolve_xff_mode(&edge_with(30, "sometimes", "off", "0.0.0.0:80")).unwrap_err();
+        assert!(
+            err.to_string().contains("x_forwarded_for"),
+            "wrong error: {err}"
+        );
     }
 
-    /// Fronted topologies derive control-listener pp `On` with loopback
-    /// trust (the nginx stream fragment emits the preamble on the control
-    /// leg); direct topologies stay off — nothing fronts the listener.
+    /// The ACME HTTP-01 listener parses from the canonical value (the
+    /// renderer pinned the port-80 default); garbage fails before any bind.
     #[test]
-    fn control_proxy_protocol_topology_defaults() {
-        for fronted in ["frontend-proxy", "manual"] {
-            let cfg = resolve_control_proxy_protocol(fronted);
-            assert_eq!(cfg.mode, ProxyProtocolMode::On, "topology {fronted}");
-            assert_eq!(cfg.trusted_proxies, vec!["127.0.0.1", "::1"]);
-        }
-        let direct = resolve_control_proxy_protocol("acme");
-        assert_eq!(direct.mode, ProxyProtocolMode::Off);
+    fn acme_http_listen_parses_or_fails_loud() {
+        assert_eq!(
+            resolve_acme_http_listen(&edge_with(30, "off", "off", "0.0.0.0:80")).unwrap(),
+            "0.0.0.0:80".parse().unwrap()
+        );
+        assert_eq!(
+            resolve_acme_http_listen(&edge_with(30, "off", "off", "127.0.0.1:8080")).unwrap(),
+            "127.0.0.1:8080".parse().unwrap()
+        );
+        let err =
+            resolve_acme_http_listen(&edge_with(30, "off", "off", "not-an-addr")).unwrap_err();
+        assert!(
+            err.to_string().contains("acme http_listen"),
+            "wrong error: {err}"
+        );
     }
 
     /// `None` keeps the QUIC face off (the h2-only status quo); a concrete
@@ -647,32 +704,34 @@ mod tests {
     }
 
     /// Transport resolution: a machine-local preference beats the pack's
-    /// signed default, no preference inherits it, h2 is the floor, and an
-    /// unexpected pack string fails loud (digest-covered node.toml — a
+    /// render-time-resolved default, no preference inherits it, h2 is the
+    /// floor (an ingress/hub pack's "" no-dial value parses as h2 too), and
+    /// an unexpected pack string fails loud (digest-covered node.toml — a
     /// version-skew tripwire, not a user-facing path).
     #[test]
     fn effective_transport_pref_over_pack_default_over_h2() {
         use interflow_mesh::config::TransportKind;
 
         assert_eq!(
-            resolve_effective_transport(Some(TransportKind::H2), Some("quic")).unwrap(),
+            resolve_effective_transport(Some(TransportKind::H2), "quic").unwrap(),
             TransportKind::H2,
             "a machine-local preference beats the pack default"
         );
         assert_eq!(
-            resolve_effective_transport(None, Some("quic")).unwrap(),
+            resolve_effective_transport(None, "quic").unwrap(),
             TransportKind::Quic,
-            "no preference inherits the pack's signed default"
+            "no preference inherits the pack's resolved default"
         );
         assert_eq!(
-            resolve_effective_transport(None, Some("h2")).unwrap(),
+            resolve_effective_transport(None, "h2").unwrap(),
             TransportKind::default()
         );
         assert_eq!(
-            resolve_effective_transport(None, None).unwrap(),
-            TransportKind::default()
+            resolve_effective_transport(None, "").unwrap(),
+            TransportKind::default(),
+            "the no-dial-face empty value parses as the h2 floor"
         );
-        let err = resolve_effective_transport(None, Some("quic3")).unwrap_err();
+        let err = resolve_effective_transport(None, "quic3").unwrap_err();
         assert!(
             err.to_string().contains("not recognized"),
             "version-skew tripwire fails loud: {err}"

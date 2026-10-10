@@ -112,6 +112,8 @@ async fn routes_select_their_own_workspace_session() {
             ingress_ca_path: Some(certs.ca_path().display().to_string()),
             transport: TransportKind::H2,
             hub_quic_addr: None,
+
+            identity_offline: false,
         };
         let client = interflow_expose::client::start(&args).expect("agent start");
         assert!(

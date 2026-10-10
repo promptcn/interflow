@@ -90,6 +90,7 @@ impl EdgeHandle {
 /// Panics if the edge exits before readiness or never becomes ready within
 /// the startup budget — the same loud contract as [`spawn_hub`].
 pub async fn spawn_edge(cfg: interflow_expose::edge::EdgeConfig) -> EdgeHandle {
+    crate::assert_nextest_runner();
     const READY_TIMEOUT: Duration = Duration::from_secs(30);
     let shutdown_token = tokio_util::sync::CancellationToken::new();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -120,6 +121,7 @@ pub async fn spawn_edge(cfg: interflow_expose::edge::EdgeConfig) -> EdgeHandle {
 /// no port probing at call sites. Panics (with the server error) if the hub
 /// never reaches readiness.
 pub async fn spawn_hub(cfg: HubConfig) -> HubHandle {
+    crate::assert_nextest_runner();
     const READY_TIMEOUT: Duration = Duration::from_secs(10);
     let hub = HubHandle::spawn(cfg).expect("hub build");
     let mut state = hub.subscribe_state();
@@ -152,6 +154,7 @@ pub async fn spawn_hub(cfg: HubConfig) -> HubHandle {
 /// Panics on an invalid config (`AgentClient::new` fails) — there is no point continuing
 /// past an assembly-time error.
 pub fn spawn_agent(cfg: AgentConfig) -> AgentHandle {
+    crate::assert_nextest_runner();
     AgentClient::new(cfg).expect("agent build").start()
 }
 
@@ -168,6 +171,7 @@ const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// agent's own registration. Panics with the final agent state on timeout —
 /// there is no recovery path for a test whose agent never registers.
 pub async fn spawn_agent_registered(cfg: AgentConfig) -> AgentHandle {
+    crate::assert_nextest_runner();
     let handle = spawn_agent(cfg);
     if !wait_agent_connected(&handle, REGISTRATION_TIMEOUT).await {
         panic!(

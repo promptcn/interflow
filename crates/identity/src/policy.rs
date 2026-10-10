@@ -20,7 +20,10 @@ use std::path::Path;
 /// Every field is required in the sealed document — the renderer always
 /// serializes the full canonical shape (empty faces as `key = []`), so a
 /// missing key means a truncated or forged document and must fail loudly.
+/// Unknown keys likewise fail loudly (`deny_unknown_fields`): a typo in a
+/// policy field must never pass verification against old semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimePolicy {
     /// Rotation generation. The pack-embedded snapshot shares the pack's
     /// generation at render time; after that the policy generation evolves
@@ -47,6 +50,7 @@ pub struct RuntimePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRoute {
     pub host: String,
     /// `<workspace>/<agent>/<service>`.
@@ -60,6 +64,7 @@ pub struct PolicyRoute {
 /// lands", never a cross-machine authorization). Compare `PolicyMeshStream`
 /// , whose `remote_addr` stays signed (an authorization pair).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyService {
     pub workspace: String,
     pub agent: String,
@@ -67,6 +72,7 @@ pub struct PolicyService {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IngressAuthorization {
     pub workspace: String,
     pub ingress: String,
@@ -78,6 +84,7 @@ pub struct IngressAuthorization {
 /// listen-side rule face: the serving agent binds `listen` under this
 /// `name` and applies `idle_timeout_secs` to the stream.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyMeshStream {
     pub source_workspace: String,
     pub source_agent: String,
@@ -100,6 +107,7 @@ pub struct PolicyMeshStream {
 /// agent derives its engine egress rules and its egress allowlist from
 /// these entries.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyMeshEgress {
     /// The serving agent's workspace.
     pub workspace: String,
@@ -217,8 +225,12 @@ impl RuntimePolicy {
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        toml::from_str(&String::from_utf8_lossy(bytes))
-            .map_err(|e| Error::policy("policy parse".to_string()).with_source(e))
+        toml::from_str(&String::from_utf8_lossy(bytes)).map_err(|e| {
+            // The strict face's rejections must name the offending key in the
+            // top-level message (not only the source chain) — an operator
+            // staring at a failed load needs the typo, not "policy parse".
+            Error::policy(format!("policy parse: {e}"))
+        })
     }
 
     /// Digest of the canonical bytes.
@@ -465,12 +477,13 @@ address = "127.0.0.1:3000"
         assert!(!text.contains("address"), "policy must not sign addresses");
     }
 
-    /// Packs rendered before the address demotion carry `address` keys in
-    /// their signed policy.toml. Those bytes still parse (serde ignores the
-    /// retired key; the signature verifies over the raw bytes) and the node
-    /// falls back to the node.toml default — no FORMAT_VERSION bump.
+    /// The signed policy face is strict (`deny_unknown_fields`, since
+    /// 2026-10-10): packs rendered before the address demotion carry
+    /// `address` keys in their signed policy.toml — those bytes are
+    /// rejected here, and the nodes must re-render (FORMAT_VERSION stays
+    /// put: the epoch is redefined in place, the realm re-renders packs).
     #[test]
-    fn retired_address_key_still_loads() {
+    fn retired_address_key_is_rejected() {
         let old_shape = r#"
 generation = 1
 routes = []
@@ -478,8 +491,25 @@ services = [{ workspace = "a", agent = "lan-a", id = "web", address = "127.0.0.1
 ingress_authorizations = []
 mesh = []
 "#;
-        let policy = RuntimePolicy::parse(old_shape.as_bytes()).unwrap();
-        assert_eq!(policy.services.len(), 1);
-        assert_eq!(policy.services[0].id, "web");
+        let err = RuntimePolicy::parse(old_shape.as_bytes()).unwrap_err();
+        assert!(
+            err.to_string().contains("address"),
+            "the retired key must be named in the rejection: {err}"
+        );
+    }
+
+    /// A typo'd top-level key fails loudly instead of signing past it.
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        let shape = r#"
+generation = 1
+routes = []
+services = []
+ingress_authorizations = []
+mesh = []
+mesh_egress = []
+routez = []
+"#;
+        assert!(RuntimePolicy::parse(shape.as_bytes()).is_err());
     }
 }

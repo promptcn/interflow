@@ -24,9 +24,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_core::fault::FaultPoint;
 use interflow_expose::edge::{wait_initial_registration, watch_agent_health};

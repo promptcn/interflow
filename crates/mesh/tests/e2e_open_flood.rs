@@ -35,14 +35,12 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_core::protocol::{FrameType, StreamProto};
 use interflow_core::tls::{InnerTlsMaterial, inner_client_config};
 use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
-use interflow_core::tunnel::{AgentTunnel, TargetSelector, TunnelData};
+use interflow_core::tunnel::{AgentTunnel, TargetSelector};
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, hub_config_tuned, metrics_harness::counter_value,
@@ -651,29 +649,4 @@ async fn f6_no_slot_leak_after_flood() {
         assert_eq!(&got, b"leak?", "corrupted echo on stream {sid}");
         inj.send_close(sid).await.expect("close");
     }
-}
-
-/// Receive exactly `n` bytes on an already-registered channel; panics on Close
-/// (printing the reason).
-async fn recv_exact_from(
-    rx: &mut tokio::sync::mpsc::Receiver<TunnelData>,
-    sid: interflow_core::protocol::StreamId,
-    n: usize,
-    deadline: Duration,
-) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + deadline;
-    let mut got = Vec::with_capacity(n);
-    while got.len() < n {
-        let td = tokio::time::timeout_at(deadline, rx.recv())
-            .await
-            .expect("reply timed out")
-            .expect("channel alive");
-        assert!(
-            !matches!(td.stream_type, FrameType::Close),
-            "stream {sid} closed prematurely: {:?}",
-            String::from_utf8_lossy(&td.data)
-        );
-        got.extend_from_slice(&td.data);
-    }
-    got
 }

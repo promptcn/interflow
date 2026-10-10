@@ -38,21 +38,25 @@ use crate::protocol::{
     CircuitToken, CloseReason, FrameOrigin, FrameType, RouteToken, StreamId, StreamProto,
 };
 use crate::tunnel::negotiation::{
-    RegisterResponse, decode_error_payload, decode_route_ack_payload, encode_hello_payload,
+    HeartbeatAd, RegisterResponse, decode_error_payload, decode_policy_pull_response,
+    decode_route_ack_payload, encode_hello_payload, encode_policy_pull_request,
     encode_route_request_payload,
 };
-use crate::tunnel::transport::{TunnelData, TunnelDispatch, TunnelTransport};
+use crate::tunnel::transport::{
+    PolicyPull, SteadyStateLiveness, TunnelData, TunnelDispatch, TunnelTransport, unix_millis_now,
+};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::tunnel::session_tasks::{Beat, SessionTasks, beat_interval};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// The QUIC ALPN protocol identifier (cf. frp's `"frp"`).
 pub const QUIC_ALPN: &str = "interflow";
@@ -130,17 +134,61 @@ const STATS_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 /// Per-stream write-command channel capacity (backpressure threshold).
 const WRITE_CHANNEL_CAP: usize = 64;
 
+/// Floor for the QUIC steady-state silence budget
+/// ([`QuicTunnel::steady_state_liveness`]). Even with heartbeat disabled
+/// the in-connection policy pull (10s cadence) keeps a downlink alive, so
+/// 90s ≈ 9 missed pulls is unambiguously fatal; with heartbeat the budget
+/// rides the cadence instead (`interval × 6`, see
+/// [`steady_state_silence_budget`]). Always strictly above the in-tree
+/// stall/death lines (75s at the default cadence) so a living task tree
+/// reacts first and the out-of-tree probe stays a pure backstop.
+///
+/// The 2026-10-09 one-way-blackhole case added the supervisor's demanding
+/// tier (answer-required roundtrips on a fixed monotonic cadence), so this
+/// cadence-derived budget no longer carries the detection burden alone —
+/// a deployment that raises the heartbeat interval inflates only the
+/// passive tier's window, never the demanding tier's.
+const MIN_STEADY_STATE_SILENCE_BUDGET: Duration = Duration::from_secs(90);
+
+/// The QUIC backend's steady-state silence budget: with heartbeat,
+/// `interval × 6`; without, the floor (the policy-pull cadence is the
+/// surviving downlink guarantee). Public to the crate for unit tests.
+pub(crate) fn steady_state_silence_budget(heartbeat: Option<&HeartbeatAd>) -> Duration {
+    heartbeat
+        .map_or(Duration::ZERO, |ad| {
+            Duration::from_secs(ad.interval_secs.saturating_mul(6))
+        })
+        .max(MIN_STEADY_STATE_SILENCE_BUDGET)
+}
+
 /// Capability bit in the Hello/HelloAck caps word: the QUIC DATAGRAM
 /// (RFC 9221) fast path (shared table: `interflow_contract::caps`).
 pub const CAP_DATAGRAM: u32 = interflow_contract::caps::DATAGRAM;
 
-/// Budget for a whole frame carried in a DATAGRAM.
+/// The QUIC guaranteed minimum datagram/packet budget (RFC 9000 initial
+/// packet size — endpoints must be able to process 1200-byte packets
+/// throughout the connection).
+const QUIC_MIN_PACKET_BUDGET: usize = 1200;
+/// Worst-case QUIC packet overhead around a DATAGRAM frame's payload:
+/// short-header flags(1) + DCID(20, max connection-id length) + packet
+/// number(4) + AEAD tag(16) + DATAGRAM frame type varint(1) + length
+/// varint(2) = 44; rounded to 64 to absorb future header expansion. A
+/// datagram larger than `1200 − overhead` exceeds the initial MTU and is
+/// dropped by the network rather than fragmented — the budget keeps the
+/// fast path's whole frame inside one initial-MTU packet.
+const QUIC_PACKET_OVERHEAD_ALLOWANCE: usize = 64;
+
+/// Budget for a whole frame carried in a DATAGRAM:
+/// `1200 − 41 (frame header) − 64 (packet overhead allowance)` = 1095.
 ///
-/// QUIC initial MTU 1200 − the fixed 41-byte frame header leaves ample
-/// margin under the 1200-byte datagram ceiling. Datagrams over budget fall
-/// back to stream carriage (reliable and ordered; under mixed carriage, UDP
-/// semantics allow out-of-order arrival).
-pub const DATAGRAM_FRAME_BUDGET: usize = 1023;
+/// (The pre-2026-10-10 value 1023 was a fossil of the old 177-byte
+/// worst-case frame header era — carried over unchanged when the header
+/// shrank to 41 bytes, silently forfeiting ~72 bytes per datagram.)
+/// Datagrams over budget fall back to stream carriage (reliable and
+/// ordered; under mixed carriage, UDP semantics allow out-of-order
+/// arrival).
+pub const DATAGRAM_FRAME_BUDGET: usize =
+    QUIC_MIN_PACKET_BUDGET - wire::FRAME_HEADER_LEN - QUIC_PACKET_OVERHEAD_ALLOWANCE;
 
 /// Write command: an ordinary frame, or a Close frame (FIN closes out after the write).
 enum WriteCmd {
@@ -180,6 +228,12 @@ pub struct QuicTunnel {
     stall_timeout: Duration,
     /// Semantic target → opaque route token, valid for this QUIC session only.
     routes: StdMutex<HashMap<String, RouteToken>>,
+    /// Unix millis of the last inbound byte on any receive path (control
+    /// frames, stream data, datagrams, in-connection request/response
+    /// exchanges). Task-independent shared state — the out-of-tree silence
+    /// probe reads it without any session task being alive
+    /// ([`SteadyStateLiveness`]).
+    last_rx: Arc<AtomicU64>,
 }
 
 /// Encodes a frame as `Bytes`.
@@ -231,6 +285,7 @@ async fn control_read_loop(
     mut rx: quinn::RecvStream,
     tx: mpsc::Sender<WriteCmd>,
     circuit: CircuitToken,
+    last_rx: Arc<AtomicU64>,
     beat: Beat,
     beat_every: Duration,
 ) {
@@ -242,6 +297,7 @@ async fn control_read_loop(
             Ok(Some(n)) => n,
             Ok(None) | Err(_) => break,
         };
+        last_rx.store(unix_millis_now(), Ordering::Relaxed);
         buf.extend_from_slice(&chunk[..n]);
         while let Some(frame) = TunnelDispatch::decode_tunnel_data(&mut buf) {
             if matches!(frame.stream_type, FrameType::Ping) {
@@ -270,6 +326,7 @@ async fn accept_loop(
     dispatch: Arc<TunnelDispatch>,
     streams: Arc<StdMutex<HashMap<StreamId, StreamHandle>>>,
     datagram_streams: Arc<StdMutex<std::collections::HashSet<StreamId>>>,
+    last_rx: Arc<AtomicU64>,
     shutdown: CancellationToken,
     beat: Beat,
     beat_every: Duration,
@@ -286,9 +343,11 @@ async fn accept_loop(
                 Err(_) => break, // connection closed
             },
         };
+        last_rx.store(unix_millis_now(), Ordering::Relaxed);
         let dispatch = dispatch.clone();
         let streams = streams.clone();
         let datagram_streams = datagram_streams.clone();
+        let stream_last_rx = last_rx.clone();
         let token = shutdown.clone();
         tokio::spawn(async move {
             // Read the first frame (Open) to obtain the stream_id, then
@@ -332,7 +391,7 @@ async fn accept_loop(
             // read loop exits in place (not left hanging on a blocking read)
             tokio::select! {
                 () = token.cancelled() => {}
-                () = stream_read_loop(rx, buf, dispatch, Some(datagram_streams)) => {}
+                () = stream_read_loop(rx, buf, dispatch, Some(datagram_streams), stream_last_rx) => {}
             }
         });
     }
@@ -349,6 +408,7 @@ async fn stream_read_loop(
     mut buf: BytesMut,
     dispatch: Arc<TunnelDispatch>,
     datagram_streams: Option<Arc<StdMutex<std::collections::HashSet<StreamId>>>>,
+    last_rx: Arc<AtomicU64>,
 ) {
     let mut chunk = vec![0u8; 16 * 1024];
     // Intercept OpenAck (the hub confirming this stream may take the DATAGRAM fast path); other frames dispatch as usual
@@ -375,6 +435,7 @@ async fn stream_read_loop(
             Ok(Some(n)) => n,
             Ok(None) | Err(_) => break,
         };
+        last_rx.store(unix_millis_now(), Ordering::Relaxed);
         buf.extend_from_slice(&chunk[..n]);
         for td in process(&mut buf) {
             dispatch.dispatch(td).await;
@@ -386,6 +447,7 @@ async fn stream_read_loop(
 async fn datagram_read_loop(
     conn: quinn::Connection,
     dispatch: Arc<TunnelDispatch>,
+    last_rx: Arc<AtomicU64>,
     beat: Beat,
     beat_every: Duration,
 ) {
@@ -395,6 +457,7 @@ async fn datagram_read_loop(
             Ok(d) => d,
             Err(_) => break, // connection closed
         };
+        last_rx.store(unix_millis_now(), Ordering::Relaxed);
         let mut buf = BytesMut::from(&datagram[..]);
         while let Some(td) = TunnelDispatch::decode_tunnel_data(&mut buf) {
             if matches!(td.stream_type, FrameType::Ping) {
@@ -454,6 +517,7 @@ impl QuicTunnel {
                         "QUIC route stream closed before RouteAck",
                     ));
                 }
+                self.last_rx.store(unix_millis_now(), Ordering::Relaxed);
                 buf.extend_from_slice(&chunk[..n]);
                 match wire::decode_frame(&mut buf) {
                     wire::DecodeOutcome::Ok(frame) => return Ok(frame),
@@ -560,7 +624,10 @@ impl QuicTunnel {
             0,
             StreamId::ZERO,
             CircuitToken::ZERO,
-            &encode_hello_payload(hello_caps, &agent_id)?,
+            // The build tag rides the registration intent: the hub keeps a
+            // fleet view of which binary each node runs (a stale node is a
+            // one-line journal answer, not per-host forensics).
+            &encode_hello_payload(hello_caps, &agent_id, Some(interflow_buildinfo::BUILD_TAG))?,
         )?;
         control_tx.write_all(&hello).await.map_err(|e| {
             InterflowError::connection("QUIC Hello write failed".to_string()).with_source(e)
@@ -638,10 +705,27 @@ impl QuicTunnel {
             .unwrap_or_else(|| declaration.task_stall_timeout());
         let beat_every = beat_interval(task_stall_timeout);
 
+        // Effective-parameter forensics (the 2026-10-09 case file §4's ask):
+        // pin what this endpoint actually armed at connect time. QUIC
+        // negotiates the idle timeout as the *minimum* of both endpoints'
+        // advertised values, so incident timelines get reconciled against
+        // logged facts instead of guesses about the deployed configs.
+        info!(
+            idle_timeout_ms = params.transport.max_idle_timeout_ms,
+            keepalive_interval_ms = u64::try_from(params.transport.keepalive_interval.as_millis())
+                .unwrap_or(u64::MAX),
+            heartbeat_interval_secs =
+                ?declaration.heartbeat.as_ref().map(|ad| ad.interval_secs),
+            "QUIC session established (effective transport parameters)"
+        );
+
         // Pong write path: the control-stream forwarding task takes over
         // AFTER establishment. Critical under the death contract: its death
         // takes the Pong path (and every outbound control frame) with it.
         let (wtx, wrx) = mpsc::channel(WRITE_CHANNEL_CAP);
+        // Out-of-tree receive-liveness ledger: registration just completed,
+        // so "now" is the honest initial freshness (see SteadyStateLiveness).
+        let last_rx = Arc::new(AtomicU64::new(unix_millis_now()));
         tasks.spawn_critical(
             "quic-control-write",
             Some(task_stall_timeout),
@@ -665,6 +749,7 @@ impl QuicTunnel {
         // healthy.
         {
             let shutdown_control = shutdown.clone();
+            let control_last_rx = last_rx.clone();
             tasks.spawn_critical(
                 "quic-control-read",
                 Some(task_stall_timeout),
@@ -674,7 +759,7 @@ impl QuicTunnel {
                     crate::fault::trigger(crate::fault::FaultPoint::QuicControlReadLoop);
                     tokio::select! {
                         () = shutdown_control.cancelled() => {}
-                        () = control_read_loop(control_rx, pong_tx, declaration.circuit_token, beat, beat_every) => {}
+                        () = control_read_loop(control_rx, pong_tx, declaration.circuit_token, control_last_rx, beat, beat_every) => {}
                     }
                 },
             );
@@ -688,6 +773,7 @@ impl QuicTunnel {
             let accept_dispatch = dispatch.clone();
             let accept_streams = streams.clone();
             let accept_datagrams = datagram_streams.clone();
+            let accept_last_rx = last_rx.clone();
             let accept_shutdown = shutdown.clone();
             tasks.spawn_critical("quic-accept", Some(task_stall_timeout), move |beat| {
                 accept_loop(
@@ -695,6 +781,7 @@ impl QuicTunnel {
                     accept_dispatch,
                     accept_streams,
                     accept_datagrams,
+                    accept_last_rx,
                     accept_shutdown,
                     beat,
                     beat_every,
@@ -707,6 +794,7 @@ impl QuicTunnel {
         if datagram_ok {
             let conn2 = conn.clone();
             let dispatch2 = dispatch.clone();
+            let datagram_last_rx = last_rx.clone();
             let shutdown2 = shutdown.clone();
             tasks.spawn_critical(
                 "quic-datagram",
@@ -714,7 +802,7 @@ impl QuicTunnel {
                 move |beat| async move {
                     tokio::select! {
                         () = shutdown2.cancelled() => {}
-                        () = datagram_read_loop(conn2, dispatch2, beat, beat_every) => {}
+                        () = datagram_read_loop(conn2, dispatch2, datagram_last_rx, beat, beat_every) => {}
                     }
                 },
             );
@@ -760,6 +848,7 @@ impl QuicTunnel {
             datagram_streams,
             stall_timeout: task_stall_timeout,
             routes: StdMutex::new(HashMap::new()),
+            last_rx,
         })
     }
 
@@ -882,10 +971,11 @@ impl TunnelTransport for QuicTunnel {
             None
         };
         let token = self.token.clone();
+        let open_last_rx = self.last_rx.clone();
         tokio::spawn(async move {
             tokio::select! {
                 () = token.cancelled() => {}
-                () = stream_read_loop(rx, BytesMut::new(), dispatch, datagram_set) => {}
+                () = stream_read_loop(rx, BytesMut::new(), dispatch, datagram_set, open_last_rx) => {}
             }
         });
 
@@ -982,9 +1072,188 @@ impl TunnelTransport for QuicTunnel {
             );
         }
     }
+
+    /// The QUIC face of the policy watcher's conditional pull: one
+    /// short-lived bi-stream per request (the same carriage as the route
+    /// lease — `resolve_route`), correlation id in the frame's `stream_id`,
+    /// the answer frame on the same stream. The requester is the connection's
+    /// registered agent, so the frame carries no circuit. A mid-rebuild
+    /// session surfaces as the usual connection error; the watcher retries
+    /// next tick. A hub that cannot serve the request answers with an Error
+    /// frame on the same stream (fail-closed, never a silent drop-to-timeout).
+    async fn pull_policy(&self, seen: u64) -> Result<PolicyPull> {
+        let response = self
+            .control_roundtrip(
+                FrameType::PolicyPullRequest,
+                FrameType::PolicyPullResponse,
+                &encode_policy_pull_request(seen),
+            )
+            .await?;
+        decode_policy_pull_response(&response.payload)
+    }
+
+    /// The QUIC face of the peer-observability read (`GET /agents`): one
+    /// short-lived bi-stream per request, empty request payload, the answer
+    /// frame on the same stream. The payload is the same JSON array the h2
+    /// face serves, decoded into the transport-uniform
+    /// [`PeerInfo`](crate::tunnel::transport::PeerInfo) shape. Same
+    /// soft-fail contract as [`Self::pull_policy`].
+    async fn list_agents(&self) -> Result<Vec<crate::tunnel::transport::PeerInfo>> {
+        let response = self
+            .control_roundtrip(FrameType::PeerListRequest, FrameType::PeerListResponse, &[])
+            .await?;
+        serde_json::from_slice(&response.payload).map_err(|e| {
+            InterflowError::protocol("QUIC peer list payload is not the peer shape".to_string())
+                .with_source(e)
+        })
+    }
+
+    /// The QUIC face of the proposal submission (kube-CSR shape): same
+    /// short-bi-stream carriage, JSON payload in / answer out.
+    async fn submit_stream_proposal(
+        &self,
+        request: &crate::tunnel::transport::StreamProposalRequest,
+    ) -> Result<crate::tunnel::transport::ProposalSubmitOutcome> {
+        let payload = serde_json::to_vec(request).map_err(|e| {
+            InterflowError::protocol("QUIC proposal request encode failed".to_string())
+                .with_source(e)
+        })?;
+        let response = self
+            .control_roundtrip(
+                FrameType::ProposalSubmitRequest,
+                FrameType::ProposalSubmitResponse,
+                &payload,
+            )
+            .await?;
+        serde_json::from_slice(&response.payload).map_err(|e| {
+            InterflowError::protocol("QUIC proposal answer is not the outcome shape".to_string())
+                .with_source(e)
+        })
+    }
+
+    /// The QUIC face of the receipts query: this node's own proposals.
+    async fn my_proposals(&self) -> Result<Vec<crate::tunnel::transport::ProposalReceipt>> {
+        let response = self
+            .control_roundtrip(
+                FrameType::ProposalMineRequest,
+                FrameType::ProposalMineResponse,
+                &[],
+            )
+            .await?;
+        serde_json::from_slice(&response.payload).map_err(|e| {
+            InterflowError::protocol("QUIC proposal receipts payload is malformed".to_string())
+                .with_source(e)
+        })
+    }
+
+    /// The QUIC face of the demanding liveness roundtrip: a
+    /// [`FrameType::LivenessPing`] on the shared control-roundtrip
+    /// carriage, a [`FrameType::LivenessPong`] on the same stream. The
+    /// control-stream heartbeat Ping does not apply here — that form is
+    /// contract-pinned to zero stream_id + HUB_ORIGIN (hub-authored); the
+    /// roundtrip form carries the correlation id in the frame's
+    /// `stream_id` exactly like every other request on this carriage, and
+    /// [`Self::control_roundtrip`] validates the echo.
+    async fn liveness_roundtrip(&self) -> Result<()> {
+        self.control_roundtrip(FrameType::LivenessPing, FrameType::LivenessPong, &[])
+            .await
+            .map(|_| ())
+    }
+
+    fn steady_state_liveness(&self) -> Option<SteadyStateLiveness> {
+        Some(SteadyStateLiveness {
+            last_rx_unix_millis: self.last_rx.load(Ordering::Relaxed),
+            silence_budget: steady_state_silence_budget(self.negotiated.heartbeat.as_ref()),
+        })
+    }
 }
 
 impl QuicTunnel {
+    /// One control-plane request/response round trip on a fresh
+    /// short-lived bi-stream: send `request_type` with `payload`
+    /// (correlation id in the frame's `stream_id`, zero circuit — the
+    /// requester is always the connection's registered agent), await
+    /// `expected_type` on the same stream. The shared carriage of the
+    /// policy pull, the peer list, and the stream-proposal ops. The hub
+    /// answers every request — an unsupported or malformed request is
+    /// answered with an Error frame on the same stream, decoded here into
+    /// an immediate failure (paired-build doctrine: no silent
+    /// drop-to-timeout); a mid-rebuild session surfaces as the usual
+    /// connection error. The 10s bound below is a defensive deadline, not
+    /// a tolerated failure mode.
+    async fn control_roundtrip(
+        &self,
+        request_type: FrameType,
+        expected_type: FrameType,
+        payload: &[u8],
+    ) -> Result<crate::protocol::frame::DecodedFrame> {
+        let request_id = crate::protocol::StreamId::random()?;
+        let (mut tx, mut rx) = self.conn.open_bi().await.map_err(|e| {
+            InterflowError::connection("QUIC control stream open failed".to_string()).with_source(e)
+        })?;
+        let request = encode_frame_bytes(request_type, 0, request_id, CircuitToken::ZERO, payload)?;
+        tx.write_all(&request).await.map_err(|e| {
+            InterflowError::connection("QUIC control request write failed".to_string())
+                .with_source(e)
+        })?;
+        let _ = tx.finish();
+
+        let response = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut buf = BytesMut::with_capacity(64);
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = rx
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|e| {
+                        InterflowError::connection("QUIC control response read failed".to_string())
+                            .with_source(e)
+                    })?
+                    .unwrap_or(0);
+                if n == 0 {
+                    return Err(InterflowError::connection(
+                        "QUIC control stream closed before the response frame",
+                    ));
+                }
+                self.last_rx.store(unix_millis_now(), Ordering::Relaxed);
+                buf.extend_from_slice(&chunk[..n]);
+                match wire::decode_frame(&mut buf) {
+                    wire::DecodeOutcome::Ok(frame) => {
+                        // The hub's explicit refusal: decode the code + text
+                        // and fail immediately — never a generic mismatch
+                        // error, never a silent drop-to-timeout.
+                        if frame.frame_type == FrameType::Error {
+                            let text =
+                                crate::tunnel::negotiation::decode_error_payload(&frame.payload)
+                                    .map_or_else(
+                                        |_| "hub rejected the request".to_string(),
+                                        |(code, text)| {
+                                            format!(
+                                                "hub rejected the request (code {code}): {text}"
+                                            )
+                                        },
+                                    );
+                            return Err(InterflowError::protocol(text));
+                        }
+                        return Ok(frame);
+                    }
+                    wire::DecodeOutcome::Error => {
+                        return Err(InterflowError::protocol(
+                            "invalid QUIC control response frame",
+                        ));
+                    }
+                    wire::DecodeOutcome::Pending | wire::DecodeOutcome::UnknownType { .. } => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| InterflowError::connection("QUIC control roundtrip timed out"))??;
+        if response.frame_type != expected_type || response.stream_id != request_id {
+            return Err(InterflowError::protocol("unexpected QUIC control response"));
+        }
+        Ok(response)
+    }
+
     /// Data send: streams within budget that have received OpenAck take the
     /// DATAGRAM fast path (unreliable and unordered — zero translation of
     /// UDP semantics; packet loss does not HOL the whole connection);
@@ -1053,7 +1322,7 @@ mod tests {
             0,
             StreamId::ZERO,
             CircuitToken::ZERO,
-            &encode_hello_payload(CAP_DATAGRAM, "edge-1").unwrap(),
+            &encode_hello_payload(CAP_DATAGRAM, "edge-1", None).unwrap(),
         )
         .unwrap();
         let mut rx = BytesMut::from(&hello[..]);
@@ -1078,5 +1347,48 @@ mod tests {
             interval_secs: 1,
             max_missed: 0,
         };
+    }
+
+    /// The steady-state silence budget contract: heartbeat-enabled hubs ride
+    /// `interval × 6`; heartbeat-disabled hubs (and any cadence whose product
+    /// lands below the floor) fall back to the 90s floor — the 10s
+    /// in-connection policy pull is the surviving downlink guarantee. The
+    /// budget must always stay strictly above the default-cadence in-tree
+    /// stall/death line (75s) so a living tree reacts first.
+    #[test]
+    fn steady_state_silence_budget_rides_the_cadence_with_a_floor() {
+        use crate::tunnel::negotiation::HeartbeatAd;
+        let disabled = steady_state_silence_budget(None);
+        assert_eq!(disabled, MIN_STEADY_STATE_SILENCE_BUDGET);
+
+        let fast = HeartbeatAd {
+            interval_secs: 1,
+            max_missed: 0,
+        };
+        assert_eq!(
+            steady_state_silence_budget(Some(&fast)),
+            MIN_STEADY_STATE_SILENCE_BUDGET,
+            "a fast cadence's product must not undercut the floor"
+        );
+
+        let production = HeartbeatAd {
+            interval_secs: 15,
+            max_missed: 4,
+        };
+        let budget = steady_state_silence_budget(Some(&production));
+        assert_eq!(budget, Duration::from_secs(90));
+        assert!(
+            budget > Duration::from_secs(15 * (4 + 1)),
+            "the out-of-tree budget must strictly exceed the in-tree stall line"
+        );
+
+        let slow = HeartbeatAd {
+            interval_secs: 60,
+            max_missed: 4,
+        };
+        assert_eq!(
+            steady_state_silence_budget(Some(&slow)),
+            Duration::from_secs(360)
+        );
     }
 }

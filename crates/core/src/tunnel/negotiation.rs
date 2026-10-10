@@ -16,7 +16,17 @@
 //! their fixed-layout binary payloads in the frame layer: hot path, fixed
 //! trivial shapes (a 16-byte token, a single byte, or nothing) with no
 //! evolution surface. Hand-written codecs remain exactly there and nowhere
-//! else.
+//! else — with one control-plane exception below.
+//!
+//! The policy pull exchange (PolicyPullRequest / PolicyPullResponse) is a
+//! control-plane concept that deliberately does **not** go through JSON: its
+//! response is opaque bulk signed bytes (a TOML bundle up to 256 KiB + an
+//! ed25519 signature), a fixed trivial shape with no evolution surface of its
+//! own (evolution lives inside the signed TOML). Base64ing the body through
+//! JSON would inflate it ~37% for zero schema benefit, so the exchange rides
+//! a fixed layout codec in this module (see `policy pull` section) — the same
+//! "fixed trivial shape ⇒ fixed layout" doctrine as the frame layer, applied
+//! one level up because it is a control-plane concept.
 //!
 //! History: the wire-format redesign removed the `[caps u8][JSON]` in-frame
 //! hybrid but left the QUIC face with a second, hand-written binary codec
@@ -42,7 +52,8 @@
 use crate::config::params::liveness::{HeartbeatCadence, TASK_STALL_FALLBACK_SECS};
 use crate::error::{InterflowError, Result};
 use crate::protocol::{CircuitToken, RouteToken};
-use bytes::Bytes;
+use crate::tunnel::transport::{PolicyFetch, PolicyPull};
+use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -85,6 +96,11 @@ pub struct RouteResponse {
 /// wire input, so the id length is bounded before allocation (DoS surface).
 const HELLO_AGENT_ID_MAX: usize = 128;
 
+/// The upper bound on a Hello build tag (`<commit-date>_<git-short-hash>[-dirty]`
+/// is 21–28 chars; the bound leaves room for the scheme to grow without
+/// leaving the hub's allocation surface open).
+pub const HELLO_BUILD_MAX: usize = 64;
+
 /// The upper bound on a RouteRequest target — same allocation-bounding
 /// rationale, mirroring the h2 face's request-body cap.
 const ROUTE_TARGET_MAX: usize = 256;
@@ -102,11 +118,16 @@ struct HelloAckWire {
 }
 
 /// The Hello payload (agent→hub registration intent): the transport caps
-/// word plus the intended semantic id.
+/// word, the intended semantic id, and (new agents) the running build tag —
+/// the hub's fleet view of which binary each node runs. The field is
+/// optional on the wire: an absent value is an older (or non-product)
+/// agent and records as unknown, never a protocol violation.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct HelloWire {
     caps: u32,
     agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build: Option<String>,
 }
 
 /// The RouteRequest payload: the target agent's semantic id. The h2 face
@@ -214,35 +235,49 @@ impl RouteResponse {
 ///
 /// `agent_id` is the agent's intended semantic id (validated by the hub
 /// against the mTLS client-certificate CN — the intent declaration, not a
-/// credential); the frame carries no credential material.
-pub fn encode_hello_payload(caps: u32, agent_id: &str) -> Result<Bytes> {
+/// credential); `build` is the running binary's build tag (the hub-side
+/// fleet view — which binary each node runs, checkable from one place
+/// instead of per-node log forensics). The frame carries no credential
+/// material.
+pub fn encode_hello_payload(caps: u32, agent_id: &str, build: Option<&str>) -> Result<Bytes> {
     if agent_id.is_empty() {
         return Err(InterflowError::protocol("agent id is empty"));
     }
     if agent_id.len() > HELLO_AGENT_ID_MAX {
         return Err(InterflowError::protocol("agent id too long for Hello"));
     }
+    if let Some(build) = build
+        && build.len() > HELLO_BUILD_MAX
+    {
+        return Err(InterflowError::protocol("build tag too long for Hello"));
+    }
     let wire = HelloWire {
         caps,
         agent_id: agent_id.to_owned(),
+        build: build.filter(|b| !b.is_empty()).map(str::to_owned),
     };
     serde_json::to_vec(&wire)
         .map(Bytes::from)
         .map_err(|e| InterflowError::protocol("Hello payload failed to encode").with_source(e))
 }
 
-/// Decodes a QUIC Hello payload, returning `(caps, agent_id)`.
+/// Decodes a QUIC Hello payload, returning `(caps, agent_id, build)`.
 ///
 /// A malformed payload — or an empty / over-long id — is a protocol
 /// violation (paired deployment; the length bound is the hub's allocation
-/// guard).
-pub fn decode_hello_payload(payload: &[u8]) -> Result<(u32, String)> {
+/// guard). An absent or over-long `build` records as `None` (unknown): it
+/// is observability metadata, never a registration input an old hub could
+/// choke on.
+pub fn decode_hello_payload(payload: &[u8]) -> Result<(u32, String, Option<String>)> {
     let invalid = || InterflowError::protocol("Hello payload is malformed");
     let wire: HelloWire = serde_json::from_slice(payload).map_err(|_| invalid())?;
     if wire.agent_id.is_empty() || wire.agent_id.len() > HELLO_AGENT_ID_MAX {
         return Err(invalid());
     }
-    Ok((wire.caps, wire.agent_id))
+    let build = wire
+        .build
+        .filter(|b| !b.is_empty() && b.len() <= HELLO_BUILD_MAX);
+    Ok((wire.caps, wire.agent_id, build))
 }
 
 /// Encodes the QUIC RouteRequest payload (one JSON object).
@@ -310,6 +345,118 @@ pub fn decode_error_payload(payload: &[u8]) -> Result<(u16, String)> {
     let wire: ErrorWire = serde_json::from_slice(payload)
         .map_err(|_| InterflowError::protocol("Error payload is malformed"))?;
     Ok((wire.code, wire.text))
+}
+
+// ---------------------------------------------------------------------------
+// Policy pull exchange (QUIC frame payloads, fixed layout)
+// ---------------------------------------------------------------------------
+
+/// PolicyPullResponse outcome byte: an update bundle follows
+/// (`[sig_len u16][signature][body]`).
+const POLICY_PULL_UPDATE: u8 = 0;
+/// PolicyPullResponse outcome byte: nothing newer than the caller's
+/// watermark; the generation field names the hub's serving generation.
+const POLICY_PULL_UNCHANGED: u8 = 1;
+/// PolicyPullResponse outcome byte: the hub carries no policy
+/// distribution face — no generation field, exactly one byte total.
+const POLICY_PULL_NO_FACE: u8 = 2;
+
+/// Encodes the QUIC PolicyPullRequest payload: `[seen u64 BE]` — the
+/// generation the caller already holds. Fixed 8 bytes, infallible.
+pub fn encode_policy_pull_request(seen: u64) -> Bytes {
+    let mut out = BytesMut::with_capacity(8);
+    out.put_u64(seen);
+    out.freeze()
+}
+
+/// Decodes a QUIC PolicyPullRequest payload. Anything but exactly 8 bytes is
+/// a protocol violation (paired deployment, no fallback shapes).
+pub fn decode_policy_pull_request(payload: &[u8]) -> Result<u64> {
+    if payload.len() != 8 {
+        return Err(InterflowError::protocol(
+            "PolicyPullRequest payload is malformed",
+        ));
+    }
+    let mut be = [0u8; 8];
+    be.copy_from_slice(payload);
+    Ok(u64::from_be_bytes(be))
+}
+
+/// Encodes the QUIC PolicyPullResponse payload.
+///
+/// `[outcome u8][generation u64 BE]` for the unchanged outcome, plus
+/// `[sig_len u16 BE][signature][body]` for an update (see the module docs
+/// for why this exchange is fixed layout rather than JSON).
+pub fn encode_policy_pull_response(pull: &PolicyPull) -> Result<Bytes> {
+    let invalid = || InterflowError::protocol("PolicyPullResponse failed to encode");
+    match pull {
+        PolicyPull::UpToDate { hub_generation } => {
+            let mut out = BytesMut::with_capacity(9);
+            out.put_u8(POLICY_PULL_UNCHANGED);
+            out.put_u64(*hub_generation);
+            Ok(out.freeze())
+        }
+        PolicyPull::Update(fetch) => {
+            let sig_len = u16::try_from(fetch.signature.len()).map_err(|_| invalid())?;
+            let mut out = BytesMut::with_capacity(11 + fetch.signature.len() + fetch.body.len());
+            out.put_u8(POLICY_PULL_UPDATE);
+            out.put_u64(fetch.generation);
+            out.put_u16(sig_len);
+            out.put_slice(&fetch.signature);
+            out.put_slice(&fetch.body);
+            Ok(out.freeze())
+        }
+        PolicyPull::NoPolicyFace => {
+            let mut out = BytesMut::with_capacity(1);
+            out.put_u8(POLICY_PULL_NO_FACE);
+            Ok(out.freeze())
+        }
+    }
+}
+
+/// Decodes a QUIC PolicyPullResponse payload.
+///
+/// Structural violations (short payload, unknown outcome byte, signature
+/// length overrun, trailing bytes on the unchanged outcome) are protocol
+/// violations — paired deployment means there is no fallback shape to try.
+pub fn decode_policy_pull_response(payload: &[u8]) -> Result<PolicyPull> {
+    let invalid = || InterflowError::protocol("PolicyPullResponse payload is malformed");
+    if payload.len() == 1 && payload[0] == POLICY_PULL_NO_FACE {
+        return Ok(PolicyPull::NoPolicyFace);
+    }
+    if payload.len() < 9 {
+        return Err(invalid());
+    }
+    let outcome = payload[0];
+    let mut gen_be = [0u8; 8];
+    gen_be.copy_from_slice(&payload[1..9]);
+    let generation = u64::from_be_bytes(gen_be);
+    match outcome {
+        POLICY_PULL_UNCHANGED => {
+            if payload.len() != 9 {
+                return Err(invalid());
+            }
+            Ok(PolicyPull::UpToDate {
+                hub_generation: generation,
+            })
+        }
+        POLICY_PULL_UPDATE => {
+            if payload.len() < 11 {
+                return Err(invalid());
+            }
+            let sig_len = usize::from(u16::from_be_bytes([payload[9], payload[10]]));
+            let rest = &payload[11..];
+            if sig_len == 0 || rest.len() < sig_len {
+                return Err(invalid());
+            }
+            Ok(PolicyPull::Update(PolicyFetch {
+                body: Bytes::copy_from_slice(&rest[sig_len..]),
+                signature: rest[..sig_len].to_vec(),
+                generation,
+            }))
+        }
+        _ => Err(invalid()),
+    }
 }
 
 /// The advertised hub heartbeat cadence.
@@ -475,22 +622,58 @@ mod tests {
     /// violations in both directions.
     #[test]
     fn hello_payload_round_trip() {
-        let payload = encode_hello_payload(0xA5A5_0101, "edge-1").unwrap();
-        let (caps, name) = decode_hello_payload(&payload).unwrap();
+        let payload = encode_hello_payload(0xA5A5_0101, "edge-1", None).unwrap();
+        let (caps, name, build) = decode_hello_payload(&payload).unwrap();
         assert_eq!(caps, 0xA5A5_0101);
         assert_eq!(name, "edge-1");
+        assert_eq!(build, None, "an old-shape Hello carries no build tag");
         assert!(decode_hello_payload(&[]).is_err());
         assert!(decode_hello_payload(b"not json {").is_err());
         assert!(decode_hello_payload(br#"{"caps":1}"#).is_err()); // missing id
         assert!(decode_hello_payload(br#"{"caps":1,"agent_id":""}"#).is_err()); // empty id
         let over_long = format!(r#"{{"caps":1,"agent_id":"{}"}}"#, "x".repeat(129));
         assert!(decode_hello_payload(over_long.as_bytes()).is_err());
-        assert!(encode_hello_payload(0, "").is_err());
-        assert!(encode_hello_payload(0, &"x".repeat(129)).is_err());
+        assert!(encode_hello_payload(0, "", None).is_err());
+        assert!(encode_hello_payload(0, &"x".repeat(129), None).is_err());
         // The bound itself is inclusive on both sides.
-        assert!(encode_hello_payload(0, &"x".repeat(128)).is_ok());
-        let boundary = encode_hello_payload(0, &"x".repeat(128)).unwrap();
+        assert!(encode_hello_payload(0, &"x".repeat(128), None).is_ok());
+        let boundary = encode_hello_payload(0, &"x".repeat(128), None).unwrap();
         assert!(decode_hello_payload(&boundary).is_ok());
+    }
+
+    /// The build tag: round-trips, an absent/empty value reads as unknown,
+    /// and an over-long value is refused on encode and degrades to unknown
+    /// on decode (it is observability metadata, never a registration
+    /// input).
+    #[test]
+    fn hello_build_tag_round_trip() {
+        let payload = encode_hello_payload(1, "edge-1", Some("2026-10-07_2f3633f")).unwrap();
+        let (_, _, build) = decode_hello_payload(&payload).unwrap();
+        assert_eq!(build.as_deref(), Some("2026-10-07_2f3633f"));
+        // Old-shape wire (no field) parses with None.
+        assert_eq!(
+            decode_hello_payload(br#"{"caps":1,"agent_id":"a"}"#)
+                .unwrap()
+                .2,
+            None
+        );
+        // Empty string normalizes to None on both faces.
+        assert_eq!(
+            decode_hello_payload(br#"{"caps":1,"agent_id":"a","build":""}"#)
+                .unwrap()
+                .2,
+            None
+        );
+        // Over-long: encode refuses; decode degrades to unknown.
+        assert!(encode_hello_payload(1, "a", Some(&"x".repeat(65))).is_err());
+        assert_eq!(
+            decode_hello_payload(
+                br#"{"caps":1,"agent_id":"a","build":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#
+            )
+            .unwrap()
+            .2,
+            None
+        );
     }
 
     /// RouteRequest/RouteAck payloads round-trip; granted/denied shapes and
@@ -539,5 +722,79 @@ mod tests {
         assert_eq!(RouteResponse::parse(&body).unwrap(), receipt);
         assert!(RouteResponse::parse(b"not json {").is_err());
         assert!(RouteResponse::parse(br"{}").is_err()); // token is mandatory
+    }
+
+    /// The policy pull payloads round-trip both outcomes; structural
+    /// violations (short/long request, unknown outcome, signature overrun,
+    /// trailing bytes on unchanged) are protocol violations.
+    #[test]
+    fn policy_pull_payloads_round_trip() {
+        // Request: exactly the 8-byte watermark.
+        let request = encode_policy_pull_request(5);
+        assert_eq!(decode_policy_pull_request(&request).unwrap(), 5);
+        assert!(
+            decode_policy_pull_request(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("malformed")
+        );
+        assert!(decode_policy_pull_request(&request[..7]).is_err());
+        let trailing: Vec<u8> = request.iter().copied().chain([0]).collect();
+        assert!(decode_policy_pull_request(&trailing).is_err());
+
+        // Unchanged outcome: outcome byte + serving generation, nothing else.
+        let unchanged =
+            encode_policy_pull_response(&PolicyPull::UpToDate { hub_generation: 2 }).unwrap();
+        assert_eq!(
+            decode_policy_pull_response(&unchanged).unwrap(),
+            PolicyPull::UpToDate { hub_generation: 2 }
+        );
+        let trailing: Vec<u8> = unchanged.iter().copied().chain([0xAA]).collect();
+        assert!(decode_policy_pull_response(&trailing).is_err());
+
+        // No-policy-face outcome: a distinct single byte — no generation
+        // field to conflate with a real serving generation.
+        let no_face = encode_policy_pull_response(&PolicyPull::NoPolicyFace).unwrap();
+        assert_eq!(no_face.len(), 1);
+        assert_eq!(
+            decode_policy_pull_response(&no_face).unwrap(),
+            PolicyPull::NoPolicyFace
+        );
+        // A generation field glued onto the no-face outcome is malformed.
+        let glued: Vec<u8> = no_face.iter().copied().chain([0u8; 8]).collect();
+        assert!(decode_policy_pull_response(&glued).is_err());
+
+        // Update outcome: generation + length-prefixed signature + body.
+        let fetch = PolicyFetch {
+            body: Bytes::from_static(b"policy bytes \0\xFF with binary"),
+            signature: vec![0xED; 64],
+            generation: 7,
+        };
+        let update = encode_policy_pull_response(&PolicyPull::Update(fetch.clone())).unwrap();
+        match decode_policy_pull_response(&update).unwrap() {
+            PolicyPull::Update(decoded) => {
+                assert_eq!(decoded.body, fetch.body);
+                assert_eq!(decoded.signature, fetch.signature);
+                assert_eq!(decoded.generation, 7);
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+
+        // Malformed shapes: short header, unknown outcome byte, empty
+        // signature, signature length overrun.
+        assert!(decode_policy_pull_response(&[]).is_err());
+        assert!(decode_policy_pull_response(&update[..8]).is_err());
+        let bad_outcome: Vec<u8> = update.iter().copied().collect();
+        let mut bad_outcome = bad_outcome;
+        bad_outcome[0] = 9;
+        assert!(decode_policy_pull_response(&bad_outcome).is_err());
+        let mut empty_sig: Vec<u8> = update.iter().copied().collect();
+        empty_sig[9] = 0;
+        empty_sig[10] = 0; // sig_len = 0
+        assert!(decode_policy_pull_response(&empty_sig).is_err());
+        let mut over_sig: Vec<u8> = update.iter().copied().collect();
+        over_sig[9] = 0xFF;
+        over_sig[10] = 0xFF; // sig_len = 65535 > payload remainder
+        assert!(decode_policy_pull_response(&over_sig).is_err());
     }
 }

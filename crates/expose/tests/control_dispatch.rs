@@ -54,7 +54,7 @@ async fn public_port_dispatches_control_sni_to_the_hub_plane() {
     .expect("hub plane");
     let control_config = plane.config.clone();
     let hub_cfg = interflow_testkit::config::hub_config(0, &certs, vec![]);
-    let hub = HubServer::with_tls_plane(hub_cfg, plane).expect("hub server");
+    let hub = HubServer::with_tls_plane(hub_cfg, plane, AuditSink::disabled()).expect("hub server");
 
     // The business/challenge planes: one-way TLS (no client certs) — the
     // contrast that proves which plane a handshake landed on.
@@ -95,7 +95,7 @@ async fn public_port_dispatches_control_sni_to_the_hub_plane() {
         xff_policy: Arc::new(
             XffPolicy::new(XffMode::Off, &["127.0.0.1".to_string()]).expect("xff policy"),
         ),
-        identity: Arc::new(IngressIdentity::new(vec![], vec![]).expect("identity")),
+        identity: Arc::new(IngressIdentity::new(vec![], vec![], false).expect("identity")),
     };
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(listener.run_signalled(ready_tx));

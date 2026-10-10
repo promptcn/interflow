@@ -32,7 +32,9 @@ use crate::protocol::{
 use crate::tunnel::agent::H2Liveness;
 use crate::tunnel::chunking::ChunkHygiene;
 use crate::tunnel::session_tasks::{Beat, SessionTasks, beat_interval};
-use crate::tunnel::transport::{TunnelData, TunnelDispatch, TunnelTransport};
+use crate::tunnel::transport::{
+    SteadyStateLiveness, TunnelData, TunnelDispatch, TunnelTransport, unix_millis_now,
+};
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, StreamBody, combinators::BoxBody};
@@ -40,6 +42,7 @@ use hyper::body::Frame;
 use hyper::client::conn::http2::SendRequest;
 use hyper::{Request, StatusCode};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use tokio::sync::{Mutex, mpsc};
@@ -82,6 +85,16 @@ pub(crate) struct H2Tunnel {
     sender: Arc<Mutex<SendRequest<H2RequestBody>>>,
     /// Semantic target → opaque route token, valid for this h2 session only.
     routes: StdMutex<HashMap<String, RouteToken>>,
+    /// Unix millis of the last inbound frame on the poll stream — the
+    /// task-independent receive-liveness ledger
+    /// ([`SteadyStateLiveness`]). Frozen (not cleared) when the poll task
+    /// dies or wedges: a frozen ledger is itself the death signal the
+    /// out-of-tree probe reads.
+    last_rx: Arc<AtomicU64>,
+    /// The negotiated poll receive-side watchdog (a task-independent copy —
+    /// the out-of-tree silence budget is derived from it, see
+    /// [`H2Tunnel::steady_state_liveness`]).
+    poll_watchdog: Duration,
 }
 
 /// How one h2 poll round ended. Cancellation is modeled as its own outcome
@@ -156,11 +169,15 @@ impl H2Tunnel {
     /// this session's control plane — the policy watcher's zero-touch
     /// distribution channel, as a conditional request: `seen` is the
     /// generation the caller already holds, sent as `x-policy-seen`; a hub
-    /// serving at or below it answers `304` and this returns `Ok(None)`
-    /// (nothing new to apply). `Ok(None)` likewise when the hub carries no
-    /// policy face (an older hub); the caller verifies any served bytes
-    /// against its own trust anchor.
-    pub async fn pull_policy_h2(&self, seen: u64) -> Result<Option<crate::tunnel::PolicyFetch>> {
+    /// serving at or below it answers `304`, whose `x-policy-generation`
+    /// header names the serving generation (kept for watermark-inversion
+    /// detection; **required** — a 304 without it is a protocol violation,
+    /// not a zero) — decoding as
+    /// [`PolicyPull::UpToDate`](crate::tunnel::transport::PolicyPull). A
+    /// `404` means the hub carries no policy face —
+    /// [`PolicyPull::NoPolicyFace`](crate::tunnel::transport::PolicyPull).
+    /// The caller verifies any served bytes against its own trust anchor.
+    pub async fn pull_policy_h2(&self, seen: u64) -> Result<crate::tunnel::transport::PolicyPull> {
         let request = Request::builder()
             .method("GET")
             .uri("/policy")
@@ -179,10 +196,25 @@ impl H2Tunnel {
         let response = tokio::time::timeout(Duration::from_secs(10), future)
             .await
             .map_err(|_| InterflowError::connection("policy pull timed out"))??;
-        if response.status() == StatusCode::NOT_FOUND
-            || response.status() == StatusCode::NOT_MODIFIED
-        {
-            return Ok(None);
+        if response.status() == StatusCode::NOT_FOUND {
+            // 404 = this hub carries no policy face — an explicit state with
+            // no generation to report, never a zero-generation "up to date".
+            return Ok(crate::tunnel::transport::PolicyPull::NoPolicyFace);
+        }
+        if response.status() == StatusCode::NOT_MODIFIED {
+            // 304 = nothing newer than the caller's watermark. The serving
+            // generation header is mandatory: paired builds always send it,
+            // so its absence is a protocol violation (fail-closed), not a
+            // "zero" to be conflated with a real generation.
+            let hub_generation = response
+                .headers()
+                .get("x-policy-generation")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .ok_or_else(|| {
+                    InterflowError::protocol("policy pull 304 lacks the x-policy-generation header")
+                })?;
+            return Ok(crate::tunnel::transport::PolicyPull::UpToDate { hub_generation });
         }
         if response.status() != StatusCode::OK {
             return Err(InterflowError::connection(format!(
@@ -208,11 +240,165 @@ impl H2Tunnel {
             InterflowError::protocol("policy signature is not hex".to_string()).with_source(e)
         })?;
         let body = response.into_body().collect().await?;
-        Ok(Some(crate::tunnel::PolicyFetch {
-            body: body.to_bytes(),
-            signature,
-            generation,
-        }))
+        Ok(crate::tunnel::transport::PolicyPull::Update(
+            crate::tunnel::PolicyFetch {
+                body: body.to_bytes(),
+                signature,
+                generation,
+            },
+        ))
+    }
+
+    /// Fetches the tenant's registered agents (`GET /agents`) over this
+    /// session's control plane — the h2 face of the peer-observability
+    /// read. Rides the session connection with the circuit header, exactly
+    /// like [`Self::pull_policy_h2`]; the body is the same JSON array the
+    /// operator's curl sees, decoded into the transport-uniform
+    /// [`PeerInfo`](crate::tunnel::transport::PeerInfo) shape.
+    pub async fn list_agents_h2(&self) -> Result<Vec<crate::tunnel::transport::PeerInfo>> {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/agents")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .body(empty_request_body())
+            .map_err(|e| {
+                InterflowError::connection("failed to build agents request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("agents list timed out"))??;
+        if response.status() != StatusCode::OK {
+            return Err(InterflowError::connection(format!(
+                "agents list rejected: {}",
+                response.status()
+            )));
+        }
+        let body = response.into_body().collect().await?;
+        serde_json::from_slice(&body.to_bytes()).map_err(|e| {
+            InterflowError::protocol("agents list payload is not the peer shape".to_string())
+                .with_source(e)
+        })
+    }
+
+    /// The h2 face of the demanding liveness roundtrip (`GET /ping`): an
+    /// empty body-only answer whose arrival within the internal deadline is
+    /// the only proof the path carries our questions back. Rides the session
+    /// connection with the circuit header, like [`Self::list_agents_h2`].
+    pub async fn liveness_roundtrip_h2(&self) -> Result<()> {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ping")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .body(empty_request_body())
+            .map_err(|e| {
+                InterflowError::connection("failed to build liveness ping request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("liveness ping timed out"))??;
+        if response.status() != StatusCode::OK {
+            return Err(InterflowError::connection(format!(
+                "liveness ping rejected: {}",
+                response.status()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Submits one self-service stream proposal (`POST /proposals`) over
+    /// this session's control plane — the h2 face of the kube-CSR-shaped
+    /// proposal flow. Rides the session connection with the circuit
+    /// header, like the route lease; the body is the JSON request, the
+    /// answer the JSON outcome.
+    pub async fn submit_proposal_h2(
+        &self,
+        request: &crate::tunnel::transport::StreamProposalRequest,
+    ) -> Result<crate::tunnel::transport::ProposalSubmitOutcome> {
+        let payload = serde_json::to_vec(request).map_err(|e| {
+            InterflowError::protocol("proposal request encode failed".to_string()).with_source(e)
+        })?;
+        let body = http_body_util::Full::new(Bytes::from(payload))
+            .map_err(|never| match never {})
+            .boxed();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/proposals")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .body(body)
+            .map_err(|e| {
+                InterflowError::connection("failed to build proposal request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("proposal submission timed out"))??;
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let text = response
+                .into_body()
+                .collect()
+                .await
+                .map(|b| String::from_utf8_lossy(&b.to_bytes()).to_string())
+                .unwrap_or_default();
+            return Err(InterflowError::connection(format!(
+                "proposal submission rejected: {status} — {text}"
+            )));
+        }
+        let body = response.into_body().collect().await?;
+        serde_json::from_slice(&body.to_bytes()).map_err(|e| {
+            InterflowError::protocol("proposal outcome payload is malformed".to_string())
+                .with_source(e)
+        })
+    }
+
+    /// Fetches this node's own proposals (`GET /proposals/mine`) — the
+    /// receipts face on the h2 side.
+    pub async fn my_proposals_h2(&self) -> Result<Vec<crate::tunnel::transport::ProposalReceipt>> {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/proposals/mine")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .body(empty_request_body())
+            .map_err(|e| {
+                InterflowError::connection("failed to build proposals-mine request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("proposals-mine timed out"))??;
+        if response.status() != StatusCode::OK {
+            return Err(InterflowError::connection(format!(
+                "proposals-mine rejected: {}",
+                response.status()
+            )));
+        }
+        let body = response.into_body().collect().await?;
+        serde_json::from_slice(&body.to_bytes()).map_err(|e| {
+            InterflowError::protocol("proposal receipts payload is malformed".to_string())
+                .with_source(e)
+        })
     }
 
     /// Creates the tunnel backend from an established HTTP/2 connection.
@@ -280,6 +466,10 @@ impl H2Tunnel {
         let token_for_poll = shutdown.clone();
         let poll_tasks = tasks.clone();
         let sender_for_tunnel = sender.clone();
+        // Receive-liveness ledger: construction follows a completed
+        // registration exchange, so "now" is the honest initial freshness.
+        let last_rx = Arc::new(AtomicU64::new(unix_millis_now()));
+        let poll_last_rx = last_rx.clone();
 
         tasks.spawn_critical("h2-poll", Some(liveness.task_stall_timeout), move |beat| {
             async move {
@@ -291,6 +481,7 @@ impl H2Tunnel {
                     token_for_poll,
                     up_tx_for_poll,
                     liveness,
+                    poll_last_rx,
                     poll_tasks,
                     liveness.task_stall_timeout,
                     beat,
@@ -315,6 +506,8 @@ impl H2Tunnel {
             up_tx,
             sender,
             routes: StdMutex::new(HashMap::new()),
+            last_rx,
+            poll_watchdog: liveness.poll_watchdog,
         }
     }
 
@@ -615,6 +808,7 @@ impl H2Tunnel {
         shutdown: CancellationToken,
         up_tx: Arc<Mutex<mpsc::Sender<Bytes>>>,
         liveness: H2Liveness,
+        last_rx: Arc<AtomicU64>,
         tasks: SessionTasks,
         stall_timeout: Duration,
         beat: Beat,
@@ -678,6 +872,7 @@ impl H2Tunnel {
                         dispatch,
                         &up_tx,
                         liveness,
+                        &last_rx,
                         &shutdown,
                         &tasks,
                         &beat,
@@ -742,6 +937,7 @@ impl H2Tunnel {
         dispatch: &TunnelDispatch,
         up_tx: &Arc<Mutex<mpsc::Sender<Bytes>>>,
         liveness: H2Liveness,
+        last_rx: &Arc<AtomicU64>,
         shutdown: &CancellationToken,
         tasks: &SessionTasks,
         beat: &Beat,
@@ -799,6 +995,7 @@ impl H2Tunnel {
                     let Ok(data) = frame.into_data() else {
                         continue;
                     };
+                    last_rx.store(unix_millis_now(), Ordering::Relaxed);
                     buffer.extend_from_slice(&data);
                     while let Some(tunnel_data) = TunnelDispatch::decode_tunnel_data(buffer) {
                         if tunnel_data.stream_type == FrameType::Ping {
@@ -870,8 +1067,27 @@ fn upload_body_stream(
 
 #[async_trait]
 impl TunnelTransport for H2Tunnel {
-    async fn pull_policy(&self, seen: u64) -> Result<Option<crate::tunnel::PolicyFetch>> {
+    async fn pull_policy(&self, seen: u64) -> Result<crate::tunnel::transport::PolicyPull> {
         self.pull_policy_h2(seen).await
+    }
+
+    async fn list_agents(&self) -> Result<Vec<crate::tunnel::transport::PeerInfo>> {
+        self.list_agents_h2().await
+    }
+
+    async fn submit_stream_proposal(
+        &self,
+        request: &crate::tunnel::transport::StreamProposalRequest,
+    ) -> Result<crate::tunnel::transport::ProposalSubmitOutcome> {
+        self.submit_proposal_h2(request).await
+    }
+
+    async fn my_proposals(&self) -> Result<Vec<crate::tunnel::transport::ProposalReceipt>> {
+        self.my_proposals_h2().await
+    }
+
+    async fn liveness_roundtrip(&self) -> Result<()> {
+        self.liveness_roundtrip_h2().await
     }
 
     async fn send_open_with(
@@ -965,6 +1181,23 @@ impl TunnelTransport for H2Tunnel {
             drop(dead_rx);
             *self.up_tx.lock().await = dead_tx;
         }
+    }
+
+    /// With heartbeat enabled, twice the in-tree poll watchdog: a living
+    /// task tree reacts at `poll_watchdog` first, and the out-of-tree probe
+    /// only fires when the tree itself is blind (wedged/dead poll task —
+    /// whose signature is exactly a frozen `last_rx` ledger). With heartbeat
+    /// disabled (`poll_watchdog == 0`) the poll stream is legitimately
+    /// silent and h2's policy pulls ride a separate TLS connection, so
+    /// silence proves nothing — no signal.
+    fn steady_state_liveness(&self) -> Option<SteadyStateLiveness> {
+        if self.poll_watchdog.is_zero() {
+            return None;
+        }
+        Some(SteadyStateLiveness {
+            last_rx_unix_millis: self.last_rx.load(Ordering::Relaxed),
+            silence_budget: self.poll_watchdog.saturating_mul(2),
+        })
     }
 }
 

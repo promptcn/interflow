@@ -6,7 +6,7 @@ resolver = "2"
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -28,6 +28,9 @@ hex = "0.4"
 # Home-directory lookup for tilde expansion in config paths (core) and the
 # profile directory (expose)
 dirs = "6"
+# Cross-platform advisory file locks (flock / LockFileEx) — the audit
+# ledger's single-writer guard across processes
+fs2 = "0.4"
 
 # ============================================================================
 # Lints — applied uniformly via [workspace.lints]; sub-crates inherit with `[lints] workspace = true`

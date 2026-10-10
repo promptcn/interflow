@@ -1,7 +1,20 @@
 import { useMemo, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { X } from "lucide-react";
 import { api, type DeployContextDto, type IssueNodeParams } from "../api";
-import { Modal, SegmentedControl } from "./ui";
+import { useT, type TFn } from "../i18n";
+import RecentContextSelect from "./RecentContextSelect";
+import {
+  Button,
+  DialogFooter,
+  DialogTitle,
+  Hint,
+  Input,
+  Modal,
+  SegmentedControl,
+  Select,
+  useToast,
+} from "./ui";
 
 /// The issue wizard: one modal from "a new machine needs a pack" to a
 /// sealed `.iflowpack` in Downloads. The user supplies exactly the two
@@ -9,11 +22,13 @@ import { Modal, SegmentedControl } from "./ui";
 /// append, validation, apply and sealing are orchestrated underneath
 type Kind = IssueNodeParams["kind"];
 
-const KINDS: { value: Kind; label: string; blurb: string }[] = [
-  { value: "agent_mesh", label: "Mesh agent", blurb: "site-to-site endpoint (ingress/egress rules)" },
-  { value: "agent_expose", label: "Expose agent", blurb: "dials local services into a public domain" },
-  { value: "hub", label: "Hub", blurb: "the public relay (one per realm)" },
-  { value: "ingress", label: "Ingress", blurb: "public entry point for expose routes" },
+/// Kind labels stay product vocabulary in both languages; the blurb
+/// translates (same vocabulary as the node cards' kindBlurb).
+const kinds = (t: TFn): { value: Kind; label: string; blurb: string }[] => [
+  { value: "agent_mesh", label: "Mesh agent", blurb: t("issue.blurbMesh") },
+  { value: "agent_expose", label: "Expose agent", blurb: t("issue.blurbExpose") },
+  { value: "hub", label: "Hub", blurb: t("issue.blurbHub") },
+  { value: "ingress", label: "Ingress", blurb: t("kindBlurb.ingress") },
 ];
 
 interface ServiceRow {
@@ -43,10 +58,11 @@ const field = (
   value: string,
   onChange: (v: string) => void,
   placeholder: string,
-  width?: string,
+  widthClass?: string,
 ) => (
-  <input
-    style={width ? { width } : undefined}
+  <Input
+    aria-label={placeholder}
+    className={widthClass}
     value={value}
     placeholder={placeholder}
     onChange={(e) => onChange(e.target.value)}
@@ -54,6 +70,24 @@ const field = (
     autoCorrect="off"
     spellCheck={false}
     autoComplete="off"
+  />
+);
+
+const protocolSelect = (
+  value: "tcp" | "udp",
+  disabled: boolean,
+  onChange: (v: "tcp" | "udp") => void,
+) => (
+  <Select
+    ariaLabel="protocol"
+    value={value}
+    disabled={disabled}
+    onValueChange={(v) => onChange(v as "tcp" | "udp")}
+    options={[
+      { value: "tcp", label: "tcp" },
+      { value: "udp", label: "udp" },
+    ]}
+    className="w-[92px]"
   />
 );
 
@@ -95,7 +129,9 @@ export default function IssuePackDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<Done | null>(null);
-  const [copied, setCopied] = useState(false);
+  const toast = useToast();
+  const { t } = useT();
+  const KINDS = kinds(t);
 
   const trimmed = node.trim();
   const ready =
@@ -189,17 +225,23 @@ export default function IssuePackDialog({
     setError(null);
     try {
       const outcome = await api.deployAddNode(buildParams());
-      onSay([`✔ ${trimmed} appended to ${manifest.trim()} → packs/${outcome.pack_dir_name}`]);
+      onSay([
+        t("issue.appendedLine", {
+          node: trimmed,
+          manifest: manifest.trim(),
+          pack: outcome.pack_dir_name,
+        }),
+      ]);
       onIssued(outcome.manifest_text);
-      const lines = await api.deployApply(manifest.trim(), issuer.trim(), out.trim());
-      onSay(lines);
+      const report = await api.deployApply(manifest.trim(), issuer.trim(), out.trim());
+      onSay(report.lines);
       if (download) {
         const passphrase = await api.deployGeneratePassphrase();
         const sealed = await api.deploySealToDownloads(
           `${out.trim()}/packs/${outcome.pack_dir_name}`,
           passphrase,
         );
-        onSay([`sealed → ${sealed.path}`]);
+        onSay([t("issue.sealedLine", { path: sealed.path })]);
         setDone({ packDirName: outcome.pack_dir_name, filePath: sealed.path, passphrase });
       } else {
         setDone({ packDirName: outcome.pack_dir_name, filePath: null, passphrase: null });
@@ -218,8 +260,7 @@ export default function IssuePackDialog({
     if (!done?.passphrase) return;
     try {
       await writeText(done.passphrase);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      toast.push(t("common.copied"));
     } catch {
       // Clipboard denied — the passphrase stays visible for manual copy.
     }
@@ -229,52 +270,41 @@ export default function IssuePackDialog({
 
   return (
     <Modal onClose={active ? () => {} : onClose} wide>
-      <h2>Issue a pack</h2>
+      <DialogTitle>{t("issue.title")}</DialogTitle>
 
       {done ? (
         <>
-          <p className="confirm-message">
+          <p className="m-0 text-base whitespace-pre-wrap text-fg-1">
             {done.passphrase
-              ? `${done.packDirName} is sealed and in your Downloads folder. The target machine's GUI asks for this passphrase on import:`
-              : `${done.packDirName} is rendered under ${out.trim()}/packs/ — seal it from its pack card when you're ready.`}
+              ? t("issue.doneSealed", { name: done.packDirName })
+              : t("issue.doneRendered", { name: done.packDirName, out: out.trim() })}
           </p>
           {done.passphrase && (
-            <div className="issue-passphrase">
-              <code>{done.passphrase}</code>
-              <button onClick={() => void copyPassphrase()}>{copied ? "Copied" : "Copy"}</button>
+            <div className="flex items-center gap-2">
+              <code className="min-w-0 flex-1 rounded-lg border border-line bg-bg-3 p-2 font-mono text-base break-all text-fg-1">
+                {done.passphrase}
+              </code>
+              <Button onClick={() => void copyPassphrase()}>{t("common.copy")}</Button>
             </div>
           )}
-          {done.filePath && <p className="hint">{done.filePath}</p>}
-          <p className="hint">
-            The manifest was rewritten non-destructively (comments kept; the previous copy is
-            beside it as .bak).
-          </p>
-          <div className="dialog-actions">
-            <button className="primary" onClick={onClose}>
-              Done
-            </button>
-          </div>
+          {done.filePath && <p className="m-0 text-small text-fg-3">{done.filePath}</p>}
+          <p className="m-0 text-small text-fg-3">{t("issue.manifestRewritten")}</p>
+          <DialogFooter>
+            <Button variant="primary" onClick={onClose}>
+              {t("common.done")}
+            </Button>
+          </DialogFooter>
         </>
       ) : (
         <>
           {recentContexts.length > 1 && (
-            <div className="row">
-              <label>Context</label>
-              <select
-                value={`${manifest}|${issuer}|${out}`}
-                onChange={(e) => {
-                  const picked = recentContexts.find(
-                    (c) => `${c.manifest}|${c.issuer}|${c.out}` === e.target.value,
-                  );
-                  if (picked) onPickContext(picked);
-                }}
-              >
-                {recentContexts.map((c) => (
-                  <option key={`${c.manifest}|${c.issuer}|${c.out}`} value={`${c.manifest}|${c.issuer}|${c.out}`}>
-                    {c.manifest} · {c.issuer}
-                  </option>
-                ))}
-              </select>
+            <div className="flex items-center gap-2">
+              <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.context")}</span>
+              <RecentContextSelect
+                contexts={recentContexts}
+                current={{ manifest, issuer, out }}
+                onPick={onPickContext}
+              />
             </div>
           )}
 
@@ -284,149 +314,163 @@ export default function IssuePackDialog({
             onChange={setKind}
             disabled={active}
           />
-          <p className="hint">{KINDS.find((k) => k.value === kind)?.blurb}</p>
+          <p className="m-0 text-small text-fg-3">{KINDS.find((k) => k.value === kind)?.blurb}</p>
 
-          <div className="row">
-            <label>Node name</label>
+          <div className="flex items-center gap-2">
+            <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.nodeName")}</span>
             {field(node, setNode, "home-win")}
           </div>
 
           {(kind === "agent_expose" || kind === "agent_mesh") && (
-            <div className="row">
-              <label>Workspace</label>
-              {field(workspace, setWorkspace, "empty = the manifest's sole workspace / default")}
+            <div className="flex items-center gap-2">
+              <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.workspace")}</span>
+              {field(workspace, setWorkspace, t("issue.workspacePh"))}
             </div>
           )}
           {kind === "hub" && (
-            <div className="row">
-              <label>Endpoint</label>
+            <div className="flex items-center gap-2">
+              <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.endpoint")}</span>
               {field(hubEndpoint, setHubEndpoint, "mesh.example.com:6666")}
             </div>
           )}
           {kind === "ingress" && (
-            <div className="row">
-              <label>Workspaces</label>
+            <div className="flex items-center gap-2">
+              <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.workspaces")}</span>
               {field(ingressWorkspaces, setIngressWorkspaces, "default")}
             </div>
           )}
 
           {kind === "agent_expose" && (
-            <div className="rule-editor">
-              <div className="rule-editor-head">
-                <span>Services</span>
-                <button className="sm" disabled={active} onClick={() => setServices([...services, { id: "", address: "" }])}>
-                  + service
-                </button>
+            <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
+              <div className="flex items-center justify-between gap-2 text-small text-fg-3">
+                <span>{t("issue.services")}</span>
+                <Button size="sm" disabled={active} onClick={() => setServices([...services, { id: "", address: "" }])}>
+                  {t("common.addService")}
+                </Button>
               </div>
               {services.map((s, i) => (
-                <div className="rule-row" key={i}>
-                  {field(s.id, (v) => setServices(services.map((r, j) => (j === i ? { ...r, id: v } : r))), "asr", "120px")}
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5" key={i}>
+                  {field(s.id, (v) => setServices(services.map((r, j) => (j === i ? { ...r, id: v } : r))), "asr", "w-[120px]")}
                   {field(s.address, (v) => setServices(services.map((r, j) => (j === i ? { ...r, address: v } : r))), "127.0.0.1:8080")}
-                  <button
-                    className="rule-remove sm"
-                    disabled={active}
-                    onClick={() => setServices(services.filter((_, j) => j !== i))}
-                  >
-                    ×
-                  </button>
+                  <Hint text={t("common.remove")}>
+                    <Button
+                      variant="link"
+                      size="icon-sm"
+                      disabled={active}
+                      aria-label={t("common.remove")}
+                      onClick={() => setServices(services.filter((_, j) => j !== i))}
+                      className="text-fg-3 hover:text-critical"
+                    >
+                      <X className="size-3.5" />
+                    </Button>
+                  </Hint>
                 </div>
               ))}
             </div>
           )}
 
           {kind === "agent_mesh" && (
-            <div className="rule-editor">
-              <div className="rule-editor-head">
-                <span>Mesh ingress — forward a local listener to a peer</span>
-                <button className="sm"
+            <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
+              <div className="flex items-center justify-between gap-2 text-small text-fg-3">
+                <span>{t("form.meshIngressTitle")}</span>
+                <Button
+                  size="sm"
                   disabled={active}
                   onClick={() =>
                     setMeshIngress([...meshIngress, { name: "", listen: "", protocol: "tcp", target_agent: "", remote_addr: "" }])
                   }
                 >
-                  + rule
-                </button>
+                  {t("common.addRule")}
+                </Button>
               </div>
               {meshIngress.map((r, i) => {
                 const patch = (p: Partial<MeshIngressRow>) =>
                   setMeshIngress(meshIngress.map((row, j) => (j === i ? { ...row, ...p } : row)));
                 return (
-                  <div className="rule-row" key={i}>
-                    {field(r.name, (v) => patch({ name: v }), "ollama", "110px")}
-                    {field(r.listen, (v) => patch({ listen: v }), "127.0.0.1:11434", "170px")}
-                    <select value={r.protocol} disabled={active} onChange={(e) => patch({ protocol: e.target.value as "tcp" | "udp" })}>
-                      <option value="tcp">tcp</option>
-                      <option value="udp">udp</option>
-                    </select>
-                    {field(r.target_agent, (v) => patch({ target_agent: v }), "peer agent", "110px")}
-                    {field(r.remote_addr, (v) => patch({ remote_addr: v }), "127.0.0.1:11434", "170px")}
-                    <button
-                      className="rule-remove sm"
-                      disabled={active}
-                      onClick={() => setMeshIngress(meshIngress.filter((_, j) => j !== i))}
-                    >
-                      ×
-                    </button>
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5" key={i}>
+                    {field(r.name, (v) => patch({ name: v }), "ollama", "w-[110px]")}
+                    {field(r.listen, (v) => patch({ listen: v }), "127.0.0.1:11434", "w-[170px]")}
+                    {protocolSelect(r.protocol, active, (p) => patch({ protocol: p }))}
+                    {field(r.target_agent, (v) => patch({ target_agent: v }), t("issue.phPeerAgent"), "w-[110px]")}
+                    {field(r.remote_addr, (v) => patch({ remote_addr: v }), "127.0.0.1:11434", "w-[170px]")}
+                    <Hint text={t("common.remove")}>
+                      <Button
+                        variant="link"
+                        size="icon-sm"
+                        disabled={active}
+                        aria-label={t("common.remove")}
+                        onClick={() => setMeshIngress(meshIngress.filter((_, j) => j !== i))}
+                        className="text-fg-3 hover:text-critical"
+                      >
+                        <X className="size-3.5" />
+                      </Button>
+                    </Hint>
                   </div>
                 );
               })}
-              <div className="rule-editor-head">
-                <span>Mesh egress — what this agent dials for peers</span>
-                <button className="sm"
+              <div className="flex items-center justify-between gap-2 text-small text-fg-3">
+                <span>{t("form.meshEgressTitle")}</span>
+                <Button
+                  size="sm"
                   disabled={active}
                   onClick={() => setMeshEgress([...meshEgress, { name: "", protocol: "tcp", target: "" }])}
                 >
-                  + rule
-                </button>
+                  {t("common.addRule")}
+                </Button>
               </div>
               {meshEgress.map((r, i) => {
                 const patch = (p: Partial<MeshEgressRow>) =>
                   setMeshEgress(meshEgress.map((row, j) => (j === i ? { ...row, ...p } : row)));
                 return (
-                  <div className="rule-row" key={i}>
-                    {field(r.name, (v) => patch({ name: v }), "loopback", "110px")}
-                    <select value={r.protocol} disabled={active} onChange={(e) => patch({ protocol: e.target.value as "tcp" | "udp" })}>
-                      <option value="tcp">tcp</option>
-                      <option value="udp">udp</option>
-                    </select>
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5" key={i}>
+                    {field(r.name, (v) => patch({ name: v }), "loopback", "w-[110px]")}
+                    {protocolSelect(r.protocol, active, (p) => patch({ protocol: p }))}
                     {field(r.target, (v) => patch({ target: v }), "127.0.0.1:11434 or 127.0.0.0/8")}
-                    <button
-                      className="rule-remove sm"
-                      disabled={active}
-                      onClick={() => setMeshEgress(meshEgress.filter((_, j) => j !== i))}
-                    >
-                      ×
-                    </button>
+                    <Hint text={t("common.remove")}>
+                      <Button
+                        variant="link"
+                        size="icon-sm"
+                        disabled={active}
+                        aria-label={t("common.remove")}
+                        onClick={() => setMeshEgress(meshEgress.filter((_, j) => j !== i))}
+                        className="text-fg-3 hover:text-critical"
+                      >
+                        <X className="size-3.5" />
+                      </Button>
+                    </Hint>
                   </div>
                 );
               })}
-              <p className="hint">
-                The peer's egress must already authorize the remote address (protocol included);
-                the validator refuses unmatched pairs.
-              </p>
+              <p className="m-0 text-small text-fg-3">{t("dialogs.peerAuthHint")}</p>
             </div>
           )}
 
           {preview !== "" && (
-            <div className="issue-preview">
-              <span className="hint">will append (non-destructive; comments kept)</span>
-              <pre>{preview}</pre>
+            <div className="flex flex-col gap-1">
+              <span className="text-small text-fg-3">{t("issue.willAppend")}</span>
+              <pre className="m-0 overflow-x-auto rounded-lg border border-line bg-bg-3 p-2.5 font-mono text-small text-fg-2">
+                {preview}
+              </pre>
             </div>
           )}
 
-          {error && <div className="dialog-error">{error}</div>}
+          {error && (
+            <div className="rounded-lg border border-critical/40 bg-critical/10 p-2.5 text-base whitespace-pre-wrap text-critical">
+              {error}
+            </div>
+          )}
 
-          <div className="dialog-actions">
-            <button disabled={active} onClick={onClose}>
-              Cancel
-            </button>
-            <button disabled={active || !ready} onClick={() => void run(false)}>
-              Issue only
-            </button>
-            <button className="primary" disabled={active || !ready} onClick={() => void run(true)}>
-              {busy ? "…" : "Issue & download"}
-            </button>
-          </div>
+          <DialogFooter>
+            <Button disabled={active} onClick={onClose}>
+              {t("common.cancel")}
+            </Button>
+            <Button disabled={active || !ready} onClick={() => void run(false)}>
+              {t("issue.issueOnly")}
+            </Button>
+            <Button variant="primary" disabled={active || !ready} onClick={() => void run(true)}>
+              {busy ? "…" : t("issue.issueDownload")}
+            </Button>
+          </DialogFooter>
         </>
       )}
     </Modal>

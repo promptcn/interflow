@@ -365,14 +365,9 @@ where
     }
 }
 
-/// Extracts the reason from a `_close_` notification payload.
-///
-/// The hub emits `CLOSE:{sid}:{reason}` (empty reason = ordinary close);
-/// anything that does not carry this prefix (a late/foreign frame) is
-/// treated as a reason-less close.
 /// Extracts the reason from a Close payload (`[reason_code u8]`;
 /// malformed payloads are the ordinary close).
-pub(crate) const fn parse_close_reason(data: &[u8]) -> CloseReason {
+pub(crate) fn parse_close_reason(data: &[u8]) -> CloseReason {
     CloseReason::from_payload(data)
 }
 

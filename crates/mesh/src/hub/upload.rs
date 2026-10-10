@@ -150,14 +150,7 @@ impl HubService {
                 .increment(1);
             return false;
         }
-        if matches!(
-            frame.frame_type,
-            FrameType::HelloAck
-                | FrameType::Ping
-                | FrameType::OpenAck
-                | FrameType::RouteAck
-                | FrameType::Error
-        ) {
+        if frame.frame_type.is_hub_only() {
             warn!(
                 "upload frame spoofing: hub-only type {:?} from agent (stream_id={})",
                 frame.frame_type, frame.stream_id
@@ -177,8 +170,15 @@ impl HubService {
             );
             metrics::counter!("interflow_hub_auth_failures", "reason" => "up_frame_spoofed")
                 .increment(1);
-            self.notify_sender_close(agent_key, frame.stream_id, "spoofed source")
-                .await;
+            self.notify_sender_close(
+                agent_key,
+                frame.stream_id,
+                &crate::hub::routing::StreamReject::new(
+                    interflow_core::protocol::CloseReason::SecurityDenied,
+                    "spoofed source",
+                ),
+            )
+            .await;
             return true;
         };
 
@@ -217,8 +217,15 @@ impl HubService {
                     .then(|| RouteToken::from_bytes(frame.payload[..16].try_into().expect("16B")))
                     .filter(|t| !t.is_zero());
                 let Some(route) = route else {
-                    self.notify_sender_close(agent_key, frame.stream_id, "invalid open payload")
-                        .await;
+                    self.notify_sender_close(
+                        agent_key,
+                        frame.stream_id,
+                        &crate::hub::routing::StreamReject::new(
+                            interflow_core::protocol::CloseReason::NoTarget,
+                            "invalid open payload",
+                        ),
+                    )
+                    .await;
                     return true;
                 };
                 let proto = StreamProto::from_frame_flags(frame.flags);
@@ -235,7 +242,7 @@ impl HubService {
                     )
                     .await
                 {
-                    self.notify_sender_close(agent_key, frame.stream_id, reason)
+                    self.notify_sender_close(agent_key, frame.stream_id, &reason)
                         .await;
                 }
                 true
@@ -251,7 +258,7 @@ impl HubService {
                     )
                     .await
                 {
-                    self.notify_sender_close(agent_key, frame.stream_id, reason)
+                    self.notify_sender_close(agent_key, frame.stream_id, &reason)
                         .await;
                 }
                 true

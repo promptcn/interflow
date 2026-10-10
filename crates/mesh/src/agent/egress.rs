@@ -90,6 +90,16 @@ use tracing::{debug, error, info, warn};
 /// reclamation).
 const CLOSE_NOTIFY_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Bounded wait for the inner-QUIC close flush barrier (`close_drained`):
+/// generous for a healthy ordered stream-write path, still bounded so a
+/// wedged tunnel send cannot delay the outer termination indefinitely.
+const INNER_CLOSE_FLUSH_BUDGET: Duration = Duration::from_secs(2);
+
+/// Catch-all refresh cadence for the local rule snapshot (the safety net
+/// behind the store's change notification — mirrors the ingress
+/// reconciler's tick).
+const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Egress session resource policy: dial/write-stall timeouts (pure duration
 /// parameters, no cross-session state).
 #[allow(clippy::struct_field_names)] // each of the three timeouts governs one path; their semantics resist merged naming
@@ -158,6 +168,7 @@ impl EgressRuntime {
         let breakers = config.egress_target_breaker_enabled.then(|| {
             Arc::new(TargetBreakers::new(
                 BreakerKind::Egress,
+                config.agent.effective_log_name().to_string(),
                 BreakerPolicy::from(config),
             ))
         });
@@ -202,6 +213,10 @@ type UdpControlStreams = Arc<std::sync::Mutex<HashMap<SessionId, quinn::StreamId
 /// tasks.
 pub(crate) struct EgressSession {
     pub(crate) tunnel: AgentTunnel,
+    /// Log attribution (`AgentInfo::effective_log_name`): cloned into every
+    /// spawned forwarder, so all per-connection lines land in the GUI "This
+    /// node" view (the steady-state business lines this module owns).
+    pub(crate) node: String,
     /// Live egress allowlist: a watch receiver over the agent-scoped
     /// [`SecurityConfig`], so a signed-policy reload (widening or narrowing
     /// the offer) takes effect on the very next Open without a session
@@ -228,6 +243,7 @@ impl Clone for EgressSession {
     fn clone(&self) -> Self {
         Self {
             tunnel: self.tunnel.clone(),
+            node: self.node.clone(),
             security: self.security.clone(),
             policy: self.policy,
             runtime: Arc::clone(&self.runtime),
@@ -253,7 +269,7 @@ impl EgressHandler {
     /// logs instead of being discovered at EMFILE. With a local cap
     /// configured it is 80% of it, otherwise a fixed 128 (half of the macOS
     /// GUI soft cap of 256).
-    fn warn_high_water(runtime: &EgressRuntime, current: usize) {
+    fn warn_high_water(node: &str, runtime: &EgressRuntime, current: usize) {
         let high_water = if runtime.max_incoming_streams > 0 {
             runtime.max_incoming_streams / 5 * 4
         } else {
@@ -261,6 +277,7 @@ impl EgressHandler {
         };
         if current == high_water.max(1) {
             warn!(
+                node = %node,
                 "Active incoming streams reached high-water mark {high_water}: if this keeps growing, check the stream teardown path\
                  (interflow_egress_stream_closed_total{{reason}} / \
                  interflow_agent_incoming_streams_active)"
@@ -285,6 +302,7 @@ impl EgressHandler {
         let tunnel = sess.tunnel.clone();
         let runtime = Arc::clone(&sess.runtime);
         let e2e = Arc::clone(&sess.e2e);
+        let node = sess.node.clone();
         let carrier = match inner_udp::accept_inner_quic(
             tunnel.clone(),
             stream_id,
@@ -304,6 +322,7 @@ impl EgressHandler {
                 };
                 crate::agent::e2e::record_handshake_failure(crate::agent::e2e::SIDE_EGRESS, reason);
                 Self::finish(
+                    &node,
                     &tunnel,
                     stream_id,
                     CloseReason::E2eHandshakeFailed,
@@ -330,6 +349,7 @@ impl EgressHandler {
         tokio::spawn(Self::dispatch_inner_udp_datagrams(
             carrier.clone(),
             Arc::clone(&senders),
+            node.clone(),
         ));
         // The inner QUIC TLS verifier is unbound because the outer source is
         // opaque. The first encrypted control frame is an identity hello that
@@ -337,10 +357,14 @@ impl EgressHandler {
         let Ok(Ok(first_control)) =
             tokio::time::timeout(Duration::from_millis(250), carrier.accept_bi()).await
         else {
-            carrier.close();
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Flush barrier: let the CONNECTION_CLOSE ride the outer Data
+            // path before the outer Close tears down the relay state —
+            // event-driven (the pump confirms the flush), never a blind
+            // timing race.
+            carrier.close_drained(INNER_CLOSE_FLUSH_BUDGET).await;
             metrics::gauge!("interflow_agent_inner_quic_associations_active").decrement(1.0);
             Self::finish(
+                &node,
                 &tunnel,
                 stream_id,
                 CloseReason::E2eHandshakeFailed,
@@ -366,7 +390,7 @@ impl EgressHandler {
                 .peer_certificates()
                 .and_then(|chain| chain.first().cloned())
             else {
-                debug!("inner UDP identity has no captured peer certificate");
+                debug!(node = %node, "inner UDP identity has no captured peer certificate");
                 return false;
             };
             let peer_cn =
@@ -375,13 +399,15 @@ impl EgressHandler {
             peer_cn == *source_principal && peer_fingerprint == *source_fingerprint
         })();
         if !identity_valid {
-            debug!("first inner UDP identity rejected: {identity:?}");
-            carrier.close();
-            // Let the inner CONNECTION_CLOSE packet ride the outer Data path
-            // before the outer Close tears down the relay state.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            debug!(node = %node, "first inner UDP identity rejected: {identity:?}");
+            // Flush barrier: let the inner CONNECTION_CLOSE packet ride the
+            // outer Data path before the outer Close tears down the relay
+            // state — event-driven (the pump confirms the flush), never a
+            // blind timing race.
+            carrier.close_drained(INNER_CLOSE_FLUSH_BUDGET).await;
             metrics::gauge!("interflow_agent_inner_quic_associations_active").decrement(1.0);
             Self::finish(
+                &node,
                 &tunnel,
                 stream_id,
                 CloseReason::E2eHandshakeFailed,
@@ -406,11 +432,11 @@ impl EgressHandler {
                                 &association_token,
                                 udp.clone(),
                             ).await {
-                                debug!("inner UDP session rejected or ended: {e}");
+                                debug!(node = %node, "inner UDP session rejected or ended: {e}");
                             }
                         }
                         Err(e) => {
-                            debug!("inner QUIC association ended: {e}");
+                            debug!(node = %node, "inner QUIC association ended: {e}");
                             break;
                         }
                     }
@@ -469,6 +495,7 @@ impl EgressHandler {
             .clear();
         metrics::gauge!("interflow_agent_inner_quic_associations_active").decrement(1.0);
         Self::finish(
+            &node,
             &tunnel,
             stream_id,
             CloseReason::CloseFrame,
@@ -481,13 +508,14 @@ impl EgressHandler {
     async fn dispatch_inner_udp_datagrams(
         carrier: inner_udp::InnerQuicCarrier,
         senders: UdpSessionSenders,
+        node: String,
     ) {
         let mut reassembler = DatagramReassembler::default();
         loop {
             let datagram = match carrier.recv_datagram().await {
                 Ok(datagram) => datagram,
                 Err(e) => {
-                    debug!("UDP egress inner datagram dispatcher ended: {e}");
+                    debug!(node = %node, "UDP egress inner datagram dispatcher ended: {e}");
                     break;
                 }
             };
@@ -533,6 +561,7 @@ impl EgressHandler {
         udp: UdpAssociationChannels,
     ) -> Result<()> {
         let EgressSession {
+            node,
             security,
             policy,
             runtime,
@@ -660,7 +689,7 @@ impl EgressHandler {
 
         let prev = runtime.active.fetch_add(1, Ordering::Relaxed);
         metrics::gauge!("interflow_agent_incoming_streams_active").increment(1.0);
-        Self::warn_high_water(runtime, prev + 1);
+        Self::warn_high_water(node, runtime, prev + 1);
         let (backend_tx, backend_rx) = mpsc::channel(64);
         senders
             .lock()
@@ -695,6 +724,7 @@ impl EgressHandler {
             runtime.breakers.clone(),
             association_token.clone(),
             idle_timeout,
+            node.clone(),
         );
         Ok(())
     }
@@ -751,6 +781,7 @@ impl EgressHandler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // session wiring handles are passed explicitly one by one
     fn spawn_inner_udp_backend(
         session: SessionId,
         target_addr: String,
@@ -760,6 +791,7 @@ impl EgressHandler {
         breakers: Option<Arc<TargetBreakers>>,
         session_token: CancellationToken,
         idle_timeout: Duration,
+        node: String,
     ) {
         let resolve_timeout = policy.resolve_timeout;
         tokio::spawn(async move {
@@ -769,7 +801,7 @@ impl EgressHandler {
                 {
                     Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
                     Ok(Err(e)) => {
-                        error!("Failed to resolve UDP target {target_addr}: {e}");
+                        error!(node = %node, "Failed to resolve UDP target {target_addr}: {e}");
                         if let Some(breakers) = &breakers {
                             breakers.note_failure(&target_addr);
                         }
@@ -777,7 +809,7 @@ impl EgressHandler {
                         return;
                     }
                     Err(_) => {
-                        error!("UDP target resolve timed out: {target_addr}");
+                        error!(node = %node, "UDP target resolve timed out: {target_addr}");
                         if let Some(breakers) = &breakers {
                             breakers.note_failure(&target_addr);
                         }
@@ -790,6 +822,7 @@ impl EgressHandler {
                 .find(|sa| !crate::agent::ssrf_deny::is_ip_ssrf_blocked(sa.ip()));
             let Some(address) = safe_address else {
                 error!(
+                    node = %node,
                     "Security block: all resolved IPs for UDP target {target_addr} hit the SSRF blocklist"
                 );
                 let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
@@ -804,11 +837,11 @@ impl EgressHandler {
                 return;
             };
             let Ok(socket) = crate::agent::ingress_udp::bind_udp_socket(bind_address) else {
-                error!("UDP socket bind failed ({bind_address})");
+                error!(node = %node, "UDP socket bind failed ({bind_address})");
                 return;
             };
             if socket.connect(address).await.is_err() {
-                error!("UDP connect failed {target_addr}");
+                error!(node = %node, "UDP connect failed {target_addr}");
                 if let Some(breakers) = &breakers {
                     breakers.note_failure(&target_addr);
                 }
@@ -912,18 +945,23 @@ impl EgressHandler {
     }
 
     pub async fn run(self) -> Result<()> {
-        info!("Egress handler started, agent_id={}", self.agent_id);
+        info!(node = %self.sess.node, "Egress handler started, agent_id={}", self.agent_id);
 
         // The hot path matches against a local snapshot: taken from the
         // store at session start (including API additions from the previous
-        // session), refreshed after command changes — per-stream matching is
-        // lock-free.
+        // session), refreshed on every store change and by a periodic
+        // catch-all tick — per-stream matching stays lock-free, and the
+        // snapshot is always re-derived from the store (level-triggered),
+        // never from a pushed payload.
         let mut rules = self.store.egress_snapshot().await;
         let store = self.store;
+        let mut version = store.version_rx();
+        let mut tick = tokio::time::interval(REFRESH_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let sess = self.sess;
 
         for rule in &rules {
-            info!("Configured egress rule: {} -> {}", rule.name, rule.target);
+            info!(node = %sess.node, "Configured egress rule: {} -> {}", rule.name, rule.target);
         }
 
         let mut command_rx = self.command_rx;
@@ -941,14 +979,14 @@ impl EgressHandler {
                 } => {
                     match cmd_opt {
                         Some(EgressCommand::Add(rule, resp_tx)) => {
-                            info!("Added egress rule: {}", rule.name);
+                            info!(node = %sess.node, "Added egress rule: {}", rule.name);
                             let res = store.add_egress(rule).await
                                 .map_err(ControlOpError::from);
                             rules = store.egress_snapshot().await;
                             let _ = resp_tx.send(res);
                         }
                         Some(EgressCommand::Remove(name, resp_tx)) => {
-                            info!("Removed egress rule: {}", name);
+                            info!(node = %sess.node, "Removed egress rule: {}", name);
                             let res = store.remove_egress(&name).await
                                 .map_err(ControlOpError::from);
                             rules = store.egress_snapshot().await;
@@ -958,24 +996,34 @@ impl EgressHandler {
                             let views = store.egress_views().await;
                             let _ = resp_tx.send(views);
                         }
-                        // Signed-policy reload: the store (rule truth) was
-                        // already replaced by the reloader; refresh this
-                        // session's matching snapshot. Selector resolution
-                        // and UDP idle budgets pick up the new rules on the
-                        // very next Open.
-                        Some(EgressCommand::Sync(desired)) => {
-                            info!(
-                                "Policy reload reconciled egress rules: {} -> {}",
-                                rules.len(),
-                                desired.len()
-                            );
-                            rules = desired;
-                        }
                         None => {
-                            info!("Egress command channel closed");
+                            info!(node = %sess.node, "Egress command channel closed");
                             command_rx = None;
                         }
                     }
+                }
+
+                // Store changed (signed-policy reload, control API from any
+                // face): refresh this session's matching snapshot. Selector
+                // resolution and UDP idle budgets pick up the new rules on
+                // the very next Open.
+                changed = version.changed() => {
+                    if changed.is_ok() {
+                        let fresh = store.egress_snapshot().await;
+                        info!(
+                            node = %sess.node,
+                            "Rule store changed, refreshed egress rules: {} -> {}",
+                            rules.len(),
+                            fresh.len()
+                        );
+                        rules = fresh;
+                    }
+                }
+
+                // Catch-all refresh: heals any state a missed wake-up could
+                // have left behind (mirrors the ingress reconciler's tick).
+                _ = tick.tick() => {
+                    rules = store.egress_snapshot().await;
                 }
 
                 // Handle a request-direction new stream: rate/concurrency
@@ -987,7 +1035,7 @@ impl EgressHandler {
                     if let Some(stream) = ev {
                         Self::handle_incoming_stream(stream, &sess, &rules).await;
                     } else {
-                        error!("Egress incoming-stream channel closed (tunnel dead), triggering session reconnect");
+                        error!(node = %sess.node, "Egress incoming-stream channel closed (tunnel dead), triggering session reconnect");
                         return Err(InterflowError::connection(
                             "egress incoming-stream channel closed (tunnel dead)".to_string(),
                         ));
@@ -1026,6 +1074,7 @@ impl EgressHandler {
     ) {
         let EgressSession {
             tunnel,
+            node,
             runtime,
             tracker,
             ..
@@ -1034,7 +1083,7 @@ impl EgressHandler {
         let stream_id = open.stream_id;
         let prev_active = runtime.active.fetch_add(1, Ordering::Relaxed);
         metrics::gauge!("interflow_agent_incoming_streams_active").increment(1.0);
-        Self::warn_high_water(runtime, prev_active + 1);
+        Self::warn_high_water(node, runtime, prev_active + 1);
 
         let proto = StreamProto::from_frame_flags(open.flags);
 
@@ -1059,6 +1108,7 @@ impl EgressHandler {
             )
             .increment(1);
             Self::finish(
+                node,
                 tunnel,
                 stream_id,
                 CloseReason::LocalLimit,
@@ -1079,9 +1129,11 @@ impl EgressHandler {
                 crate::agent::e2e::REASON_NOT_NEGOTIATED,
             );
             warn!(
+                node = %node,
                 "e2e required: rejecting non-e2e {proto:?} stream {stream_id} (stripped FLAG_E2E or legacy peer), source={src_agent}"
             );
             Self::finish(
+                node,
                 tunnel,
                 stream_id,
                 CloseReason::E2eHandshakeFailed,
@@ -1147,6 +1199,7 @@ impl EgressHandler {
     ) {
         let EgressSession {
             tunnel,
+            node,
             security,
             policy,
             runtime,
@@ -1176,9 +1229,11 @@ impl EgressHandler {
                     "protocol",
                 );
                 error!(
+                    node = %node,
                     "inner TLS acceptor build failed for {stream_id} (source {src_agent}): {e}; closing stream"
                 );
                 Self::finish(
+                    &node,
                     &tunnel,
                     stream_id,
                     CloseReason::E2eHandshakeFailed,
@@ -1206,12 +1261,13 @@ impl EgressHandler {
                 {
                     Ok(Ok(hello)) => hello,
                     Ok(Err(e)) => {
-                        error!("inner selector read failed for {stream_id}: {e}");
+                        error!(node = %node, "inner selector read failed for {stream_id}: {e}");
                         crate::agent::e2e::record_handshake_failure(
                             crate::agent::e2e::SIDE_EGRESS,
                             "protocol",
                         );
                         Self::finish(
+                            &node,
                             &tunnel,
                             stream_id,
                             CloseReason::E2eHandshakeFailed,
@@ -1222,12 +1278,13 @@ impl EgressHandler {
                         return;
                     }
                     Err(_) => {
-                        error!("inner selector read timed out for {stream_id}");
+                        error!(node = %node, "inner selector read timed out for {stream_id}");
                         crate::agent::e2e::record_handshake_failure(
                             crate::agent::e2e::SIDE_EGRESS,
                             "protocol",
                         );
                         Self::finish(
+                            &node,
                             &tunnel,
                             stream_id,
                             CloseReason::E2eHandshakeFailed,
@@ -1241,12 +1298,13 @@ impl EgressHandler {
                 let (_, server_conn) = tls.get_ref();
                 let Some(peer_leaf) = server_conn.peer_certificates().and_then(|c| c.first())
                 else {
-                    error!("inner TLS completed without a peer leaf for {stream_id}");
+                    error!(node = %node, "inner TLS completed without a peer leaf for {stream_id}");
                     crate::agent::e2e::record_handshake_failure(
                         crate::agent::e2e::SIDE_EGRESS,
                         "protocol",
                     );
                     Self::finish(
+                        &node,
                         &tunnel,
                         stream_id,
                         CloseReason::E2eHandshakeFailed,
@@ -1262,6 +1320,7 @@ impl EgressHandler {
                 if peer_cn != hello.source_principal || peer_fingerprint != hello.source_fingerprint
                 {
                     error!(
+                        node = %node,
                         "inner selector identity mismatch for {stream_id}: claimed {}, presented {peer_cn}",
                         hello.source_principal
                     );
@@ -1270,6 +1329,7 @@ impl EgressHandler {
                         "protocol",
                     );
                     Self::finish(
+                        &node,
                         &tunnel,
                         stream_id,
                         CloseReason::E2eHandshakeFailed,
@@ -1321,7 +1381,15 @@ impl EgressHandler {
                         "reason" => close_reason.to_string()
                     )
                     .increment(1);
-                    Self::finish(&tunnel, stream_id, close_reason, true, &runtime.active).await;
+                    Self::finish(
+                        &node,
+                        &tunnel,
+                        stream_id,
+                        close_reason,
+                        true,
+                        &runtime.active,
+                    )
+                    .await;
                     return;
                 }
                 // Charge the open budget only for work that will actually
@@ -1336,6 +1404,7 @@ impl EgressHandler {
                     )
                     .increment(1);
                     Self::finish(
+                        &node,
                         &tunnel,
                         stream_id,
                         CloseReason::RateLimited,
@@ -1351,9 +1420,11 @@ impl EgressHandler {
                 let reason = crate::agent::e2e::failure_reason_of(&error);
                 crate::agent::e2e::record_handshake_failure(crate::agent::e2e::SIDE_EGRESS, reason);
                 warn!(
+                    node = %node,
                     "inner TLS handshake failed ({reason}: {error}), closing stream {stream_id} without dial"
                 );
                 Self::finish(
+                    &node,
                     &tunnel,
                     stream_id,
                     CloseReason::E2eHandshakeFailed,
@@ -1377,11 +1448,12 @@ impl EgressHandler {
         {
             Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
             Ok(Err(e)) => {
-                error!("Failed to resolve target address {}: {}", target_addr, e);
+                error!(node = %node, "Failed to resolve target address {}: {}", target_addr, e);
                 if let Some(b) = &runtime.breakers {
                     b.note_failure(&target_addr);
                 }
                 Self::finish(
+                    &node,
                     &tunnel,
                     stream_id,
                     CloseReason::ConnectFailed,
@@ -1393,6 +1465,7 @@ impl EgressHandler {
             }
             Err(_) => {
                 error!(
+                    node = %node,
                     "Target address resolution timed out {}: exceeded {:?}, killing stream",
                     target_addr, resolve_timeout
                 );
@@ -1400,6 +1473,7 @@ impl EgressHandler {
                     b.note_failure(&target_addr);
                 }
                 Self::finish(
+                    &node,
                     &tunnel,
                     stream_id,
                     CloseReason::ConnectFailed,
@@ -1415,10 +1489,12 @@ impl EgressHandler {
             .find(|sa| !crate::agent::ssrf_deny::is_ip_ssrf_blocked(sa.ip()));
         let Some(target_socket_addr) = safe_addr else {
             error!(
+                node = %node,
                 "Security block: all resolved IPs for target {} hit the SSRF blocklist",
                 target_addr
             );
             Self::finish(
+                &node,
                 &tunnel,
                 stream_id,
                 CloseReason::SecurityDenied,
@@ -1437,11 +1513,12 @@ impl EgressHandler {
         {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                error!("Failed to connect to target {}: {}", target_addr, e);
+                error!(node = %node, "Failed to connect to target {}: {}", target_addr, e);
                 if let Some(b) = &runtime.breakers {
                     b.note_failure(&target_addr);
                 }
                 Self::finish(
+                    &node,
                     &tunnel,
                     stream_id,
                     CloseReason::ConnectFailed,
@@ -1453,6 +1530,7 @@ impl EgressHandler {
             }
             Err(_) => {
                 error!(
+                    node = %node,
                     "Connect to target timed out {}: exceeded {:?} (black-hole address?), killing stream and releasing slot",
                     target_addr, connect_timeout
                 );
@@ -1460,6 +1538,7 @@ impl EgressHandler {
                     b.note_failure(&target_addr);
                 }
                 Self::finish(
+                    &node,
                     &tunnel,
                     stream_id,
                     CloseReason::ConnectFailed,
@@ -1474,6 +1553,7 @@ impl EgressHandler {
             b.note_success(&target_addr);
         }
         info!(
+            node = %node,
             "Backend connection established: {} -> {}",
             stream_id, target_addr
         );
@@ -1508,6 +1588,7 @@ impl EgressHandler {
             .or_else(|| close_reason.get())
             .unwrap_or(CloseReason::CloseFrame);
         debug!(
+            node = %node,
             "inner TLS stream {stream_id} ended: {:?} (relayed={})",
             reason, outcome.response_relayed
         );
@@ -1515,7 +1596,15 @@ impl EgressHandler {
         // stream Close response is sent here when we ended the stream
         // (peer-initiated ends need no echo — the hub already reaped it).
         let echo_close = !matches!(reason, CloseReason::CloseFrame | CloseReason::SessionClosed);
-        Self::finish(&tunnel, stream_id, reason, echo_close, &runtime.active).await;
+        Self::finish(
+            &node,
+            &tunnel,
+            stream_id,
+            reason,
+            echo_close,
+            &runtime.active,
+        )
+        .await;
     }
 
     /// Unified forwarder wind-down: counting, Close echo as needed (bounded —
@@ -1528,6 +1617,7 @@ impl EgressHandler {
     /// closes) so the far end — hub/edge — can distinguish backend failures
     /// from normal teardown (route-level negative caching, 2026-09-16).
     async fn finish(
+        node: &str,
         tunnel: &AgentTunnel,
         stream_id: interflow_core::protocol::StreamId,
         reason: CloseReason,
@@ -1547,9 +1637,10 @@ impl EgressHandler {
             {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
-                    debug!("Close echo failed (expected during session teardown): {stream_id}");
+                    debug!(node = %node, "Close echo failed (expected during session teardown): {stream_id}");
                 }
                 Err(_) => debug!(
+                    node = %node,
                     "Close echo stalled for over {CLOSE_NOTIFY_TIMEOUT:?} (expected during session teardown): {stream_id}"
                 ),
             }

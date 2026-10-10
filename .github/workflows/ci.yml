@@ -78,6 +78,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       # The five test stages (lib / bins / doc / mesh e2e / rest e2e) and
       # the pebble environment contract live in ONE script — the same one
       # scripts/export_public.sh runs against the exported tree before
@@ -85,10 +88,12 @@ jobs:
       # never drift apart. Stages tee full output to a log and, on failure,
       # surface ::error:: annotations: anonymous API readers cannot download
       # run logs, but annotations ARE public — this is the failure-visibility
-      # channel for outside collaborators. Integration tests run in parallel:
-      # every listener binds `:0` and reads its actual address from readiness
-      # signals (hub/agent handles, EdgeReady); stages split per crate so a
-      # failure names the crate.
+      # channel for outside collaborators. Stages 1/2/4/5 run under
+      # cargo-nextest (per-test process isolation + cross-binary parallelism;
+      # installed above), doc tests on libtest. Integration tests run in
+      # parallel: every listener binds `:0` and reads its actual address
+      # from readiness signals (hub/agent handles, EdgeReady); stages split
+      # per crate so a failure names the crate.
       - name: test stages
         run: bash scripts/ci_test_stages.sh
 
@@ -119,6 +124,9 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       # dist/ must exist before cargo compiles src-tauri: generate_context!
       # embeds the frontend assets at compile time.
       - name: Frontend typecheck and build
@@ -128,8 +136,8 @@ jobs:
           npm run build
       - name: clippy (gui)
         run: cargo clippy -p interflow-gui --all-targets --all-features
-      - name: cargo test (gui)
-        run: cargo test -p interflow-gui --all-features --no-fail-fast
+      - name: cargo nextest (gui)
+        run: cargo nextest run -p interflow-gui --all-features
 
   deny:
     runs-on: ubuntu-24.04

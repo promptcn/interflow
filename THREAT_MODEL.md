@@ -246,6 +246,14 @@ agent-to-agent inner layer.
   session ids multiplex UDP clients, the target selector travels on an
   encrypted control stream, and datagrams ride QUIC DATAGRAM frames.
   Large datagrams are explicitly fragmented and reassembled at the agents.
+- **Revocation is fail-closed everywhere a chain verifies.** The issuer
+  store's deny list signs per-issuer CRLs (monotonic `crlNumber`, RFC
+  5280 reason codes); every verifier that mounts tenant anchors — hub,
+  inner TLS both sides, expose edge — loads the same CRLs. Registrar-mode
+  nodes re-pull them every 60s and a pull outage older than 1h refuses
+  credentials outright (no "unrevocable credential" window); offline
+  deployments embed a snapshot in the pack with a freshness horizon
+  matching the leaf's own lifetime.
 - In both cases the egress performs DNS resolution and the LAN dial only
   after the inner peer verifies. A relay can still drop, delay, reorder,
   or close traffic. Protocol v3 keeps semantic tenant/agent names out of
@@ -324,6 +332,45 @@ may carry multiple tenants, each with its own client CA:
 - Residual: the §6 relay-host content exposure is closed for TCP and
   UDP data planes by agent↔agent inner TLS / inner QUIC. Availability and
   traffic-analysis exposure remain as stated above.
+
+### 6.6 The stream-proposal face (self-service stream requests)
+
+The kube-CSR-shaped self-service flow (2026-10-08): nodes may only
+**propose** streams; minting stays exclusively with the issuer machine.
+The hub holds the queue — a neutral store-and-forward role exactly like
+its policy distribution (it never signs anything; an approval lands as
+an ordinary manifest edit + `plan apply` on the same single source of
+truth, so no bypass issuance path exists).
+
+- **Requester identity is the mTLS chain, never a request-body field**
+  (`{workspace}/{agent}` from the anchored root + leaf CN), and the
+  submitter must be a *registered* agent — a certified-but-unregistered
+  identity has no standing to queue operator work. Receipts (`/proposals/
+  mine`, the `ProposalMine` frame) are keyed the same way: an agent sees
+  only its own proposals. The hub's queue listing and the decision
+  endpoints (`approve`/`reject`) require the control principal — agents
+  cannot decide their own requests.
+- **The submit funnel runs the serving policy's own pairing semantics**
+  (target exists, its signed egress offers the `remote_addr`, loopback
+  listen, idle bounds, no live name collision) — a proposal that could
+  not pass the apply-time validator never enters the queue. Proposals
+  are stream-face-only by construction: the funnel validates a
+  `mesh_ingress` rule shape and the approve orchestration applies that
+  one edit; no proposal can touch identity, keys, hubs, or transport.
+- **Anti-pile**: a 72h TTL (expiry is one audit event per lapsed
+  proposal), per-requester (20) and total (200) pending caps, idempotent
+  resubmit by rule fingerprint, and persistence beside the policy
+  channel (`<pack>/state/proposals.json`, atomic write; a corrupt file is
+  quarantined beside the queue with one `ProposalQueueQuarantined` audit
+  event and the face restarts empty — the loss is explicit and the
+  evidence preserved, never a silent reset; the data plane is unaffected
+  because the queue is operator workflow state, not trust material).
+- **Audit**: the lifecycle is four events (submitted / submit-denied /
+  approved / rejected / expired), one each per proposal, into the hashed
+  audit chain. **Isolation**: a pending proposal has zero effect on the
+  running policy (the proposal face and the effective face never meet
+  until an issuer-machine approval mints a generation) — e2e-locked in
+  `crates/cli/tests/proposal_approval.rs`.
 
 ### Supply-chain note (the `ppp` dependency)
 

@@ -17,9 +17,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code,
-    unused_mut
+    missing_docs
 )]
 use interflow_expose::client::{ExposeArgs, LocalService};
 use interflow_expose::edge::{
@@ -94,6 +92,8 @@ async fn spawn_stack(
         ca_path: Some(certs.ca_path().display().to_string()),
         transport: TransportKind::H2,
         hub_quic_addr: None,
+
+        identity_offline: false,
     };
     let handle = interflow_expose::client::start(&client_args).expect("start expose client");
     let mut state = handle.subscribe_state();

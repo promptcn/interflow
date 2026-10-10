@@ -83,6 +83,13 @@ pub struct PolicyAdminConfig {
     /// publications).
     #[serde(default)]
     pub generation: u64,
+    /// The pack directory this hub runs from — present exactly on
+    /// pack-built configs. The hub's run future runs the signed-policy ACL
+    /// hot-swap watcher intrinsically from this path; there is no embedder
+    /// wiring to forget (the seam this field closed:
+    /// (internal design notes)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_dir: Option<std::path::PathBuf>,
 }
 
 /// Hub-side transport tuning: h2 keepalive plus the QUIC listener section.
@@ -337,7 +344,10 @@ pub struct TlsConfig {
     /// Server private key PEM path (must be 0600).
     pub key_path: String,
     /// Minimum TLS version. Defaults to "1.2". Enforced via rustls
-    /// protocol selection in every server-config builder.
+    /// protocol selection in every server-config builder. One section
+    /// serves both faces: when `[transport.quic]` is enabled the value
+    /// must be "1.3" (QUIC mandates TLS 1.3) — rejected at validation,
+    /// never silently clamped per-face.
     #[serde(default = "default_tls_min_version")]
     pub min_version: interflow_core::tls::TlsMinVersion,
 }

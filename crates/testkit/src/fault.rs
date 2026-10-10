@@ -42,6 +42,16 @@ impl FaultPlan {
         self.entries.insert(point, (FaultAction::Stall, 1));
         self
     }
+
+    /// Stall-class action that fires on **every** consultation while the
+    /// plan is installed (unlimited repeats) — for call points whose
+    /// semantic is "while armed" rather than "once", e.g. the hub's
+    /// liveness-probe swallow: disarming (replacing/clearing the plan)
+    /// restores service on the next consultation.
+    pub fn stall_every_at(mut self, point: FaultPoint) -> Self {
+        self.entries.insert(point, (FaultAction::Stall, u32::MAX));
+        self
+    }
 }
 
 /// Consumption log for an installed plan: proves injections actually fired.

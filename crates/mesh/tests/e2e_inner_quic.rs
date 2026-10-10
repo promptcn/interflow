@@ -6,8 +6,7 @@
     clippy::panic,
     clippy::unwrap_used,
     clippy::expect_used,
-    missing_docs,
-    dead_code
+    missing_docs
 )]
 use bytes::Bytes;
 use interflow_core::protocol::{FLAG_E2E, FrameType, StreamProto};
