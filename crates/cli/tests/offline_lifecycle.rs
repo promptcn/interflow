@@ -329,7 +329,7 @@ fn revoke_then_rotate_embeds_the_deny_list_snapshot() {
         .expect("registrar lookup tolerates absence");
     assert_eq!(
         found,
-        Some(stray.clone()),
+        Some(stray),
         "registrar packs read state/crls when present"
     );
     let empty = dir.join("nonexistent-pack");

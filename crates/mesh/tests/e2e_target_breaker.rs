@@ -151,8 +151,9 @@ async fn open_until_rejected(
     // Generous budget: on slow shared CI runners the storm's inner-TLS
     // handshakes starve the rejection round trip far past the sub-second
     // healthy case (same lesson as the self-heal suite's watchdog budgets;
-    // 8s was observed flaking on a 2vCPU runner, 2026-09-30).
-    let _ = tokio::time::timeout(Duration::from_secs(30), tls.read(&mut probe))
+    // 8s was observed flaking on a 2vCPU runner, 2026-09-30; 30s then
+    // flaked the same way once the mesh suite grew to 140 e2e — 2026-10-10).
+    let _ = tokio::time::timeout(Duration::from_secs(60), tls.read(&mut probe))
         .await
         .expect("timed out waiting for the rejecting Close")
         .expect_err("dead target must close the inner stream");
