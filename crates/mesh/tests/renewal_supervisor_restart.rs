@@ -83,8 +83,6 @@ async fn renewal_exits_onto_supervisor_restart_with_new_material() {
     let hub_port = free_port();
     let echo_port = free_port();
     let listen_port = free_port();
-    let registrar_port = free_port();
-    let registrar_endpoint = format!("https://127.0.0.1:{registrar_port}");
 
     // The far-end service behind lan-b.
     let echo = tokio::net::TcpListener::bind(("127.0.0.1", echo_port))
@@ -114,49 +112,18 @@ async fn renewal_exits_onto_supervisor_restart_with_new_material() {
     // The real registrar the agent renews against (45s leaves, matching
     // the manifest below — only under identity's short-leaf-ttl test
     // feature, which never reaches production graphs).
-    let dir = tempfile::tempdir().unwrap();
-    let issuer_dir = dir.path().join("issuer");
-    let issuer = IssuerStore::open(&issuer_dir);
-    issuer.ensure_realm().unwrap();
-    issuer.ensure_workspace("main").unwrap();
-    issuer.ensure_policy_key().unwrap();
-    let tls = issuer
-        .issue_control_endpoint("test", "registrar", &registrar_endpoint)
-        .unwrap();
-    std::fs::write(dir.path().join("registrar.crt"), &tls.chain_pem).unwrap();
-    std::fs::write(dir.path().join("registrar.key"), &tls.key_pem).unwrap();
-    tokio::spawn(interflow_registrar::server::serve(
-        issuer_dir.clone(),
-        interflow_registrar::server::ServeOptions {
-            listen: format!("127.0.0.1:{registrar_port}").parse().unwrap(),
-            public_endpoint: registrar_endpoint.clone(),
-            tls_cert: dir.path().join("registrar.crt"),
-            tls_key: dir.path().join("registrar.key"),
+    let registrar = interflow_testkit::registrar::spawn_registrar(
+        interflow_testkit::registrar::RegistrarFixtureOptions {
             ttl: LeafTtl::from_seconds(LEAF_TTL).unwrap(),
-            control_endpoint: "127.0.0.1:16666".to_owned(),
-            hub_endpoints: Default::default(),
+            ..interflow_testkit::registrar::RegistrarFixtureOptions::default()
         },
-    ));
-    let ca = issuer.realm_issuer().unwrap().cert_pem().to_owned();
-    let registrar_ready = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let probe = reqwest::Client::builder()
-                .add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).unwrap())
-                .build()
-                .unwrap();
-            if probe
-                .get(format!("{registrar_endpoint}/health"))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    )
     .await;
-    assert!(registrar_ready.is_ok(), "registrar never became ready");
+    registrar.wait_ready().await;
+    let registrar_endpoint = registrar.endpoint().to_owned();
+    let issuer = IssuerStore::open(registrar.issuer_dir());
+    // The packs tree (the issuer lives in the registrar fixture's tempdir).
+    let dir = tempfile::tempdir().unwrap();
 
     let manifest = Manifest::parse(&format!(
         r#"

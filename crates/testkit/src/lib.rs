@@ -14,7 +14,10 @@
 //! - [`backend`]: echo / UDP echo / SSE timestamped-chunk backends (phased, with silence/burst support)
 //! - [`impair`]: impairment proxies (TCP byte withholding to simulate lost-segment HOL / real UDP drops + delay)
 //! - [`hub_http`]: consumer-side mirrors of the hub's operator HTTP contracts + the shared `GET /agents` e2e client
+//! - [`http`]: the direct-dial reqwest constructor every test client goes through (ambient-proxy immunity)
+//! - [`logging`]: global test-process tracing sink (stderr + ring mirror, `RUST_LOG`-overridable)
 //! - [`metrics`]: quantiles and scenario result types (bench artifact schema)
+//! - [`registrar`]: in-process registrar fixture (dead-then-alive port, asserted readiness)
 //! - [`soak`]: long-running regression gate (real process topology + eight assertions; CLI in `bin/soak.rs`)
 //! - [`supervisor`]: bounded Restart=on-success loop (the renewal exit contract's e2e harness)
 
@@ -37,10 +40,13 @@ pub mod clock;
 pub mod config;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
+pub mod http;
 pub mod hub_http;
 pub mod impair;
+pub mod logging;
 pub mod metrics;
 pub mod metrics_harness;
+pub mod registrar;
 pub mod soak;
 pub mod stack;
 pub mod supervisor;

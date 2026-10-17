@@ -102,6 +102,22 @@ impl FakeClock {
             .sleep_requests
             .clone()
     }
+
+    /// The quiescence signal for chunked driving: at least one sleep is
+    /// parked and every parked deadline lies in the fake future. A wake's
+    /// processing (real I/O, consults whose timestamps the tests assert
+    /// on) runs with the previous sleep already consumed — parked is
+    /// empty then — so this is exactly "the woken work finished and
+    /// re-parked", independent of how slow the runner's real time is.
+    #[must_use]
+    pub fn all_parked_beyond_now(&self) -> bool {
+        let state = self.state.lock().expect("fake clock lock poisoned");
+        !state.parked.is_empty()
+            && state
+                .parked
+                .iter()
+                .all(|(_, deadline, _)| *deadline > state.monotonic)
+    }
 }
 
 impl Clock for FakeClock {

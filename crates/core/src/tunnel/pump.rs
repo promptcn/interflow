@@ -386,13 +386,21 @@ pub(crate) fn parse_close_reason(data: &[u8]) -> CloseReason {
 /// channel. On the local-EOF path it runs only after the bounded drain below.
 ///
 /// End-of-stream choreography (mirroring [`pump_tcp_stream`]'s close-out
-/// semantics):
-/// - `local` EOF first → the tunnel write half stays open for the late request
-///   drain window (`local_eof_drain`; egress uses five seconds, public client
-///   endpoints use zero), then dispatch is cut and the caller's stream-close
-///   epilogue owns teardown; `local_eof_reason` is the authoritative outcome;
-/// - tunnel EOF first (peer Close / channel closure surfaced as EOF by the
-///   TLS layer) → `local` is shut down and the pump returns.
+/// semantics) — a proper directional close:
+/// - `local` EOF first → the FIN propagates as the TLS layer's close_notify
+///   (Data frames), and the tunnel half keeps relaying the peer's answer for
+///   the `local_eof_drain` window (`local_eof_drain`; both production call
+///   sites use the five-second [`DUPLEX_LOCAL_EOF_DRAIN`] — a client that
+///   half-closes its write side and awaits the response is standard TCP
+///   usage, and cutting delivery at the FIN races the whole response chain
+///   through the hub; the 2026-10-17 Linux backlog was exactly that race
+///   lost deterministically); only then is dispatch cut and the caller's
+///   stream-close epilogue owns the raw teardown; `local_eof_reason` is the
+///   authoritative outcome;
+/// - tunnel EOF first (peer Close / peer close_notify) → `local` is FINned
+///   and its remaining tail drains through this side's writes for the same
+///   window (the egress's backend response to a half-closed request), then
+///   the pump returns.
 ///
 /// Cancellation safety: same as [`pump_tcp_stream`] — droppable at any
 /// time by an outer select, losing at most one in-flight chunk.
@@ -460,12 +468,16 @@ where
                 Err(_) => {}
             }
         }
-        // Local direction ended: keep the tunnel write half open for the
-        // bounded drain window (late request tail). The caller's dispatch cut
-        // and stream close epilogue own final teardown; shutting down here
-        // would race a Close back through the tunnel half and misclassify the
-        // authoritative local EOF.
-        tokio::time::sleep(local_eof_drain).await;
+        // Local direction ended: propagate the FIN as the TLS layer's
+        // close_notify (it rides writes as Data frames; the adapter's
+        // shutdown is inert by contract) so the peer can finish its own
+        // local endpoint and answer. The raw stream Close stays with the
+        // caller's epilogue — sending it here would tear the stream down
+        // at the hub while the response is still in flight (the 2026-10-17
+        // half-close race).
+        if let Err(e) = tunnel_wr.shutdown().await {
+            debug!("{label} e2e tunnel close_notify failed: {e}");
+        }
     };
 
     // tunnel → local: sole observer of the outcome facts.
@@ -536,36 +548,39 @@ where
         () = &mut local_half => HalfDone::Local,
     };
 
-    match done {
-        // Tunnel side ended (peer Close / EOF): the local endpoint is
-        // dropped with this function — nothing more to relay.
+    let outcome = match done {
+        // Tunnel side ended (peer Close / peer close_notify): the local
+        // endpoint gets its FIN (the tunnel half already shut it down), and
+        // its remaining tail drains through this side's writes — for the
+        // egress that tail is exactly the response to a half-closed
+        // request. Bounded by the same window; the drain's own end carries
+        // this side's close_notify, so the peer's reader sees a clean EOF.
         HalfDone::Tunnel(outcome) => {
-            // Dispatch stops delivering for this stream before the pump returns.
-            (&mut cut_delivery).await;
+            let _ = tokio::time::timeout(local_eof_drain, &mut local_half).await;
             outcome
         }
-        // Local endpoint EOF: drain the tunnel→local direction until the
-        // peer's Close arrives, then cut dispatch boundedly even if a peer
-        // withholds it.
-        HalfDone::Local => {
-            let outcome = match tokio::time::timeout(local_eof_drain, &mut tunnel_half).await {
-                Ok(mut outcome) => {
-                    // The local endpoint initiated the close; its EOF is the
-                    // authoritative outcome even if the peer's ordinary Close
-                    // races back through the tunnel half.
-                    outcome.close_reason = Some(local_eof_reason);
-                    outcome
-                }
-                Err(_) => StreamOutcome {
-                    close_reason: Some(local_eof_reason),
-                    response_relayed: response_relayed.load(Ordering::Acquire),
-                    idle_expired: idle_expired.load(Ordering::Acquire),
-                },
-            };
-            (&mut cut_delivery).await;
-            outcome
-        }
-    }
+        // Local endpoint EOF'd first: the peer may still answer — hold the
+        // dispatch cut for the drain window while the tunnel half keeps
+        // relaying whatever comes back, then cut boundedly even if a peer
+        // withholds its close.
+        HalfDone::Local => match tokio::time::timeout(local_eof_drain, &mut tunnel_half).await {
+            Ok(mut outcome) => {
+                // The local endpoint initiated the close; its EOF is the
+                // authoritative outcome even if the peer's ordinary Close
+                // races back through the tunnel half.
+                outcome.close_reason = Some(local_eof_reason);
+                outcome
+            }
+            Err(_) => StreamOutcome {
+                close_reason: Some(local_eof_reason),
+                response_relayed: response_relayed.load(Ordering::Acquire),
+                idle_expired: idle_expired.load(Ordering::Acquire),
+            },
+        },
+    };
+    // Dispatch stops delivering for this stream before the pump returns.
+    (&mut cut_delivery).await;
+    outcome
 }
 
 #[cfg(test)]
@@ -1077,6 +1092,49 @@ mod tests {
         .await;
         assert!(!outcome.response_relayed);
         assert_eq!(tunnel_side.await.unwrap(), b"req-data");
+    }
+
+    /// The half-close idiom: the local endpoint FINs after its request and
+    /// the response only exists afterwards. The pump must relay that late
+    /// response within the drain window — the delivery cut may not race it
+    /// (the 2026-10-17 Linux backlog's exact shape).
+    #[tokio::test(start_paused = true)]
+    async fn duplex_local_eof_late_response_still_relays() {
+        let (local, mut local_peer) = duplex(64 * 1024);
+        let (tunnel, mut tunnel_peer) = duplex(64 * 1024);
+
+        local_peer.write_all(b"req").await.unwrap();
+        local_peer.shutdown().await.unwrap();
+
+        // The tunnel peer serves only after the request direction fully
+        // ended (bytes + the close_notify shutdown), then answers and
+        // departs — the response is by construction late.
+        let server = tokio::spawn(async move {
+            let mut got = Vec::new();
+            tunnel_peer.read_to_end(&mut got).await.unwrap();
+            assert_eq!(got, b"req");
+            tunnel_peer.write_all(b"resp").await.unwrap();
+            tunnel_peer.shutdown().await.unwrap();
+        });
+
+        let outcome = pump_duplex(
+            local,
+            tunnel,
+            &test_cfg(),
+            CloseReason::CloseFrame,
+            DUPLEX_LOCAL_EOF_DRAIN,
+            StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31").unwrap(),
+            async {},
+        )
+        .await;
+        assert!(
+            outcome.response_relayed,
+            "the response to a half-closed request must reach the local end"
+        );
+        let _ = server.await;
+        let mut got = Vec::new();
+        local_peer.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"resp");
     }
 
     /// A non-reading local endpoint hits the write-stall budget and ends

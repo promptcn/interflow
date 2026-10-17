@@ -1,11 +1,11 @@
 //! HTTP/mTLS smoke test for the registrar lifecycle.
 
-use interflow_identity::issuance::{IssuerStore, LeafTtl, generate_csr};
+use interflow_identity::issuance::generate_csr;
 use interflow_identity::{PrincipalKind, PrincipalPath};
 use interflow_registrar::EnrollmentCodes;
+use interflow_testkit::http::direct_client;
+use interflow_testkit::registrar::{RegistrarFixture, RegistrarFixtureOptions};
 use serde_json::Value;
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Serializes the tests: the fault hook is process-global (the same
@@ -13,68 +13,30 @@ use std::sync::Arc;
 /// an armed plan.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// A live in-process registrar: tempdir + endpoint + realm CA PEM.
-struct Registrar {
-    #[expect(dead_code, reason = "holds the tempdir alive for the test body")]
-    dir: tempfile::TempDir,
-    endpoint: String,
-    ca: String,
-    issuer_dir: PathBuf,
-}
-
-async fn spawn_registrar() -> Registrar {
-    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let dir = tempfile::tempdir().unwrap();
-    let issuer_dir = dir.path().join("issuer");
-    let issuer = IssuerStore::open(&issuer_dir);
-    issuer.ensure_realm().unwrap();
-    issuer.ensure_workspace("main").unwrap();
-    issuer.ensure_policy_key().unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let endpoint = format!("https://127.0.0.1:{port}");
-    let tls = issuer
-        .issue_control_endpoint("test", "registrar", &endpoint)
-        .unwrap();
-    std::fs::write(dir.path().join("registrar.crt"), &tls.chain_pem).unwrap();
-    std::fs::write(dir.path().join("registrar.key"), &tls.key_pem).unwrap();
-    tokio::spawn(interflow_registrar::server::serve(
-        issuer_dir.clone(),
-        interflow_registrar::server::ServeOptions {
-            listen: format!("127.0.0.1:{port}").parse().unwrap(),
-            public_endpoint: endpoint.clone(),
-            tls_cert: dir.path().join("registrar.crt"),
-            tls_key: dir.path().join("registrar.key"),
-            ttl: LeafTtl::default_ttl(),
-            control_endpoint: "https://relay.test".to_owned(),
-            hub_endpoints: Default::default(),
-        },
-    ));
-    let ca = issuer.realm_issuer().unwrap().cert_pem().to_owned();
-    wait_ready(&endpoint, &ca).await.unwrap();
-    Registrar {
-        dir,
-        endpoint,
-        ca,
-        issuer_dir,
-    }
+/// A live in-process registrar, already answering `GET /health`.
+async fn spawn_registrar() -> RegistrarFixture {
+    let registrar =
+        interflow_testkit::registrar::spawn_registrar(RegistrarFixtureOptions::default()).await;
+    registrar.wait_ready().await;
+    registrar
 }
 
 /// Enrolls one agent identity by code and returns its mTLS client.
-async fn enrolled_agent(registrar: &Registrar) -> reqwest::Client {
-    let code = EnrollmentCodes::open(registrar.issuer_dir.join("enrollments.json"))
+async fn enrolled_agent(registrar: &RegistrarFixture) -> reqwest::Client {
+    let code = EnrollmentCodes::open(registrar.issuer_dir().join("enrollments.json"))
         .unwrap()
         .create("test", PrincipalKind::Agent, Some("main"), "desktop")
         .unwrap();
     let principal =
         PrincipalPath::workspace_member("test", "main", PrincipalKind::Agent, "desktop").unwrap();
     let csr = generate_csr(&principal, &[], false).unwrap();
-    let initial: Value = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(registrar.ca.as_bytes()).unwrap())
+    let initial: Value = direct_client()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(registrar.ca_pem().as_bytes()).unwrap(),
+        )
         .build()
         .unwrap()
-        .post(format!("{}/v1/enroll", registrar.endpoint))
+        .post(format!("{}/v1/enroll", registrar.endpoint()))
         .json(&serde_json::json!({
             "code": code.code,
             "csr_pem": csr.csr_pem,
@@ -87,8 +49,10 @@ async fn enrolled_agent(registrar: &Registrar) -> reqwest::Client {
         .json()
         .await
         .unwrap();
-    reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(registrar.ca.as_bytes()).unwrap())
+    direct_client()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(registrar.ca_pem().as_bytes()).unwrap(),
+        )
         .identity(
             reqwest::Identity::from_pem(
                 format!("{}{}", initial["chain_pem"].as_str().unwrap(), csr.key_pem).as_bytes(),
@@ -108,21 +72,19 @@ fn renew_body() -> serde_json::Value {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "in-process registrar serve binds but never accepts on Linux (client TLS gets EOF at zero accepts) — ticketed in (internal design notes)"
-)]
 async fn renew_without_client_certificate_is_rejected() {
     let _serial = SERIAL.lock().await;
     let registrar = spawn_registrar().await;
 
     // The TLS plane admits anonymous peers (the CRL pull lane relies on
     // it); the renew handler must still refuse them.
-    let response = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(registrar.ca.as_bytes()).unwrap())
+    let response = direct_client()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(registrar.ca_pem().as_bytes()).unwrap(),
+        )
         .build()
         .unwrap()
-        .post(format!("{}/v1/renew", registrar.endpoint))
+        .post(format!("{}/v1/renew", registrar.endpoint()))
         .json(&renew_body())
         .send()
         .await
@@ -135,10 +97,6 @@ async fn renew_without_client_certificate_is_rejected() {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "in-process registrar serve binds but never accepts on Linux (client TLS gets EOF at zero accepts) — ticketed in (internal design notes)"
-)]
 async fn fault_injected_renew_is_a_503_then_recovers() {
     let _serial = SERIAL.lock().await;
     interflow_registrar::fault::clear_hook();
@@ -162,7 +120,7 @@ async fn fault_injected_renew_is_a_503_then_recovers() {
     }));
 
     let failed = client
-        .post(format!("{}/v1/renew", registrar.endpoint))
+        .post(format!("{}/v1/renew", registrar.endpoint()))
         .json(&renew_body())
         .send()
         .await
@@ -173,18 +131,20 @@ async fn fault_injected_renew_is_a_503_then_recovers() {
 
     // The fault is request-scoped: health never failed, and the very next
     // renew succeeds (recovery).
-    let health = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(registrar.ca.as_bytes()).unwrap())
+    let health = direct_client()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(registrar.ca_pem().as_bytes()).unwrap(),
+        )
         .build()
         .unwrap()
-        .get(format!("{}/health", registrar.endpoint))
+        .get(format!("{}/health", registrar.endpoint()))
         .send()
         .await
         .unwrap();
     assert!(health.status().is_success());
 
     let recovered = client
-        .post(format!("{}/v1/renew", registrar.endpoint))
+        .post(format!("{}/v1/renew", registrar.endpoint()))
         .json(&renew_body())
         .send()
         .await
@@ -195,67 +155,23 @@ async fn fault_injected_renew_is_a_503_then_recovers() {
     interflow_registrar::fault::clear_hook();
 }
 
-async fn wait_ready(endpoint: &str, ca: &str) -> Result<(), String> {
-    for _ in 0..100 {
-        let client = reqwest::Client::builder()
-            .add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).unwrap())
-            .build()
-            .unwrap();
-        let response = client.get(format!("{endpoint}/health")).send().await;
-        if response.is_ok_and(|response| response.status().is_success()) {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    Err("registrar did not become ready".to_string())
-}
-
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "in-process registrar serve binds but never accepts on Linux (client TLS gets EOF at zero accepts) — ticketed in (internal design notes)"
-)]
 async fn enroll_renew_and_confirm_over_https_mtls() -> Result<(), Box<dyn std::error::Error>> {
     let _serial = SERIAL.lock().await;
-    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let dir = tempfile::tempdir().unwrap();
-    let issuer = IssuerStore::open(dir.path().join("issuer"));
-    issuer.ensure_realm().unwrap();
-    issuer.ensure_workspace("main").unwrap();
-    issuer.ensure_policy_key().unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let endpoint = format!("https://127.0.0.1:{port}");
-    let tls = issuer
-        .issue_control_endpoint("test", "registrar", &endpoint)
-        .unwrap();
-    std::fs::write(dir.path().join("registrar.crt"), &tls.chain_pem).unwrap();
-    std::fs::write(dir.path().join("registrar.key"), &tls.key_pem).unwrap();
-    let code = EnrollmentCodes::open(dir.path().join("issuer/enrollments.json"))
+    let registrar = spawn_registrar().await;
+    let code = EnrollmentCodes::open(registrar.issuer_dir().join("enrollments.json"))
         .unwrap()
         .create("test", PrincipalKind::Agent, Some("main"), "desktop")
         .unwrap();
 
-    tokio::spawn(interflow_registrar::server::serve(
-        dir.path().join("issuer"),
-        interflow_registrar::server::ServeOptions {
-            listen: format!("127.0.0.1:{port}").parse().unwrap(),
-            public_endpoint: endpoint.clone(),
-            tls_cert: dir.path().join("registrar.crt"),
-            tls_key: dir.path().join("registrar.key"),
-            ttl: LeafTtl::default_ttl(),
-            control_endpoint: "https://relay.test".to_owned(),
-            hub_endpoints: Default::default(),
-        },
-    ));
-    let ca = issuer.realm_issuer().unwrap().cert_pem().to_owned();
-    wait_ready(&endpoint, &ca).await?;
+    let endpoint = registrar.endpoint().to_owned();
     let principal =
         PrincipalPath::workspace_member("test", "main", PrincipalKind::Agent, "desktop").unwrap();
     let enrollment_csr = generate_csr(&principal, &[], false).unwrap();
-    let initial: Value = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).unwrap())
+    let initial: Value = direct_client()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(registrar.ca_pem().as_bytes()).unwrap(),
+        )
         .build()
         .unwrap()
         .post(format!("{endpoint}/v1/enroll"))
@@ -281,8 +197,10 @@ async fn enroll_renew_and_confirm_over_https_mtls() -> Result<(), Box<dyn std::e
         .as_bytes(),
     )
     .unwrap();
-    let initial_client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).unwrap())
+    let initial_client = direct_client()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(registrar.ca_pem().as_bytes()).unwrap(),
+        )
         .identity(initial_identity)
         .build()
         .unwrap();
@@ -312,8 +230,10 @@ async fn enroll_renew_and_confirm_over_https_mtls() -> Result<(), Box<dyn std::e
         .as_bytes(),
     )
     .unwrap();
-    let confirmed_response = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).unwrap())
+    let confirmed_response = direct_client()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(registrar.ca_pem().as_bytes()).unwrap(),
+        )
         .identity(renewed_identity)
         .build()
         .unwrap()
@@ -328,6 +248,11 @@ async fn enroll_renew_and_confirm_over_https_mtls() -> Result<(), Box<dyn std::e
     assert!(confirmed_text.contains("confirmed"), "{confirmed_text}");
     let confirmed: Value = serde_json::from_str(&confirmed_text).unwrap();
     assert_eq!(confirmed["confirmed"], true);
-    assert!(Path::new(&dir.path().join("issuer/registrar-audit.jsonl")).exists());
+    assert!(
+        registrar
+            .issuer_dir()
+            .join("registrar-audit.jsonl")
+            .exists()
+    );
     Ok(())
 }

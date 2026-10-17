@@ -64,7 +64,13 @@ fn tls_identity(cert_pem: &str, key_pem: &str) -> Result<reqwest::Identity> {
 fn client(_endpoint: &str, ca_pem: &str, cert_pem: &str, key_pem: &str) -> Result<reqwest::Client> {
     let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())
         .map_err(|e| config_error(format!("registrar trust anchor: {e}")))?;
+    // The registrar is an identity-plane endpoint pinned by the pack's own
+    // trust store; its mTLS traffic must dial directly. reqwest otherwise
+    // honors ambient http(s)_proxy, which silently reroutes renewal through
+    // a proxy that cannot reach the (usually loopback) registrar and kills
+    // every renewal with a fast opaque connection error.
     reqwest::Client::builder()
+        .no_proxy()
         .add_root_certificate(certificate)
         .identity(tls_identity(cert_pem, key_pem)?)
         .build()
@@ -115,6 +121,7 @@ async fn refresh_crls(pack: &CredentialPack) -> Result<bool> {
     let certificate = reqwest::Certificate::from_pem(ca.as_bytes())
         .map_err(|e| config_error(format!("registrar trust anchor: {e}")))?;
     let response: BTreeMap<String, String> = reqwest::Client::builder()
+        .no_proxy()
         .add_root_certificate(certificate)
         .build()
         .map_err(|e| config_error(format!("registrar HTTPS client: {e}")))?

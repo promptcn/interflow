@@ -6,7 +6,7 @@ resolver = "2"
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -46,18 +46,18 @@ similar = "3.2"
 # is pinned to the workspace version by check_version_contract.py, so it
 # cannot drift the way the v0.11.0 bump's 39 stale member-manifest pins did
 # (fixed in c458728). scripts/bump_version.py moves it with every bump.
-interflow-buildinfo = { path = "crates/buildinfo", version = "0.11.0" }
-interflow-certs = { path = "crates/certs", version = "0.11.0" }
-interflow-cli = { path = "crates/cli", version = "0.11.0" }
-interflow-contract = { path = "crates/contract", version = "0.11.0" }
-interflow-core = { path = "crates/core", version = "0.11.0" }
-interflow-expose = { path = "crates/expose", version = "0.11.0" }
-interflow-identity = { path = "crates/identity", version = "0.11.0" }
-interflow-mesh = { path = "crates/mesh", version = "0.11.0" }
-interflow-registrar = { path = "crates/registrar", version = "0.11.0" }
-interflow-renewal = { path = "crates/renewal", version = "0.11.0" }
-interflow-testkit = { path = "crates/testkit", version = "0.11.0" }
-interflow-util = { path = "crates/util", version = "0.11.0" }
+interflow-buildinfo = { path = "crates/buildinfo", version = "0.11.1" }
+interflow-certs = { path = "crates/certs", version = "0.11.1" }
+interflow-cli = { path = "crates/cli", version = "0.11.1" }
+interflow-contract = { path = "crates/contract", version = "0.11.1" }
+interflow-core = { path = "crates/core", version = "0.11.1" }
+interflow-expose = { path = "crates/expose", version = "0.11.1" }
+interflow-identity = { path = "crates/identity", version = "0.11.1" }
+interflow-mesh = { path = "crates/mesh", version = "0.11.1" }
+interflow-registrar = { path = "crates/registrar", version = "0.11.1" }
+interflow-renewal = { path = "crates/renewal", version = "0.11.1" }
+interflow-testkit = { path = "crates/testkit", version = "0.11.1" }
+interflow-util = { path = "crates/util", version = "0.11.1" }
 
 # ============================================================================
 # Lints — applied uniformly via [workspace.lints]; sub-crates inherit with `[lints] workspace = true`

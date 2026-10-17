@@ -14,6 +14,60 @@ the first public release carrying this changelog.
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-17
+
+### Fixed
+
+- Ambient proxy environments no longer break renewal: the renewal client now
+  dials the registrar directly (`no_proxy()`). On any host exporting
+  `http(s)_proxy` (Docker Desktop injects one into every container; corporate
+  shells export one), every renewal request — mTLS identity-plane traffic to a
+  pinned, usually loopback endpoint — was silently rerouted to a proxy that
+  cannot reach it and failed with a fast opaque connection error. Discovered
+  as the real root cause behind the "registrar fixture never becomes ready on
+  Linux" backlog (the server never saw a single connection; the requests
+  never entered the container's network namespace at all). Test-built clients
+  gained the same immunity through a single direct-dial constructor. CI now
+  enforces the immunity structurally: a dedicated test stage re-runs the
+  identity-plane crates (registrar and renewal wholesale, plus the CLI
+  renewal e2e) under injected unreachable proxies — every spelling reqwest
+  reads, with an empty `no_proxy` so loopback is not exempt — and carries
+  fail-closed self-checks (the injection asserted in the shell and again at
+  the child-process layer; a proxy-honoring probe client must fail under the
+  environment) that redden the stage itself if its injection or its teeth
+  are ever lost. A regression to proxy-honoring dials is now caught on any
+  runner, not only in a proxy-laden local container.
+- Half-closing TCP clients now get their response on every platform. A client
+  that shuts down its write side and awaits the answer (curl's shape) raced
+  the whole teardown chain through the hub: the ingress pump's local-EOF
+  drain window was zero, so the FIN became an immediate raw stream Close and
+  the hub tore the stream down before the response could traverse it — macOS
+  passed only by winning that race within ~3ms, Linux lost it
+  deterministically. The tunnel now performs a proper directional close: the
+  FIN propagates as the inner-TLS close_notify, the response drains within
+  the same five-second window the egress side already used, the relay shuttle
+  keeps serving the response leg after the TLS write half ends, and the raw
+  Close goes out only after the answer has drained. The proposal-approval
+  e2e (the only half-closing probe in the suite) and an ingress-side
+  half-close regression test pass identically on macOS and Linux — the pin
+  covers both hub transports, since h2 and QUIC share no stream-close code
+  beneath the pump and each needed its own.
+
+### Changed
+
+- The registrar server's lifecycle is now injectable and observable:
+  `serve` splits into bind + `serve_on(listener, token)`, so callers own the
+  listening socket from its first moment (the ephemeral-port TOCTOU doctrine
+  — no probe/drop/rebind window) and a `CancellationToken` performs graceful
+  shutdown with connection drain; the stand-alone entry wires SIGTERM/Ctrl-C.
+  Accept, PROXY-framing and TLS-handshake failures now log their full errors
+  instead of closing silently, and the testkit grows a shared registrar
+  fixture plus a global test logging sink (stderr + ring buffer, embedded
+  into readiness panics) — the two Linux backlogs of 2026-10-17 were
+  prolonged exactly by that blind spot. The eleven `#[ignore]`s they had
+  pinned are removed; the suite is green on macOS (`just ci`) and in a
+  proxy-laden Linux container (`scripts/linux-test.sh`).
+
 ## [0.11.0] - 2026-10-17
 
 ### Added

@@ -123,14 +123,19 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      # The five test stages (lib / bins / doc / mesh e2e / rest e2e) and
-      # the pebble environment contract live in ONE script — the same one
-      # scripts/export_public.sh runs against the exported tree before
-      # committing (public-CI parity), so the workflow and the export can
-      # never drift apart. This job selects its stage subset by argument;
-      # the mesh e2e stage runs in the parallel test-mesh-e2e job (the
-      # timing-sensitive tier, isolated so starved-runner flakes stop
-      # moving wall-clock budgets — 2026-10-11 starvation backlog). Stages
+      # The six test stages (lib / bins / doc / mesh e2e / rest e2e /
+      # ambient-proxy) and the pebble environment contract live in ONE
+      # script — the same one scripts/export_public.sh runs against the
+      # exported tree before committing (public-CI parity), so the workflow
+      # and the export can never drift apart. This job selects its stage
+      # subset by argument; the mesh e2e stage runs in the parallel
+      # test-mesh-e2e job (the timing-sensitive tier, isolated so
+      # starved-runner flakes stop moving wall-clock budgets — 2026-10-11
+      # starvation backlog), and the ambient-proxy stage runs LAST here:
+      # the identity-plane crates re-run under injected unreachable
+      # proxies, so a regression to proxy-honoring dials (no_proxy() /
+      # direct_client dropped) reddens this job on any runner — an
+      # environment-class invariant no functional stage can catch. Stages
       # tee full output to a log and, on failure, surface ::error::
       # annotations: anonymous API readers cannot download run logs, but
       # annotations ARE public — this is the failure-visibility channel for
@@ -140,8 +145,8 @@ jobs:
       # every listener binds `:0` and reads its actual address from
       # readiness signals (hub/agent handles, EdgeReady); stages split per
       # crate so a failure names the crate.
-      - name: test stages (lib/bins/doc/rest)
-        run: bash scripts/ci_test_stages.sh lib bins doc rest
+      - name: test stages (lib/bins/doc/rest/ambient-proxy)
+        run: bash scripts/ci_test_stages.sh lib bins doc rest ambient-proxy
 
   test-mesh-e2e:
     runs-on: ubuntu-24.04

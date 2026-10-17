@@ -47,6 +47,8 @@ workspace = true
 tempfile = "3"
 interflow-registrar.workspace = true
 interflow-renewal.workspace = true
+# Test-process tracing sink (agent watcher / registrar serve under --nocapture)
+interflow-testkit.workspace = true
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 # In-process hub hosting for the apply e2e (policy_apply_hub_reinstall.rs)
 tokio-util = { workspace = true }

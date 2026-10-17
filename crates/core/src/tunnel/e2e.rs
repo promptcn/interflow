@@ -105,9 +105,13 @@ impl E2eCloseReason {
 /// across reads); a Close frame (or channel closure — poisoning/teardown)
 /// is EOF; the reason token is recorded in the shared [`E2eCloseReason`].
 /// Write: chunks capped at [`MAX_FRAME_PAYLOAD`] become one send each.
-/// Shutdown maps to the direction's close. All async tunnel sends are
-/// stored as futures polled inside the poll methods (the sync poll
-/// contract cannot await).
+/// Shutdown is inert: the TLS layer's close_notify rides ordinary writes
+/// (Data frames) before it ever gets here, and the raw stream Close
+/// belongs EXCLUSIVELY to the caller's pump epilogue — emitting it from
+/// the adapter would tear the stream down at the hub while the response
+/// to a half-closed request is still in flight (the 2026-10-17 race).
+/// All async tunnel sends are stored as futures polled inside the poll
+/// methods (the sync poll contract cannot await).
 pub struct E2eTunnelIo {
     rx: mpsc::Receiver<TunnelData>,
     read_buf: BytesMut,
@@ -120,7 +124,6 @@ pub struct E2eTunnelIo {
     /// Byte count reported to the caller once `write_fut` completes
     /// (the future owns the chunk; the length must survive outside it).
     pending_len: usize,
-    close_fut: Option<BoxFuture<'static, io::Result<()>>>,
     write_failed: bool,
 }
 
@@ -160,7 +163,6 @@ impl E2eTunnelIo {
             direction,
             write_fut: None,
             pending_len: 0,
-            close_fut: None,
             write_failed: false,
         }
     }
@@ -176,27 +178,6 @@ impl E2eTunnelIo {
         self.eof = true;
         let reason = CloseReason::from_payload(data);
         *self.reason_slot.lock().expect("e2e reason slot poisoned") = Some(reason);
-    }
-
-    fn spawn_close_future(&mut self) {
-        if self.close_fut.is_some() {
-            return;
-        }
-        let sink = Arc::clone(&self.sink);
-        let sid = self.stream_id;
-        let fut: BoxFuture<'static, io::Result<()>> = match self.direction {
-            E2eDirection::Ingress => Box::pin(async move {
-                sink.send_close(sid)
-                    .await
-                    .map_err(|e| io::Error::other(e.to_string()))
-            }),
-            E2eDirection::Egress => Box::pin(async move {
-                sink.send_close_response(sid, CloseReason::CloseFrame)
-                    .await
-                    .map_err(|e| io::Error::other(e.to_string()))
-            }),
-        };
-        self.close_fut = Some(fut);
     }
 }
 
@@ -264,12 +245,6 @@ impl AsyncWrite for E2eTunnelIo {
                 "inner TLS adapter: write side already failed",
             )));
         }
-        if this.close_fut.is_some() {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "inner TLS adapter: write after shutdown",
-            )));
-        }
         if this.write_fut.is_none() {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
@@ -333,32 +308,13 @@ impl AsyncWrite for E2eTunnelIo {
         }
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = &mut *self;
-        // A send still in flight must complete before the close goes out
-        // (ordering: payload bytes precede the Close frame).
-        if let Some(fut) = this.write_fut.as_mut() {
-            match fut.as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => this.write_fut = None,
-                Poll::Ready(Err(e)) => {
-                    this.write_fut = None;
-                    this.write_failed = true;
-                    return Poll::Ready(Err(e));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        this.spawn_close_future();
-        match this
-            .close_fut
-            .as_mut()
-            .expect("close future armed")
-            .as_mut()
-            .poll(cx)
-        {
-            Poll::Ready(result) => Poll::Ready(result),
-            Poll::Pending => Poll::Pending,
-        }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Inert by contract (see the struct docs): the TLS layer's
+        // close_notify already rode writes as Data frames, and the raw
+        // stream Close belongs to the caller's epilogue. Doing anything
+        // here re-introduces the half-close race this split exists to
+        // prevent.
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -437,10 +393,17 @@ where
         let mut buf_to_adapter = vec![0u8; 16 * 1024];
         let mut buf_to_pipe = vec![0u8; 16 * 1024];
         let mut adapter_dead = false;
+        // The TLS side's write-half EOF (the close_notify shutdown) closes
+        // only its direction: the adapter→pipe leg keeps serving the
+        // response to that half-close. Dropping the adapter here (the
+        // pre-2026-10-17 behavior) tore the stream's response channel down
+        // at the hub the moment a client FIN propagated, killing the
+        // answer mid-flight.
+        let mut pipe_eof = false;
         loop {
             tokio::select! {
-                r = pipe.read(&mut buf_to_adapter) => match r {
-                    Ok(0) | Err(_) => return,
+                r = pipe.read(&mut buf_to_adapter), if !pipe_eof => match r {
+                    Ok(0) | Err(_) => pipe_eof = true,
                     Ok(n) => {
                         if adapter.write_all(&buf_to_adapter[..n]).await.is_err() {
                             adapter_dead = true;
@@ -459,6 +422,9 @@ where
                         }
                     }
                 },
+            }
+            if pipe_eof && adapter_dead {
+                return;
             }
         }
     });
@@ -628,19 +594,31 @@ mod tests {
         );
     }
 
-    /// Shutdown maps to the direction's close and rejects later writes.
+    /// Shutdown is inert: no raw stream Close is emitted (that belongs to
+    /// the caller's pump epilogue) and writes remain legal — the TLS
+    /// layer's close_notify rode writes as Data frames before this.
     #[tokio::test]
-    async fn shutdown_sends_close_and_blocks_writes() {
+    async fn shutdown_is_inert_and_writes_still_flow() {
         let sink = Arc::new(MockSink::default());
         let (mut io, _tx) = adapter(Arc::clone(&sink));
         io.shutdown().await.unwrap();
-        assert_eq!(sink.closes.lock().unwrap().clone(), vec![sid()]);
-        assert!(io.write(b"late").await.is_err());
+        assert!(
+            sink.closes.lock().unwrap().is_empty(),
+            "no raw Close from the adapter"
+        );
+        io.write_all(b"after-shutdown").await.unwrap();
+        assert_eq!(
+            sink.data.lock().unwrap().clone(),
+            vec![Bytes::from_static(b"after-shutdown")]
+        );
 
         let (_tx, rx) = mpsc::channel(8);
         let mut io2 = E2eTunnelIo::with_sink(rx, dyn_sink(&sink), sid2(), E2eDirection::Egress);
         io2.shutdown().await.unwrap();
-        assert_eq!(sink.close_responses.lock().unwrap().clone(), vec![sid2()]);
+        assert!(
+            sink.close_responses.lock().unwrap().is_empty(),
+            "no raw Close response from the adapter"
+        );
     }
 
     /// A sink wired to the opposite side's channel: everything one adapter

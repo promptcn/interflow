@@ -30,9 +30,17 @@ path = "src/bin/soak_node.rs"
 [dependencies]
 interflow-core.workspace = true
 interflow-expose.workspace = true
+interflow-identity.workspace = true
 interflow-mesh.workspace = true
 # The fake clock implements renewal's Clock seam (scheduler tests)
 interflow-renewal.workspace = true
+# In-process registrar fixture (serve_on handoff, asserted readiness)
+interflow-registrar.workspace = true
+# Fixture tempdirs (issuer store, TLS material)
+tempfile = "3"
+
+# Direct-dial HTTP client constructor for tests (ambient-proxy immunity)
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 
 # Async runtime
 tokio = { workspace = true }

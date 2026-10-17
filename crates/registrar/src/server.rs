@@ -26,6 +26,8 @@ use tokio_rustls::rustls::crypto::aws_lc_rs;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 #[derive(Clone)]
 pub struct ServeOptions {
@@ -69,7 +71,68 @@ struct ConfirmControlRequest {
     new_serial: String,
 }
 
+/// Grace bound for in-flight connections after the shutdown signal: the
+/// registrar's requests are short; anything still running past this is
+/// dropped with its TCP close, which peers treat as a disconnect.
+const CONN_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 pub async fn serve(issuer: PathBuf, options: ServeOptions) -> Result<()> {
+    let listener =
+        TcpListener::bind(options.listen)
+            .await
+            .map_err(|e| interflow_identity::Error::Io {
+                path: options.listen.to_string(),
+                source: e,
+            })?;
+    // The stand-alone entry ties graceful drain to the terminal signals;
+    // embedders (tests, supervisors) own the token and pass it to
+    // `serve_on` directly.
+    let shutdown = CancellationToken::new();
+    let signal_token = shutdown.clone();
+    tokio::spawn(async move {
+        wait_for_terminal_signal().await;
+        signal_token.cancel();
+    });
+    serve_on(issuer, options, listener, shutdown).await
+}
+
+#[cfg(unix)]
+async fn wait_for_terminal_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_terminal_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Serves on an already-bound listener.
+///
+/// The listener is injected so its lifetime is owned by the caller — the
+/// ephemeral-port doctrine (a port learned from a listener that is then
+/// dropped and re-bound races every other process drawing from the same
+/// range): the fixture binds `127.0.0.1:0`, reads the real port from the
+/// live socket, builds every address-bearing artifact (cert SANs,
+/// endpoints) against it, and hands the still-open listener over.
+/// Cancellation stops the accept loop and drains in-flight connections
+/// within [`CONN_SHUTDOWN_GRACE`].
+pub async fn serve_on(
+    issuer: PathBuf,
+    options: ServeOptions,
+    listener: TcpListener,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let local = listener
+        .local_addr()
+        .map_err(|e| interflow_identity::Error::Io {
+            path: "<registrar listener>".to_owned(),
+            source: e,
+        })?;
     let source = FileKeySource::open(&issuer)?;
     let enrollments = crate::EnrollmentCodes::open(issuer.join("enrollments.json"))?;
     let rotations = crate::RotationState::open(issuer.join("rotation-state.json"))?;
@@ -95,24 +158,25 @@ pub async fn serve(issuer: PathBuf, options: ServeOptions) -> Result<()> {
         rotation_source,
         rotation_options,
         Arc::clone(&acceptor),
+        shutdown.clone(),
     ));
-    let listener =
-        TcpListener::bind(options.listen)
-            .await
-            .map_err(|e| interflow_identity::Error::Io {
-                path: options.listen.to_string(),
-                source: e,
-            })?;
-    tracing::info!("registrar listening on https://{}", options.listen);
+    tracing::info!("registrar listening on https://{local}");
+    let connections = TaskTracker::new();
     loop {
-        let (mut stream, peer) =
-            listener
-                .accept()
-                .await
-                .map_err(|e| interflow_identity::Error::Io {
-                    path: options.listen.to_string(),
-                    source: e,
-                })?;
+        let (mut stream, peer) = tokio::select! {
+            () = shutdown.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer)) => (stream, peer),
+                Err(e) => {
+                    tracing::warn!("registrar accept failed on {local}: {e}");
+                    return Err(interflow_identity::Error::Io {
+                        path: local.to_string(),
+                        source: e,
+                    });
+                }
+            },
+        };
+        tracing::debug!("registrar accepted connection from {peer}");
         // The nginx stream fragment fronts this listener with PROXY
         // protocol on every SNI-map target; discard the framing before the
         // TLS acceptor sees the wire. Loopback-only, so plain direct
@@ -122,9 +186,12 @@ pub async fn serve(issuer: PathBuf, options: ServeOptions) -> Result<()> {
             continue;
         }
         let acceptor = acceptor.read().await.clone();
-        let Ok(tls_stream) = acceptor.accept(stream).await else {
-            tracing::warn!("registrar TLS handshake failed");
-            continue;
+        let tls_stream = match acceptor.accept(stream).await {
+            Ok(tls_stream) => tls_stream,
+            Err(e) => {
+                tracing::warn!("registrar TLS handshake failed: {e} peer={peer}");
+                continue;
+            }
         };
         let peer = tls_stream
             .get_ref()
@@ -132,7 +199,7 @@ pub async fn serve(issuer: PathBuf, options: ServeOptions) -> Result<()> {
             .peer_certificates()
             .map(|certs| certs.iter().map(|cert| cert.to_vec()).collect::<Vec<_>>());
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let service = hyper::service::service_fn(move |request| {
                 let state = Arc::clone(&state);
                 let peer = peer.clone();
@@ -146,6 +213,10 @@ pub async fn serve(issuer: PathBuf, options: ServeOptions) -> Result<()> {
             }
         });
     }
+    connections.close();
+    let _ = tokio::time::timeout(CONN_SHUTDOWN_GRACE, connections.wait()).await;
+    tracing::info!("registrar stopped on {local}");
+    Ok(())
 }
 
 /// PROXY protocol v2 signature (12 bytes): `\r\n\r\n\0\r\nQUIT\n`. Framing
@@ -282,6 +353,7 @@ async fn registrar_tls_rotation(
     source: FileKeySource,
     options: ServeOptions,
     acceptor: Arc<tokio::sync::RwLock<TlsAcceptor>>,
+    shutdown: CancellationToken,
 ) {
     loop {
         let Ok(expiry) = certificate_expiry(&options.tls_cert) else {
@@ -296,10 +368,12 @@ async fn registrar_tls_rotation(
         let threshold =
             expiry - time::Duration::seconds(options.ttl.duration().whole_seconds() / 2);
         if now < threshold {
-            tokio::time::sleep(Duration::from_secs(
-                u64::try_from((threshold - now).whole_seconds().max(0)).unwrap_or_default(),
-            ))
-            .await;
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(Duration::from_secs(
+                    u64::try_from((threshold - now).whole_seconds().max(0)).unwrap_or_default(),
+                )) => {}
+            }
         }
         match rotate_registrar_tls(&source, &options) {
             Ok(()) => match build_acceptor(&source, &options) {
@@ -312,7 +386,10 @@ async fn registrar_tls_rotation(
                         "registrar TLS reload failed: {}",
                         interflow_util::format_chain(&e)
                     );
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    }
                 }
             },
             Err(e) => {
@@ -320,7 +397,10 @@ async fn registrar_tls_rotation(
                     "registrar TLS rotation failed: {}",
                     interflow_util::format_chain(&e)
                 );
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                }
             }
         }
     }

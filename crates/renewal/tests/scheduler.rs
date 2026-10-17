@@ -17,11 +17,12 @@
 
 use interflow_cli::plan::{self, BackupInitOptions};
 use interflow_identity::credentials::ActiveCredentialSet;
-use interflow_identity::issuance::{IssuerStore, LeafTtl};
+use interflow_identity::issuance::IssuerStore;
 use interflow_identity::pack::CredentialPack;
 use interflow_registrar::fault::{self, FaultAction, FaultPoint};
 use interflow_renewal::{renewal_scheduler_with_clock, renewal_scheduler_with_crl_reload};
 use interflow_testkit::clock::FakeClock;
+use interflow_testkit::registrar::{RegistrarFixture, RegistrarFixtureOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,15 +34,31 @@ use interflow_core::error::Result;
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Settled real time per fake-time chunk — enough for the scheduler's
-/// in-loop HTTPS round trips on loopback.
-// Real settle time for the in-loop HTTPS traffic between fake-time chunks.
-// 50ms was enough on an idle dev machine, but a starved 2vCPU CI runner
-// lets pulls that came due in fake time miss their settle window (the
-// crl_pull cadence case counted 4 of the expected >= 6 on 2026-10-17) —
-// 300ms buys the real round trip without moving the suite's wall clock
-// meaningfully (the drive loops are chunk-count bound, not settle bound).
-const SETTLE: Duration = Duration::from_millis(300);
+/// Real-time cap for one chunk's quiescence wait: a wake's processing is a
+/// handful of loopback HTTPS round trips — anything approaching this is a
+/// hang, not slowness, and must fail loudly instead of stalling the drive.
+const SETTLE_CAP: Duration = Duration::from_secs(5);
+
+/// Waits until the scheduler has finished whatever a wake started: either
+/// the whole task completed, or every fake-clock sleep is re-parked beyond
+/// the current fake time. Runner speed no longer influences which fake
+/// chunk a consult lands in — the fixed real-time settles of the 2026-10
+/// era let a slow container's round trips straddle a chunk boundary and
+/// shifted attempt timestamps a whole chunk late (the backoff-ladder
+/// assertions pay for exactly that).
+async fn settle(clock: &FakeClock, scheduler: &Scheduler) {
+    let cap = tokio::time::Instant::now() + SETTLE_CAP;
+    loop {
+        if scheduler.is_finished() || clock.all_parked_beyond_now() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < cap,
+            "scheduler did not go quiescent within {SETTLE_CAP:?} of a chunk advance"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tracing capture: the scheduler's banners (rotation_failed, the warning
@@ -72,6 +89,11 @@ mod capture {
                 .lock()
                 .expect("capture lock poisoned")
                 .push(String::from_utf8_lossy(buf).trim().to_owned());
+            // Mirror to stderr: the buffer is only readable through the
+            // assertions, so a fixture that never becomes ready needs the
+            // stderr copy to be diagnosable under --nocapture (nextest
+            // prints captured output on failure only).
+            let _ = std::io::stderr().write_all(buf);
             Ok(buf.len())
         }
 
@@ -115,11 +137,13 @@ mod capture {
 
 /// A registrar-tier agent pack plus the live registrar behind it.
 struct AgentFixture {
+    /// The live registrar (issuer provisioning, ready, killable).
+    registrar: RegistrarFixture,
+    #[expect(
+        dead_code,
+        reason = "holds the manifest/dist tree alive for the test body"
+    )]
     dir: tempfile::TempDir,
-    endpoint: String,
-    /// The spawned `serve` task — abortable to make the registrar
-    /// unreachable mid-test.
-    serve: tokio::task::JoinHandle<interflow_identity::Result<()>>,
     pack_dir: PathBuf,
 }
 
@@ -127,41 +151,21 @@ struct AgentFixture {
 /// `ttl`-long leaves (`ttl` is a humantime string; manifest and registrar
 /// agree on it).
 async fn agent_fixture(ttl: &str) -> AgentFixture {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let ttl_secs = i64::try_from(
         humantime::parse_duration(ttl)
             .expect("ttl humantime")
             .as_secs(),
     )
     .expect("ttl fits");
+    let registrar = interflow_testkit::registrar::spawn_registrar(RegistrarFixtureOptions {
+        ttl: interflow_identity::issuance::LeafTtl::from_seconds(ttl_secs).expect("serve ttl"),
+        ..RegistrarFixtureOptions::default()
+    })
+    .await;
+    registrar.wait_ready().await;
     let dir = tempfile::tempdir().expect("tempdir");
-    let issuer_dir = dir.path().join("issuer");
-    let issuer = IssuerStore::open(&issuer_dir);
-    issuer.ensure_realm().expect("ensure realm");
-    issuer.ensure_workspace("main").expect("ensure workspace");
-    issuer.ensure_policy_key().expect("ensure policy key");
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-    let port = listener.local_addr().expect("local addr").port();
-    drop(listener);
-    let endpoint = format!("https://127.0.0.1:{port}");
-    let tls = issuer
-        .issue_control_endpoint("test", "registrar", &endpoint)
-        .expect("registrar TLS identity");
-    std::fs::write(dir.path().join("registrar.crt"), &tls.chain_pem).expect("write crt");
-    std::fs::write(dir.path().join("registrar.key"), &tls.key_pem).expect("write key");
-    let serve = tokio::spawn(interflow_registrar::server::serve(
-        issuer_dir.clone(),
-        interflow_registrar::server::ServeOptions {
-            listen: format!("127.0.0.1:{port}").parse().expect("socket addr"),
-            public_endpoint: endpoint.clone(),
-            tls_cert: dir.path().join("registrar.crt"),
-            tls_key: dir.path().join("registrar.key"),
-            ttl: LeafTtl::from_seconds(ttl_secs).expect("serve ttl"),
-            control_endpoint: "127.0.0.1:16666".to_owned(),
-            hub_endpoints: Default::default(),
-        },
-    ));
-    wait_ready(&issuer_dir, &endpoint).await;
+    let endpoint = registrar.endpoint().to_owned();
+    let issuer_dir = registrar.issuer_dir().to_owned();
     let manifest_path = dir.path().join("interflow.toml");
     std::fs::write(
         &manifest_path,
@@ -203,9 +207,8 @@ service = "main/desktop/web"
     .expect("plan apply");
     let pack_dir = dir.path().join("dist/packs/agent-desktop");
     AgentFixture {
+        registrar,
         dir,
-        endpoint,
-        serve,
         pack_dir,
     }
 }
@@ -264,35 +267,6 @@ service = "main/desktop/web"
     (dir, pack_dir)
 }
 
-async fn wait_ready(issuer_dir: &Path, endpoint: &str) {
-    let ca = IssuerStore::open(issuer_dir)
-        .realm_issuer()
-        .expect("realm issuer")
-        .cert_pem()
-        .to_owned();
-    // One client for the whole poll: rebuilding per iteration re-initializes
-    // the TLS provider every time and a slow runner spends the budget on
-    // client construction instead of requests.
-    let client = reqwest::Client::builder()
-        .add_root_certificate(
-            reqwest::Certificate::from_pem(ca.as_bytes()).expect("root certificate"),
-        )
-        .build()
-        .expect("client");
-    for _ in 0..1000 {
-        if client
-            .get(format!("{endpoint}/health"))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    unreachable!("registrar never became ready at {endpoint}");
-}
-
 fn active_set(pack_dir: &Path) -> ActiveCredentialSet {
     ActiveCredentialSet::load_or_bootstrap(&CredentialPack::load_runtime(pack_dir).expect("pack"))
         .expect("active set")
@@ -342,7 +316,7 @@ async fn drive_to_completion(
             return scheduler.await.expect("scheduler join");
         }
         clock.advance(step);
-        tokio::time::sleep(SETTLE).await;
+        settle(clock, &scheduler).await;
     }
     assert!(
         scheduler.is_finished(),
@@ -364,7 +338,7 @@ async fn drive_chunks(
             return true;
         }
         clock.advance(step);
-        tokio::time::sleep(SETTLE).await;
+        settle(clock, scheduler).await;
     }
     scheduler.is_finished()
 }
@@ -411,10 +385,6 @@ impl RenewFault {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "registrar fixture never becomes ready on Linux (serve runs, /health never answers) — ticketed in (internal design notes)"
-)]
 async fn scheduler_renews_at_half_ttl_and_not_before() {
     let _serial = SERIAL.lock().await;
     capture::install_once();
@@ -467,10 +437,6 @@ async fn scheduler_renews_at_half_ttl_and_not_before() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "registrar fixture never becomes ready on Linux (serve runs, /health never answers) — ticketed in (internal design notes)"
-)]
 async fn failed_renewals_back_off_then_recover() {
     let _serial = SERIAL.lock().await;
     capture::install_once();
@@ -530,10 +496,6 @@ async fn failed_renewals_back_off_then_recover() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "registrar fixture never becomes ready on Linux (serve runs, /health never answers) — ticketed in (internal design notes)"
-)]
 async fn expired_credentials_fail_closed() {
     let _serial = SERIAL.lock().await;
     capture::install_once();
@@ -564,10 +526,6 @@ async fn expired_credentials_fail_closed() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "registrar fixture never becomes ready on Linux (serve runs, /health never answers) — ticketed in (internal design notes)"
-)]
 async fn less_than_ten_percent_ttl_logs_the_expiry_warning() {
     let _serial = SERIAL.lock().await;
     capture::install_once();
@@ -655,10 +613,6 @@ async fn offline_watch_warns_once_at_twenty_percent_then_fails_closed() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "registrar fixture never becomes ready on Linux (serve runs, /health never answers) — ticketed in (internal design notes)"
-)]
 async fn unreachable_registrar_maps_to_connection_error() {
     let _serial = SERIAL.lock().await;
     capture::install_once();
@@ -666,9 +620,9 @@ async fn unreachable_registrar_maps_to_connection_error() {
     let fixture = agent_fixture("1h").await;
 
     // Kill the registrar and wait for the port to stop answering.
-    fixture.serve.abort();
+    fixture.registrar.kill();
     let ca = {
-        let issuer = IssuerStore::open(fixture.dir.path().join("issuer"));
+        let issuer = IssuerStore::open(fixture.registrar.issuer_dir());
         issuer
             .realm_issuer()
             .expect("realm issuer")
@@ -676,14 +630,14 @@ async fn unreachable_registrar_maps_to_connection_error() {
             .to_owned()
     };
     for _ in 0..100 {
-        let probe = reqwest::Client::builder()
+        let probe = interflow_testkit::http::direct_client()
             .add_root_certificate(
                 reqwest::Certificate::from_pem(ca.as_bytes()).expect("root certificate"),
             )
             .build()
             .expect("probe client");
         if probe
-            .get(format!("{}/health", fixture.endpoint))
+            .get(format!("{}/health", fixture.registrar.endpoint()))
             .send()
             .await
             .is_err()
@@ -709,10 +663,6 @@ async fn unreachable_registrar_maps_to_connection_error() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "registrar fixture never becomes ready on Linux (serve runs, /health never answers) — ticketed in (internal design notes)"
-)]
 async fn crl_pull_failures_beyond_one_hour_fail_closed() {
     let _serial = SERIAL.lock().await;
     capture::install_once();

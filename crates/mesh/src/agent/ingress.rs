@@ -683,7 +683,7 @@ impl IngressHandler {
                     tls,
                     &pump_cfg,
                     CloseReason::CloseFrame,
-                    Duration::ZERO,
+                    interflow_core::tunnel::pump::DUPLEX_LOCAL_EOF_DRAIN,
                     stream_id,
                     async move {
                         // The TLS close_notify rode Data frames; the stream

@@ -1,10 +1,6 @@
 //! End-to-end pack → registrar → active-credential renewal test.
 
-use interflow_identity::issuance::{IssuerStore, LeafTtl};
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-
-fn bin() -> PathBuf {
+fn bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop();
     path.pop();
@@ -12,55 +8,11 @@ fn bin() -> PathBuf {
 }
 
 #[tokio::test]
-#[cfg_attr(
-    target_os = "linux",
-    ignore = "in-process registrar serve binds but never accepts on Linux (client TLS gets EOF at zero accepts) — ticketed in (internal design notes)"
-)]
 async fn agent_pack_renews_without_operator_intervention() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let registrar = interflow_testkit::registrar::spawn_registrar(Default::default()).await;
+    registrar.wait_ready().await;
     let dir = tempfile::tempdir().unwrap();
-    let issuer = IssuerStore::open(dir.path().join("issuer"));
-    issuer.ensure_realm().unwrap();
-    issuer.ensure_workspace("main").unwrap();
-    issuer.ensure_policy_key().unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let endpoint = format!("https://127.0.0.1:{port}");
-    let tls = issuer
-        .issue_control_endpoint("test", "registrar", &endpoint)
-        .unwrap();
-    std::fs::write(dir.path().join("registrar.crt"), &tls.chain_pem).unwrap();
-    std::fs::write(dir.path().join("registrar.key"), &tls.key_pem).unwrap();
-    tokio::spawn(interflow_registrar::server::serve(
-        dir.path().join("issuer"),
-        interflow_registrar::server::ServeOptions {
-            listen: format!("127.0.0.1:{port}").parse().unwrap(),
-            public_endpoint: endpoint.clone(),
-            tls_cert: dir.path().join("registrar.crt"),
-            tls_key: dir.path().join("registrar.key"),
-            ttl: LeafTtl::default_ttl(),
-            control_endpoint: "127.0.0.1:16666".to_owned(),
-            hub_endpoints: Default::default(),
-        },
-    ));
-    let ca = issuer.realm_issuer().unwrap().cert_pem().to_owned();
-    for _ in 0..100 {
-        let client = reqwest::Client::builder()
-            .add_root_certificate(reqwest::Certificate::from_pem(ca.as_bytes()).unwrap())
-            .build()
-            .unwrap();
-        if client
-            .get(format!("{endpoint}/health"))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-
+    let endpoint = registrar.endpoint().to_owned();
     let manifest_path = dir.path().join("interflow.toml");
     std::fs::write(
         &manifest_path,
@@ -95,7 +47,7 @@ service = "main/desktop/web"
             "--manifest",
             manifest_path.to_str().unwrap(),
             "--issuer",
-            dir.path().join("issuer").to_str().unwrap(),
+            registrar.issuer_dir().to_str().unwrap(),
             "--out",
             dir.path().join("dist").to_str().unwrap(),
         ])
@@ -137,5 +89,10 @@ service = "main/desktop/web"
             .join("dist/packs/agent-desktop/state/crls/workspace-main.crl.pem")
             .is_file()
     );
-    assert!(Path::new(&dir.path().join("issuer/registrar-audit.jsonl")).exists());
+    assert!(
+        registrar
+            .issuer_dir()
+            .join("registrar-audit.jsonl")
+            .exists()
+    );
 }

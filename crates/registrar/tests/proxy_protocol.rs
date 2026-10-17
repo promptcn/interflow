@@ -4,30 +4,19 @@
 //! cases pin both wire versions; the headerless path is covered by the
 //! enroll/renew lifecycle in `http.rs`.
 
-use interflow_identity::issuance::{IssuerStore, LeafTtl};
 use interflow_registrar::EnrollmentCodes;
-use std::net::TcpListener;
+use interflow_testkit::registrar::{RegistrarFixture, RegistrarFixtureOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::pki_types::ServerName;
 
-/// Spawns the registrar (same setup as `http.rs`) and returns its endpoint
-/// plus the realm CA PEM for verification.
-fn spawn_registrar() -> (String, String, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let issuer = IssuerStore::open(dir.path().join("issuer"));
-    issuer.ensure_realm().unwrap();
-    issuer.ensure_policy_key().unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    let endpoint = format!("https://127.0.0.1:{port}");
-    let tls = issuer
-        .issue_control_endpoint("test", "registrar", &endpoint)
-        .unwrap();
-    std::fs::write(dir.path().join("registrar.crt"), &tls.chain_pem).unwrap();
-    std::fs::write(dir.path().join("registrar.key"), &tls.key_pem).unwrap();
-    EnrollmentCodes::open(dir.path().join("issuer/enrollments.json"))
+/// Spawns the registrar (shared fixture) and returns its endpoint plus the
+/// realm CA PEM for verification.
+async fn spawn_registrar() -> (String, String, RegistrarFixture) {
+    let registrar =
+        interflow_testkit::registrar::spawn_registrar(RegistrarFixtureOptions::default()).await;
+    registrar.wait_ready().await;
+    EnrollmentCodes::open(registrar.issuer_dir().join("enrollments.json"))
         .unwrap()
         .create(
             "test",
@@ -36,21 +25,11 @@ fn spawn_registrar() -> (String, String, tempfile::TempDir) {
             "desktop",
         )
         .unwrap();
-
-    tokio::spawn(interflow_registrar::server::serve(
-        dir.path().join("issuer"),
-        interflow_registrar::server::ServeOptions {
-            listen: format!("127.0.0.1:{port}").parse().unwrap(),
-            public_endpoint: endpoint.clone(),
-            tls_cert: dir.path().join("registrar.crt"),
-            tls_key: dir.path().join("registrar.key"),
-            ttl: LeafTtl::default_ttl(),
-            control_endpoint: "https://relay.test".to_owned(),
-            hub_endpoints: Default::default(),
-        },
-    ));
-    let ca = issuer.realm_issuer().unwrap().cert_pem().to_owned();
-    (endpoint, ca, dir)
+    (
+        registrar.endpoint().to_owned(),
+        registrar.ca_pem().to_owned(),
+        registrar,
+    )
 }
 
 fn v2_preamble(src: [u8; 4]) -> Vec<u8> {
@@ -112,7 +91,7 @@ async fn health_over_preamble(endpoint: &str, ca: &str, preamble: &[u8]) -> Stri
 #[tokio::test]
 async fn v1_preamble_then_tls_handshake_serves_health() {
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (endpoint, ca, _dir) = spawn_registrar();
+    let (endpoint, ca, _fixture) = spawn_registrar().await;
     let response = health_over_preamble(
         &endpoint,
         &ca,
@@ -126,7 +105,7 @@ async fn v1_preamble_then_tls_handshake_serves_health() {
 #[tokio::test]
 async fn v2_preamble_then_tls_handshake_serves_health() {
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (endpoint, ca, _dir) = spawn_registrar();
+    let (endpoint, ca, _fixture) = spawn_registrar().await;
     let response = health_over_preamble(&endpoint, &ca, &v2_preamble([198, 51, 100, 7])).await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.contains("ok"), "{response}");
@@ -139,7 +118,7 @@ async fn v2_preamble_then_tls_handshake_serves_health() {
 #[tokio::test]
 async fn no_preamble_still_serves_health() {
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let (endpoint, ca, _dir) = spawn_registrar();
+    let (endpoint, ca, _fixture) = spawn_registrar().await;
     let response = health_over_preamble(&endpoint, &ca, b"").await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 }

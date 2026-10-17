@@ -2850,11 +2850,11 @@ dependencies = [
 
 [[package]]
 name = "interflow-buildinfo"
-version = "0.11.0"
+version = "0.11.1"
 
 [[package]]
 name = "interflow-certs"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "rcgen 0.14.8",
  "rustls",
@@ -2867,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-cli"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "clap",
  "hex",
@@ -2878,6 +2878,7 @@ dependencies = [
  "interflow-mesh",
  "interflow-registrar",
  "interflow-renewal",
+ "interflow-testkit",
  "interflow-util",
  "reqwest",
  "rustls",
@@ -2897,11 +2898,11 @@ dependencies = [
 
 [[package]]
 name = "interflow-contract"
-version = "0.11.0"
+version = "0.11.1"
 
 [[package]]
 name = "interflow-core"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2947,7 +2948,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-expose"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -2976,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-gui"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "dirs",
  "gethostname",
@@ -3012,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-identity"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "age",
  "ed25519-dalek",
@@ -3040,7 +3041,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-mesh"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3088,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-registrar"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "bytes",
  "clap",
@@ -3102,6 +3103,7 @@ dependencies = [
  "interflow-buildinfo",
  "interflow-identity",
  "interflow-registrar",
+ "interflow-testkit",
  "interflow-util",
  "reqwest",
  "rustls-pemfile",
@@ -3111,13 +3113,14 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tracing",
  "x509-parser",
 ]
 
 [[package]]
 name = "interflow-renewal"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "humantime",
  "interflow-cli",
@@ -3139,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-testkit"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "chrono",
  "clap",
@@ -3148,16 +3151,20 @@ dependencies = [
  "interflow-certs",
  "interflow-core",
  "interflow-expose",
+ "interflow-identity",
  "interflow-mesh",
+ "interflow-registrar",
  "interflow-renewal",
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "rand 0.9.5",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -3169,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "interflow-util"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "hex",
  "http",

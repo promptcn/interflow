@@ -36,6 +36,8 @@ getrandom = "0.3"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 humantime = "2.3"
 tokio = { workspace = true }
+# Graceful shutdown (CancellationToken) + connection drain (TaskTracker) for serve
+tokio-util = { workspace = true, features = ["rt"] }
 tokio-rustls = { version = "0.26.4", features = ["aws-lc-rs"] }
 hyper = { version = "1.10", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
@@ -49,6 +51,8 @@ x509-parser = "0.18"
 [dev-dependencies]
 tempfile = "3"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+# Test-process tracing sink (serve failure paths under --nocapture)
+interflow-testkit.workspace = true
 # Self dev-dependency: turns on `fault-injection` for this crate's own
 # integration tests (the tokio-style self-dev-dep trick).
 interflow-registrar = { path = ".", features = ["fault-injection"] }
