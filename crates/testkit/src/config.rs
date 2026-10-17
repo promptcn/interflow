@@ -7,10 +7,10 @@ use crate::certs::TestCerts;
 use interflow_core::protocol::StreamProto;
 use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
-    AclConfig, AclRule, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, ControlConfig,
-    EgressRule, EgressTarget, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig,
-    HubTlsConfig, IngressRule, LoggingConfig, MetricsConfig, ServerConfig, TenantConfig,
-    TransportKind,
+    AclConfig, AclRule, AgentConfig, AgentInfo, AgentQuicConfig, AgentTlsConfig, AuthConfig,
+    ControlConfig, EgressRule, EgressTarget, HeartbeatConfig, HubConfig, HubQuicConfig,
+    HubSecurityConfig, HubTlsConfig, IngressRule, LivenessProbeConfig, LoggingConfig,
+    MetricsConfig, ServerConfig, TenantConfig, TransportKind,
 };
 use std::net::SocketAddr;
 
@@ -54,6 +54,7 @@ pub fn hub_config_tuned(
                 .parse()
                 .expect("listen addr"),
             node_name: None,
+            hub_name: None,
             proxy_protocol: Default::default(),
         },
         auth: AuthConfig {
@@ -87,7 +88,31 @@ pub fn hub_config_tuned(
 /// Build a QUIC-enabled hub config (QUIC and TCP share the same port as a
 /// dual stack).
 pub fn hub_quic_config(listen_port: u16, certs: &TestCerts, acl_rules: Vec<AclRule>) -> HubConfig {
-    let mut cfg = hub_config(listen_port, certs, acl_rules);
+    hub_quic_config_tuned(
+        listen_port,
+        certs,
+        acl_rules,
+        HubSecurityConfig::default(),
+        HeartbeatConfig::default(),
+        HubQuicConfig::default(),
+    )
+}
+
+/// Build a QUIC-enabled hub config with full timer tuning (the e2e
+/// clock-compression entry: heartbeat/security as `hub_config_tuned`, plus
+/// the QUIC transport face — pair with `agent_quic_config_tuned` /
+/// `quic_transport_compressed` so the idle timeout's negotiated minimum is
+/// the compressed value on both ends).
+#[allow(clippy::too_many_arguments)]
+pub fn hub_quic_config_tuned(
+    listen_port: u16,
+    certs: &TestCerts,
+    acl_rules: Vec<AclRule>,
+    security: HubSecurityConfig,
+    heartbeat: HeartbeatConfig,
+    quic: HubQuicConfig,
+) -> HubConfig {
+    let mut cfg = hub_config_tuned(listen_port, certs, acl_rules, security, heartbeat);
     // One [tls] section serves both faces and QUIC mandates TLS 1.3: the
     // QUIC variant rides the 1.3 floor on both faces (validation rejects
     // the 1.2 + QUIC combination).
@@ -96,9 +121,7 @@ pub fn hub_quic_config(listen_port: u16, certs: &TestCerts, acl_rules: Vec<AclRu
     }
     cfg.transport.quic = HubQuicConfig {
         enabled: true,
-        // Default: same port as TCP (TCP/UDP coexist independently)
-        listen_addr: None,
-        ..HubQuicConfig::default()
+        ..quic
     };
     cfg
 }
@@ -149,10 +172,68 @@ pub fn agent_config(id: &str, hub_port: u16, certs: &TestCerts) -> AgentConfig {
 
 /// Build a QUIC agent config (mTLS, same certificate discipline as h2).
 pub fn agent_quic_config(id: &str, hub_port: u16, certs: &TestCerts) -> AgentConfig {
+    agent_quic_config_tuned(
+        id,
+        hub_port,
+        certs,
+        AgentQuicConfig::default(),
+        LivenessProbeConfig::default(),
+    )
+}
+
+/// Build a QUIC agent config with tunable transport + liveness-probe timers
+/// (the e2e clock-compression entry; see `quic_transport_compressed` /
+/// `liveness_probe_compressed`).
+pub fn agent_quic_config_tuned(
+    id: &str,
+    hub_port: u16,
+    certs: &TestCerts,
+    quic: AgentQuicConfig,
+    liveness_probe: LivenessProbeConfig,
+) -> AgentConfig {
     let mut cfg = agent_config(id, hub_port, certs);
     cfg.agent.transport = TransportKind::Quic;
     cfg.agent.hub_quic_addr = Some(format!("127.0.0.1:{hub_port}"));
+    cfg.transport.quic = quic;
+    cfg.liveness_probe = liveness_probe;
     cfg
+}
+
+/// QUIC transport timers for e2e clock compression: idle 3s / keepalive 1s,
+/// returned as the (hub, agent) pair — the QUIC idle timeout is negotiated
+/// as the endpoints' minimum, so compressing one end only leaves the
+/// production 30s default winning on the other.
+///
+/// Budget derivation for tests using this preset: a connection whose path
+/// dies without a close frame is declared dead by quinn at ~3s on either
+/// end (watcher wake / agent-side rebuild trigger).
+pub fn quic_transport_compressed() -> (HubQuicConfig, AgentQuicConfig) {
+    (
+        HubQuicConfig {
+            enabled: true,
+            listen_addr: None,
+            max_idle_timeout_ms: 3_000,
+            keepalive_interval_ms: 1_000,
+            ..HubQuicConfig::default()
+        },
+        AgentQuicConfig {
+            max_idle_timeout_ms: 3_000,
+            keepalive_interval_ms: 1_000,
+        },
+    )
+}
+
+/// Liveness-probe timers for e2e clock compression: worst-case demanding
+/// tier detection ≈ `demand_every + strikes × (tick + demand_deadline)`
+/// = 1 + 2 × (1 + 1) = **5s** — every probe-budget assertion derives from
+/// this formula, never from observed timings.
+pub fn liveness_probe_compressed() -> LivenessProbeConfig {
+    LivenessProbeConfig {
+        tick_secs: 1,
+        demand_every_secs: 1,
+        demand_deadline_secs: 1,
+        demand_strikes: 2,
+    }
 }
 
 /// A TCP egress rule.

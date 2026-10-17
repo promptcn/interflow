@@ -254,6 +254,16 @@ agent-to-agent inner layer.
   credentials outright (no "unrevocable credential" window); offline
   deployments embed a snapshot in the pack with a freshness horizon
   matching the leaf's own lifetime.
+- **Revocation is also DELIVERED, not just recorded.** `revoke` (with
+  `--manifest`) and the offline apply tail push the issuer's current CRLs
+  to the hub's control plane (`PUT /crls`, control-principal gated,
+  `crl_number` anti-rollback floor); the hub hot-swaps its verification
+  plane onto the pushed set — revoked credentials are rejected at the
+  NEXT mTLS handshake with no restart, live sessions holding a revoked
+  leaf are swept and evicted by serial, and the registration paths gate
+  on the same live CRLs so an evicted credential cannot resurrect over a
+  still-open connection. The hub's pull lane (registrar tier) rides the
+  same swap instead of exiting for a supervisor restart.
 - In both cases the egress performs DNS resolution and the LAN dial only
   after the inner peer verifies. A relay can still drop, delay, reorder,
   or close traffic. Protocol v3 keeps semantic tenant/agent names out of

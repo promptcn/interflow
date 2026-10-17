@@ -7,6 +7,7 @@
 //! - [`ActiveStream`] is the metadata of one opened end-to-end TCP stream
 
 use bytes::{Bytes, BytesMut};
+use interflow_contract::generation::GenerationalHandle;
 use interflow_core::error::InterflowError;
 use interflow_core::protocol::{CircuitToken, RouteToken, StreamProto};
 use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker};
@@ -74,6 +75,11 @@ pub struct PeerIdentity {
     /// phase the agent's credential expiry; `None` only if the leaf
     /// failed to parse, in which case expiry phasing simply has no input.
     pub leaf_validity_unix: Option<(i64, i64)>,
+    /// The connection certificate's serial in canonical hex — the
+    /// revocation-sweep input (the CRL hot-swap compares it against the
+    /// pushed CRLs and evicts a live session holding a revoked leaf).
+    /// `None` only if the leaf failed to parse.
+    pub leaf_serial_hex: Option<String>,
 }
 
 impl PeerIdentity {
@@ -424,9 +430,20 @@ pub struct HubState {
     /// The signed-policy publication channel (`PUT /policy`): verifier +
     /// persistence dir + the anti-rollback floor. `None` on non-pack hubs.
     pub policy_channel: Option<Arc<PolicyChannel>>,
+    /// The CRL publication channel (`PUT /crls`): persistence dir + the
+    /// per-issuer counter floor. `None` on non-pack hubs (the endpoint
+    /// 404s, the plane has no live CRL lane).
+    pub crl_channel: Option<Arc<crate::hub::crl::CrlChannel>>,
     /// Audit dedup table for policy servings (see
     /// [`SharedPolicyPullLedger`]).
     pub policy_pull_ledger: SharedPolicyPullLedger,
+    /// Cumulative count of agent evictions that actually landed (the
+    /// `Internal::Evict` branch of the removal funnel — voided removals do
+    /// not count). A domain counter, not a metrics-registry readback: the
+    /// steady-state face (`GET /snapshot`) reports it without depending on
+    /// the Prometheus face being enabled, and an upgrade-acceptance window
+    /// is exactly "this number did not move".
+    pub evicted_total: Arc<AtomicU64>,
     /// The stream-proposal queue (the kube-CSR-shaped self-service face);
     /// `None` when the hub carries no policy channel — proposals need a
     /// serving policy to validate against.
@@ -516,7 +533,7 @@ pub struct AgentSession {
     /// Dual to poll's rx single-consumer semantics:
     /// - when an active upload exists in the same generation, a new upload
     ///   gets 409;
-    /// - register preemption / [`crate::hub::heartbeat::evict_agent`]
+    /// - register preemption / [`crate::hub::heartbeat::remove_agent_if_current`]
     ///   eviction cancels the lease; the reader task exits → the 200
     ///   response body ends → the agent perceives the death signal and
     ///   rebuilds;
@@ -541,6 +558,12 @@ pub struct AgentSession {
     /// `install_channels` keeps the previous value, the register sites
     /// overwrite it).
     pub leaf_validity_unix: Option<(i64, i64)>,
+    /// The registration certificate's `(serial hex, issuer stem)` — the
+    /// revocation-sweep input (the CRL hot-swap evicts a live session
+    /// whose leaf the pushed CRLs revoke). Same refresh semantics as
+    /// [`Self::leaf_validity_unix`]: register sites overwrite,
+    /// `install_channels` keeps the previous value.
+    pub leaf_serial: Option<(String, String)>,
     /// When the last `/poll` body ended (the RxStream returned or discarded
     /// its receiver). The h2 half of [`AgentSession::online`]: a live agent
     /// re-polls within the reconnect backoff (topping out at 5s), so a
@@ -590,11 +613,15 @@ impl AgentSession {
     /// carries the relay connection when registration arrives over QUIC;
     /// `leaf_validity_unix` carries the registration certificate's
     /// validity window (None when the leaf did not parse — expiry phasing
-    /// then simply has no input for this session).
+    /// then simply has no input for this session); `leaf_serial` carries
+    /// the certificate's `(serial, issuer stem)` for the revocation sweep
+    /// (None when the leaf did not parse — the sweep then skips this
+    /// session, leaving it to the swapped plane's dial-time rejection).
     pub fn new(
         circuit: CircuitToken,
         quic: Option<Arc<QuicAgentConn>>,
         leaf_validity_unix: Option<(i64, i64)>,
+        leaf_serial: Option<(String, String)>,
     ) -> Self {
         let (tx, rx) = mpsc::channel(HUB_CHANNEL_CAP);
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
@@ -612,6 +639,7 @@ impl AgentSession {
             quic,
             build: None,
             leaf_validity_unix,
+            leaf_serial,
             last_poll_end: Instant::now(),
         }
     }
@@ -674,6 +702,26 @@ impl AgentSession {
             waker.wake();
         }
     }
+}
+
+/// The armed credential of one death signal: the registration entry it was
+/// armed against (the session Arc captured at arming time) and that
+/// registration's circuit at that moment.
+///
+/// Construct this **where the signal is armed** — watcher spawn, poll
+/// channel take, heartbeat tick — never where it fires: the gap in between
+/// is exactly where a re-registration can rotate the entry in place (same
+/// Arc, new circuit), which pointer identity alone cannot see
+/// The credential is checked by the single removal funnel
+/// [`crate::hub::heartbeat::remove_agent_if_current`]; a new death-signal
+/// source must go through that funnel (and past the lifecycle-matrix row
+/// for its entry event) rather than mutating the registry directly.
+#[derive(Clone)]
+pub(crate) struct SessionWitness {
+    /// The registry entry captured when the signal was armed.
+    pub(crate) session: Arc<RwLock<AgentSession>>,
+    /// The entry's circuit at arming time — the epoch half of the credential.
+    pub(crate) circuit: CircuitToken,
 }
 
 /// Dispatch plane of one end of a stream (the transport shape is encoded in
@@ -763,20 +811,26 @@ pub struct RxStream {
     ctrl_backlog: Option<Arc<AtomicUsize>>,
     pending_payload: Option<Bytes>,
     state: Option<Arc<RwLock<AgentSession>>>,
-    generation: u64,
+    /// The channel-generation credential armed when this poll took the
+    /// channels (key = agent id, epoch = generation at take time): every
+    /// "does this poll still own the session's channels" check — receiver
+    /// return, grace recheck, poll_next staleness — goes through the
+    /// generational-handle contract.
+    armed: GenerationalHandle<String, u64>,
     /// Wake slot sharing the origin of `AgentSession::poll_waker` (cloned
     /// at construction; accessed synchronously in poll_next).
     poll_waker: Option<Arc<std::sync::Mutex<Option<Waker>>>>,
     /// Shared hub state needed by the poll-grace task.
     hub: Arc<HubState>,
-    /// Owning agent id (only for the grace task's logging and eviction).
-    agent_id: String,
+    /// The session's circuit when this poll took the channels — the grace
+    /// task's eviction witness (see [`crate::hub::heartbeat::remove_agent_if_current`]).
+    circuit: CircuitToken,
 }
 
 impl RxStream {
     /// Builds the poll response body stream: returns rx when the connection
     /// drops, and evicts the agent if nobody re-`/poll`s within the grace
-    /// period (see [`crate::hub::heartbeat::evict_agent`]).
+    /// period (see [`crate::hub::heartbeat::remove_agent_if_current`]).
     #[allow(clippy::too_many_arguments)] // channel/state handles are passed explicitly one by one; the semantics cannot be merged
     pub const fn new(
         rx: mpsc::Receiver<TunnelData>,
@@ -787,6 +841,7 @@ impl RxStream {
         poll_waker: Arc<std::sync::Mutex<Option<Waker>>>,
         hub: Arc<HubState>,
         agent_id: String,
+        circuit: CircuitToken,
     ) -> Self {
         Self {
             rx: Some(rx),
@@ -794,10 +849,10 @@ impl RxStream {
             ctrl_backlog: Some(ctrl_backlog),
             pending_payload: None,
             state: Some(state),
-            generation,
+            armed: GenerationalHandle::armed_at(agent_id, generation),
             poll_waker: Some(poll_waker),
             hub,
-            agent_id,
+            circuit,
         }
     }
 }
@@ -820,7 +875,9 @@ impl Drop for RxStream {
     /// the grace period, the agent is dead (a healthy agent's poll
     /// reconnect backoff tops out at 5s) — evict the registry entry +
     /// orphan streams so subsequent requests take the fast-fail "agent does
-    /// not exist" path instead of a black hole.
+    /// not exist" path instead of a black hole. A hub shutdown cancels the
+    /// wait (the registry dies with the run — no eviction, no post-drain
+    /// audit write).
     fn drop(&mut self) {
         let rx = self.rx.take();
         let ctrl_rx = self.ctrl_rx.take();
@@ -831,13 +888,17 @@ impl Drop for RxStream {
             return;
         };
         let hub = self.hub.clone();
-        let agent_id = self.agent_id.clone();
-        let generation = self.generation;
+        let armed = self.armed.clone();
+        let witness = self.circuit;
+        let tracker = hub.tasks.clone();
         // Drop may happen during runtime shutdown (tests / process exit);
         // if try_current fails, discard and degrade to the keepalive-timeout
-        // fallback.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
+        // fallback. try_current doubles as the TaskTracker::spawn context
+        // guard: the grace task must be tracked (it holds an Arc<HubState>,
+        // so the audit ledger claim outlives the drain otherwise) — see the
+        // invariant note at the tracker construction in server.rs.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tracker.spawn(async move {
                 {
                     let mut st = state.write().await;
                     // The poll body ended — the h2 liveness clock for
@@ -846,7 +907,7 @@ impl Drop for RxStream {
                     // generation mismatch means a newer channel is already
                     // serving, which carries its own timestamp).
                     st.last_poll_end = Instant::now();
-                    if st.generation == generation && st.rx.is_none() {
+                    if armed.equal_epoch(&st.generation).is_current() && st.rx.is_none() {
                         if let Some(rx) = rx {
                             st.rx = Some(rx);
                         }
@@ -854,27 +915,39 @@ impl Drop for RxStream {
                             st.ctrl_rx = Some(ctrl_rx);
                         }
                         tracing::debug!(
-                            "poll connection dropped, rx/ctrl_rx returned (generation={generation})"
+                            "poll connection dropped, rx/ctrl_rx returned (generation={})",
+                            armed.epoch
                         );
                     }
                 }
                 let grace = std::time::Duration::from_secs(
                     hub.limits.poll_grace_secs.load(AtomicOrdering::Relaxed),
                 );
-                tokio::time::sleep(grace).await;
+                tokio::select! {
+                    () = tokio::time::sleep(grace) => {}
+                    // The hub is draining: the registry (and this session
+                    // with it) dies with the run, so the grace timer is
+                    // moot. Exit without evicting — a post-shutdown
+                    // AgentEvicted write would land after the drain's
+                    // audit flush and hold the sink's ledger claim open.
+                    () = hub.shutdown.cancelled() => return,
+                }
                 // Re-check: same Arc + same generation + rx still never
                 // taken → confirmed dead. Any failure of these conditions
                 // (re-registration / rebuild / a fresh poll) means the
                 // agent is still active.
                 let still_idle = {
                     let st = state.read().await;
-                    st.generation == generation && st.rx.is_some()
+                    armed.equal_epoch(&st.generation).is_current() && st.rx.is_some()
                 };
                 if still_idle {
-                    crate::hub::heartbeat::evict_agent(
+                    crate::hub::heartbeat::remove_agent_if_current(
                         &hub,
-                        &agent_id,
-                        &state,
+                        &armed.key,
+                        SessionWitness {
+                            session: state,
+                            circuit: witness,
+                        },
                         "poll_grace_expired",
                     )
                     .await;
@@ -902,7 +975,7 @@ impl futures::Stream for RxStream {
         // contention, skip this round and check again on the next frame.
         let stale = match self.state.as_ref() {
             Some(state) => match state.try_read() {
-                Ok(st) => st.generation != self.generation,
+                Ok(st) => !self.armed.equal_epoch(&st.generation).is_current(),
                 Err(_) => false,
             },
             None => false,
@@ -1019,7 +1092,7 @@ mod tests {
 
         // h2 form: fresh registration is inside the reconnect grace (the
         // first poll follows immediately) — online.
-        let mut s = AgentSession::new(circuit, None, None);
+        let mut s = AgentSession::new(circuit, None, None, None);
         assert!(s.online(), "a fresh registration is online by the grace");
 
         // A poll body in place: online by connection presence.

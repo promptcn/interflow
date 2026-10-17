@@ -28,17 +28,22 @@ name = "interflow-soak-node"
 path = "src/bin/soak_node.rs"
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.8" }
-interflow-expose = { path = "../expose", version = "0.8" }
-interflow-mesh = { path = "../mesh", version = "0.8" }
+interflow-core.workspace = true
+interflow-expose.workspace = true
+interflow-mesh.workspace = true
+# The fake clock implements renewal's Clock seam (scheduler tests)
+interflow-renewal.workspace = true
 
 # Async runtime
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 
+# Fake-clock wall readings (OffsetDateTime)
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
 # Certificate issuance — the single rcgen implementation shared with
 # internal issuance and the test kit
-interflow-certs = { path = "../certs", version = "0.8" }
+interflow-certs.workspace = true
 
 # Metrics-snapshot assertion harness (same versions as mesh)
 metrics = "0.24.6"

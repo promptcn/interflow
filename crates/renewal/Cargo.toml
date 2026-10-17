@@ -11,10 +11,10 @@ name = "interflow_renewal"
 path = "src/lib.rs"
 
 [dependencies]
-interflow-identity = { path = "../identity", version = "0.8" }
-interflow-core = { path = "../core", version = "0.8" }
+interflow-identity.workspace = true
+interflow-core.workspace = true
 # Shared atomic writes (CRL refresh)
-interflow-util = { path = "../util", version = "0.8" }
+interflow-util.workspace = true
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
@@ -27,3 +27,18 @@ tracing = "0.1.44"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Real-registrar fixture (serve + IssuerStore) for scheduler-direct tests
+interflow-registrar = { workspace = true, features = ["fault-injection"] }
+# FakeClock (the Clock seam's test implementation)
+interflow-testkit.workspace = true
+# Real pack rendering for the fixture (plan::apply); cargo permits the
+# dev-dependency cycle cli → renewal (same pattern as mesh ↔ testkit)
+interflow-cli.workspace = true
+interflow-identity.workspace = true
+tempfile = "3"
+humantime = "2.3"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = "0.23"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

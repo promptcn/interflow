@@ -497,12 +497,18 @@ impl Manifest {
     /// leaves carry the whole rotation cadence.
     pub(crate) fn effective_leaf_ttl(&self) -> Result<LeafTtl> {
         use IdentityMode::*;
+        // The registrar-tier range text tracks the cfg'd test-build floor
+        // (see issuance::MIN_LEAF_TTL_SECONDS).
+        #[cfg(not(feature = "short-leaf-ttl"))]
+        const REGISTRAR_TTL_RANGE_TEXT: &str = "1h and 24h";
+        #[cfg(feature = "short-leaf-ttl")]
+        const REGISTRAR_TTL_RANGE_TEXT: &str = "30s and 24h";
         let (min, max, default, range_text) = match self.identity.mode {
             Registrar => (
                 super::issuance::MIN_LEAF_TTL_SECONDS,
                 super::issuance::MAX_LEAF_TTL_SECONDS,
                 super::issuance::DEFAULT_LEAF_TTL_SECONDS,
-                "1h and 24h",
+                REGISTRAR_TTL_RANGE_TEXT,
             ),
             Offline => (
                 super::issuance::OFFLINE_MIN_LEAF_TTL_SECONDS,
@@ -1208,7 +1214,9 @@ service = "main/desktop/asr"
     #[test]
     fn leaf_ttl_is_bounded_to_one_day() {
         assert!(Manifest::parse(&VALID.replace("\"24h\"", "\"1h\"")).is_ok());
-        assert!(Manifest::parse(&VALID.replace("\"24h\"", "\"30m\"")).is_err());
+        // "1s" sits below the floor in both build flavors (the 1h production
+        // floor and the 30s short-leaf-ttl test floor).
+        assert!(Manifest::parse(&VALID.replace("\"24h\"", "\"1s\"")).is_err());
         assert!(Manifest::parse(&VALID.replace("\"24h\"", "\"25h\"")).is_err());
     }
 

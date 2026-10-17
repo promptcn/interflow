@@ -23,17 +23,17 @@ path = "src/bin/export_bindings.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-interflow-core = { path = "../crates/core", version = "0.8" }
-interflow-cli = { path = "../crates/cli", version = "0.8" }
-interflow-expose = { path = "../crates/expose", version = "0.8" }
-interflow-identity = { path = "../crates/identity", version = "0.8" }
-interflow-mesh = { path = "../crates/mesh", version = "0.8" }
+interflow-core.workspace = true
+interflow-cli.workspace = true
+interflow-expose.workspace = true
+interflow-identity.workspace = true
+interflow-mesh.workspace = true
 # Credential renewal scheduler (one per running node — GUI/binary parity)
-interflow-renewal = { path = "../crates/renewal", version = "0.8" }
+interflow-renewal.workspace = true
 # Atomic profile writes
-interflow-util = { path = "../crates/util", version = "0.8" }
+interflow-util.workspace = true
 # Compile-time build identity (machine header, tray tooltip, startup log)
-interflow-buildinfo = { path = "../crates/buildinfo", version = "0.8" }
+interflow-buildinfo.workspace = true
 
 tauri = { version = "2", features = ["tray-icon", "image-png", "specta"] }
 tauri-plugin-clipboard-manager = "2"
@@ -66,11 +66,14 @@ toml = { workspace = true }
 dirs = "6"
 # Node ids (UUID v4, minted at add time; stable across credential rotations)
 uuid = { version = "1.23", features = ["v4"] }
+# GUI-owned prefs db (nodes profile + deploy recents + gui settings; one
+# SQLite replaces the three per-domain TOML workaround files).
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 # In-process hub + self-signed certs for the Start/Stop round-trip regression
 # tests (tunnel.rs) — the 2026-09-18 deadlock acceptance gate.
-interflow-testkit = { path = "../crates/testkit", version = "0.8" }
+interflow-testkit.workspace = true
 # Bindings-freshness drift guard test (contract.rs)
 tempfile = "3"
 

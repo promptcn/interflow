@@ -8,6 +8,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use interflow_core::config::AuditConfig;
 use interflow_mesh::hub::{HubHandle, HubLifecycle};
 use interflow_testkit::hub_config;
 use std::time::{Duration, Instant};
@@ -77,4 +78,60 @@ async fn busy_port_surfaces_as_failed() {
         .await
         .expect_err("dead hub resolves with its failure");
     drop(holder);
+}
+
+/// An in-process respawn after the hub has SERVED agent sessions must not
+/// trip the audit ledger's single-writer guard. Every background task
+/// holding an `Arc<HubState>` — the poll-grace timer (`RxStream::drop`),
+/// the `/stream/up` reader, the QUIC relay reader — is tracked on the
+/// run's TaskTracker and exits on shutdown, so the ledger claim releases
+/// with the drain and the same path hosts the next generation. This is
+/// the GUI rotate / update shape (stop → swap → start inside one
+/// process); before the teardown completion fix the second spawn panicked
+/// at `AuditSink::spawn`'s claim guard, aborting the whole host process
+#[tokio::test]
+async fn respawn_after_agent_sessions_reclaims_the_ledger_claim() {
+    let certs = interflow_testkit::certs::TestCerts::generate("hub-respawn", "agent");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = dir.path().join("audit.jsonl");
+    let mut cfg = hub_config(0, &certs, Vec::new());
+    cfg.audit = AuditConfig {
+        enabled: true,
+        path: Some(ledger.display().to_string()),
+        ..AuditConfig::default()
+    };
+
+    // Generation one serves a real agent session (register + /poll ⇒ an
+    // RxStream exists), then drains. `spawn_hub` forgoes its bind retry
+    // with an enabled audit sink (a second spawn would collide with the
+    // claim); this config is h2-only, so the dual-stack same-port flake
+    // the retry exists for does not apply.
+    let hub = interflow_testkit::spawn_hub(cfg.clone()).await;
+    let port = hub.local_addr().expect("hub bound").port();
+    let agent = interflow_testkit::spawn_agent_registered(interflow_testkit::agent_config(
+        "respawn-agent",
+        port,
+        &certs,
+    ))
+    .await;
+    hub.shutdown_graceful()
+        .await
+        .expect("generation one drains");
+    let _ = agent.shutdown_graceful().await;
+
+    // The ledger was really engaged (register audited + flushed by the
+    // drain), so the respawn below exercises the claim, not a vacuous
+    // disabled sink.
+    let served = std::fs::read_to_string(&ledger).expect("ledger readable");
+    assert!(
+        !served.is_empty(),
+        "generation one must have audited events"
+    );
+
+    // Generation two, same process, same ledger path. Panics at spawn if
+    // any HubState holder outlived the drain.
+    let hub2 = interflow_testkit::spawn_hub(cfg).await;
+    hub2.shutdown_graceful()
+        .await
+        .expect("generation two drains");
 }

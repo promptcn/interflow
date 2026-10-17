@@ -12,6 +12,13 @@ set -e
 # it as a local-iteration convenience build.
 cd "$(dirname "$0")/.."
 
+# Production-artifact tree discipline (refuse dirty; escape hatches leave
+# marks). Runs before any tool check so refusal costs nothing — this is the
+# GUI's production packaging path (a raw `npm run tauri build` is a dev
+# build and never lands in artifacts/).
+source "$(dirname "$0")/lib/build_guard.sh"
+build_guard_check "build-windows-gui.sh" "$@"
+
 # Cargo-side tools (auto-install, same policy as build-windows.sh)
 if ! command -v cargo-xwin &> /dev/null; then
     echo "Installing cargo-xwin..."
@@ -33,9 +40,13 @@ MISSING=()
 for TOOL in clang-cl llvm-rc lld-link nasm makensis; do
     command -v "$TOOL" &> /dev/null || MISSING+=("$TOOL")
 done
+# 7z opens the finished NSIS archive for the content gate at the end.
+if ! guard_sevenzip_bin > /dev/null; then
+    MISSING+=(7z)
+fi
 if [ ${#MISSING[@]} -gt 0 ]; then
     echo "Error: missing host tools: ${MISSING[*]}"
-    echo "Install them with: brew install llvm lld nasm nsis"
+    echo "Install them with: brew install llvm lld nasm nsis p7zip"
     exit 1
 fi
 
@@ -59,16 +70,28 @@ echo "Preparing cargo-xwin environment (downloads Windows SDK/CRT slices on firs
 eval "$(cargo xwin env --target x86_64-pc-windows-msvc | grep '^export ')"
 
 echo "Building NSIS installer for x86_64-pc-windows-msvc..."
+# Reset the NSIS staging dir first: tauri names its setups by version and
+# nothing else ever cleans them out, so the dir accumulates one setup per
+# version ever built here. Selection below is exact-name and would survive
+# the accumulation, but a clean staging makes any surprise visible as a
+# build failure instead of a pile of unrelated history.
+rm -rf target/x86_64-pc-windows-msvc/release/bundle/nsis
 # --bundles nsis overrides the ["dmg","app"] targets in tauri.conf.json; the
 # vite frontend build runs via beforeBuildCommand.
 cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
-# Copy the artifact. Tauri names it <product>_<version>_x64-setup.exe; the
-# artifacts/ convention drops the version (cf. interflow-mesh-windows-x86_64.exe).
-mkdir -p artifacts
-for SETUP in target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe; do
-    OUTPUT_FILE="artifacts/interflow-gui-windows-x86_64-setup.exe"
-    cp "$SETUP" "$OUTPUT_FILE"
-    echo "Built: $PWD/$OUTPUT_FILE (from $(basename "$SETUP"))"
-    file "$OUTPUT_FILE"
-done
+# Select the installer by its exact tauri-generated name — never a glob.
+# The staging dir used to be glob-copied (*-setup.exe, last lexicographic
+# round wins) and from the first double-digit version on (0.10.0 < 0.8.0 <
+# 0.9.0) that shipped a stale installer while the fresh one stayed behind.
+# The version contract (scripts/check_version_contract.py) keeps
+# package.json == the workspace == what tauri stamps into the name, so
+# reading package.json is reading the name tauri just wrote.
+APP_VERSION="$(node -p "require('./package.json').version")"
+PRODUCT_NAME="$(node -p "require('./src-tauri/tauri.conf.json').productName")"
+STAGED_SETUP="target/x86_64-pc-windows-msvc/release/bundle/nsis/${PRODUCT_NAME}_${APP_VERSION}_x64-setup.exe"
+OUTPUT_FILE="$(guard_ship_artifact "$STAGED_SETUP" \
+    "artifacts/interflow-gui-windows-x86_64-setup.exe" nsis interflow-gui.exe)"
+echo "Built: $PWD/$OUTPUT_FILE (from $(basename "$STAGED_SETUP"))"
+file "$OUTPUT_FILE"
+build_guard_write_manifest "build-windows-gui"

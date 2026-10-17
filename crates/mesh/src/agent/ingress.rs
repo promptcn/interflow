@@ -1,6 +1,7 @@
 use crate::agent::control::{ControlOpError, IngressCommand};
 use crate::agent::ingress_addrs::IngressAddrs;
 use crate::agent::ingress_listeners::IngressListeners;
+use crate::agent::reconcile_report::ReconcileReport;
 use crate::agent::rules::RuleStore;
 use crate::config::IngressRule;
 use interflow_core::error::{InterflowError, Result};
@@ -260,10 +261,7 @@ impl IngressHandler {
     /// one (bind failures pending retry).
     async fn reconcile(&mut self) -> usize {
         let desired = self.store.ingress_snapshot().await;
-        let mut added = 0usize;
-        let mut changed = 0usize;
-        let mut removed = 0usize;
-        let mut failed = 0usize;
+        let mut report = ReconcileReport::new();
 
         // Stop listeners whose rule is gone from the desired face.
         let names: Vec<String> = self.bound.keys().cloned().collect();
@@ -280,7 +278,7 @@ impl IngressHandler {
             self.listeners.remove(&name);
             metrics::gauge!("interflow_agent_ingress_listener_bound", "rule" => name.clone())
                 .set(0.0);
-            removed += 1;
+            report.record_removed();
         }
 
         // Drive every desired rule to its listener.
@@ -300,7 +298,7 @@ impl IngressHandler {
                     if let Some(addr) = self.addrs.get(&name) {
                         self.listeners.set_bound(&name, addr);
                     }
-                    changed += 1;
+                    report.record_changed();
                     info!(node = %self.node, "Policy change hot-applied to ingress listener params: {name}");
                 }
                 _ => {
@@ -312,9 +310,9 @@ impl IngressHandler {
                             if let Some(handle) = old {
                                 info!(node = %self.node, "Identity change, replacing ingress listener: {name}");
                                 stop_and_reap(handle).await;
-                                changed += 1;
+                                report.record_changed();
                             } else {
-                                added += 1;
+                                report.record_added();
                             }
                         }
                         Err(e) => {
@@ -337,14 +335,16 @@ impl IngressHandler {
                                 "rule" => name.clone(),
                             )
                             .increment(1);
-                            failed += 1;
+                            report.record_failed();
                         }
                     }
                 }
             }
         }
-        info!(node = %self.node, "Ingress reconciled: +{added} ~{changed} -{removed} !{failed}");
-        failed
+        // Transitions → info, steady-state sample → debug: the module
+        // policy lives in ReconcileReport, machine-locked by its tests.
+        report.log(&self.node, "Ingress");
+        report.failed()
     }
 
     /// Add (or replace by name): the store is the desired truth and the

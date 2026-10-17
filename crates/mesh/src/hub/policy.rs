@@ -18,6 +18,7 @@ use http::Response;
 use http::StatusCode;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
+use interflow_contract::generation::floor_epoch;
 use interflow_core::error::{InterflowError, Result};
 use interflow_core::security::AuditKind;
 use interflow_identity::policy::RuntimePolicy;
@@ -153,7 +154,7 @@ impl HubService {
 }
 
 /// One file, atomically: write the temp sibling, rename over the target.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)
         .and_then(|()| std::fs::rename(&tmp, path))
@@ -333,14 +334,25 @@ impl HubService {
             })
             .collect::<Vec<_>>()
             .join(",");
+        // The hub self-reports its declared name so clients can attribute
+        // presence and generations to the hub that actually answered (the
+        // endpoint may be fronted or re-pointed during a migration).
+        // `serde_json::to_string` supplies the escaping. Like `serving`
+        // below, the key is omitted (not faked) when there is no name.
+        let hub_name = self.state.config.read().await.server.hub_name.clone();
+        let hub_json = hub_name.map_or_else(String::new, |name| {
+            let mut field = serde_json::to_string(&name).expect("a String always serializes");
+            field.push(',');
+            field
+        });
         // `serving` is omitted (not faked as 0) when nothing servable is on
         // disk — clients treat a missing key as "this hub cannot report
         // it" rather than "it reports zero".
         let body = match serve_cached(&channel) {
-            Some((_, _, serving)) => {
-                format!("{{\"floor\":{floor},\"serving\":{serving},\"agents\":[{agents_json}]}}")
-            }
-            None => format!("{{\"floor\":{floor},\"agents\":[{agents_json}]}}"),
+            Some((_, _, serving)) => format!(
+                "{{\"hub\":{hub_json}\"floor\":{floor},\"serving\":{serving},\"agents\":[{agents_json}]}}"
+            ),
+            None => format!("{{\"hub\":{hub_json}\"floor\":{floor},\"agents\":[{agents_json}]}}"),
         };
         Ok(super::service::json_response(StatusCode::OK, body))
     }
@@ -395,7 +407,12 @@ pub(crate) fn serve_policy_conditional(
         return PolicyServe::NoFace;
     };
     metrics::counter!("interflow_hub_policy_pulled_total").increment(1);
-    if seen >= generation {
+    // The puller's watermark vs. the serving generation — watermark-floor
+    // semantics through the generational-handle contract (the single
+    // compare-before-mutate implementation every rotation guard shares):
+    // at-or-above the serving generation means up to date, below it means
+    // an update is due.
+    if floor_epoch(&seen, &generation).is_current() {
         if seen > generation {
             // Inverted watermark: log once per (agent, generation)
             // crossing; the counter keeps every occurrence.
@@ -673,6 +690,9 @@ pub struct PolicyFloorQuery {
 /// the GUI's Apply-result/convergence card reads this.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HubOverview {
+    /// The answering hub's manifest-declared name (`None` = an older hub
+    /// that does not self-report, or the 404 no-policy-face fallback).
+    pub hub: Option<String>,
     /// Same as [`PolicyFloorQuery::floor`].
     pub floor: u64,
     /// Same as [`PolicyFloorQuery::serving`].
@@ -803,6 +823,7 @@ pub async fn query_hub_overview(
         let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
         if status == http::StatusCode::NOT_FOUND {
             return Ok(HubOverview {
+                hub: None,
                 floor: 0,
                 serving: None,
                 agents: Vec::new(),
@@ -825,6 +846,12 @@ pub async fn query_hub_overview(
                 InterflowError::protocol(format!("hub overview 200 without a floor: {text:?}"))
             })?;
         let serving = value.get("serving").and_then(serde_json::Value::as_u64);
+        // Tolerant parse: `hub` is additive (an older hub self-reports no
+        // name — attribution then falls to the caller's honest fallbacks).
+        let hub = value
+            .get("hub")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         // Tolerant parse: `agents` is additive (an older hub reports no
         // array — the convergence view then shows watermarks only).
         let agents = value
@@ -843,6 +870,7 @@ pub async fn query_hub_overview(
             })
             .unwrap_or_default();
         Ok(HubOverview {
+            hub,
             floor,
             serving,
             agents,

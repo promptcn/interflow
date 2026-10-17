@@ -4,8 +4,11 @@
 //! Operator surface: pack / trust / rotate / revoke / identity.
 
 mod doctor;
+mod doctor_link;
+mod status;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use interflow_cli::outln;
 use interflow_cli::plan;
 use interflow_cli::runtime;
 use interflow_identity::pack::CredentialPack;
@@ -110,6 +113,12 @@ enum Command {
         #[command(subcommand)]
         command: NodeOp,
     },
+    /// The fleet's steady state: capture a snapshot from the running hub,
+    /// diff two captures (the upgrade acceptance reading).
+    Status {
+        #[command(subcommand)]
+        command: status::StatusCommand,
+    },
     /// Inspect and manage Credential Packs.
     Pack {
         #[command(subcommand)]
@@ -170,11 +179,27 @@ enum Command {
         /// The pack (directory) to revoke.
         #[arg(long)]
         pack: PathBuf,
+        /// Also revoke the node-owned renewal ledger this pack's
+        /// `state/credentials` points at — the serial a RUNNING node
+        /// authenticates with. The ledger follows the node across pack
+        /// generations, so revoking it evicts and locks out the live node:
+        /// this is the explicit "kill the node's runtime credential" intent.
+        /// Without the flag a revoked pack (current, archived or `.previous`)
+        /// only ever denies its own bootstrap identities.
+        #[arg(long)]
+        include_active_credentials: bool,
         /// Revocation reason — recorded in the deny list AND carried as the
         /// CRL's RFC 5280 reason code, so a leak emergency is
         /// distinguishable from a planned retirement downstream.
         #[arg(long, value_enum, default_value_t = RevokeReason::KeyCompromise)]
         reason: RevokeReason,
+        /// Deployment manifest — when given, revoke's finisher pushes the
+        /// fresh CRLs to the hub's control plane (`PUT /crls`): the hub
+        /// hot-swaps its verification plane and rejects the revoked
+        /// credentials within seconds, no restart. Without it the push is
+        /// skipped and the remaining steps are narrated honestly.
+        #[arg(long, short = 'm')]
+        manifest: Option<PathBuf>,
     },
     /// Manage the issuer store's encrypted backup (the deployment's entire
     /// signing capability — realm CA, workspace CAs, policy key, deny list).
@@ -294,6 +319,18 @@ enum IssuerBackupCommand {
         #[arg(long)]
         identity_out: Option<PathBuf>,
     },
+    /// Move the backup target directory (e.g. onto a second medium): keeps
+    /// the encryption key and retention, checkpoints into the new directory
+    /// immediately. Prior versions stay in the old directory, readable by
+    /// the same recovery identity.
+    Relocate {
+        /// Issuer store directory.
+        #[arg(long, default_value = "issuer")]
+        dir: PathBuf,
+        /// New directory the versioned backups land in.
+        #[arg(long)]
+        backup_dir: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -325,6 +362,18 @@ enum NodeOp {
         /// INTERFLOW_PACK_PASSPHRASE always works).
         #[arg(long)]
         passphrase: bool,
+        /// Restart OTHER units found still running a replaced engine
+        /// binary after this install (换盘不换进程 detection). Without
+        /// this flag the findings are printed with the exact restart
+        /// commands instead.
+        #[arg(long)]
+        restart_units: bool,
+        /// Allow installing a pack whose generation is LOWER than the
+        /// target's current install — the deliberate, typed rollback path
+        /// (the policy anti-rollback may still refuse the older material
+        /// at the next start).
+        #[arg(long)]
+        allow_downgrade: bool,
     },
     /// Append a node to the manifest — structured and non-destructive
     /// (comments and layout stay; the edited manifest must pass the full
@@ -405,6 +454,15 @@ enum PlanCommand {
         #[arg(long, default_value = "interflow.toml")]
         manifest: PathBuf,
     },
+    /// Show what the next `plan apply` would change: the declaration vs
+    /// the exact text of the last applied state, with the change
+    /// classification on top. Nothing is minted or dialed.
+    Diff {
+        #[arg(long, default_value = "interflow.toml")]
+        manifest: PathBuf,
+        #[arg(long, default_value = "issuer")]
+        issuer: PathBuf,
+    },
     /// Issue identities + packs + node configs from the manifest.
     Apply {
         #[arg(long, default_value = "interflow.toml")]
@@ -436,6 +494,12 @@ enum PlanCommand {
         /// stores) — `doctor issuer` keeps flagging it.
         #[arg(long)]
         no_issuer_backup: bool,
+        /// Skip the no-op gate and re-render every pack even when the
+        /// manifest is unchanged — the explicit exit for pack-format
+        /// retirements and renderer-vintage refreshes. The policy
+        /// generation still mints above every watermark (no reset).
+        #[arg(long)]
+        force_rerender: bool,
     },
 }
 
@@ -529,26 +593,26 @@ async fn main() -> interflow_core::error::Result<()> {
                 SetupFace::Mesh => plan::setup_mesh_template(&realm, &hub_name, &hub_endpoint),
             };
             std::fs::write(&out, template)?;
-            println!("Manifest template written to {}", out.display());
-            println!("Next:");
+            outln!("Manifest template written to {}", out.display());
+            outln!("Next:");
             match face {
                 SetupFace::Expose => {
-                    println!(
+                    outln!(
                         "  1. edit {} (or append nodes: interflow-cli node add agent/<name> --service id:address)",
                         out.display()
                     );
-                    println!("  2. interflow-cli plan apply --manifest {}", out.display());
+                    outln!("  2. interflow-cli plan apply --manifest {}", out.display());
                 }
                 // The skeleton ships no placeholder agent — the first node
                 // add is what makes the mesh manifest deployable.
                 SetupFace::Mesh => {
-                    println!(
+                    outln!(
                         "  1. service side:   interflow-cli node add agent/<name> --mesh-egress <rule>:127.0.0.1:8080"
                     );
-                    println!(
+                    outln!(
                         "     connect side:   interflow-cli node add agent/<name> --mesh-ingress <rule>:127.0.0.1:8080:127.0.0.1:8080@<peer>"
                     );
-                    println!("  2. interflow-cli plan apply --manifest {}", out.display());
+                    outln!("  2. interflow-cli plan apply --manifest {}", out.display());
                 }
             }
             Ok(())
@@ -556,7 +620,13 @@ async fn main() -> interflow_core::error::Result<()> {
         Command::Plan { command } => match command {
             PlanCommand::Validate { manifest } => {
                 for line in plan::validate(&manifest)? {
-                    println!("{line}");
+                    outln!("{line}");
+                }
+                Ok(())
+            }
+            PlanCommand::Diff { manifest, issuer } => {
+                for line in plan::diff(&manifest, &issuer)? {
+                    outln!("{line}");
                 }
                 Ok(())
             }
@@ -569,6 +639,7 @@ async fn main() -> interflow_core::error::Result<()> {
                 backup_recipient,
                 backup_identity_out,
                 no_issuer_backup,
+                force_rerender,
             } => {
                 let backup = plan::BackupInitOptions {
                     skip: no_issuer_backup,
@@ -576,10 +647,17 @@ async fn main() -> interflow_core::error::Result<()> {
                     backup_dir,
                     identity_out: backup_identity_out,
                 };
-                for line in
-                    plan::apply(&manifest, &issuer, &out, issuer_allow_shared, &backup)?.lines
+                for line in plan::apply(
+                    &manifest,
+                    &issuer,
+                    &out,
+                    issuer_allow_shared,
+                    &backup,
+                    force_rerender,
+                )?
+                .lines
                 {
-                    println!("{line}");
+                    outln!("{line}");
                 }
                 Ok(())
             }
@@ -587,8 +665,8 @@ async fn main() -> interflow_core::error::Result<()> {
         Command::Proposals { command } => match command {
             ProposalsCommand::List { manifest, issuer } => {
                 match plan::list_proposals(&manifest, &issuer)? {
-                    None => println!("the manifest names no hub endpoint"),
-                    Some(list) if list.is_empty() => println!("queue empty — no proposals"),
+                    None => outln!("the manifest names no hub endpoint"),
+                    Some(list) if list.is_empty() => outln!("queue empty — no proposals"),
                     Some(list) => {
                         for p in list {
                             let status = match &p.status {
@@ -602,7 +680,7 @@ async fn main() -> interflow_core::error::Result<()> {
                                     reason,
                                 } => format!("rejected ({reason})"),
                             };
-                            println!(
+                            outln!(
                                 "{}  [{}]  {} wants → {} @ {} (listen {}, rule {})",
                                 p.id,
                                 status,
@@ -627,7 +705,7 @@ async fn main() -> interflow_core::error::Result<()> {
                 let report =
                     plan::approve_proposal(&manifest, &issuer, &out, &id, issuer_allow_shared)?;
                 for line in report.lines {
-                    println!("{line}");
+                    outln!("{line}");
                 }
                 Ok(())
             }
@@ -638,7 +716,7 @@ async fn main() -> interflow_core::error::Result<()> {
                 issuer,
             } => {
                 plan::reject_proposal(&manifest, &issuer, &id, &reason)?;
-                println!("rejected {id}: {reason}");
+                outln!("rejected {id}: {reason}");
                 Ok(())
             }
         },
@@ -654,6 +732,8 @@ async fn main() -> interflow_core::error::Result<()> {
                 root,
                 user,
                 passphrase,
+                restart_units,
+                allow_downgrade,
             } => {
                 let pass = read_passphrase(passphrase).ok();
                 let report = interflow_cli::node_install::install(
@@ -662,9 +742,11 @@ async fn main() -> interflow_core::error::Result<()> {
                         root,
                         user,
                         passphrase: pass,
+                        restart_stale_units: restart_units,
+                        allow_downgrade,
                     },
                 )?;
-                println!(
+                outln!(
                     "✔ installed {} node {} → {}{}",
                     report.kind.as_str(),
                     report.node,
@@ -675,13 +757,51 @@ async fn main() -> interflow_core::error::Result<()> {
                         ""
                     },
                 );
-                println!("  unit: {}", report.unit_path.display());
+                outln!("  unit: {}", report.unit_path.display());
                 if report.service_started {
-                    println!("  service: started (systemd, ready)");
+                    outln!("  service: started (systemd, ready)");
                 } else {
-                    println!(
-                        "  service: not managed (non-system layout) — start manually if needed"
+                    outln!("  service: not managed (non-system layout) — start manually if needed");
+                }
+                if !report.stale_processes.is_empty() {
+                    outln!(
+                        "⚠ {} running process(es) still use the OLD disk (binary replaced \
+                         underneath them) — node install restarts only this node's unit:",
+                        report.stale_processes.len()
                     );
+                    for finding in &report.stale_processes {
+                        outln!("  · {}", finding.describe());
+                    }
+                    if report.restarted_units.is_empty() {
+                        let mut targets: Vec<&str> = report
+                            .stale_processes
+                            .iter()
+                            .filter_map(|f| f.restart_target())
+                            .collect();
+                        targets.sort_unstable();
+                        targets.dedup();
+                        if targets.is_empty() {
+                            outln!(
+                                "  no product unit owns the stale process(es) — restart \
+                                 manually (see the pid(s) above)"
+                            );
+                        } else {
+                            let commands: Vec<String> = targets
+                                .iter()
+                                .map(|u| format!("systemctl restart {u}"))
+                                .collect();
+                            outln!(
+                                "  restart them now: {} — or re-run this command with \
+                                 --restart-units",
+                                commands.join(" && ")
+                            );
+                        }
+                    } else {
+                        outln!(
+                            "  restarted via --restart-units: {}",
+                            report.restarted_units.join(", ")
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -716,20 +836,21 @@ async fn main() -> interflow_core::error::Result<()> {
                     hub_endpoint: endpoint,
                 };
                 let outcome = plan::add_node(&manifest, &spec)?;
-                println!(
+                outln!(
                     "✔ {} appended to {} (pack: packs/{}, backup: {}.bak)",
                     node,
                     manifest.display(),
                     outcome.pack_dir_name,
                     manifest.display()
                 );
-                println!(
+                outln!(
                     "Next: interflow-cli plan apply --manifest {}",
                     manifest.display()
                 );
                 Ok(())
             }
         },
+        Command::Status { command } => command.run(),
         Command::Pack { command } => match command {
             PackCommand::Seal {
                 pack,
@@ -754,14 +875,14 @@ async fn main() -> interflow_core::error::Result<()> {
                         .map_err(runtime::pack_error)?;
                     seal(&pack, &out, &SealKey::Passphrase(pass.clone()))
                         .map_err(runtime::pack_error)?;
-                    println!("sealed {} → {}", pack.display(), out.display());
-                    println!("passphrase (shown once): {pass}");
+                    outln!("sealed {} → {}", pack.display(), out.display());
+                    outln!("passphrase (shown once): {pass}");
                     return Ok(());
                 } else {
                     SealKey::Passphrase(read_passphrase(passphrase)?)
                 };
                 seal(&pack, &out, &key).map_err(runtime::pack_error)?;
-                println!("sealed {} → {}", pack.display(), out.display());
+                outln!("sealed {} → {}", pack.display(), out.display());
                 Ok(())
             }
             PackCommand::Install {
@@ -771,7 +892,7 @@ async fn main() -> interflow_core::error::Result<()> {
             } => {
                 let pass = read_passphrase(passphrase)?;
                 let installed = install(&sealed, &out, &pass).map_err(runtime::pack_error)?;
-                println!(
+                outln!(
                     "installed {} ({}, generation {}, digest {})",
                     out.display(),
                     installed.metadata.kind.as_str(),
@@ -782,7 +903,7 @@ async fn main() -> interflow_core::error::Result<()> {
             }
             PackCommand::Inspect { pack } => {
                 let loaded = CredentialPack::load(&pack).map_err(runtime::pack_error)?;
-                println!("{}", serde_json::to_string_pretty(&loaded.summary())?);
+                outln!("{}", serde_json::to_string_pretty(&loaded.summary())?);
                 Ok(())
             }
         },
@@ -792,7 +913,7 @@ async fn main() -> interflow_core::error::Result<()> {
         } => {
             let loaded = CredentialPack::load(&pack_dir).map_err(runtime::pack_error)?;
             loaded.trust.save(&out).map_err(runtime::pack_error)?;
-            println!(
+            outln!(
                 "Trust Bundle realm={} generation={} digest={} → {}",
                 loaded.trust.metadata.realm,
                 loaded.trust.metadata.generation,
@@ -809,13 +930,13 @@ async fn main() -> interflow_core::error::Result<()> {
             IdentityCommand::Renew { pack: pack_dir } => {
                 runtime::init_node_logging();
                 let report = interflow_renewal::renew_all(&pack_dir, true).await?;
-                println!(
+                outln!(
                     "renewed {} credential(s) for {}",
                     report.renewed.len(),
                     report.pack_dir.display()
                 );
                 for principal in report.renewed {
-                    println!("  ✔ {principal}");
+                    outln!("  ✔ {principal}");
                 }
                 Ok(())
             }
@@ -829,12 +950,12 @@ async fn main() -> interflow_core::error::Result<()> {
                 vec![path.clone()]
             };
             if files.is_empty() {
-                println!("no audit ledger found under {}", path.display());
+                outln!("no audit ledger found under {}", path.display());
                 return Ok(());
             }
             match interflow_core::security::verify_audit_files(&files) {
                 Ok(report) => {
-                    println!(
+                    outln!(
                         "✔ audit ledger verified: {} record(s) across {} file(s), {} chain(s){}",
                         report.records,
                         report.segments,
@@ -848,7 +969,7 @@ async fn main() -> interflow_core::error::Result<()> {
                     Ok(())
                 }
                 Err(e) => {
-                    println!("✘ audit ledger broken: {e}");
+                    outln!("✘ audit ledger broken: {e}");
                     std::process::exit(1);
                 }
             }
@@ -870,17 +991,25 @@ async fn main() -> interflow_core::error::Result<()> {
                 out.as_deref(),
                 issuer_allow_shared,
             )? {
-                println!("{line}");
+                outln!("{line}");
             }
             Ok(())
         }
         Command::Revoke {
             issuer,
             pack: pack_dir,
+            include_active_credentials,
             reason,
+            manifest,
         } => {
-            for line in plan::revoke(&issuer, &pack_dir, reason.as_reason())? {
-                println!("{line}");
+            for line in plan::revoke(
+                &issuer,
+                &pack_dir,
+                reason.as_reason(),
+                manifest.as_deref(),
+                include_active_credentials,
+            )? {
+                outln!("{line}");
             }
             Ok(())
         }
@@ -911,25 +1040,34 @@ fn read_identity_arg(spec: &str) -> interflow_core::error::Result<String> {
     Ok(trimmed)
 }
 
+fn print_identity_banner(secret: &str) {
+    outln!("┌─ ONE-TIME RECOVERY IDENTITY — store it OFFLINE (password manager / printed) ┐");
+    outln!("│ {secret}");
+    outln!("│ It is the ONLY key that can restore backups. It is never stored on this");
+    outln!("│ machine; losing it makes every backup permanently unreadable.");
+    outln!("└──────────────────────────────────────────────────────────────────────────────┘");
+}
+
 fn print_one_time_identity(
     secret: &str,
     identity_out: Option<&PathBuf>,
 ) -> interflow_core::error::Result<()> {
-    println!("┌─ ONE-TIME RECOVERY IDENTITY — store it OFFLINE (password manager / printed) ─┐");
-    println!("│ {secret}");
-    println!("│ It is the ONLY key that can restore backups. It is never stored on this");
-    println!("│ machine; losing it makes every backup permanently unreadable.");
-    println!("└──────────────────────────────────────────────────────────────────────────────┘");
+    // The durable artifact lands BEFORE anything is announced: stdout may
+    // be a pipe the reader already abandoned, and the file — not the
+    // banner — is the copy that must survive any output trouble.
     if let Some(out) = identity_out {
         interflow_util::atomic_write(
             out,
             format!("{secret}\n").as_bytes(),
             interflow_util::WriteMode::Set(0o600),
         )?;
-        println!(
+        print_identity_banner(secret);
+        outln!(
             "recovery identity also written to {} (0600) — move that medium offline",
             out.display()
         );
+    } else {
+        print_identity_banner(secret);
     }
     Ok(())
 }
@@ -948,22 +1086,23 @@ fn run_issuer(command: IssuerCommand) -> interflow_core::error::Result<()> {
                 let backup_dir =
                     backup_dir.unwrap_or_else(|| store_backup::default_backup_dir(&dir));
                 if let Some(recipient) = &recipient {
-                    store_backup::configure(&dir, recipient, &backup_dir, retention)
+                    let cfg = store_backup::configure(&dir, recipient, &backup_dir, retention)
                         .map_err(runtime::pack_error)?;
-                    println!(
+                    outln!(
                         "✔ backups configured → {} (recipient supplied; no secret was \
                          generated here)",
-                        backup_dir.display()
+                        cfg.backup_dir.display()
                     );
                 } else {
                     let identity =
                         store_backup::generate_identity().map_err(runtime::pack_error)?;
-                    store_backup::configure(&dir, &identity.recipient, &backup_dir, retention)
-                        .map_err(runtime::pack_error)?;
-                    println!(
+                    let cfg =
+                        store_backup::configure(&dir, &identity.recipient, &backup_dir, retention)
+                            .map_err(runtime::pack_error)?;
+                    outln!(
                         "✔ backups configured → {} — every change now checkpoints an \
                          encrypted, versioned copy",
-                        backup_dir.display()
+                        cfg.backup_dir.display()
                     );
                     print_one_time_identity(&identity.secret, identity_out.as_ref())?;
                 }
@@ -972,14 +1111,14 @@ fn run_issuer(command: IssuerCommand) -> interflow_core::error::Result<()> {
             IssuerBackupCommand::Now { dir } => {
                 match store_backup::checkpoint(&dir).map_err(runtime::pack_error)? {
                     store_backup::Checkpoint::Written { path } => {
-                        println!("✔ checkpoint written: {}", path.display());
+                        outln!("✔ checkpoint written: {}", path.display());
                     }
                     store_backup::Checkpoint::Unchanged => {
-                        println!("· newest backup already matches the store — nothing to do");
+                        outln!("· newest backup already matches the store — nothing to do");
                     }
                     store_backup::Checkpoint::Unconfigured => {
-                        println!("✘ this store has no backup configuration");
-                        println!(
+                        outln!("✘ this store has no backup configuration");
+                        outln!(
                             "Fix: `interflow-cli issuer backup init --dir {}` (or re-run plan \
                              apply)",
                             dir.display()
@@ -994,8 +1133,8 @@ fn run_issuer(command: IssuerCommand) -> interflow_core::error::Result<()> {
             IssuerBackupCommand::Status { dir } => {
                 let status = store_backup::status(&dir).map_err(runtime::pack_error)?;
                 let Some(cfg) = status.config else {
-                    println!("✘ no backup configuration for {}", dir.display());
-                    println!(
+                    outln!("✘ no backup configuration for {}", dir.display());
+                    outln!(
                         "Fix: `interflow-cli issuer backup init --dir {}`",
                         dir.display()
                     );
@@ -1004,10 +1143,10 @@ fn run_issuer(command: IssuerCommand) -> interflow_core::error::Result<()> {
                     ));
                 };
                 {
-                    println!("backup dir:  {}", cfg.backup_dir.display());
-                    println!("recipient:   {}", cfg.recipient);
-                    println!("retention:   {} versions", cfg.retention);
-                    println!(
+                    outln!("backup dir:  {}", cfg.backup_dir.display());
+                    outln!("recipient:   {}", cfg.recipient);
+                    outln!("retention:   {} versions", cfg.retention);
+                    outln!(
                         "versions:    {} (newest: {})",
                         status.versions.len(),
                         status
@@ -1016,7 +1155,7 @@ fn run_issuer(command: IssuerCommand) -> interflow_core::error::Result<()> {
                             .map_or_else(|| "none yet".to_owned(), |p| p.display().to_string())
                     );
                     if status.versions.is_empty() {
-                        println!(
+                        outln!(
                             "✘ no backup has landed yet — run `interflow-cli issuer backup now`"
                         );
                         return Err(interflow_core::error::InterflowError::config(
@@ -1024,10 +1163,10 @@ fn run_issuer(command: IssuerCommand) -> interflow_core::error::Result<()> {
                         ));
                     }
                     if status.newest_is_current {
-                        println!("✔ newest backup matches the current store content");
+                        outln!("✔ newest backup matches the current store content");
                     } else {
-                        println!("✘ the store changed since the last successful backup");
-                        println!(
+                        outln!("✘ the store changed since the last successful backup");
+                        outln!(
                             "Fix: `interflow-cli issuer backup now --dir {}`",
                             dir.display()
                         );
@@ -1036,9 +1175,9 @@ fn run_issuer(command: IssuerCommand) -> interflow_core::error::Result<()> {
                         ));
                     }
                     if status.same_device == Some(true) {
-                        println!(
+                        outln!(
                             "· warning: backup dir shares the disk with the store — point \
-                             it at a second medium (`issuer backup init --backup-dir`)"
+                             it at a second medium (`issuer backup relocate --backup-dir`)"
                         );
                     }
                     Ok(())
@@ -1052,31 +1191,67 @@ fn run_issuer(command: IssuerCommand) -> interflow_core::error::Result<()> {
                 // new key (old versions stay sealed to the old identity).
                 match store_backup::checkpoint(&dir).map_err(runtime::pack_error)? {
                     store_backup::Checkpoint::Written { path } => {
-                        println!(
+                        outln!(
                             "✔ rekeyed; first backup under the new key: {}",
                             path.display()
                         );
                     }
-                    _ => println!("✔ rekeyed; next change checkpoints under the new key"),
+                    _ => outln!("✔ rekeyed; next change checkpoints under the new key"),
                 }
-                println!("backups stay in {}", cfg.backup_dir.display());
-                println!("old backups remain readable ONLY by the previous identity");
+                outln!("backups stay in {}", cfg.backup_dir.display());
+                outln!("old backups remain readable ONLY by the previous identity");
                 print_one_time_identity(&next.secret, identity_out.as_ref())
+            }
+            IssuerBackupCommand::Relocate { dir, backup_dir } => {
+                let Some(previous) = store_backup::config(&dir).map_err(runtime::pack_error)?
+                else {
+                    outln!("✘ this store has no backup configuration");
+                    outln!(
+                        "Fix: `interflow-cli issuer backup init --dir {}`",
+                        dir.display()
+                    );
+                    return Err(interflow_core::error::InterflowError::config(
+                        "issuer store backup is not configured",
+                    ));
+                };
+                let old_dir = previous.backup_dir;
+                let prior_versions = store_backup::version_count(&old_dir);
+                let cfg = store_backup::relocate(&dir, &backup_dir).map_err(runtime::pack_error)?;
+                // Checkpoint immediately so the new medium carries a current
+                // version before the operator walks away.
+                match store_backup::checkpoint(&dir).map_err(runtime::pack_error)? {
+                    store_backup::Checkpoint::Written { path } => {
+                        outln!(
+                            "✔ relocated; first backup in the new location: {}",
+                            path.display()
+                        );
+                    }
+                    _ => outln!("✔ relocated; next change checkpoints into the new location"),
+                }
+                outln!("backups now land in {}", cfg.backup_dir.display());
+                outln!(
+                    "{prior_versions} prior version(s) remain in {} — untouched, readable by \
+                     the same recovery identity",
+                    old_dir.display()
+                );
+                Ok(())
             }
         },
         IssuerCommand::Verify { backup, identity } => {
             let identity = read_identity_arg(&identity)?;
             let report = store_backup::verify(&backup, &identity).map_err(runtime::pack_error)?;
-            println!("✔ {} decrypts and parses cleanly", backup.display());
-            println!(
+            outln!("✔ {} decrypts and parses cleanly", backup.display());
+            outln!(
                 "members: {} files, {} private key file(s)",
                 report.members.len(),
                 report.key_files
             );
             for cert in &report.certs {
-                println!(
+                outln!(
                     "  cert {}: {} (expires {})",
-                    cert.path, cert.subject, cert.not_after
+                    cert.path,
+                    cert.subject,
+                    cert.not_after
                 );
             }
             Ok(())
@@ -1089,20 +1264,36 @@ fn run_issuer(command: IssuerCommand) -> interflow_core::error::Result<()> {
             let identity = read_identity_arg(&identity)?;
             let report =
                 store_backup::restore(&backup, &identity, &to).map_err(runtime::pack_error)?;
-            println!("✔ issuer store restored to {}", report.root.display());
-            println!("  realm CA fingerprint: {}", report.realm_fingerprint);
-            println!(
+            outln!("✔ issuer store restored to {}", report.root.display());
+            outln!("  realm CA fingerprint: {}", report.realm_fingerprint);
+            outln!(
                 "  policy signing key:   {}",
                 if report.policy_key { "ok" } else { "MISSING" }
             );
             for ws in &report.workspaces {
-                println!("  workspace {} CA: {}", ws.name, ws.fingerprint);
+                outln!("  workspace {} CA: {}", ws.name, ws.fingerprint);
             }
-            println!("  deny list: {} revocation(s)", report.revocations);
-            println!(
-                "Next: re-run `plan apply --issuer {}` against the restored store",
-                report.root.display()
-            );
+            outln!("  deny list: {} revocation(s)", report.revocations);
+            // The restored store carries no backup configuration by design:
+            // the old machine's backup_dir is an absolute path that means
+            // nothing here. Re-arm backups for THIS machine before applying.
+            outln!("  backups:   not configured — the old machine's backup config never travels");
+            if let Ok(recipient) = store_backup::recipient_of(&identity) {
+                outln!(
+                    "Next: `interflow-cli issuer backup init --dir {} --recipient {recipient}` \
+                     (reuses the recovery identity you already hold), then `plan apply --issuer \
+                     {}`",
+                    report.root.display(),
+                    report.root.display()
+                );
+            } else {
+                outln!(
+                    "Next: `interflow-cli issuer backup init --dir {}`, then `plan apply \
+                     --issuer {}`",
+                    report.root.display(),
+                    report.root.display()
+                );
+            }
             Ok(())
         }
     }

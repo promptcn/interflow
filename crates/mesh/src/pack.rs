@@ -184,6 +184,9 @@ pub fn build_hub_config(
             // Log attribution for embedders hosting several nodes in one
             // process (the GUI keys captured events on this name).
             node_name: Some(pack.metadata.node.clone()),
+            // The declared identity the control-plane answer self-reports;
+            // survives the GUI's `node_name` overwrite above.
+            hub_name: Some(pack.metadata.node.clone()),
             proxy_protocol: Default::default(),
         },
         auth: AuthConfig {
@@ -520,6 +523,74 @@ pub(crate) fn spawn_hub_policy_reload(
     });
 }
 
+/// Spawns a signed-policy watcher for embedding surfaces.
+///
+/// Every policy the node-local channel applies (verified +
+/// anti-rollback-checked through the same pack-load funnel the hub's own
+/// reload runs) is handed to `apply`. The expose edge's host-routing
+/// hot-swap rides this — the engine crate keeps its "no identity-crate
+/// dependency" layering while still reacting to verified generations (the
+/// callback receives the already-trusted type through this crate's API
+/// surface).
+pub fn spawn_policy_apply_watch(
+    pack_dir: &Path,
+    shutdown: &tokio_util::sync::CancellationToken,
+    log_name: &str,
+    apply: impl Fn(&RuntimePolicy) + Send + Sync + 'static,
+) {
+    let dir = pack_dir.to_owned();
+    let shutdown = shutdown.clone();
+    let log_name = log_name.to_owned();
+    tokio::spawn(async move {
+        let policy_dir = dir.join("state/policy");
+        let mut fingerprint = policy_channel_fingerprint(&policy_dir);
+        let mut seen: Option<u64> = None;
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(crate::agent::policy_watch::POLICY_WATCH_INTERVAL) => {}
+            }
+            let Some(watermark) = seen else {
+                if let Ok(pack) = CredentialPack::load_runtime(&dir) {
+                    seen = Some(pack.policy.generation);
+                }
+                continue;
+            };
+            let current = policy_channel_fingerprint(&policy_dir);
+            if current == fingerprint {
+                continue;
+            }
+            fingerprint = current;
+            let Ok(pack) = CredentialPack::load_runtime(&dir) else {
+                tracing::warn!(
+                    node = %log_name,
+                    "policy apply watch: pack reload failed (torn update?), keeping current"
+                );
+                continue;
+            };
+            match pack.policy_update(watermark) {
+                Ok(Some(update)) => {
+                    let generation = update.policy.generation;
+                    apply(&update.policy);
+                    seen = Some(generation);
+                    tracing::info!(
+                        node = %log_name,
+                        generation,
+                        "policy apply watch: handed verified generation to the embedder"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        node = %log_name,
+                        "policy apply watch: rejecting update (keeping current): {e}"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// Derives one agent's engine ingress rules from the signed policy's stream
 /// face — its own listen-side rows (`source_agent == node`).
 ///
@@ -605,6 +676,51 @@ pub fn policy_egress_rules(
     Ok((egress, allowed_targets))
 }
 
+/// Derives an expose agent's egress rules from the signed policy's service
+/// list (`agent == node`) × the node-side address table.
+///
+/// One rule per service, named by the id (the edge's
+/// `TargetSelector::Service(id)` resolves against these names), target =
+/// override ?? signed default ?? pack default.
+///
+/// A service id with no resolvable address is **skipped with a warning**,
+/// not a rejection — a hot-added service on a legacy policy (no signed
+/// address) and no pack entry simply waits for an address to arrive via
+/// the override channel; the rest of the policy still applies
+/// (fail-forward, not fail-closed: the id set is signed truth, the address
+/// is a node fact). Single derivation for startup and hot reload, like
+/// [`policy_egress_rules`].
+pub fn policy_service_egress_rules(
+    policy: &RuntimePolicy,
+    node: &str,
+    addresses: &crate::config::ServiceAddresses,
+) -> Result<(Vec<EgressRule>, Vec<String>)> {
+    let mut egress = Vec::new();
+    let mut allowed_targets = Vec::new();
+    for service in &policy.services {
+        if service.agent != node {
+            continue;
+        }
+        let Some(target) = addresses.resolve(&service.id, service.address.as_deref()) else {
+            tracing::warn!(
+                node,
+                service = %service.id,
+                "service declared by policy has no resolvable address (no override, no signed \
+                 default, no pack default) — skipped until an address arrives"
+            );
+            continue;
+        };
+        allowed_targets.push(target.to_string());
+        egress.push(EgressRule {
+            name: service.id.clone(),
+            target: EgressTarget::Addr(target),
+            target_protocol: StreamProto::Tcp,
+            udp_idle_timeout_secs: None,
+        });
+    }
+    Ok((egress, allowed_targets))
+}
+
 /// `interflow-mesh hub --pack <dir>`: engine + renewal scheduler, whichever
 /// finishes first wins (renewal/CRL updates exit gracefully so the
 /// supervisor restarts onto the new material).
@@ -639,6 +755,10 @@ pub async fn run_hub(pack_dir: &Path) -> Result<()> {
     // decision lives here and here only).
     let audit = interflow_core::security::AuditSink::spawn(&config.audit);
     let hub = HubServer::with_tls_plane(config, plane, audit)?;
+    // Captured before the run future consumes the server: the Arc fields
+    // the CRL hot-swap hook acts on are the same ones the run's rebuilt
+    // state carries.
+    let hub_state_handle = hub.state_handle();
     // The signed-policy ACL watcher is intrinsic to the hub's run future
     // (the config's policy plane names the pack) — nothing to spawn or
     // select over here.
@@ -684,9 +804,31 @@ pub async fn run_hub(pack_dir: &Path) -> Result<()> {
     started?;
     interflow_util::systemd::notify_ready();
 
+    // CRL updates from the pull lane hot-swap the verification plane in
+    // place (the hub is the one fleet member whose TLS material may change
+    // under it without a restart); credential renewals below still exit
+    // onto the supervisor restart.
+    let crl_state = hub_state_handle.clone();
+    let crl_hook: interflow_renewal::CrlChangeHook = std::sync::Arc::new(move || {
+        let crl_state = crl_state.clone();
+        Box::pin(async move {
+            match crate::hub::crl::reload_tls_plane(&crl_state).await {
+                Ok(report) => tracing::info!(
+                    evicted = ?report.evicted,
+                    "crl_updated: verification plane hot-swapped (no restart)"
+                ),
+                Err(e) => tracing::error!("crl_reload_failed (the old plane keeps verifying): {e}"),
+            }
+        })
+    });
+
     tokio::select! {
         result = &mut hub_run => result,
-        result = interflow_renewal::renewal_scheduler(pack_dir) => result,
+        result = interflow_renewal::renewal_scheduler_with_crl_reload(
+            pack_dir,
+            None,
+            Some(crl_hook),
+        ) => result,
     }
 }
 

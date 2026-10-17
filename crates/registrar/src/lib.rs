@@ -5,6 +5,7 @@
 //! Nodes enroll once with an operator-issued code and thereafter renew a
 //! client-generated key pair using their current short-lived certificate.
 
+pub mod fault;
 pub mod server;
 pub mod service;
 

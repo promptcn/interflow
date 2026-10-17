@@ -3,7 +3,16 @@ import { api, type NodeInfo, type ProposalSubmitOutcomeDto } from "../api";
 import { useT } from "../i18n";
 import { parseLoopbackAddr } from "../lib/net";
 import { cn } from "../lib/utils";
-import { Button, DialogFooter, DialogTitle, Field, Input, Modal, Select } from "./ui";
+import {
+  Button,
+  DialogFooter,
+  DialogTitle,
+  Field,
+  InfoHint,
+  Input,
+  Modal,
+  Select,
+} from "./ui";
 
 /// The requester's "Request stream" form (the kube-CSR face): a node
 /// asks ITS operator for one more mesh stream. The fields are the
@@ -25,7 +34,8 @@ export default function ProposalDialog({
 }) {
   const { t } = useT();
   const peers = useMemo(
-    () => (node.peers?.peers ?? []).map((p) => p.agent.split("/").pop() ?? p.agent),
+    () =>
+      (node.peers?.peers ?? []).map((p) => p.agent.split("/").pop() ?? p.agent),
     [node.peers],
   );
   const [name, setName] = useState("");
@@ -44,7 +54,10 @@ export default function ProposalDialog({
         ? t("stream.listenError")
         : null;
   const complete =
-    name.trim() !== "" && parseLoopbackAddr(listen) !== null && target !== "" && remote.trim() !== "";
+    name.trim() !== "" &&
+    parseLoopbackAddr(listen) !== null &&
+    target !== "" &&
+    remote.trim() !== "";
 
   const submit = async () => {
     setBusy(true);
@@ -72,8 +85,13 @@ export default function ProposalDialog({
 
   return (
     <Modal onClose={onClose} wide>
-      <DialogTitle>{t("proposal.title")}</DialogTitle>
-      <p className="m-0 text-small text-fg-3">{t("proposal.semantics")}</p>
+      <DialogTitle>
+        {t("proposal.title")}
+        <InfoHint
+          text={`${t("stream.semantics")} ${t("proposal.decisionLands")}`}
+          className="relative -top-px"
+        />
+      </DialogTitle>
       <Field label={t("stream.name")}>
         {(id) => (
           <Input
@@ -103,7 +121,9 @@ export default function ProposalDialog({
               spellCheck={false}
             />
             {listenError && (
-              <span className="text-small whitespace-nowrap text-critical">{listenError}</span>
+              <span className="text-small whitespace-nowrap text-critical">
+                {listenError}
+              </span>
             )}
           </>
         )}
@@ -188,13 +208,18 @@ export default function ProposalDialog({
         >
           {outcome.outcome === "queued" && t("proposal.queued")}
           {outcome.outcome === "duplicate" && t("proposal.duplicate")}
-          {outcome.outcome === "denied" && `${t("proposal.denied")}${outcome.reason}`}
+          {outcome.outcome === "denied" &&
+            `${t("proposal.denied")}${outcome.reason}`}
         </div>
       )}
 
       <DialogFooter>
         <Button onClick={onClose}>{t("common.cancel")}</Button>
-        <Button variant="primary" disabled={busy || !complete} onClick={() => void submit()}>
+        <Button
+          variant="primary"
+          disabled={busy || !complete}
+          onClick={() => void submit()}
+        >
           {busy ? "…" : t("proposal.submit")}
         </Button>
       </DialogFooter>

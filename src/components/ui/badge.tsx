@@ -1,6 +1,7 @@
 import type { HTMLAttributes } from "react";
 import { cva, type VariantProps } from "class-variance-authority";
-import { kindLabel, type NodeKindDto } from "../../api";
+import { kindBlurb, kindLabel, type NodeKindDto } from "../../api";
+import { useT } from "../../i18n";
 import { cn } from "../../lib/utils";
 
 /// Pills/tags/chips — one shape, tones carry semantics. Kind hues keep the
@@ -40,8 +41,17 @@ const KIND_TONE = {
   expose_agent: "expose",
 } as const satisfies Record<NodeKindDto, NonNullable<VariantProps<typeof badgeVariants>["tone"]>>;
 
-/// Short kind badge — product vocabulary, shared with the tray (never
-/// localized). Same API as the old ui.tsx primitive.
-export function KindBadge({ kind }: { kind: NodeKindDto }) {
-  return <Badge tone={KIND_TONE[kind]}>{kindLabel(kind)}</Badge>;
+/// Short kind badge — the text is the product vocabulary (kindLabel,
+/// shared with the tray, the binaries and the ops docs; never localized,
+/// never overridable), and the hover title defaults to the localized
+/// blurb, so "term + explanation" is a component invariant rather than
+/// per-call-site discipline. `title` overrides the blurb only where a
+/// surface needs a context-specific explanation.
+export function KindBadge({ kind, title }: { kind: NodeKindDto; title?: string }) {
+  const { t } = useT();
+  return (
+    <Badge tone={KIND_TONE[kind]} title={title ?? kindBlurb(kind, t)}>
+      {kindLabel(kind)}
+    </Badge>
+  );
 }

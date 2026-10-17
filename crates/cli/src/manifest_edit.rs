@@ -241,12 +241,39 @@ pub enum ManifestEdit {
         agent: String,
         name: String,
     },
+    /// In-place rename of one mesh ingress rule — locate by `from`, rewrite
+    /// the `name` key. The entry's position, decor, and comments survive
+    /// (an upsert-under-new-name + remove pair would move the entry to the
+    /// array's tail and lose its comments — the two-step shape the form had
+    /// to ask of users before this existed).
+    RenameMeshIngress {
+        agent: String,
+        from: String,
+        to: String,
+    },
     /// One `[[agent.<agent>.mesh_egress]]` rule, keyed by `name`; exactly
     /// one of `target_addr` / `target_cidr` non-blank.
     UpsertMeshEgress(MeshEgressEdit),
     RemoveMeshEgress {
         agent: String,
         name: String,
+    },
+    /// In-place rename of one mesh egress rule (same contract as
+    /// [`ManifestEdit::RenameMeshIngress`]; ingress and egress names are
+    /// independent identities, so a "stream rename" is two singles).
+    RenameMeshEgress {
+        agent: String,
+        from: String,
+        to: String,
+    },
+    /// In-place rename of one service **with route cascade**: every
+    /// `[[route]]` whose service ref is `<workspace>/<agent>/<from>` is
+    /// rewritten to `<to>` in the same transform — a stale ref would fail
+    /// the valid→valid funnel, so the cascade is not optional.
+    RenameService {
+        agent: String,
+        from: String,
+        to: String,
     },
     /// One `[[route]]`, keyed by `host`.
     UpsertRoute(RouteEdit),
@@ -537,6 +564,11 @@ pub fn apply_edit(text: &str, edit: &ManifestEdit) -> Result<String> {
             remove_entry(rules, "mesh ingress rule", "name", name)?;
             drop_empty(agent_table, "mesh_ingress");
         }
+        ManifestEdit::RenameMeshIngress { agent, from, to } => {
+            let agent_table = agent_table_mut(root, agent)?;
+            let rules = array_of_tables_mut(agent_table, "mesh_ingress")?;
+            rename_entry(rules, "mesh ingress rule", "name", from, to)?;
+        }
         ManifestEdit::UpsertMeshEgress(edit) => {
             let agent_table = agent_table_mut(root, edit.agent.trim())?;
             let rules = array_of_tables_mut(agent_table, "mesh_egress")?;
@@ -553,6 +585,50 @@ pub fn apply_edit(text: &str, edit: &ManifestEdit) -> Result<String> {
             let rules = array_of_tables_mut(agent_table, "mesh_egress")?;
             remove_entry(rules, "mesh egress rule", "name", name)?;
             drop_empty(agent_table, "mesh_egress");
+        }
+        ManifestEdit::RenameMeshEgress { agent, from, to } => {
+            let agent_table = agent_table_mut(root, agent)?;
+            let rules = array_of_tables_mut(agent_table, "mesh_egress")?;
+            rename_entry(rules, "mesh egress rule", "name", from, to)?;
+        }
+        ManifestEdit::RenameService { agent, from, to } => {
+            let from = from.trim();
+            let to = to.trim();
+            if from == to {
+                return Ok(text.to_string());
+            }
+            if to.is_empty() {
+                return Err(InterflowError::config(
+                    "rename target must not be blank".to_string(),
+                ));
+            }
+            // The route cascade needs the agent's workspace (service refs
+            // are `<workspace>/<agent>/<id>`); read it before the mutable
+            // root borrow below.
+            let workspace = current
+                .agent
+                .get(agent.trim())
+                .map(|a| a.workspace.clone())
+                .ok_or_else(|| unknown("agent", agent.trim()))?;
+            {
+                let agent_table = agent_table_mut(root, agent.trim())?;
+                let services = array_of_tables_mut(agent_table, "services")?;
+                rename_entry(services, "service", "id", from, to)?;
+            }
+            let wanted = format!("{}/{}/{from}", workspace, agent.trim());
+            let replacement = format!("{}/{}/{to}", workspace, agent.trim());
+            if let Some(routes) = root.get_mut("route").and_then(Item::as_array_of_tables_mut) {
+                for route in routes.iter_mut() {
+                    let stale = route
+                        .get("service")
+                        .and_then(Item::as_value)
+                        .and_then(Value::as_str)
+                        .is_some_and(|svc| svc == wanted);
+                    if stale {
+                        set_str(route, "service", Some(&replacement));
+                    }
+                }
+            }
         }
         ManifestEdit::UpsertRoute(edit) => {
             let routes = array_of_tables_mut(root, "route")?;
@@ -853,6 +929,44 @@ fn remove_entry(array: &mut ArrayOfTables, label: &str, key_field: &str, key: &s
     }
 }
 
+/// Renames an entry in place: located by `key_field = from`, that key
+/// rewritten to `to` through [`set_str`] (the entry's decor and comments
+/// survive; only the key value moves). `from == to` is a tolerated no-op; a
+/// taken `to` or a missing `from` fails — both would break the valid→valid
+/// contract.
+fn rename_entry(
+    array: &mut ArrayOfTables,
+    label: &str,
+    key_field: &str,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    let from = from.trim();
+    let to = to.trim();
+    if from == to {
+        return Ok(());
+    }
+    if to.is_empty() {
+        return Err(InterflowError::config(
+            "rename target must not be blank".to_string(),
+        ));
+    }
+    if find_entry_index(array, key_field, to).is_some() {
+        return Err(InterflowError::config(format!(
+            "the manifest already declares a {label} named {to:?} — rename to a free name"
+        )));
+    }
+    match find_entry_index(array, key_field, from) {
+        Some(index) => {
+            if let Some(entry) = array.get_mut(index) {
+                set_str(entry, key_field, Some(to));
+            }
+            Ok(())
+        }
+        None => Err(unknown(label, from)),
+    }
+}
+
 /// Declares `[workspace.<name>]` when the manifest does not have it yet —
 /// appended nodes may introduce a new isolation namespace in the same
 /// breath as referencing it.
@@ -978,9 +1092,9 @@ pub struct AddNodeOutcome {
 /// fail-closed (see [`add_node_in_text`]); writes through
 /// [`save_manifest`].
 pub fn add_node(manifest_path: &Path, spec: &AddNodeSpec) -> Result<AddNodeOutcome> {
-    let original = std::fs::read_to_string(manifest_path)?;
-    let edited = add_node_in_text(&original, spec)?;
-    save_manifest(manifest_path, &edited)?;
+    let original = read_manifest(manifest_path)?;
+    let edited = add_node_in_text(&original.text, spec)?;
+    save_manifest(manifest_path, &edited, Some(&original.digest))?;
     Ok(AddNodeOutcome {
         manifest_text: edited,
         pack_dir_name: format!("{}-{}", spec.kind.dir_prefix(), spec.node),
@@ -1141,13 +1255,50 @@ fn default_workspace(current: &Manifest) -> String {
 // Persistence — the one write shell
 // ---------------------------------------------------------------------------
 
+/// The manifest document as one read-modify-write cycle sees it.
+///
+/// The text plus its freshness token (sha256 of the bytes on disk at read
+/// time). Saving with a stale digest is a conflict, never a silent
+/// overwrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestDocument {
+    pub text: String,
+    pub digest: String,
+}
+
+/// Reads the manifest with its freshness token.
+pub fn read_manifest(path: &Path) -> Result<ManifestDocument> {
+    let text = std::fs::read_to_string(path).map_err(InterflowError::Io)?;
+    let digest = interflow_util::sha256_hex(text.as_bytes());
+    Ok(ManifestDocument { text, digest })
+}
+
 /// Persists manifest text with the editor's write discipline.
+///
+/// `expected_digest` is the freshness token the caller captured when it
+/// read the document (`None` = unconditional, for paths that create
+/// rather than modify). A mismatch — or a file that vanished — is a
+/// [`InterflowError::Conflict`]: the file changed on disk while the caller
+/// held it open, exactly the editor changed-on-disk case; the caller
+/// reloads or reconciles instead of silently clobbering the other writer.
 ///
 /// A silent one-generation `.bak` (best effort — the atomic replace below
 /// is the write safety; validation upstream is the content safety), then
 /// the atomic write. This is the only function in the module that touches
 /// a file, and the only write path its callers share.
-pub fn save_manifest(path: &Path, text: &str) -> Result<()> {
+pub fn save_manifest(path: &Path, text: &str, expected_digest: Option<&str>) -> Result<()> {
+    if let Some(expected) = expected_digest {
+        let unchanged =
+            std::fs::read(path).is_ok_and(|bytes| interflow_util::sha256_hex(&bytes) == expected);
+        if !unchanged {
+            return Err(InterflowError::Conflict {
+                message: format!(
+                    "{} changed on disk since it was read — reload it and re-apply your                      change (the other writer's edit is on disk now)",
+                    path.display()
+                ),
+            });
+        }
+    }
     if path.exists() {
         let mut backup = path.as_os_str().to_os_string();
         backup.push(".bak");
@@ -1243,23 +1394,25 @@ target_cidr = "127.0.0.0/8"
     }
 
     /// TTL bounds track the issuance constants — the form hint can never
-    /// disagree with the validator's裁决.
+    /// disagree with the validator's裁决. Expected values derive from the
+    /// same constants so the test holds under the cfg'd test-build floor
+    /// (identity's short-leaf-ttl feature lowers the registrar minimum).
     #[test]
     fn leaf_ttl_bounds_match_tiers() {
         assert_eq!(
             LeafTtlBounds::for_mode(IdentityMode::Registrar),
             LeafTtlBounds {
-                min: "1h".into(),
-                max: "24h".into(),
-                default: "24h".into(),
+                min: secs_text(MIN_LEAF_TTL_SECONDS),
+                max: secs_text(MAX_LEAF_TTL_SECONDS),
+                default: secs_text(DEFAULT_LEAF_TTL_SECONDS),
             }
         );
         assert_eq!(
             LeafTtlBounds::for_mode(IdentityMode::Offline),
             LeafTtlBounds {
-                min: "7d".into(),
-                max: "365d".into(),
-                default: "90d".into(),
+                min: secs_text(OFFLINE_MIN_LEAF_TTL_SECONDS),
+                max: secs_text(OFFLINE_MAX_LEAF_TTL_SECONDS),
+                default: secs_text(OFFLINE_DEFAULT_LEAF_TTL_SECONDS),
             }
         );
     }
@@ -1802,11 +1955,11 @@ service = "default/desktop/asr"
     fn save_manifest_leaves_one_generation_backup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("interflow.toml");
-        save_manifest(&path, MESH_MANIFEST).unwrap();
+        save_manifest(&path, MESH_MANIFEST, None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), MESH_MANIFEST);
         assert!(!path.with_extension("toml.bak").exists());
 
-        save_manifest(&path, "# replaced\n").unwrap();
+        save_manifest(&path, "# replaced\n", None).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "# replaced\n");
         let mut backup = path.as_os_str().to_os_string();
         backup.push(".bak");
@@ -1814,6 +1967,187 @@ service = "default/desktop/asr"
             std::fs::read_to_string(std::path::PathBuf::from(backup)).unwrap(),
             MESH_MANIFEST,
             "the previous generation is the backup"
+        );
+    }
+
+    /// The changed-on-disk guard: a save whose expected digest no longer
+    /// matches what the disk holds is a Conflict — never a clobber — and a
+    /// save against a file that vanished is a Conflict too, not a create.
+    /// This is the lost-update window of backlog
+    /// 2026-10-11-manifest-sqlite-pivot §2.1 closing.
+    #[test]
+    fn stale_digest_save_conflicts_instead_of_clobbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interflow.toml");
+        save_manifest(&path, MESH_MANIFEST, None).unwrap();
+        let first = read_manifest(&path).unwrap();
+
+        // Another writer (terminal `node add`, another editor window) wins
+        // the file after our read.
+        save_manifest(&path, "# other writer\n", None).unwrap();
+        let err = save_manifest(&path, "# mine\n", Some(&first.digest)).unwrap_err();
+        assert!(
+            matches!(err, InterflowError::Conflict { .. }),
+            "wrong error: {err:?}"
+        );
+        assert_eq!(
+            read_manifest(&path).unwrap().text,
+            "# other writer\n",
+            "the other writer's version stands"
+        );
+
+        // After a reload (fresh digest) the same intent saves cleanly.
+        let fresh = read_manifest(&path).unwrap();
+        save_manifest(&path, "# mine, retried\n", Some(&fresh.digest)).unwrap();
+        assert_eq!(read_manifest(&path).unwrap().text, "# mine, retried\n");
+
+        // A missing file with an expected digest is a conflict, not a
+        // silent create over a deletion.
+        let gone = dir.path().join("deleted.toml");
+        save_manifest(&gone, "v1\n", None).unwrap();
+        let token = read_manifest(&gone).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        let err = save_manifest(&gone, "v2\n", Some(&token.digest)).unwrap_err();
+        assert!(
+            matches!(err, InterflowError::Conflict { .. }),
+            "a vanished file is a conflict: {err:?}"
+        );
+    }
+
+    /// A rule rename moves the name in place: the entry keeps its position,
+    /// fields, decor, and comments, and the document stays valid. This is
+    /// what makes a GUI rename one atomic transform instead of the
+    /// upsert-under-new-name + remove pair that relocated entries and
+    /// stranded the old rule if the user stopped halfway.
+    #[test]
+    fn rename_mesh_rule_moves_the_name_in_place() {
+        let edited = apply_edit(
+            MESH_MANIFEST,
+            &ManifestEdit::RenameMeshIngress {
+                agent: "leo-mesh".into(),
+                from: "ollama".into(),
+                to: "llama".into(),
+            },
+        )
+        .unwrap();
+        comments_survive(MESH_MANIFEST, &edited);
+        let manifest = Manifest::parse(&edited).unwrap();
+        assert!(manifest.validate().is_ok());
+        let rules = &manifest.agent["leo-mesh"].mesh_ingress;
+        assert_eq!(rules[0].name, "llama");
+        assert_eq!(rules[0].listen, "127.0.0.1:11434");
+        assert_eq!(rules[1].name, "asr", "the sibling keeps its position");
+        assert!(
+            edited
+                .find("llama")
+                .is_some_and(|i| i < edited.find("asr").unwrap()),
+            "the renamed entry stays first in the array"
+        );
+    }
+
+    /// Renames refuse the two states that would break the valid→valid
+    /// contract: a taken target (duplicate name) and a missing source; the
+    /// identity rename is a tolerated no-op.
+    #[test]
+    fn rename_rejects_taken_target_and_missing_source() {
+        let taken = apply_edit(
+            MESH_MANIFEST,
+            &ManifestEdit::RenameMeshIngress {
+                agent: "leo-mesh".into(),
+                from: "ollama".into(),
+                to: "asr".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            chain_of(&taken).contains("already declares"),
+            "duplicate target must be phrased by the schema: {taken}"
+        );
+
+        let missing = apply_edit(
+            MESH_MANIFEST,
+            &ManifestEdit::RenameMeshEgress {
+                agent: "home-win".into(),
+                from: "nope".into(),
+                to: "other".into(),
+            },
+        )
+        .unwrap_err();
+        assert!(chain_of(&missing).contains("no mesh egress rule"));
+
+        let noop = apply_edit(
+            MESH_MANIFEST,
+            &ManifestEdit::RenameMeshIngress {
+                agent: "leo-mesh".into(),
+                from: "ollama".into(),
+                to: "ollama".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(noop, MESH_MANIFEST, "an identity rename is a no-op");
+    }
+
+    /// A service rename cascades every `[[route]]` referencing
+    /// `<workspace>/<agent>/<from>` — the ref is the route's dial target,
+    /// so a stale ref would fail the funnel and the cascade is what makes
+    /// the rename valid→valid on its own.
+    #[test]
+    fn rename_service_cascades_route_refs() {
+        const EXPOSE_MANIFEST: &str = r#"[realm]
+id = "expose-realm"
+control_endpoint = "tunnel.example.com:443"
+
+[identity]
+mode = "offline"
+
+[workspace.team]
+
+[ingress.edge]
+workspaces = ["team"]
+
+[agent.desktop]
+workspace = "team"
+
+# the service a public host points at
+[[agent.desktop.services]]
+id = "asr"
+address = "127.0.0.1:8080"
+
+[[agent.desktop.services]]
+id = "web"
+address = "127.0.0.1:3000"
+
+[[route]]
+host = "app.example.com"
+service = "team/desktop/asr"
+
+[[route]]
+host = "other.example.com"
+service = "team/desktop/web"
+"#;
+        let edited = apply_edit(
+            EXPOSE_MANIFEST,
+            &ManifestEdit::RenameService {
+                agent: "desktop".into(),
+                from: "asr".into(),
+                to: "speech".into(),
+            },
+        )
+        .unwrap();
+        comments_survive(EXPOSE_MANIFEST, &edited);
+        let manifest = Manifest::parse(&edited).unwrap();
+        assert!(
+            manifest.validate().is_ok(),
+            "the cascade keeps the document valid (a stale ref would not)"
+        );
+        assert_eq!(manifest.agent["desktop"].services[0].id, "speech");
+        assert_eq!(
+            manifest.route[0].service, "team/desktop/speech",
+            "the referencing route follows the rename"
+        );
+        assert_eq!(
+            manifest.route[1].service, "team/desktop/web",
+            "unrelated routes are untouched"
         );
     }
 }

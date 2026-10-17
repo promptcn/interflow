@@ -1,4 +1,4 @@
-import type { HTMLAttributes, ReactNode } from "react";
+import type { ReactNode } from "react";
 import * as SeparatorPrimitive from "@radix-ui/react-separator";
 import { cn } from "../../lib/utils";
 
@@ -14,19 +14,6 @@ export function EmptyState({ className, children }: { className?: string; childr
     >
       {children}
     </div>
-  );
-}
-
-/// Keyboard affordance (the "Esc" chips on back buttons).
-export function Kbd({ className, ...props }: HTMLAttributes<HTMLElement>) {
-  return (
-    <kbd
-      className={cn(
-        "inline-flex h-5 min-w-5 items-center justify-center rounded border border-line bg-bg-3 px-1 font-mono text-micro text-fg-2",
-        className,
-      )}
-      {...props}
-    />
   );
 }
 

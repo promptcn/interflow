@@ -10,6 +10,7 @@ import {
   type NodeInfo,
 } from "../api";
 import { useT, type TFn } from "../i18n";
+import { principalRealm } from "../lib/shellFace";
 import { cn } from "../lib/utils";
 import { Badge, Button, Hint, KindBadge, StateDot } from "./ui";
 
@@ -86,6 +87,9 @@ export default function NodeCard({
   const leaf = leafPhase(node.credential);
   const { t } = useT();
   const summary = summaryLines(node, t);
+  // Identity from the signed principal — a sealed import always carries a
+  // realm, so the card never needs a deployment tree to be nameable.
+  const realm = principalRealm(node.principal);
 
   return (
     <Hint text={node.principal ?? node.pack_dir}>
@@ -106,6 +110,7 @@ export default function NodeCard({
         <div className="flex items-center gap-2">
           <StateDot state={node.state} />
           <strong className="min-w-0 flex-1 truncate text-base font-semibold">{node.name}</strong>
+          {realm && <span className="shrink-0 font-mono text-micro text-fg-3">{realm}</span>}
           <KindBadge kind={node.kind} />
         </div>
         <div className="flex min-h-[18px] flex-col gap-0.5 font-mono text-small text-fg-2">

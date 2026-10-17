@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Plus } from "lucide-react";
 import { api, isRunning, policyInverted, type NodeInfo } from "../api";
 import { useT } from "../i18n";
+import { shouldPromptStartAll } from "../lib/startupPrompt";
 import AddNodeDialog from "./AddNodeDialog";
 import NodeCard from "./NodeCard";
-import { Hint } from "./ui";
+import { Button, Hint } from "./ui";
 
 /// The Nodes face landing view: every node on this machine as one card, a
 /// one-glance aggregate line above, the add flow at the end. This layer
@@ -26,6 +27,34 @@ export default function NodeOverview({
 }) {
   const [adding, setAdding] = useState(false);
   const { t } = useT();
+
+  // The startup "all stopped, no intent" prompt — evaluated ONCE, when the
+  // baseline list first lands. It is a fallback for state the intent
+  // restore cannot decide (prefs from the old quit-wipes-intent builds,
+  // deliberate stops that outlived a reinstall), so it must not nag again
+  // after in-session stops.
+  const [startAllNotice, setStartAllNotice] = useState(false);
+  const noticed = useRef(false);
+  useEffect(() => {
+    if (loaded && !noticed.current) {
+      noticed.current = true;
+      setStartAllNotice(shouldPromptStartAll(nodes));
+    }
+  }, [loaded, nodes]);
+
+  const startAll = async () => {
+    setStartAllNotice(false);
+    const failures: string[] = [];
+    for (const node of nodes) {
+      try {
+        await api.startNode(node.id);
+      } catch (e) {
+        failures.push(t("overview.actionFailed", { action: t("common.start"), name: node.name, error: String(e) }));
+      }
+    }
+    await onChanged();
+    if (failures.length > 0) onError(failures[0]);
+  };
 
   const quickAction = async (node: NodeInfo) => {
     try {
@@ -72,6 +101,20 @@ export default function NodeOverview({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto">
+      {startAllNotice && (
+        <div
+          role="status"
+          className="flex items-baseline gap-3 rounded-lg border border-warn/55 bg-warn/10 px-3 py-2 text-base text-warn"
+        >
+          <span className="min-w-0 flex-1">{t("overview.allStoppedNotice")}</span>
+          <Button variant="secondary" size="sm" onClick={() => void startAll()}>
+            {t("overview.startAll")}
+          </Button>
+          <Button variant="link" size="sm" onClick={() => setStartAllNotice(false)}>
+            {t("app.dismiss")}
+          </Button>
+        </div>
+      )}
       {nodes.length > 0 ? (
         <div className="px-0.5 text-small text-fg-3">
           {aggregate}

@@ -617,6 +617,29 @@ mod tests {
         );
     }
 
+    /// Compatibility contract (documentation/versioning.md, "Additive changes never
+    /// bump the epoch"): unknown JSON keys are ignored on both faces — a
+    /// newer peer may add a key without breaking the older parser. The
+    /// strictness above (mandatory fields, trailing bytes, wrong types)
+    /// is untouched; tolerance is for additions only.
+    #[test]
+    fn unknown_json_keys_are_ignored_on_both_faces() {
+        let hello = br#"{"caps":1,"agent_id":"edge-1","future_key":{"nested":true}}"#;
+        let (caps, name, build) = decode_hello_payload(hello).unwrap();
+        assert_eq!(caps, 1);
+        assert_eq!(name, "edge-1");
+        assert_eq!(build, None);
+
+        let ack =
+            br#"{"caps":1,"circuit_token":"12078a05e14f4e2c99b1679be1df7c30","future_key":7}"#;
+        let (caps, decoded) = RegisterResponse::parse_ack_payload(ack).unwrap();
+        assert_eq!(caps, 1);
+        assert_eq!(
+            decoded.circuit_token,
+            CircuitToken::from_hex("12078a05e14f4e2c99b1679be1df7c30").unwrap()
+        );
+    }
+
     /// The Hello payload round-trips the caps word and the intended id;
     /// malformed payloads and boundary-violating ids are protocol
     /// violations in both directions.

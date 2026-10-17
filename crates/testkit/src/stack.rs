@@ -120,31 +120,56 @@ pub async fn spawn_edge(cfg: interflow_expose::edge::EdgeConfig) -> EdgeHandle {
 /// time a `HubHandle` exists the hub can be connected to — no startup sleeps,
 /// no port probing at call sites. Panics (with the server error) if the hub
 /// never reaches readiness.
+///
+/// Dual-stack flake hardening: a `:0` hub binds TCP (kernel assigns port P)
+/// then QUIC's UDP listener on the **same** port — under a fully parallel
+/// nextest run another test's QUIC hub can already hold UDP P (the two
+/// port spaces are independent, so the kernel cannot avoid it), failing
+/// the spawn with `Address already in use`. Re-spawning re-rolls the dice
+/// with a fresh TCP port, so a bounded retry turns a percent-level suite
+/// flake into a non-event. Only safe with the (testkit-default) disabled
+/// audit sink — an enabled jsonl sink claims its path per process and a
+/// second spawn would trip that guard.
 pub async fn spawn_hub(cfg: HubConfig) -> HubHandle {
     crate::assert_nextest_runner();
     const READY_TIMEOUT: Duration = Duration::from_secs(10);
-    let hub = HubHandle::spawn(cfg).expect("hub build");
-    let mut state = hub.subscribe_state();
-    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
-    loop {
-        match state.borrow_and_update().clone() {
-            HubLifecycle::Running => return hub,
-            // Ended before readiness (e.g. listen bind failure): surface the
-            // real error instead of a confusing downstream failure.
-            HubLifecycle::Failed { error } => panic!("hub not ready: {error}"),
-            HubLifecycle::Starting => {}
-            terminal => panic!("hub left readiness wait in {terminal:?}"),
-        }
-        if tokio::time::timeout_at(deadline, state.changed())
-            .await
-            .is_err()
-        {
-            panic!(
-                "hub not ready within {READY_TIMEOUT:?} (state: {:?})",
-                hub.state()
-            );
+    const BIND_ATTEMPTS: usize = 5;
+    let retryable = !cfg.audit.enabled;
+    let mut last_error = String::new();
+    for attempt in 1..=BIND_ATTEMPTS {
+        let hub = HubHandle::spawn(cfg.clone()).expect("hub build");
+        let mut state = hub.subscribe_state();
+        let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            match state.borrow_and_update().clone() {
+                HubLifecycle::Running => return hub,
+                // Ended before readiness (e.g. listen bind failure): surface the
+                // real error instead of a confusing downstream failure.
+                HubLifecycle::Failed { error } => {
+                    if retryable
+                        && attempt < BIND_ATTEMPTS
+                        && error.contains("Address already in use")
+                    {
+                        last_error = error;
+                        break; // re-roll the dual-stack same-port dice
+                    }
+                    panic!("hub not ready: {error}");
+                }
+                HubLifecycle::Starting => {}
+                terminal => panic!("hub left readiness wait in {terminal:?}"),
+            }
+            if tokio::time::timeout_at(deadline, state.changed())
+                .await
+                .is_err()
+            {
+                panic!(
+                    "hub not ready within {READY_TIMEOUT:?} (state: {:?})",
+                    hub.state()
+                );
+            }
         }
     }
+    panic!("hub bind still failing after {BIND_ATTEMPTS} attempts: {last_error}");
 }
 
 /// Start an agent and return its handle. Call `shutdown_graceful` for a clean stop;

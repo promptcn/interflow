@@ -26,7 +26,11 @@ type Kind = IssueNodeParams["kind"];
 /// translates (same vocabulary as the node cards' kindBlurb).
 const kinds = (t: TFn): { value: Kind; label: string; blurb: string }[] => [
   { value: "agent_mesh", label: "Mesh agent", blurb: t("issue.blurbMesh") },
-  { value: "agent_expose", label: "Expose agent", blurb: t("issue.blurbExpose") },
+  {
+    value: "agent_expose",
+    label: "Expose agent",
+    blurb: t("issue.blurbExpose"),
+  },
   { value: "hub", label: "Hub", blurb: t("issue.blurbHub") },
   { value: "ingress", label: "Ingress", blurb: t("kindBlurb.ingress") },
 ];
@@ -101,6 +105,7 @@ export default function IssuePackDialog({
   onSay,
   onIssued,
   onComplete,
+  onAddHere,
   onClose,
 }: {
   manifest: string;
@@ -114,14 +119,26 @@ export default function IssuePackDialog({
   onIssued: (manifestText: string) => void;
   /// Refreshes the pack grid after a successful apply.
   onComplete: () => void;
+  /// The done screen's "add on this machine now" entry (the new IA's
+  /// dead-end fix): receives the rendered pack directory. Optional —
+  /// absent hides the button.
+  onAddHere?: (packDir: string) => void;
   onClose: () => void;
 }) {
   const [kind, setKind] = useState<Kind>("agent_mesh");
   const [node, setNode] = useState("");
   const [workspace, setWorkspace] = useState("");
-  const [services, setServices] = useState<ServiceRow[]>([{ id: "", address: "" }]);
+  const [services, setServices] = useState<ServiceRow[]>([
+    { id: "", address: "" },
+  ]);
   const [meshIngress, setMeshIngress] = useState<MeshIngressRow[]>([
-    { name: "", listen: "", protocol: "tcp", target_agent: "", remote_addr: "" },
+    {
+      name: "",
+      listen: "",
+      protocol: "tcp",
+      target_agent: "",
+      remote_addr: "",
+    },
   ]);
   const [meshEgress, setMeshEgress] = useState<MeshEgressRow[]>([]);
   const [ingressWorkspaces, setIngressWorkspaces] = useState("default");
@@ -188,7 +205,12 @@ export default function IssuePackDialog({
       lines.push(`[agent.${trimmed}]`);
       if (ws) lines.push(`workspace = "${ws}"`);
       for (const s of services.filter((s) => s.id.trim() !== "")) {
-        lines.push(``, `[[agent.${trimmed}.services]]`, `id = "${s.id.trim()}"`, `address = "${s.address.trim()}"`);
+        lines.push(
+          ``,
+          `[[agent.${trimmed}.services]]`,
+          `id = "${s.id.trim()}"`,
+          `address = "${s.address.trim()}"`,
+        );
       }
       for (const r of meshIngress.filter((r) => r.name.trim() !== "")) {
         lines.push(
@@ -215,10 +237,25 @@ export default function IssuePackDialog({
     } else if (kind === "hub") {
       lines.push(`[mesh.hub.${trimmed}]`, `endpoint = "${hubEndpoint.trim()}"`);
     } else {
-      lines.push(`[ingress.${trimmed}]`, `workspaces = [${ingressWorkspaces.split(",").map((w) => `"${w.trim()}"`).join(", ")}]`);
+      lines.push(
+        `[ingress.${trimmed}]`,
+        `workspaces = [${ingressWorkspaces
+          .split(",")
+          .map((w) => `"${w.trim()}"`)
+          .join(", ")}]`,
+      );
     }
     return lines.join("\n");
-  }, [kind, trimmed, workspace, services, meshIngress, meshEgress, hubEndpoint, ingressWorkspaces]);
+  }, [
+    kind,
+    trimmed,
+    workspace,
+    services,
+    meshIngress,
+    meshEgress,
+    hubEndpoint,
+    ingressWorkspaces,
+  ]);
 
   const run = async (download: boolean) => {
     setBusy(true);
@@ -233,7 +270,11 @@ export default function IssuePackDialog({
         }),
       ]);
       onIssued(outcome.manifest_text);
-      const report = await api.deployApply(manifest.trim(), issuer.trim(), out.trim());
+      const report = await api.deployApply(
+        manifest.trim(),
+        issuer.trim(),
+        out.trim(),
+      );
       onSay(report.lines);
       if (download) {
         const passphrase = await api.deployGeneratePassphrase();
@@ -242,9 +283,17 @@ export default function IssuePackDialog({
           passphrase,
         );
         onSay([t("issue.sealedLine", { path: sealed.path })]);
-        setDone({ packDirName: outcome.pack_dir_name, filePath: sealed.path, passphrase });
+        setDone({
+          packDirName: outcome.pack_dir_name,
+          filePath: sealed.path,
+          passphrase,
+        });
       } else {
-        setDone({ packDirName: outcome.pack_dir_name, filePath: null, passphrase: null });
+        setDone({
+          packDirName: outcome.pack_dir_name,
+          filePath: null,
+          passphrase: null,
+        });
       }
       onComplete();
     } catch (e) {
@@ -277,19 +326,38 @@ export default function IssuePackDialog({
           <p className="m-0 text-base whitespace-pre-wrap text-fg-1">
             {done.passphrase
               ? t("issue.doneSealed", { name: done.packDirName })
-              : t("issue.doneRendered", { name: done.packDirName, out: out.trim() })}
+              : t("issue.doneRendered", {
+                  name: done.packDirName,
+                  out: out.trim(),
+                })}
           </p>
           {done.passphrase && (
             <div className="flex items-center gap-2">
               <code className="min-w-0 flex-1 rounded-lg border border-line bg-bg-3 p-2 font-mono text-base break-all text-fg-1">
                 {done.passphrase}
               </code>
-              <Button onClick={() => void copyPassphrase()}>{t("common.copy")}</Button>
+              <Button onClick={() => void copyPassphrase()}>
+                {t("common.copy")}
+              </Button>
             </div>
           )}
-          {done.filePath && <p className="m-0 text-small text-fg-3">{done.filePath}</p>}
-          <p className="m-0 text-small text-fg-3">{t("issue.manifestRewritten")}</p>
+          {done.filePath && (
+            <p className="m-0 text-small text-fg-3">{done.filePath}</p>
+          )}
+          <p className="m-0 text-small text-fg-3">
+            {t("issue.manifestRewritten")}
+          </p>
           <DialogFooter>
+            {onAddHere && (
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  onAddHere(`${out.trim()}/packs/${done.packDirName}`)
+                }
+              >
+                {t("dep.node.addHere")}
+              </Button>
+            )}
             <Button variant="primary" onClick={onClose}>
               {t("common.done")}
             </Button>
@@ -299,7 +367,9 @@ export default function IssuePackDialog({
         <>
           {recentContexts.length > 1 && (
             <div className="flex items-center gap-2">
-              <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.context")}</span>
+              <span className="w-[140px] shrink-0 text-base text-fg-2">
+                {t("issue.context")}
+              </span>
               <RecentContextSelect
                 contexts={recentContexts}
                 current={{ manifest, issuer, out }}
@@ -310,32 +380,43 @@ export default function IssuePackDialog({
 
           <SegmentedControl
             value={kind}
-            options={KINDS.map((k) => ({ value: k.value, label: k.label, title: k.blurb }))}
+            options={KINDS.map((k) => ({
+              value: k.value,
+              label: k.label,
+              title: k.blurb,
+            }))}
             onChange={setKind}
             disabled={active}
           />
-          <p className="m-0 text-small text-fg-3">{KINDS.find((k) => k.value === kind)?.blurb}</p>
 
           <div className="flex items-center gap-2">
-            <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.nodeName")}</span>
+            <span className="w-[140px] shrink-0 text-base text-fg-2">
+              {t("issue.nodeName")}
+            </span>
             {field(node, setNode, "home-win")}
           </div>
 
           {(kind === "agent_expose" || kind === "agent_mesh") && (
             <div className="flex items-center gap-2">
-              <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.workspace")}</span>
+              <span className="w-[140px] shrink-0 text-base text-fg-2">
+                {t("issue.workspace")}
+              </span>
               {field(workspace, setWorkspace, t("issue.workspacePh"))}
             </div>
           )}
           {kind === "hub" && (
             <div className="flex items-center gap-2">
-              <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.endpoint")}</span>
+              <span className="w-[140px] shrink-0 text-base text-fg-2">
+                {t("issue.endpoint")}
+              </span>
               {field(hubEndpoint, setHubEndpoint, "mesh.example.com:6666")}
             </div>
           )}
           {kind === "ingress" && (
             <div className="flex items-center gap-2">
-              <span className="w-[140px] shrink-0 text-base text-fg-2">{t("issue.workspaces")}</span>
+              <span className="w-[140px] shrink-0 text-base text-fg-2">
+                {t("issue.workspaces")}
+              </span>
               {field(ingressWorkspaces, setIngressWorkspaces, "default")}
             </div>
           )}
@@ -344,21 +425,49 @@ export default function IssuePackDialog({
             <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
               <div className="flex items-center justify-between gap-2 text-small text-fg-3">
                 <span>{t("issue.services")}</span>
-                <Button size="sm" disabled={active} onClick={() => setServices([...services, { id: "", address: "" }])}>
+                <Button
+                  size="sm"
+                  disabled={active}
+                  onClick={() =>
+                    setServices([...services, { id: "", address: "" }])
+                  }
+                >
                   {t("common.addService")}
                 </Button>
               </div>
               {services.map((s, i) => (
-                <div className="flex min-w-0 flex-wrap items-center gap-1.5" key={i}>
-                  {field(s.id, (v) => setServices(services.map((r, j) => (j === i ? { ...r, id: v } : r))), "asr", "w-[120px]")}
-                  {field(s.address, (v) => setServices(services.map((r, j) => (j === i ? { ...r, address: v } : r))), "127.0.0.1:8080")}
+                <div
+                  className="flex min-w-0 flex-wrap items-center gap-1.5"
+                  key={i}
+                >
+                  {field(
+                    s.id,
+                    (v) =>
+                      setServices(
+                        services.map((r, j) => (j === i ? { ...r, id: v } : r)),
+                      ),
+                    "asr",
+                    "w-[120px]",
+                  )}
+                  {field(
+                    s.address,
+                    (v) =>
+                      setServices(
+                        services.map((r, j) =>
+                          j === i ? { ...r, address: v } : r,
+                        ),
+                      ),
+                    "127.0.0.1:8080",
+                  )}
                   <Hint text={t("common.remove")}>
                     <Button
                       variant="link"
                       size="icon-sm"
                       disabled={active}
                       aria-label={t("common.remove")}
-                      onClick={() => setServices(services.filter((_, j) => j !== i))}
+                      onClick={() =>
+                        setServices(services.filter((_, j) => j !== i))
+                      }
                       className="text-fg-3 hover:text-critical"
                     >
                       <X className="size-3.5" />
@@ -377,7 +486,16 @@ export default function IssuePackDialog({
                   size="sm"
                   disabled={active}
                   onClick={() =>
-                    setMeshIngress([...meshIngress, { name: "", listen: "", protocol: "tcp", target_agent: "", remote_addr: "" }])
+                    setMeshIngress([
+                      ...meshIngress,
+                      {
+                        name: "",
+                        listen: "",
+                        protocol: "tcp",
+                        target_agent: "",
+                        remote_addr: "",
+                      },
+                    ])
                   }
                 >
                   {t("common.addRule")}
@@ -385,21 +503,52 @@ export default function IssuePackDialog({
               </div>
               {meshIngress.map((r, i) => {
                 const patch = (p: Partial<MeshIngressRow>) =>
-                  setMeshIngress(meshIngress.map((row, j) => (j === i ? { ...row, ...p } : row)));
+                  setMeshIngress(
+                    meshIngress.map((row, j) =>
+                      j === i ? { ...row, ...p } : row,
+                    ),
+                  );
                 return (
-                  <div className="flex min-w-0 flex-wrap items-center gap-1.5" key={i}>
-                    {field(r.name, (v) => patch({ name: v }), "ollama", "w-[110px]")}
-                    {field(r.listen, (v) => patch({ listen: v }), "127.0.0.1:11434", "w-[170px]")}
-                    {protocolSelect(r.protocol, active, (p) => patch({ protocol: p }))}
-                    {field(r.target_agent, (v) => patch({ target_agent: v }), t("issue.phPeerAgent"), "w-[110px]")}
-                    {field(r.remote_addr, (v) => patch({ remote_addr: v }), "127.0.0.1:11434", "w-[170px]")}
+                  <div
+                    className="flex min-w-0 flex-wrap items-center gap-1.5"
+                    key={i}
+                  >
+                    {field(
+                      r.name,
+                      (v) => patch({ name: v }),
+                      "ollama",
+                      "w-[110px]",
+                    )}
+                    {field(
+                      r.listen,
+                      (v) => patch({ listen: v }),
+                      "127.0.0.1:11434",
+                      "w-[170px]",
+                    )}
+                    {protocolSelect(r.protocol, active, (p) =>
+                      patch({ protocol: p }),
+                    )}
+                    {field(
+                      r.target_agent,
+                      (v) => patch({ target_agent: v }),
+                      t("issue.phPeerAgent"),
+                      "w-[110px]",
+                    )}
+                    {field(
+                      r.remote_addr,
+                      (v) => patch({ remote_addr: v }),
+                      "127.0.0.1:11434",
+                      "w-[170px]",
+                    )}
                     <Hint text={t("common.remove")}>
                       <Button
                         variant="link"
                         size="icon-sm"
                         disabled={active}
                         aria-label={t("common.remove")}
-                        onClick={() => setMeshIngress(meshIngress.filter((_, j) => j !== i))}
+                        onClick={() =>
+                          setMeshIngress(meshIngress.filter((_, j) => j !== i))
+                        }
                         className="text-fg-3 hover:text-critical"
                       >
                         <X className="size-3.5" />
@@ -409,30 +558,57 @@ export default function IssuePackDialog({
                 );
               })}
               <div className="flex items-center justify-between gap-2 text-small text-fg-3">
-                <span>{t("form.meshEgressTitle")}</span>
+                <Hint text={t("dialogs.peerAuthHint")}>
+                  <span>{t("form.meshEgressTitle")}</span>
+                </Hint>
                 <Button
                   size="sm"
                   disabled={active}
-                  onClick={() => setMeshEgress([...meshEgress, { name: "", protocol: "tcp", target: "" }])}
+                  onClick={() =>
+                    setMeshEgress([
+                      ...meshEgress,
+                      { name: "", protocol: "tcp", target: "" },
+                    ])
+                  }
                 >
                   {t("common.addRule")}
                 </Button>
               </div>
               {meshEgress.map((r, i) => {
                 const patch = (p: Partial<MeshEgressRow>) =>
-                  setMeshEgress(meshEgress.map((row, j) => (j === i ? { ...row, ...p } : row)));
+                  setMeshEgress(
+                    meshEgress.map((row, j) =>
+                      j === i ? { ...row, ...p } : row,
+                    ),
+                  );
                 return (
-                  <div className="flex min-w-0 flex-wrap items-center gap-1.5" key={i}>
-                    {field(r.name, (v) => patch({ name: v }), "loopback", "w-[110px]")}
-                    {protocolSelect(r.protocol, active, (p) => patch({ protocol: p }))}
-                    {field(r.target, (v) => patch({ target: v }), "127.0.0.1:11434 or 127.0.0.0/8")}
+                  <div
+                    className="flex min-w-0 flex-wrap items-center gap-1.5"
+                    key={i}
+                  >
+                    {field(
+                      r.name,
+                      (v) => patch({ name: v }),
+                      "loopback",
+                      "w-[110px]",
+                    )}
+                    {protocolSelect(r.protocol, active, (p) =>
+                      patch({ protocol: p }),
+                    )}
+                    {field(
+                      r.target,
+                      (v) => patch({ target: v }),
+                      t("dialogs.phEgressTarget"),
+                    )}
                     <Hint text={t("common.remove")}>
                       <Button
                         variant="link"
                         size="icon-sm"
                         disabled={active}
                         aria-label={t("common.remove")}
-                        onClick={() => setMeshEgress(meshEgress.filter((_, j) => j !== i))}
+                        onClick={() =>
+                          setMeshEgress(meshEgress.filter((_, j) => j !== i))
+                        }
                         className="text-fg-3 hover:text-critical"
                       >
                         <X className="size-3.5" />
@@ -441,13 +617,14 @@ export default function IssuePackDialog({
                   </div>
                 );
               })}
-              <p className="m-0 text-small text-fg-3">{t("dialogs.peerAuthHint")}</p>
             </div>
           )}
 
           {preview !== "" && (
             <div className="flex flex-col gap-1">
-              <span className="text-small text-fg-3">{t("issue.willAppend")}</span>
+              <span className="text-small text-fg-3">
+                {t("issue.willAppend")}
+              </span>
               <pre className="m-0 overflow-x-auto rounded-lg border border-line bg-bg-3 p-2.5 font-mono text-small text-fg-2">
                 {preview}
               </pre>
@@ -467,7 +644,11 @@ export default function IssuePackDialog({
             <Button disabled={active || !ready} onClick={() => void run(false)}>
               {t("issue.issueOnly")}
             </Button>
-            <Button variant="primary" disabled={active || !ready} onClick={() => void run(true)}>
+            <Button
+              variant="primary"
+              disabled={active || !ready}
+              onClick={() => void run(true)}
+            >
               {busy ? "…" : t("issue.issueDownload")}
             </Button>
           </DialogFooter>

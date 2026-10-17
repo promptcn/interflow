@@ -85,6 +85,13 @@ impl HubService {
                 "control-plane principals cannot register as agents",
             ));
         }
+        // The revocation gate: the mTLS handshake may predate the CRL swap
+        // that revoked this credential (the acceptor only gates NEW
+        // connections) — registration is the second gate.
+        if let Some(serial) = self.connection_credential_revoked().await {
+            warn!("registration denied: credential revoked ({serial})");
+            return Ok(self.revoked_credential_denied(&serial));
+        }
         let circuit = CircuitToken::random()?;
         *self.connection_circuit.write().await = Some(circuit);
         info!(
@@ -98,9 +105,14 @@ impl HubService {
             .await
             .retain(|_, (_, source, _)| source != &agent_key);
 
-        // The registration certificate's validity window rides the session
-        // (refreshed here — a reconnected agent presents its current leaf).
+        // The registration certificate's validity window and revocation
+        // serial ride the session (refreshed here — a reconnected agent
+        // presents its current leaf).
         let leaf_validity = identity.leaf_validity_unix;
+        let leaf_serial = identity
+            .leaf_serial_hex
+            .clone()
+            .map(|serial| (serial, crate::hub::crl::tenant_crl_stem(&identity.tenant)));
 
         // Single write lock: atomically insert or replace the channel in
         // place (see [`AgentSession::install_channels`] for why in place).
@@ -115,9 +127,10 @@ impl HubService {
                 let mut session = existing.write().await;
                 session.install_channels(circuit, None);
                 session.leaf_validity_unix = leaf_validity;
+                session.leaf_serial = leaf_serial;
                 session.build.clone_from(&build);
             } else {
-                let mut session = AgentSession::new(circuit, None, leaf_validity);
+                let mut session = AgentSession::new(circuit, None, leaf_validity, leaf_serial);
                 session.build.clone_from(&build);
                 agents.insert(agent_key.clone(), Arc::new(RwLock::new(session)));
             }
@@ -188,17 +201,41 @@ impl HubService {
     /// in particular).
     ///
     /// The identity binding check must be completed before calling; the
-    /// authentication level is equivalent to `/register`.
-    pub(crate) async fn implicit_re_register(&self, agent_id: &str) -> Arc<RwLock<AgentSession>> {
+    /// authentication level is equivalent to `/register`. `Err` = the
+    /// revocation gate refused (the caller answers with the denial).
+    pub(crate) async fn implicit_re_register(
+        &self,
+        agent_id: &str,
+    ) -> std::result::Result<Arc<RwLock<AgentSession>>, Box<Response<HubResponseBody>>> {
         let Some(circuit) = self.circuit().await else {
             // A data-plane request cannot implicitly register: it has no
             // response in which to learn the freshly generated circuit.
             unreachable!("implicit re-registration requires a connection circuit");
         };
         info!("Agent circuit={circuit} not registered, implicitly re-registering");
-        // The connection certificate's window rides the fresh session.
-        let leaf_validity = self.identity().await.and_then(|i| i.leaf_validity_unix);
-        let arc = Arc::new(RwLock::new(AgentSession::new(circuit, None, leaf_validity)));
+        // The revocation gate: a revoked credential must not resurrect its
+        // session over a still-open connection (the sweep evicted it; the
+        // acceptor will reject its next dial — this closes the in-place
+        // re-registration hole between the two).
+        if let Some(serial) = self.connection_credential_revoked().await {
+            warn!("implicit re-registration denied: credential revoked ({serial})");
+            return Err(Box::new(self.revoked_credential_denied(&serial)));
+        }
+        // The connection certificate's window and revocation serial ride
+        // the fresh session.
+        let identity = self.identity().await;
+        let leaf_validity = identity.as_ref().and_then(|i| i.leaf_validity_unix);
+        let leaf_serial = identity.as_ref().and_then(|i| {
+            i.leaf_serial_hex
+                .clone()
+                .map(|serial| (serial, crate::hub::crl::tenant_crl_stem(&i.tenant)))
+        });
+        let arc = Arc::new(RwLock::new(AgentSession::new(
+            circuit,
+            None,
+            leaf_validity,
+            leaf_serial,
+        )));
         {
             let mut agents = self.state.agents.write().await;
             agents.insert(agent_id.to_string(), arc.clone());
@@ -222,7 +259,7 @@ impl HubService {
         );
         // Heartbeats are served by the global supervision loop (see
         // hub/heartbeat.rs); re-registration needs no spawn
-        arc
+        Ok(arc)
     }
 }
 
@@ -232,7 +269,7 @@ impl HubService {
     /// the peer's dispatch plane**.
     ///
     /// Called on `/register` (h2 and QUIC) and by the eviction primitive
-    /// (`evict_agent`): an agent reconnecting/being evicted means its previous
+    /// (`remove_agent_if_current`): an agent reconnecting/being evicted means its previous
     /// connection is gone, so old streams are invalid even without receiving
     /// a Close. Not cleaning up leaks `active_streams` and drifts
     /// `stream_counts`; afterwards `max_streams_per_agent` stays occupied

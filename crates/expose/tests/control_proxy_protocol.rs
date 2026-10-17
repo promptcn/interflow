@@ -26,7 +26,7 @@
     missing_docs
 )]
 use interflow_core::security::{ProxyProtocolConfig, ProxyProtocolMode};
-use interflow_expose::client::{ExposeArgs, LocalService};
+use interflow_expose::client::ExposeArgs;
 use interflow_expose::edge::{
     ControlEndpointTls, EdgeConfig, IngressPrincipal, Route, WorkspaceTrust,
 };
@@ -236,11 +236,8 @@ async fn pp_proxied_registration_records_real_ip_in_audit() {
     let (client_cert, client_key) = certs.client_paths();
     let client_args = ExposeArgs {
         log_name: None,
-        services: vec![LocalService {
-            id: "web".into(),
-            target_addr: echo_addr,
-            overridden: false,
-        }],
+        service_addresses: interflow_mesh::config::ServiceAddresses::of(&[("web", echo_addr)], &[]),
+        pack_dir: None,
         hub_url: format!("https://127.0.0.1:{}", forwarder.port()),
         client_cert: Some(client_cert.display().to_string()),
         client_key: Some(client_key.display().to_string()),

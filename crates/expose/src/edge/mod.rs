@@ -270,6 +270,15 @@ pub struct EdgeConfig {
     /// it. Same contract as the agent side's `ExposeArgs::log_name` /
     /// `AgentInfo::log_name`.
     pub log_name: Option<String>,
+    /// The embedded hub's signed-policy plane, wired from the ingress pack
+    /// by `build_edge_config`. `Some` gives the control endpoint its policy
+    /// serving + publication face (agents pull updates over their session;
+    /// the operator may publish when reachable) AND arms the edge's route
+    /// watcher — a verified generation that moves routes swaps the host
+    /// table in place (fail-keep). `None` (in-memory embedders: tests,
+    /// benches) keeps the render-time table static, the pre-hot-channel
+    /// behavior.
+    pub policy: Option<interflow_mesh::config::PolicyAdminConfig>,
     /// Whether this deployment runs the offline identity tier — pins the
     /// CRL source to the pack-embedded `trust/crls` snapshot instead of the
     /// registrar-refreshed `state/crls` (mirrors
@@ -313,6 +322,7 @@ impl Default for EdgeConfig {
             agent_recovery_timeout: Duration::from_secs(DEFAULT_AGENT_RECOVERY_TIMEOUT_SECS),
             control_dispatch_host: None,
             log_name: None,
+            policy: None,
             identity_offline: false,
         }
     }
@@ -467,6 +477,66 @@ async fn run_until_inner(
         config.principals.len(),
         router.len()
     );
+    // The route hot channel (pack-built edges): every verified policy
+    // generation re-resolves the routing table and swaps it atomically.
+    // Fail-keep on a bad table (duplicates, unparseable hosts) and on
+    // routes whose workspace has no pre-assembled principal material (a
+    // brand-new workspace is an identity-face change — pack re-render
+    // territory, correctly not hot); a route for an EXISTING workspace is
+    // the hot case (new host → existing service).
+    if let Some(plane) = &config.policy
+        && let Some(pack_dir) = &plane.pack_dir
+    {
+        let router_for_watch = Arc::clone(&router);
+        let identity_for_watch = Arc::clone(&identity);
+        let watch_name = node.clone();
+        let watch_name_for_spawn = watch_name.clone();
+        interflow_mesh::pack::spawn_policy_apply_watch(
+            pack_dir,
+            &shutdown,
+            &watch_name_for_spawn,
+            move |policy| {
+                let mut fresh_routes = Vec::with_capacity(policy.routes.len());
+                for route in &policy.routes {
+                    let Some(service) = policy.find_service(&route.service) else {
+                        tracing::warn!(
+                            node = %watch_name,
+                            "route hot-swap: policy route {host:?} references unknown service {service:?} — skipped",
+                            host = route.host,
+                            service = route.service
+                        );
+                        continue;
+                    };
+                    if identity_for_watch.material_for(&service.workspace).is_err() {
+                        tracing::warn!(
+                            node = %watch_name,
+                            "route hot-swap: workspace {ws:?} has no principal material (identity-face change; re-render the pack) — route {host:?} deferred",
+                            ws = service.workspace,
+                            host = route.host
+                        );
+                        continue;
+                    }
+                    fresh_routes.push(Route {
+                        host: route.host.clone(),
+                        workspace: service.workspace.clone(),
+                        agent_id: service.agent.clone(),
+                        service_id: service.id.clone(),
+                    });
+                }
+                match router_for_watch.replace(&fresh_routes) {
+                    Ok(()) => tracing::info!(
+                        node = %watch_name,
+                        hosts = fresh_routes.len(),
+                        "route table hot-swapped from the verified policy generation"
+                    ),
+                    Err(e) => tracing::error!(
+                        node = %watch_name,
+                        "route hot-swap rejected (keeping the current table): {e}"
+                    ),
+                }
+            },
+        );
+    }
 
     // 2. Audit sink — the process's ONE ledger writer (this was once a
     //    lie: the hub used to re-spawn its own sink on the same path and
@@ -954,6 +1024,10 @@ fn build_hub_config(config: &EdgeConfig) -> HubConfig {
             // attribution (the hub engine's own `node_name` mechanism), so
             // its lines land in the hosting node's log view too.
             node_name: Some(config.effective_log_name()),
+            // No declared identity to self-report: an edge's control
+            // endpoint serves realms that declare no mesh hub, so no
+            // manifest name exists for it (the answer omits the field).
+            hub_name: None,
             // Fronted topologies: the nginx stream fragment fronts the
             // control leg with PROXY protocol (see `control_proxy_protocol`);
             // direct topologies keep the default (off) — the TCP peer is
@@ -988,9 +1062,10 @@ fn build_hub_config(config: &EdgeConfig) -> HubConfig {
         // the injected edge sink (see run_until_inner step 4) — config and
         // writer stay single-sourced.
         audit: Default::default(),
-        // No policy publication face on the embedded expose edge — that is
-        // the mesh hub's control plane.
-        policy: Default::default(),
+        // The signed-policy face: pack-built edges carry the full plane
+        // (serving to agents, publication when reachable, intrinsic ACL
+        // hot-swap); in-memory embedders keep the legacy static default.
+        policy: config.policy.clone().unwrap_or_default(),
         logging: LoggingConfig::default(),
         transport: HubTransportConfig {
             quic: HubQuicConfig {

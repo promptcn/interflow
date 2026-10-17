@@ -1,7 +1,16 @@
 import { useState } from "react";
 import { ChevronDown, ChevronRight, X } from "lucide-react";
 import { useT, type TFn } from "../i18n";
-import { Badge, Button, ConfirmDialog, Field, Hint, Input, SectionPanel, Select } from "./ui";
+import {
+  Badge,
+  Button,
+  ConfirmDialog,
+  Field,
+  Hint,
+  Input,
+  SectionPanel,
+  Select,
+} from "./ui";
 import {
   CreateNodeDialog,
   HubDialog,
@@ -13,6 +22,7 @@ import {
 } from "./ManifestDialogs";
 import type {
   AgentRoleDto,
+  AgentSummaryDto,
   EditActionDto,
   ManifestSummaryDto,
   PublicTlsModeDto,
@@ -46,12 +56,20 @@ export default function ManifestForm({
 }) {
   const { t } = useT();
   const [deployTimeOpen, setDeployTimeOpen] = useState(false);
+  /// The Agents picker's selection (2026-10-16 master-detail ruling) —
+  /// owned HERE, one level above the `key={JSON.stringify(...)}`
+  /// remounts: the remount resets dialog state when the agents change,
+  /// but the selection must survive every structured edit.
+  const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   return (
     <div className="flex flex-col gap-2.5">
       <AgentsSection
         key={JSON.stringify(summary.agents)}
         agents={summary.agents}
         workspaces={summary.workspaces}
+        issues={summary.issues}
+        selectedNode={selectedAgent}
+        onSelectNode={setSelectedAgent}
         busy={busy}
         onEdit={onEdit}
       />
@@ -123,8 +141,8 @@ export default function ManifestForm({
   );
 }
 
-/// One section's Apply button + the "this writes into the document, not
-/// the file" reminder when a draft diverges.
+/// One section's Apply button — the "this writes into the document, not
+/// the file" reminder rides the button's tooltip when a draft diverges.
 function SectionApply({
   disabled,
   label,
@@ -136,12 +154,11 @@ function SectionApply({
 }) {
   const { t } = useT();
   return (
-    <div className="flex items-center gap-2">
+    <Hint text={t("form.editsLandHint")}>
       <Button variant="primary" disabled={disabled} onClick={onClick}>
         {label ?? t("common.apply")}
       </Button>
-      <span className="text-small text-fg-3">{t("form.editsLandHint")}</span>
-    </div>
+    </Hint>
   );
 }
 
@@ -158,7 +175,12 @@ function RealmSection({
   const [endpoint, setEndpoint] = useState(realm.control_endpoint);
   const { t } = useT();
   const dirty = id !== realm.id || endpoint !== realm.control_endpoint;
-  const input = (value: string, set: (v: string) => void, placeholder: string, fieldId: string) => (
+  const input = (
+    value: string,
+    set: (v: string) => void,
+    placeholder: string,
+    fieldId: string,
+  ) => (
     <Input
       id={fieldId}
       value={value}
@@ -172,13 +194,19 @@ function RealmSection({
   );
   return (
     <SectionPanel title={t("form.realmTitle")} hint={t("form.realmHint")}>
-      <Field label={t("form.id")}>{(fieldId) => input(id, setId, "promptcn-mesh", fieldId)}</Field>
+      <Field label={t("form.id")}>
+        {(fieldId) => input(id, setId, "promptcn-mesh", fieldId)}
+      </Field>
       <Field label={t("form.controlEndpoint")}>
-        {(fieldId) => input(endpoint, setEndpoint, t("form.controlEndpointPh"), fieldId)}
+        {(fieldId) =>
+          input(endpoint, setEndpoint, t("form.controlEndpointPh"), fieldId)
+        }
       </Field>
       <SectionApply
         disabled={busy || !dirty}
-        onClick={() => void onEdit({ SetRealm: { id, control_endpoint: endpoint } })}
+        onClick={() =>
+          void onEdit({ SetRealm: { id, control_endpoint: endpoint } })
+        }
       />
     </SectionPanel>
   );
@@ -240,7 +268,11 @@ function IdentitySection({
           <Input
             id={id}
             value={registrar}
-            placeholder={mode === "registrar" ? t("form.registrarPh") : t("form.registrarPhOffline")}
+            placeholder={
+              mode === "registrar"
+                ? t("form.registrarPh")
+                : t("form.registrarPhOffline")
+            }
             onChange={(e) => setRegistrar(e.target.value)}
             autoCapitalize="none"
             autoCorrect="off"
@@ -283,7 +315,10 @@ function PublicTlsSection({
     email !== (tls.email ?? "") ||
     directory !== (tls.directory ?? "");
   return (
-    <SectionPanel title={t("form.publicTlsTitle")} hint={t("form.publicTlsHint")}>
+    <SectionPanel
+      title={t("form.publicTlsTitle")}
+      hint={t("form.publicTlsHint")}
+    >
       <Field label={t("form.mode")}>
         {(id) => (
           <Select
@@ -355,9 +390,9 @@ function HubSection({
   busy: boolean;
   onEdit: Edit;
 }) {
-  const [dialog, setDialog] = useState<{ hub: ManifestSummaryDto["hubs"][number] | null } | null>(
-    null,
-  );
+  const [dialog, setDialog] = useState<{
+    hub: ManifestSummaryDto["hubs"][number] | null;
+  } | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
   const { t } = useT();
   return (
@@ -366,24 +401,44 @@ function HubSection({
       hint={t("form.hubHint")}
       actions={
         hubs.length === 0 ? (
-          <Button size="sm" disabled={busy} onClick={() => setDialog({ hub: null })}>
+          <Button
+            size="sm"
+            disabled={busy}
+            onClick={() => setDialog({ hub: null })}
+          >
             {t("form.addHub")}
           </Button>
         ) : undefined
       }
     >
-      {hubs.length === 0 && <p className="m-0 text-small text-fg-3">{t("form.noHub")}</p>}
+      {hubs.length === 0 && (
+        <p className="m-0 text-small text-fg-3">{t("form.noHub")}</p>
+      )}
       {hubs.map((hub) => (
-        <div className="flex min-w-0 flex-wrap items-center gap-2" key={hub.name}>
-          <span className="min-w-[90px] shrink-0 font-mono text-small">{hub.name}</span>
+        <div
+          className="flex min-w-0 flex-wrap items-center gap-2"
+          key={hub.name}
+        >
+          <span className="min-w-[90px] shrink-0 font-mono text-small">
+            {hub.name}
+          </span>
           <span className="font-mono text-small text-fg-2">{hub.endpoint}</span>
           <span className="text-small text-fg-3">listen {hub.listen}</span>
-          {hub.quic_listen && <span className="text-small text-fg-3">· quic {hub.quic_listen}</span>}
+          {hub.quic_listen && (
+            <span className="text-small text-fg-3">
+              · quic {hub.quic_listen}
+            </span>
+          )}
           <span className="flex-1" />
           <Button size="sm" disabled={busy} onClick={() => setDialog({ hub })}>
             {t("common.edit")}
           </Button>
-          <Button size="sm" variant="danger" disabled={busy} onClick={() => setRemoving(hub.name)}>
+          <Button
+            size="sm"
+            variant="danger"
+            disabled={busy}
+            onClick={() => setRemoving(hub.name)}
+          >
             {t("common.remove")}
           </Button>
         </div>
@@ -436,7 +491,10 @@ function WorkspaceSection({
   const [name, setName] = useState("");
   const { t } = useT();
   return (
-    <SectionPanel title={t("form.workspacesTitle")} hint={t("form.workspacesHint")}>
+    <SectionPanel
+      title={t("form.workspacesTitle")}
+      hint={t("form.workspacesHint")}
+    >
       <div className="flex flex-wrap items-center gap-1.5">
         {workspaces.map((ws) => (
           <span
@@ -458,7 +516,9 @@ function WorkspaceSection({
             </Hint>
           </span>
         ))}
-        {workspaces.length === 0 && <span className="text-small text-fg-3">{t("form.noneDeclared")}</span>}
+        {workspaces.length === 0 && (
+          <span className="text-small text-fg-3">{t("form.noneDeclared")}</span>
+        )}
       </div>
       <div className="flex items-center gap-2">
         <Input
@@ -508,23 +568,127 @@ const roleLabel = (role: AgentRoleDto, t: TFn): string => {
   }
 };
 
+/// Dialog targets — which agent a rule/service dialog edits.
+type ServiceDialogTarget = {
+  agent: string;
+  service: AgentSummaryDto["services"][number] | null;
+};
+type IngressDialogTarget = {
+  agent: string;
+  rule: AgentSummaryDto["mesh_ingress"][number] | null;
+};
+type EgressDialogTarget = {
+  agent: string;
+  rule: AgentSummaryDto["mesh_egress"][number] | null;
+};
+
+/// The stats bar (2026-10-16 ruling two): counts describe the
+/// formation faster than a wall of cards — only non-zero items, the
+/// agent total always.
+const ROLE_STAT_KEY = {
+  mesh: "form.agentsStatMesh",
+  expose: "form.agentsStatExpose",
+  mixed: "form.agentsStatMixed",
+  empty: "form.agentsStatEmpty",
+} as const;
+
+function agentsStatsLine(agents: AgentSummaryDto[], t: TFn): string {
+  const roles: Record<AgentRoleDto, number> = {
+    mesh: 0,
+    expose: 0,
+    mixed: 0,
+    empty: 0,
+  };
+  for (const a of agents) roles[a.role]++;
+  const services = agents.reduce((n, a) => n + a.services.length, 0);
+  const ingress = agents.reduce((n, a) => n + a.mesh_ingress.length, 0);
+  const egress = agents.reduce((n, a) => n + a.mesh_egress.length, 0);
+  const parts = [
+    agents.length === 1
+      ? t("form.agentsStatAgent", { n: agents.length })
+      : t("form.agentsStatAgents", { n: agents.length }),
+    ...(["mesh", "expose", "mixed", "empty"] as const)
+      .filter((role) => roles[role] > 0)
+      .map((role) => t(ROLE_STAT_KEY[role], { n: roles[role] })),
+  ];
+  if (services > 0) parts.push(t("form.agentsStatServices", { n: services }));
+  if (ingress > 0) parts.push(t("form.agentsStatIn", { n: ingress }));
+  if (egress > 0) parts.push(t("form.agentsStatOut", { n: egress }));
+  return parts.join(" · ");
+}
+
+/// One picker item's label — `node · role · counts`, the per-agent
+/// counts ALWAYS shown, zeros included (a sparse agent is exactly what
+/// the picker should expose), and ⚠ when validation points at the
+/// agent: mixed/empty roles are structurally rejected, and the issue
+/// chain names agents in `'quotes'` (the quote match keeps `web` from
+/// matching `web-2`).
+function agentPickerLabel(
+  agent: AgentSummaryDto,
+  issues: string[],
+  t: TFn,
+): string {
+  const counts: string[] = [];
+  if (agent.role === "expose" || agent.role === "mixed") {
+    counts.push(t("form.agentsStatServices", { n: agent.services.length }));
+  }
+  if (agent.role === "mesh" || agent.role === "mixed") {
+    counts.push(
+      t("form.pickerInOut", {
+        i: agent.mesh_ingress.length,
+        o: agent.mesh_egress.length,
+      }),
+    );
+  }
+  const warned =
+    agent.role === "mixed" ||
+    agent.role === "empty" ||
+    issues.some((s) => s.includes(`'${agent.node}'`));
+  return [
+    ...[agent.node, agent.role, counts.join(" · ")].filter(
+      (part) => part !== "",
+    ),
+    ...(warned ? ["⚠"] : []),
+  ].join(" · ");
+}
+
+/// The Agents section as a master-detail (2026-10-16 ruling two): a
+/// stats bar (the formation's shape in numbers), a picker (every agent,
+/// each with its role and counts), and ONE full edit card for the
+/// selection — the selected agent keeps the whole block, so its rule
+/// lists get real width. The selection lives in ManifestForm, above
+/// this section's `key` remount, and is derived here so a removed agent
+/// falls back to the first instead of dangling.
 function AgentsSection({
   agents,
   workspaces,
+  issues,
+  selectedNode,
+  onSelectNode,
   busy,
   onEdit,
 }: {
   agents: ManifestSummaryDto["agents"];
   workspaces: string[];
+  /// The manifest's issue chain — the picker's ⚠ markers.
+  issues: string[];
+  selectedNode: string | null;
+  onSelectNode: (node: string | null) => void;
   busy: boolean;
   onEdit: Edit;
 }) {
   const [creating, setCreating] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
-  const [serviceDialog, setServiceDialog] = useState<{ agent: string; service: ManifestSummaryDto["agents"][number]["services"][number] | null } | null>(null);
-  const [ingressDialog, setIngressDialog] = useState<{ agent: string; rule: ManifestSummaryDto["agents"][number]["mesh_ingress"][number] | null } | null>(null);
-  const [egressDialog, setEgressDialog] = useState<{ agent: string; rule: ManifestSummaryDto["agents"][number]["mesh_egress"][number] | null } | null>(null);
+  const [serviceDialog, setServiceDialog] =
+    useState<ServiceDialogTarget | null>(null);
+  const [ingressDialog, setIngressDialog] =
+    useState<IngressDialogTarget | null>(null);
+  const [egressDialog, setEgressDialog] = useState<EgressDialogTarget | null>(
+    null,
+  );
   const { t } = useT();
+  const selected =
+    agents.find((a) => a.node === selectedNode) ?? agents[0] ?? null;
   return (
     <SectionPanel
       title={t("form.agentsTitle")}
@@ -535,179 +699,42 @@ function AgentsSection({
         </Button>
       }
     >
-      {agents.map((agent) => (
-        <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-bg-3/60 p-2" key={agent.node}>
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <span className="min-w-[90px] shrink-0 font-mono text-small">{agent.node}</span>
-            <Badge tone={agent.role === "mesh" || agent.role === "expose" ? "accent" : "critical"}>
-              {roleLabel(agent.role, t)}
-            </Badge>
-            <Select
-              value={agent.workspace}
-              disabled={busy || workspaces.length < 2}
-              title={
-                workspaces.length < 2 ? t("form.singleWorkspaceTitle") : t("form.retargetWorkspaceTitle")
-              }
-              onValueChange={(ws) =>
-                void onEdit({ SetAgentWorkspace: { agent: agent.node, workspace: ws } })
-              }
-              options={workspaces.map((ws) => ({ value: ws, label: ws }))}
-              className="w-[140px]"
-            />
-            <Select
-              value={agent.transport ?? "h2"}
-              disabled={busy}
-              title={t("form.transportTitle")}
-              onValueChange={(v) =>
-                void onEdit({
-                  SetAgentTransport: {
-                    agent: agent.node,
-                    transport: v === "quic" ? "quic" : null,
-                  },
-                })
-              }
-              options={[
-                { value: "h2", label: "h2" },
-                { value: "quic", label: "quic" },
-              ]}
-              className="w-[110px]"
-            />
-            <span className="flex-1" />
-            <Button size="sm" variant="danger" disabled={busy} onClick={() => setRemoving(agent.node)}>
-              {t("common.remove")}
-            </Button>
+      {selected === null ? (
+        <p className="m-0 text-small text-fg-3">{t("form.noAgents")}</p>
+      ) : (
+        <>
+          <div className="text-small text-fg-3">
+            {agentsStatsLine(agents, t)}
           </div>
-
-          {(agent.role === "expose" || agent.role === "mixed") && (
-            <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
-              <div className="flex items-center justify-between gap-2 text-small text-fg-3">
-                <span>{t("form.servicesExpose")}</span>
-                <Button
-                  size="sm"
-                  disabled={busy}
-                  onClick={() => setServiceDialog({ agent: agent.node, service: null })}
-                >
-                  {t("common.addService")}
-                </Button>
-              </div>
-              {agent.services.map((s) => (
-                <div className="flex min-w-0 flex-wrap items-center gap-2" key={s.id}>
-                  <span className="min-w-[90px] shrink-0 font-mono text-small">{s.id}</span>
-                  <span className="font-mono text-small text-fg-2">{s.address}</span>
-                  <span className="flex-1" />
-                  <Button size="sm" disabled={busy} onClick={() => setServiceDialog({ agent: agent.node, service: s })}>
-                    {t("common.edit")}
-                  </Button>
-                  <Hint text={t("common.remove")}>
-                    <Button
-                      variant="link"
-                      size="icon-sm"
-                      disabled={busy}
-                      aria-label={t("common.remove")}
-                      onClick={() => void onEdit({ RemoveService: { agent: agent.node, id: s.id } })}
-                      className="text-fg-3 hover:text-critical"
-                    >
-                      <X className="size-3.5" />
-                    </Button>
-                  </Hint>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {(agent.role === "mesh" || agent.role === "mixed") && (
-            <>
-              <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
-                <div className="flex items-center justify-between gap-2 text-small text-fg-3">
-                  <span>{t("form.meshIngressTitle")}</span>
-                  <Button
-                    size="sm"
-                    disabled={busy}
-                    onClick={() => setIngressDialog({ agent: agent.node, rule: null })}
-                  >
-                    {t("common.addRule")}
-                  </Button>
-                </div>
-                {agent.mesh_ingress.map((r) => (
-                  <div className="flex min-w-0 flex-wrap items-center gap-2" key={r.name}>
-                    <span className="min-w-[90px] shrink-0 font-mono text-small">{r.name}</span>
-                    <span className="font-mono text-small text-fg-2">{r.listen}</span>
-                    <span className="text-small text-fg-3">{r.protocol === "udp" ? "udp" : "tcp"}</span>
-                    <span className="font-mono text-small text-fg-2">
-                      → {r.target_agent} @ {r.remote_addr}
-                    </span>
-                    {r.idle_timeout_secs != null && (
-                      <span className="text-small text-fg-3">idle {r.idle_timeout_secs}s</span>
-                    )}
-                    <span className="flex-1" />
-                    <Button size="sm" disabled={busy} onClick={() => setIngressDialog({ agent: agent.node, rule: r })}>
-                      {t("common.edit")}
-                    </Button>
-                    <Hint text={t("common.remove")}>
-                      <Button
-                        variant="link"
-                        size="icon-sm"
-                        disabled={busy}
-                        aria-label={t("common.remove")}
-                        onClick={() =>
-                          void onEdit({ RemoveMeshIngress: { agent: agent.node, name: r.name } })
-                        }
-                        className="text-fg-3 hover:text-critical"
-                      >
-                        <X className="size-3.5" />
-                      </Button>
-                    </Hint>
-                  </div>
-                ))}
-              </div>
-              <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
-                <div className="flex items-center justify-between gap-2 text-small text-fg-3">
-                  <span>{t("form.meshEgressTitle")}</span>
-                  <Button
-                    size="sm"
-                    disabled={busy}
-                    onClick={() => setEgressDialog({ agent: agent.node, rule: null })}
-                  >
-                    {t("common.addRule")}
-                  </Button>
-                </div>
-                {agent.mesh_egress.map((r) => (
-                  <div className="flex min-w-0 flex-wrap items-center gap-2" key={r.name}>
-                    <span className="min-w-[90px] shrink-0 font-mono text-small">{r.name}</span>
-                    <span className="text-small text-fg-3">{r.protocol === "udp" ? "udp" : "tcp"}</span>
-                    <span className="font-mono text-small text-fg-2">
-                      {r.target_addr ?? r.target_cidr}
-                      {r.target_cidr ? t("form.rangeSuffix") : ""}
-                    </span>
-                    {r.udp_idle_timeout_secs != null && (
-                      <span className="text-small text-fg-3">udp idle {r.udp_idle_timeout_secs}s</span>
-                    )}
-                    <span className="flex-1" />
-                    <Button size="sm" disabled={busy} onClick={() => setEgressDialog({ agent: agent.node, rule: r })}>
-                      {t("common.edit")}
-                    </Button>
-                    <Hint text={t("common.remove")}>
-                      <Button
-                        variant="link"
-                        size="icon-sm"
-                        disabled={busy}
-                        aria-label={t("common.remove")}
-                        onClick={() =>
-                          void onEdit({ RemoveMeshEgress: { agent: agent.node, name: r.name } })
-                        }
-                        className="text-fg-3 hover:text-critical"
-                      >
-                        <X className="size-3.5" />
-                      </Button>
-                    </Hint>
-                  </div>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-      ))}
-      {agents.length === 0 && <p className="m-0 text-small text-fg-3">{t("form.noAgents")}</p>}
+          <Select
+            value={selected.node}
+            ariaLabel={t("form.agentsPickerTitle")}
+            disabled={busy}
+            onValueChange={onSelectNode}
+            options={agents.map((a) => ({
+              value: a.node,
+              label: agentPickerLabel(a, issues, t),
+            }))}
+            className="w-full max-w-[340px]"
+          />
+          <AgentCard
+            agent={selected}
+            workspaces={workspaces}
+            busy={busy}
+            onEdit={onEdit}
+            onRemove={() => setRemoving(selected.node)}
+            onServiceDialog={(service) =>
+              setServiceDialog({ agent: selected.node, service })
+            }
+            onIngressDialog={(rule) =>
+              setIngressDialog({ agent: selected.node, rule })
+            }
+            onEgressDialog={(rule) =>
+              setEgressDialog({ agent: selected.node, rule })
+            }
+          />
+        </>
+      )}
 
       {creating && (
         <CreateNodeDialog
@@ -719,14 +746,24 @@ function AgentsSection({
                 kind: spec.kind,
                 node: spec.node,
                 workspace: spec.workspace === "" ? null : spec.workspace,
-                services: spec.services.filter((s) => s.id !== "" && s.address !== ""),
+                services: spec.services.filter(
+                  (s) => s.id !== "" && s.address !== "",
+                ),
                 mesh_ingress: spec.mesh_ingress.filter((r) => r.name !== ""),
                 mesh_egress: spec.mesh_egress.filter((r) => r.name !== ""),
                 ingress_workspaces: spec.ingress_workspaces,
-                hub_endpoint: spec.hub_endpoint === "" ? null : spec.hub_endpoint,
+                hub_endpoint:
+                  spec.hub_endpoint === "" ? null : spec.hub_endpoint,
               },
             });
-            if (ok) setCreating(false);
+            if (ok) {
+              setCreating(false);
+              // A new agent lands selected; hubs and ingresses are not
+              // agents and never enter the picker.
+              if (spec.kind === "agent_mesh" || spec.kind === "agent_expose") {
+                onSelectNode(spec.node);
+              }
+            }
           }}
         />
       )}
@@ -752,7 +789,11 @@ function AgentsSection({
           onClose={() => setServiceDialog(null)}
           onConfirm={async (edit) => {
             const ok = await onEdit({
-              UpsertService: { agent: serviceDialog.agent, id: edit.id, address: edit.address },
+              UpsertService: {
+                agent: serviceDialog.agent,
+                id: edit.id,
+                address: edit.address,
+              },
             });
             if (ok) setServiceDialog(null);
           }}
@@ -793,7 +834,8 @@ function AgentsSection({
                 agent: egressDialog.agent,
                 name: edit.name,
                 protocol: edit.protocol,
-                target_addr: !isRange && edit.target !== "" ? edit.target : null,
+                target_addr:
+                  !isRange && edit.target !== "" ? edit.target : null,
                 target_cidr: isRange ? edit.target : null,
                 udp_idle_timeout_secs: edit.udp_idle_timeout_secs,
               },
@@ -803,6 +845,267 @@ function AgentsSection({
         />
       )}
     </SectionPanel>
+  );
+}
+
+/// The detail side of the master-detail: one agent's full edit card.
+/// Structure unchanged from the all-cards form — only the remove button
+/// and the dialogs' openers arrive as callbacks bound to the selected
+/// agent.
+function AgentCard({
+  agent,
+  workspaces,
+  busy,
+  onEdit,
+  onRemove,
+  onServiceDialog,
+  onIngressDialog,
+  onEgressDialog,
+}: {
+  agent: AgentSummaryDto;
+  workspaces: string[];
+  busy: boolean;
+  onEdit: Edit;
+  onRemove: () => void;
+  onServiceDialog: (
+    service: AgentSummaryDto["services"][number] | null,
+  ) => void;
+  onIngressDialog: (
+    rule: AgentSummaryDto["mesh_ingress"][number] | null,
+  ) => void;
+  onEgressDialog: (rule: AgentSummaryDto["mesh_egress"][number] | null) => void;
+}) {
+  const { t } = useT();
+  return (
+    <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-bg-3/60 p-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <span className="min-w-[90px] shrink-0 font-mono text-small">
+          {agent.node}
+        </span>
+        <Badge
+          tone={
+            agent.role === "mesh" || agent.role === "expose"
+              ? "accent"
+              : "critical"
+          }
+        >
+          {roleLabel(agent.role, t)}
+        </Badge>
+        <Select
+          value={agent.workspace}
+          disabled={busy || workspaces.length < 2}
+          title={
+            workspaces.length < 2
+              ? t("form.singleWorkspaceTitle")
+              : t("form.retargetWorkspaceTitle")
+          }
+          onValueChange={(ws) =>
+            void onEdit({
+              SetAgentWorkspace: { agent: agent.node, workspace: ws },
+            })
+          }
+          options={workspaces.map((ws) => ({ value: ws, label: ws }))}
+          className="w-[140px]"
+        />
+        <Select
+          value={agent.transport ?? "h2"}
+          disabled={busy}
+          title={t("form.transportTitle")}
+          onValueChange={(v) =>
+            void onEdit({
+              SetAgentTransport: {
+                agent: agent.node,
+                transport: v === "quic" ? "quic" : null,
+              },
+            })
+          }
+          options={[
+            { value: "h2", label: "h2" },
+            { value: "quic", label: "quic" },
+          ]}
+          className="w-[110px]"
+        />
+        <span className="flex-1" />
+        <Button size="sm" variant="danger" disabled={busy} onClick={onRemove}>
+          {t("common.remove")}
+        </Button>
+      </div>
+
+      {(agent.role === "expose" || agent.role === "mixed") && (
+        <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
+          <div className="flex items-center justify-between gap-2 text-small text-fg-3">
+            <span>{t("form.servicesExpose")}</span>
+            <Button
+              size="sm"
+              disabled={busy}
+              onClick={() => onServiceDialog(null)}
+            >
+              {t("common.addService")}
+            </Button>
+          </div>
+          {agent.services.map((s) => (
+            <div
+              className="flex min-w-0 flex-wrap items-center gap-2"
+              key={s.id}
+            >
+              <span className="min-w-[90px] shrink-0 font-mono text-small">
+                {s.id}
+              </span>
+              <span className="font-mono text-small text-fg-2">
+                {s.address}
+              </span>
+              <span className="flex-1" />
+              <Button
+                size="sm"
+                disabled={busy}
+                onClick={() => onServiceDialog(s)}
+              >
+                {t("common.edit")}
+              </Button>
+              <Hint text={t("common.remove")}>
+                <Button
+                  variant="link"
+                  size="icon-sm"
+                  disabled={busy}
+                  aria-label={t("common.remove")}
+                  onClick={() =>
+                    void onEdit({
+                      RemoveService: { agent: agent.node, id: s.id },
+                    })
+                  }
+                  className="text-fg-3 hover:text-critical"
+                >
+                  <X className="size-3.5" />
+                </Button>
+              </Hint>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {(agent.role === "mesh" || agent.role === "mixed") && (
+        <>
+          <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
+            <div className="flex items-center justify-between gap-2 text-small text-fg-3">
+              <span>{t("form.meshIngressTitle")}</span>
+              <Button
+                size="sm"
+                disabled={busy}
+                onClick={() => onIngressDialog(null)}
+              >
+                {t("common.addRule")}
+              </Button>
+            </div>
+            {agent.mesh_ingress.map((r) => (
+              <div
+                className="flex min-w-0 flex-wrap items-center gap-2"
+                key={r.name}
+              >
+                <span className="min-w-[90px] shrink-0 font-mono text-small">
+                  {r.name}
+                </span>
+                <span className="font-mono text-small text-fg-2">
+                  {r.listen}
+                </span>
+                <span className="text-small text-fg-3">
+                  {r.protocol === "udp" ? "udp" : "tcp"}
+                </span>
+                <span className="font-mono text-small text-fg-2">
+                  → {r.target_agent} @ {r.remote_addr}
+                </span>
+                {r.idle_timeout_secs != null && (
+                  <span className="text-small text-fg-3">
+                    idle {r.idle_timeout_secs}s
+                  </span>
+                )}
+                <span className="flex-1" />
+                <Button
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => onIngressDialog(r)}
+                >
+                  {t("common.edit")}
+                </Button>
+                <Hint text={t("common.remove")}>
+                  <Button
+                    variant="link"
+                    size="icon-sm"
+                    disabled={busy}
+                    aria-label={t("common.remove")}
+                    onClick={() =>
+                      void onEdit({
+                        RemoveMeshIngress: { agent: agent.node, name: r.name },
+                      })
+                    }
+                    className="text-fg-3 hover:text-critical"
+                  >
+                    <X className="size-3.5" />
+                  </Button>
+                </Hint>
+              </div>
+            ))}
+          </div>
+          <div className="flex flex-col gap-1 rounded-lg border border-dashed border-line p-2">
+            <div className="flex items-center justify-between gap-2 text-small text-fg-3">
+              <span>{t("form.meshEgressTitle")}</span>
+              <Button
+                size="sm"
+                disabled={busy}
+                onClick={() => onEgressDialog(null)}
+              >
+                {t("common.addRule")}
+              </Button>
+            </div>
+            {agent.mesh_egress.map((r) => (
+              <div
+                className="flex min-w-0 flex-wrap items-center gap-2"
+                key={r.name}
+              >
+                <span className="min-w-[90px] shrink-0 font-mono text-small">
+                  {r.name}
+                </span>
+                <span className="text-small text-fg-3">
+                  {r.protocol === "udp" ? "udp" : "tcp"}
+                </span>
+                <span className="font-mono text-small text-fg-2">
+                  {r.target_addr ?? r.target_cidr}
+                  {r.target_cidr ? t("form.rangeSuffix") : ""}
+                </span>
+                {r.udp_idle_timeout_secs != null && (
+                  <span className="text-small text-fg-3">
+                    udp idle {r.udp_idle_timeout_secs}s
+                  </span>
+                )}
+                <span className="flex-1" />
+                <Button
+                  size="sm"
+                  disabled={busy}
+                  onClick={() => onEgressDialog(r)}
+                >
+                  {t("common.edit")}
+                </Button>
+                <Hint text={t("common.remove")}>
+                  <Button
+                    variant="link"
+                    size="icon-sm"
+                    disabled={busy}
+                    aria-label={t("common.remove")}
+                    onClick={() =>
+                      void onEdit({
+                        RemoveMeshEgress: { agent: agent.node, name: r.name },
+                      })
+                    }
+                    className="text-fg-3 hover:text-critical"
+                  >
+                    <X className="size-3.5" />
+                  </Button>
+                </Hint>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -817,7 +1120,9 @@ function IngressSection({
   busy: boolean;
   onEdit: Edit;
 }) {
-  const [dialog, setDialog] = useState<{ node: ManifestSummaryDto["ingress"][number] | null } | null>(null);
+  const [dialog, setDialog] = useState<{
+    node: ManifestSummaryDto["ingress"][number] | null;
+  } | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
   const { t } = useT();
   return (
@@ -825,16 +1130,29 @@ function IngressSection({
       title={t("form.ingressTitle")}
       hint={t("form.ingressHint")}
       actions={
-        <Button size="sm" disabled={busy} onClick={() => setDialog({ node: null })}>
+        <Button
+          size="sm"
+          disabled={busy}
+          onClick={() => setDialog({ node: null })}
+        >
           {t("form.addIngress")}
         </Button>
       }
     >
-      {ingress.length === 0 && <p className="m-0 text-small text-fg-3">{t("form.noIngress")}</p>}
+      {ingress.length === 0 && (
+        <p className="m-0 text-small text-fg-3">{t("form.noIngress")}</p>
+      )}
       {ingress.map((node) => (
-        <div className="flex min-w-0 flex-wrap items-center gap-2" key={node.node}>
-          <span className="min-w-[90px] shrink-0 font-mono text-small">{node.node}</span>
-          <span className="font-mono text-small text-fg-2">{node.workspaces.join(", ")}</span>
+        <div
+          className="flex min-w-0 flex-wrap items-center gap-2"
+          key={node.node}
+        >
+          <span className="min-w-[90px] shrink-0 font-mono text-small">
+            {node.node}
+          </span>
+          <span className="font-mono text-small text-fg-2">
+            {node.workspaces.join(", ")}
+          </span>
           <span className="text-small text-fg-3">
             {node.listen}
             {node.quic_listen != null ? ` · quic ${node.quic_listen}` : ""}
@@ -846,13 +1164,20 @@ function IngressSection({
           <Button size="sm" disabled={busy} onClick={() => setDialog({ node })}>
             {t("common.edit")}
           </Button>
-          <Button size="sm" variant="danger" disabled={busy} onClick={() => setRemoving(node.node)}>
+          <Button
+            size="sm"
+            variant="danger"
+            disabled={busy}
+            onClick={() => setRemoving(node.node)}
+          >
             {t("common.remove")}
           </Button>
         </div>
       ))}
       {workspaces.length === 0 && (
-        <p className="m-0 text-small text-fg-3">{t("form.declareWorkspaceFirst")}</p>
+        <p className="m-0 text-small text-fg-3">
+          {t("form.declareWorkspaceFirst")}
+        </p>
       )}
       {dialog && (
         <IngressNodeDialog
@@ -865,7 +1190,8 @@ function IngressSection({
                 node: edit.node,
                 workspaces: edit.workspaces,
                 listen: edit.listen === "" ? null : edit.listen,
-                control_listen: edit.control_listen === "" ? null : edit.control_listen,
+                control_listen:
+                  edit.control_listen === "" ? null : edit.control_listen,
                 quic_listen: edit.quic_listen === "" ? null : edit.quic_listen,
                 edge_rate_per_ip_per_minute: edit.edge_rate,
               },
@@ -901,25 +1227,42 @@ function RoutesSection({
   busy: boolean;
   onEdit: Edit;
 }) {
-  const [dialog, setDialog] = useState<{ route: ManifestSummaryDto["routes"][number] | null } | null>(null);
+  const [dialog, setDialog] = useState<{
+    route: ManifestSummaryDto["routes"][number] | null;
+  } | null>(null);
   const { t } = useT();
   return (
     <SectionPanel
       title={t("form.routesTitle")}
       hint={t("form.routesHint")}
       actions={
-        <Button size="sm" disabled={busy} onClick={() => setDialog({ route: null })}>
+        <Button
+          size="sm"
+          disabled={busy}
+          onClick={() => setDialog({ route: null })}
+        >
           {t("form.addRoute")}
         </Button>
       }
     >
       {routes.map((route) => (
-        <div className="flex min-w-0 flex-wrap items-center gap-2" key={route.host}>
-          <span className="min-w-[90px] shrink-0 font-mono text-small">{route.host}</span>
+        <div
+          className="flex min-w-0 flex-wrap items-center gap-2"
+          key={route.host}
+        >
+          <span className="min-w-[90px] shrink-0 font-mono text-small">
+            {route.host}
+          </span>
           <span className="text-small text-fg-3">→</span>
-          <span className="font-mono text-small text-fg-2">{route.service}</span>
+          <span className="font-mono text-small text-fg-2">
+            {route.service}
+          </span>
           <span className="flex-1" />
-          <Button size="sm" disabled={busy} onClick={() => setDialog({ route })}>
+          <Button
+            size="sm"
+            disabled={busy}
+            onClick={() => setDialog({ route })}
+          >
             {t("common.edit")}
           </Button>
           <Hint text={t("common.remove")}>
@@ -936,14 +1279,18 @@ function RoutesSection({
           </Hint>
         </div>
       ))}
-      {routes.length === 0 && <p className="m-0 text-small text-fg-3">{t("form.noRoutes")}</p>}
+      {routes.length === 0 && (
+        <p className="m-0 text-small text-fg-3">{t("form.noRoutes")}</p>
+      )}
       {dialog && (
         <RouteDialog
           initial={dialog.route}
           busy={busy}
           onClose={() => setDialog(null)}
           onConfirm={async (edit) => {
-            const ok = await onEdit({ UpsertRoute: { host: edit.host, service: edit.service } });
+            const ok = await onEdit({
+              UpsertRoute: { host: edit.host, service: edit.service },
+            });
             if (ok) setDialog(null);
           }}
         />

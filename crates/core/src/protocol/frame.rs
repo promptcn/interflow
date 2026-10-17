@@ -914,6 +914,15 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    // ------------------------------------------------------------------
+    // Compatibility contract (documentation/versioning.md, "Additive changes never
+    // bump the epoch"): the tolerances below are load-bearing wire
+    // guarantees, not incidental behavior. A receiver MUST keep tolerating
+    // unknown frame types (skipped unless FLAG_MUST_UNDERSTAND) and unknown
+    // flag bits; the encode side rejects unknown bits fail-fast as a local
+    // caller-bug guard. Removing any of these tests is a protocol-breaking
+    // decision and must follow the epoch procedure.
+    // ------------------------------------------------------------------
     #[test]
     fn unknown_type_without_must_understand_reports_skippable() {
         let mut buf = BytesMut::new();
@@ -989,6 +998,24 @@ mod tests {
             );
         }
         assert!(buf.is_empty(), "nothing may be written on rejection");
+    }
+
+    #[test]
+    fn unknown_flag_bits_are_ignored_on_decode() {
+        // Receive-side half of the flags contract: bits outside
+        // FLAGS_KNOWN_MASK — future bits (0x80) and the retired
+        // COMPRESSED/SIGNED bits (0x02/0x04) alike — do not reject the
+        // frame; the raw byte survives for the receiver to interpret.
+        for unknown in [0x80u8, 0x02, 0x04] {
+            let mut buf = BytesMut::new();
+            encode_frame(FrameType::Data, 0, sid(), circuit(), b"p", &mut buf).unwrap();
+            buf[4] |= unknown;
+            let DecodeOutcome::Ok(f) = decode_frame(&mut buf) else {
+                panic!("flag bit {unknown:#04x} must be tolerated on decode");
+            };
+            assert_eq!(f.frame_type, FrameType::Data);
+            assert_eq!(f.flags, unknown, "the raw flags byte survives, unparsed");
+        }
     }
 
     #[test]

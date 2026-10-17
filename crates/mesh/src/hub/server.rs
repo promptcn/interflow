@@ -18,7 +18,7 @@ use crate::hub::state::HubState;
 use crate::hub::state::SharedTlsPlane;
 use interflow_core::error::{InterflowError, Result};
 use interflow_core::security::{AuditKind, AuditSink, AuthRateLimiter, ConnTracker};
-use interflow_core::tls::{TenantTrustRoot, TlsPlane, build_tls_plane};
+use interflow_core::tls::{TenantTrustRoot, TlsPlane};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,14 +33,22 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Builds the runtime TLS plane from the config's tenant trust table:
 /// loads each tenant CA, builds the merged-root acceptor and the
 /// per-tenant derivation set.
+///
+/// The CRL choice goes through [`crate::hub::crl::choose_tenant_crls`] —
+/// the live push lane (`<pack>/state/crls`) outranks the static snapshot
+/// when its counter is not below it — and the HANDSHAKE acceptor carries
+/// the CRLs whenever every tenant has one (revocation rejected at the
+/// handshake itself, the merged-root unknown-status-deny rule permitting).
 pub(crate) fn build_runtime_tls_plane(cfg: &HubConfig) -> Result<TlsPlane> {
     let Some(tls) = &cfg.tls else {
         return Err(InterflowError::config(
             "mTLS requires [tls] to be configured (client certificates are verified at the TLS handshake)",
         ));
     };
+    let choices = crate::hub::crl::choose_tenant_crls(cfg);
     let mut roots = Vec::with_capacity(cfg.auth.tenants.len());
-    for tenant in &cfg.auth.tenants {
+    let mut chosen_ders = Vec::new();
+    for (tenant, choice) in cfg.auth.tenants.iter().zip(&choices) {
         let pem = std::fs::read(&tenant.ca_path).map_err(|e| {
             InterflowError::config(format!(
                 "tenant '{}' CA read failed ({})",
@@ -49,8 +57,10 @@ pub(crate) fn build_runtime_tls_plane(cfg: &HubConfig) -> Result<TlsPlane> {
             .with_source(e)
         })?;
         let mut crls = Vec::new();
-        if let Some(crl_path) = &tenant.crl_path {
-            crls.push(interflow_core::tls::load_crl(crl_path)?);
+        if let Some(crl_pem) = &choice.pem {
+            let der = interflow_core::tls::load_crl_from_pem(crl_pem)?;
+            chosen_ders.push(der.clone());
+            crls.push(der);
         }
         roots.push(TenantTrustRoot::from_pem_with_crls(
             &tenant.name,
@@ -59,7 +69,20 @@ pub(crate) fn build_runtime_tls_plane(cfg: &HubConfig) -> Result<TlsPlane> {
             &crls,
         )?);
     }
-    build_tls_plane(&tls.cert_path, &tls.key_path, &roots, tls.min_version)
+    // All-or-nothing: an acceptor CRL set missing one tenant would deny
+    // that tenant's chains as "revocation status unknown".
+    let acceptor_crls = if cfg.auth.tenants.len() == chosen_ders.len() {
+        chosen_ders
+    } else {
+        Vec::new()
+    };
+    interflow_core::tls::build_tls_plane_with_acceptor_crls(
+        &tls.cert_path,
+        &tls.key_path,
+        &roots,
+        &acceptor_crls,
+        tls.min_version,
+    )
 }
 
 /// Hub server orchestrator.
@@ -157,6 +180,33 @@ impl HubServer {
             }
             _ => None,
         };
+        // The CRL publication channel (`PUT /crls`): present exactly on
+        // pack-built hubs — the live lane persists under the pack's state
+        // dir and the counter floor seeds from the CRLs the plane would
+        // load (live lane AND embedded snapshot both count, so a push can
+        // never sneak below the render baseline).
+        let crl_channel = config.policy.pack_dir.as_deref().map(|pack_dir| {
+            let mut floors: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            let mut current: std::collections::BTreeMap<String, String> =
+                std::collections::BTreeMap::new();
+            for choice in crate::hub::crl::choose_tenant_crls(&config) {
+                if let Some(number) = choice.number {
+                    floors
+                        .entry(choice.stem.clone())
+                        .and_modify(|e| *e = (*e).max(number))
+                        .or_insert(number);
+                }
+                if let Some(pem) = choice.pem {
+                    current.insert(choice.stem, pem);
+                }
+            }
+            Arc::new(crate::hub::crl::CrlChannel {
+                dir: pack_dir.join("state").join("crls"),
+                floors: std::sync::Mutex::new(floors),
+                current: std::sync::Mutex::new(current),
+            })
+        });
         // The proposal queue rides the policy channel's presence (its
         // funnel validates against the serving policy) and its state dir
         // (`<pack>/state/proposals.json`, beside `state/policy`).
@@ -226,7 +276,9 @@ impl HubServer {
             stream_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             audit,
             policy_channel,
+            crl_channel,
             policy_pull_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            evicted_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             proposals,
             stale_watermark_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             expiry_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -266,6 +318,14 @@ impl HubServer {
         HubDispatchHandle {
             state: Arc::clone(&self.state),
         }
+    }
+
+    /// The shared state aggregate (registry, config, TLS plane, the
+    /// publication channels) — for embedders wiring reload hooks: the Arc
+    /// fields a run future's rebuilt state carries are the same Arcs, so
+    /// a hook captured before the run acts on the live hub.
+    pub fn state_handle(&self) -> std::sync::Arc<HubState> {
+        Arc::clone(&self.state)
     }
 
     /// [`Self::run_until`] with an external readiness signal: `ready` fires
@@ -311,7 +371,18 @@ impl HubServer {
         info!(node = %node, "Hub server listening on: {listen_addr}");
 
         // Background task group: QUIC listener / per-connection tasks
-        // all attach to the tracker; drain waits for all of them
+        // all attach to the tracker; drain waits for all of them.
+        //
+        // INVARIANT — every background task that holds an `Arc<HubState>`
+        // (directly or through a `HubService` clone) MUST spawn through
+        // this tracker and exit on `shutdown` being cancelled: the audit
+        // sink's ledger claim releases only when the LAST HubState handle
+        // drops, so any detached holder keeps the path claimed after
+        // shutdown_graceful returns and the next in-process spawn panics
+        // (GUI rotate/update of a live, session-serving hub — backlog
+        // 2026-10-14-hub-inprocess-respawn-trips-audit-claim). Tasks that
+        // hold no engine state (e.g. relay_stream_writer, which owns only
+        // quinn streams) may stay detached — they die with the connection.
         let tasks = tokio_util::task::TaskTracker::new();
         // Adopt this run's shutdown token + task group into the shared state:
         // connection tasks, the QUIC listener, and the drain all select on

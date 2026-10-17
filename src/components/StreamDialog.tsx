@@ -2,7 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import { api, type ManifestSummaryDto } from "../api";
 import { useT } from "../i18n";
 import { parseLoopbackAddr } from "../lib/net";
-import { Badge, Button, DialogFooter, DialogTitle, Field, Input, Modal, Select } from "./ui";
+import {
+  Badge,
+  Button,
+  DialogFooter,
+  DialogTitle,
+  Drawer,
+  Field,
+  InfoHint,
+  Input,
+  Select,
+} from "./ui";
 
 /// The add/adjust-stream wizard (2026-10-08 deploy-legibility backlog):
 /// the task-path answer to "give an agent one more stream". The form's
@@ -37,7 +47,7 @@ export default function StreamDialog({
   /// Adjust mode: the agent + rule name being edited (undefined = add).
   prefill?: { agent: string; ruleName: string };
   busy: boolean;
-  /// Submit = edit + validate + save + apply (owned by DeployFace);
+  /// Submit = edit + validate + save (publishing is the shell's commit);
   /// resolves to an error string or null.
   onSubmit: (fields: StreamFields) => Promise<string | null>;
   onClose: () => void;
@@ -57,7 +67,10 @@ export default function StreamDialog({
           protocol: rule.protocol,
           target_agent: rule.target_agent,
           remote_addr: rule.remote_addr,
-          idle_timeout_secs: rule.idle_timeout_secs == null ? "" : String(rule.idle_timeout_secs),
+          idle_timeout_secs:
+            rule.idle_timeout_secs == null
+              ? ""
+              : String(rule.idle_timeout_secs),
         };
       }
     }
@@ -75,16 +88,22 @@ export default function StreamDialog({
   }, [prefill?.agent, prefill?.ruleName]);
 
   const [fields, setFields] = useState<StreamFields>(initial);
-  const [preview, setPreview] = useState<{ state: "idle" | "checking" | "ok" | "error"; message: string | null }>(
-    { state: "idle", message: null },
-  );
+  const [preview, setPreview] = useState<{
+    state: "idle" | "checking" | "ok" | "error";
+    message: string | null;
+  }>({ state: "idle", message: null });
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const set = (patch: Partial<StreamFields>) => setFields((prev) => ({ ...prev, ...patch }));
+  const set = (patch: Partial<StreamFields>) =>
+    setFields((prev) => ({ ...prev, ...patch }));
 
   const listenError =
-    fields.listen.trim() === "" ? null : parseLoopbackAddr(fields.listen) === null ? t("stream.listenError") : null;
+    fields.listen.trim() === ""
+      ? null
+      : parseLoopbackAddr(fields.listen) === null
+        ? t("stream.listenError")
+        : null;
   const remoteError =
     fields.remote_addr.trim() === ""
       ? null
@@ -120,10 +139,14 @@ export default function StreamDialog({
               target_agent: fields.target_agent,
               remote_addr: fields.remote_addr.trim(),
               idle_timeout_secs:
-                fields.idle_timeout_secs.trim() === "" ? null : Number(fields.idle_timeout_secs),
+                fields.idle_timeout_secs.trim() === ""
+                  ? null
+                  : Number(fields.idle_timeout_secs),
             },
           });
-          const newIssues = result.summary.issues.filter((issue) => !summary.issues.includes(issue));
+          const newIssues = result.summary.issues.filter(
+            (issue) => !summary.issues.includes(issue),
+          );
           if (cancelled) return;
           if (newIssues.length > 0) {
             setPreview({ state: "error", message: newIssues.join("\n") });
@@ -141,7 +164,17 @@ export default function StreamDialog({
     };
     // The dry-run base moves with the document; fields drive re-runs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [text, complete, fields.agent, fields.name, fields.listen, fields.protocol, fields.target_agent, fields.remote_addr, fields.idle_timeout_secs]);
+  }, [
+    text,
+    complete,
+    fields.agent,
+    fields.name,
+    fields.listen,
+    fields.protocol,
+    fields.target_agent,
+    fields.remote_addr,
+    fields.idle_timeout_secs,
+  ]);
 
   const submit = async () => {
     setSubmitting(true);
@@ -158,11 +191,13 @@ export default function StreamDialog({
   const targetOptions = agents.filter((a) => a !== fields.agent);
 
   return (
-    <Modal onClose={onClose} wide>
+    <Drawer onClose={onClose} guard={submitting}>
       <DialogTitle>
-        {prefill ? t("stream.adjustTitle", { name: prefill.ruleName }) : t("stream.addTitle")}
+        {prefill
+          ? t("stream.adjustTitle", { name: prefill.ruleName })
+          : t("stream.addTitle")}
+        <InfoHint text={t("stream.semantics")} className="relative -top-px" />
       </DialogTitle>
-      <p className="m-0 text-small text-fg-3">{t("stream.semantics")}</p>
       <Field label={t("stream.agent")}>
         {(id) => (
           <Select
@@ -203,7 +238,9 @@ export default function StreamDialog({
               spellCheck={false}
             />
             {listenError && (
-              <span className="text-small whitespace-nowrap text-critical">{listenError}</span>
+              <span className="text-small whitespace-nowrap text-critical">
+                {listenError}
+              </span>
             )}
           </>
         )}
@@ -234,7 +271,9 @@ export default function StreamDialog({
               className="max-w-[280px]"
             />
             {targetOptions.length === 0 && (
-              <span className="text-small text-fg-3">{t("stream.noTargets")}</span>
+              <span className="text-small text-fg-3">
+                {t("stream.noTargets")}
+              </span>
             )}
           </div>
         )}
@@ -254,7 +293,9 @@ export default function StreamDialog({
               spellCheck={false}
             />
             {remoteError && (
-              <span className="text-small whitespace-nowrap text-critical">{remoteError}</span>
+              <span className="text-small whitespace-nowrap text-critical">
+                {remoteError}
+              </span>
             )}
           </>
         )}
@@ -275,8 +316,12 @@ export default function StreamDialog({
       </Field>
 
       <div className="flex flex-col gap-1">
-        {preview.state === "checking" && <span className="text-small text-fg-3">…</span>}
-        {preview.state === "ok" && <Badge tone="success">{t("stream.previewOk")}</Badge>}
+        {preview.state === "checking" && (
+          <span className="text-small text-fg-3">…</span>
+        )}
+        {preview.state === "ok" && (
+          <Badge tone="success">{t("stream.previewOk")}</Badge>
+        )}
         {preview.state === "error" && (
           <div className="rounded-lg border border-critical/40 bg-critical/10 p-2.5 text-base whitespace-pre-wrap text-critical">
             {t("stream.previewReject")}
@@ -285,7 +330,9 @@ export default function StreamDialog({
           </div>
         )}
         {preview.state === "idle" && complete === false && (
-          <span className="text-small text-fg-3">{t("stream.previewIncomplete")}</span>
+          <span className="text-small text-fg-3">
+            {t("stream.previewIncomplete")}
+          </span>
         )}
       </div>
       {submitError && (
@@ -298,12 +345,14 @@ export default function StreamDialog({
         <Button onClick={onClose}>{t("common.cancel")}</Button>
         <Button
           variant="primary"
-          disabled={busy || submitting || !complete || preview.state === "error"}
+          disabled={
+            busy || submitting || !complete || preview.state === "error"
+          }
           onClick={() => void submit()}
         >
-          {submitting ? "…" : t("stream.saveApply")}
+          {submitting ? "…" : t("dep.streams.save")}
         </Button>
       </DialogFooter>
-    </Modal>
+    </Drawer>
   );
 }

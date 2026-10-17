@@ -199,6 +199,50 @@ pub fn cert_serial_hex(cert_pem: &str) -> Result<String> {
     }
 }
 
+/// The RFC 5280 `crl_number` a signed CRL PEM carries — the same monotonic
+/// counter every issuance site mints from [`RevocationList::next_crl_number`].
+/// This is the read side for material already on disk (the issuer store's
+/// CRL files, a pack's embedded snapshot, a hub's live push lane):
+/// consumers compare numbers to read "no change" and to refuse rollbacks.
+pub fn crl_number(crl_pem: &str) -> Result<u64> {
+    use x509_parser::pem::parse_x509_pem;
+    use x509_parser::prelude::FromDer;
+    use x509_parser::revocation_list::CertificateRevocationList;
+    let (_, pem) = parse_x509_pem(crl_pem.as_bytes())
+        .map_err(|e| Error::issuance("CRL PEM parse".to_string()).with_source(Box::new(e)))?;
+    let (_, crl) = CertificateRevocationList::from_der(&pem.contents)
+        .map_err(|e| Error::issuance("CRL parse".to_string()).with_source(Box::new(e)))?;
+    crl.crl_number()
+        .and_then(|n| n.to_string().parse::<u64>().ok())
+        .ok_or_else(|| Error::issuance("CRL carries no readable crl_number".to_string()))
+}
+
+/// Whether a CRL in PEM form revokes the given certificate serial (hex,
+/// same canonical form [`cert_serial_hex`] produces) — the pack-side
+/// consumption half of the deny-list pipeline (a node checks its own leaf
+/// against the CRL material it carries).
+///
+/// `Ok(None)` = the CRL parsed but the serial's issuer/scope could not be
+/// decided here — callers treat that as "cannot judge", never as "clean".
+pub fn crl_revokes_serial(crl_pem: &str, serial_hex: &str) -> Result<Option<bool>> {
+    use x509_parser::pem::parse_x509_pem;
+    use x509_parser::prelude::FromDer;
+    use x509_parser::revocation_list::CertificateRevocationList;
+    let (_, pem) = parse_x509_pem(crl_pem.as_bytes())
+        .map_err(|e| Error::issuance("CRL PEM parse".to_string()).with_source(Box::new(e)))?;
+    let (_, crl) = CertificateRevocationList::from_der(&pem.contents)
+        .map_err(|e| Error::issuance("CRL parse".to_string()).with_source(Box::new(e)))?;
+    let wanted = hex::decode(serial_hex)
+        .map_err(|e| Error::issuance("serial hex".to_string()).with_source(e))?;
+    // Numeric comparison: DER serial integers may carry a leading sign
+    // byte on either side, and BigUint equality absorbs that.
+    let wanted = x509_parser::num_bigint::BigUint::from_bytes_be(&wanted);
+    Ok(Some(
+        crl.iter_revoked_certificates()
+            .any(|entry| entry.user_certificate == wanted),
+    ))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -234,6 +278,16 @@ mod tests {
         )
         .unwrap();
         assert!(crl.contains("BEGIN X509 CRL"));
+        // The pack-side consumption half: the built CRL answers membership
+        // for exactly the recorded serials (leading-zero encodings meet).
+        assert_eq!(crl_revokes_serial(&crl, "00ff").unwrap(), Some(true));
+        assert_eq!(crl_revokes_serial(&crl, "ff").unwrap(), Some(true));
+        assert_eq!(crl_revokes_serial(&crl, "00ee").unwrap(), Some(false));
+        assert!(crl_revokes_serial("not a crl", "ff").is_err());
+        // The counter read side: the on-disk number is the monotonic
+        // counter, the rollback/no-change judgment key.
+        assert_eq!(crl_number(&crl).unwrap(), reloaded.next_crl_number);
+        assert!(crl_number("not a crl").is_err());
     }
 
     #[test]

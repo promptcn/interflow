@@ -28,7 +28,10 @@
 //!   engine (spawn, returns immediately), wire a state listener, and spawn
 //!   the renewal scheduler beside it. Start intent (`desired_running`) is
 //!   persisted — Start means "keep it on", Stop "keep it off"; the GUI
-//!   restores the desired set on launch.
+//!   restores the desired set on launch. Quitting the app is not a stop:
+//!   [`NodeManager::shutdown_all`] takes the engines down without touching
+//!   the intent, so the next launch (post-upgrade reopen, shell:startup
+//!   reboot) brings the desired set straight back
 //! - **renewal** (parity with the CLI/mesh binaries): one
 //!   `renewal_scheduler(pack_dir)` per node. Its `Ok` completion means "new
 //!   credential generation is active — restart onto it" (the in-process
@@ -102,6 +105,27 @@ impl NodeKind {
             Self::Ingress => "ingress",
         }
     }
+
+    /// The staging-name prefix `plan::rotate` derives from the manifest's
+    /// node spec — both agent flavors share `agent`.
+    pub const fn staging_prefix(self) -> &'static str {
+        match self {
+            Self::Hub => "hub",
+            Self::Ingress => "ingress",
+            Self::MeshAgent | Self::ExposeAgent => "agent",
+        }
+    }
+}
+
+/// Whether a pack directory's name is one of rotate's `-gen<N>` staging
+/// outputs: `plan::rotate` renders the next generation into
+/// `<kind>-<node>-gen<N>` beside the current pack, for distribution to the
+/// node. The rule is self-describing — the candidate name is rebuilt from
+/// the pack's OWN metadata — so a base directory of a node that merely
+/// happens to be named `foo-gen3` can never false-positive (its rebuilt
+/// staging name would be `agent-foo-gen3-gen<its generation>`).
+pub fn is_rotate_staging(dir_name: &str, kind: NodeKind, node: &str, generation: u64) -> bool {
+    dir_name == format!("{}-{node}-gen{generation}", kind.staging_prefix())
 }
 
 /// What the UI shows when a pack is picked, before anything starts.
@@ -877,6 +901,13 @@ impl FutureEngine {
 /// Everything mutable per node, under the manager's single lock.
 struct NodeEntry {
     spec: NodeSpec,
+    /// The RUNNING expose agent's address table (the live override
+    /// channel): a clone of the handle the engine derives from, so a
+    /// service-address edit applies without a restart — the watcher
+    /// re-derives the egress table on the change signal and the next Open
+    /// dials the new target. Cleared when the engine stops; `None` on
+    /// non-expose kinds.
+    service_table: Option<interflow_mesh::config::ServiceAddresses>,
     /// Persisted start intent (Start = keep on, Stop = keep off).
     desired_running: bool,
     /// A stop the manager itself initiated (user stop or credential
@@ -1262,6 +1293,7 @@ impl NodeManager {
                     restart: SupervisorRestartPolicy::new(),
                     generation: 0,
                     spec: spec.spec,
+                    service_table: None,
                 },
             );
         }
@@ -1331,6 +1363,7 @@ impl NodeManager {
                 restart: SupervisorRestartPolicy::new(),
                 generation: 0,
                 spec,
+                service_table: None,
             },
         );
         self.record_persist(inner.profile_entries());
@@ -1355,10 +1388,18 @@ impl NodeManager {
     /// Updates an agent node's runtime preferences (applied at next
     /// start; refused while running so what is shown is what runs).
     ///
-    /// Service-address preferences are strictly validated here — strict
+    /// Preference updates. Transport and hub QUIC address are the dial
+    /// face — changing them means re-dialing, so they stay stopped-only.
+    /// Service addresses are the node-local dial targets and apply LIVE on
+    /// a running expose agent (the address table's change signal
+    /// re-derives the egress table; established streams drain, the next
+    /// Open dials the new target) — no restart, matching the address's
+    /// status as a machine fact rather than signed truth. Strict
     /// `SocketAddr`, loopback-only — matching exactly what the engine's
-    /// default-deny security policy will dial for expose agents; failing
-    /// at save time beats a `SecurityDenied` buried in the logs.
+    /// default-deny security policy will dial; failing at save time beats
+    /// a `SecurityDenied` buried in the logs. Ids beyond the pack's
+    /// declared set are accepted: the signed policy may hot-add that
+    /// service later, and the preference should apply on arrival.
     pub fn set_prefs(
         &self,
         id: &str,
@@ -1371,24 +1412,18 @@ impl NodeManager {
             .nodes
             .get_mut(id)
             .ok_or_else(|| "unknown node".to_string())?;
-        if entry.engine.as_ref().is_some_and(Engine::is_alive) {
-            return Err("stop the node before changing its preferences".into());
+        let running = entry.engine.as_ref().is_some_and(Engine::is_alive);
+        let transport_moves = running
+            && (entry.spec.transport != transport || entry.spec.hub_quic_addr != hub_quic_addr);
+        if transport_moves {
+            return Err(
+                "stop the node before changing transport or the hub QUIC address (the dial \
+                 face must re-connect)"
+                    .into(),
+            );
         }
         let mut overrides = std::collections::BTreeMap::new();
         for pref in service_addresses {
-            if !entry.spec.pack_services.iter().any(|s| s.id == pref.id) {
-                let valid = entry
-                    .spec
-                    .pack_services
-                    .iter()
-                    .map(|s| s.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(format!(
-                    "service {:?} is not declared by this pack (declared: [{valid}])",
-                    pref.id
-                ));
-            }
             let addr: std::net::SocketAddr = pref.address.trim().parse().map_err(|_| {
                 format!(
                     "address for service {:?} must be <ip>:<port> (e.g. 127.0.0.1:3000), \
@@ -1403,11 +1438,33 @@ impl NodeManager {
                     pref.id
                 ));
             }
-            overrides.insert(pref.id.clone(), addr.to_string());
+            overrides.insert(pref.id.clone(), addr);
+        }
+        // Live apply: diff the old preferences against the new set and move
+        // only what changed — the table's change signal fires per edit and
+        // the watcher re-derives once per burst it observes (level-
+        // triggered either way; per-edit granularity only tightens logs).
+        if let Some(table) = &entry.service_table {
+            for (pid, addr) in &overrides {
+                table.set_override(pid, Some(*addr));
+            }
+            let removed: Vec<String> = entry
+                .spec
+                .service_addresses
+                .keys()
+                .filter(|pid| !overrides.contains_key(*pid))
+                .cloned()
+                .collect();
+            for pid in removed {
+                table.set_override(&pid, None);
+            }
         }
         entry.spec.transport = transport;
         entry.spec.hub_quic_addr = hub_quic_addr;
-        entry.spec.service_addresses = overrides;
+        entry.spec.service_addresses = overrides
+            .into_iter()
+            .map(|(pid, addr)| (pid, addr.to_string()))
+            .collect();
         self.record_persist(inner.profile_entries());
         Ok(())
     }
@@ -1417,8 +1474,10 @@ impl NodeManager {
     /// `state/` carried over; the previous pack kept as
     /// `<pack_dir>.previous`) → refresh the display caches → restore the
     /// start intent. The profile entry (node id, preferences) survives:
-    /// same identity, same node. A generation *downgrade* fails loudly at
-    /// the next start via the anti-rollback check.
+    /// same identity, same node. Installing moves FORWARD only: a strict
+    /// generation downgrade is refused up front, before anything is
+    /// touched — the deliberate rollback path is the typed CLI
+    /// (`node install --allow-downgrade`)
     pub async fn update_pack(&self, id: &str, source: &Path) -> Result<UpdateReport, String> {
         // Snapshot what we need; nothing holds the lock across an await.
         let (pack_dir, principal, desired_running, cached_generation) = {
@@ -1456,8 +1515,8 @@ impl NodeManager {
             }
             _ => {}
         }
-        // The current pack's generation feeds only the report's "from"
-        // display; it must never gate the swap. An unreadable current pack
+        // The current pack's generation feeds the report's "from" display
+        // AND the downgrade gate below. An unreadable current pack
         // (directory moved aside or emptied — e.g. while re-organizing the
         // dist tree) is exactly what this swap repairs, so fall back to the
         // cached generation and proceed — Update IS the recovery path
@@ -1472,6 +1531,21 @@ impl NodeManager {
             |pack| pack.metadata.generation,
         );
 
+        // Installing moves forward only. A strict downgrade would put older
+        // — possibly revoked — material back on the node, and the policy
+        // anti-rollback would only reject it at the NEXT start, after the
+        // swap had already rolled `.previous`. Refuse it here, before the
+        // stop/swap touch anything; the deliberate rollback path is the
+        // typed CLI flag. Reinstalls (same generation) and upgrades pass.
+        if installed_source.metadata.generation < generation_from {
+            return Err(format!(
+                "downgrade refused: the source pack is generation {} but this node already \
+                 runs generation {}; deliberate rollbacks go through `interflow-cli node \
+                 install --allow-downgrade`",
+                installed_source.metadata.generation, generation_from
+            ));
+        }
+
         // Stop unconditionally: it also aborts the renewal supervisor and
         // cancels death-restart retries that could race the swap. The
         // captured intent is restored by `start` below.
@@ -1480,6 +1554,31 @@ impl NodeManager {
         let installed = interflow_cli::node_install::swap_pack_into(source, &pack_dir, None, true)
             .map_err(|e| format!("pack swap failed: {e}"))?;
         let generation_to = installed.metadata.generation;
+
+        // The consumed staging window closes here: the source (identity- and
+        // generation-checked above) was one of rotate's `-genN` distribution
+        // directories, and its only possible receiver was this node — an
+        // identity is one machine, so nothing offline can still be waiting
+        // for it. The strict load already agreed on node + generation, so
+        // the rebuilt-name match is the whole predicate. Best-effort: the
+        // swap already succeeded; a failed removal is a warning, never a
+        // failure. (The CLI `node install` deliberately has no counterpart —
+        // over there the source is the operator's own copy.)
+        let source_kind = NodeKind::classify(&installed);
+        let source_is_staging = source.file_name().is_some_and(|name| {
+            is_rotate_staging(
+                &name.to_string_lossy(),
+                source_kind,
+                &installed.metadata.node,
+                generation_to,
+            )
+        });
+        if source_is_staging && let Err(e) = std::fs::remove_dir_all(source) {
+            tracing::warn!(
+                "could not remove consumed staging {}: {e}",
+                source.display()
+            );
+        }
 
         // Refresh the display caches from the new content: kind, name, and
         // the declared service set may legitimately change across
@@ -1729,7 +1828,9 @@ impl NodeManager {
         // backlog); the expose engine's own startup line repeats it as a
         // second, engine-side source.
         let services = match &prepared {
-            Prepared::Expose(args) => interflow_expose::client::service_log_summary(&args.services),
+            Prepared::Expose(args) => {
+                interflow_expose::client::service_log_summary(&args.resolved_services())
+            }
             _ => String::new(),
         };
         tracing::info!(
@@ -1767,6 +1868,7 @@ impl NodeManager {
         let generation = entry.generation;
         match prepared {
             Prepared::Expose(args) => {
+                entry.service_table = Some(args.service_addresses.clone());
                 let handle = interflow_expose::client::start(&args)
                     .map_err(|e| format!("cannot start: {e}"))?;
                 self.clone()
@@ -1852,6 +1954,7 @@ impl NodeManager {
                 renewal.abort();
             }
             let engine = entry.engine.take();
+            entry.service_table = None;
             let name = engine.as_ref().map(|_| log_attribution(&entry.spec));
             entry.generation += 1;
             self.record_persist(inner.profile_entries());
@@ -1877,7 +1980,11 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Stops every running node concurrently (app quit).
+    /// Stops every running node concurrently — the user-facing stop-all
+    /// (frontend command + tray menu). A user action, so like [`Self::stop`]
+    /// it clears the start intent and persists it off; the next launch
+    /// restores nothing. App quit must NOT come here — see
+    /// [`Self::shutdown_all`].
     pub async fn stop_all(&self) {
         let engines: Vec<(NodeId, Engine)> = {
             let mut inner = self.lock();
@@ -1915,6 +2022,59 @@ impl NodeManager {
                     tracing::info!(
                         node = %log_attribution(&entry.spec),
                         "node stopped (stop-all)"
+                    );
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+        // One final sink per node so the UI/tray see the terminal state.
+        let inner = self.lock();
+        for (id, entry) in &inner.nodes {
+            if matches!(entry.state, NodeState::Stopped) {
+                self.record_state(id, &NodeState::Stopped);
+            }
+        }
+    }
+
+    /// App quit: engines down, intent untouched. Same graceful shutdown as
+    /// [`Self::stop_all`] (expected_stop, renewal abort) so the hub sees
+    /// clean closes instead of session timeouts — but quitting the app is
+    /// not a stop request: `desired_running` keeps its value and nothing is
+    /// persisted, so prefs.db still names the desired set and the next
+    /// launch ([`Self::start_desired`]) brings it straight back. Before
+    /// this split, tray Quit routed through `stop_all` and wiped every
+    /// intent — a Windows upgrade (quit → setup.exe → relaunch) then landed
+    /// every node Stopped until a human remembered to click Start
+    pub async fn shutdown_all(&self) {
+        let engines: Vec<(NodeId, Engine)> = {
+            let mut inner = self.lock();
+            inner
+                .nodes
+                .iter_mut()
+                .filter_map(|(id, entry)| {
+                    entry.expected_stop = true;
+                    if let Some(renewal) = entry.renewal.take() {
+                        renewal.abort();
+                    }
+                    entry
+                        .engine
+                        .take()
+                        .filter(Engine::is_alive)
+                        .map(|e| (id.clone(), e))
+                })
+                .collect()
+        };
+        let mut set = tokio::task::JoinSet::new();
+        for (id, engine) in engines {
+            let manager = self.clone();
+            set.spawn(async move {
+                let _ = engine.shutdown_graceful().await;
+                let mut inner = manager.lock();
+                if let Some(entry) = inner.nodes.get_mut(&id) {
+                    entry.state = NodeState::Stopped;
+                    tracing::info!(
+                        node = %log_attribution(&entry.spec),
+                        "node stopped (app quit)"
                     );
                 }
             });
@@ -3617,6 +3777,100 @@ target_addr = "127.0.0.1:{echo_port}"
         }
     }
 
+    /// App quit is not a stop: `shutdown_all` takes the engines down but the
+    /// start intent — persisted AND in-memory (what the next launch's
+    /// `start_desired` reads) — keeps naming the desired set. The pre-split
+    /// behavior (tray Quit routing through `stop_all`) wiped the intent —
+    /// a Windows upgrade then landed every node Stopped until a human
+    /// clicked Start
+    ///
+    /// The relaunch IS replayed: with the hub having served two agent
+    /// sessions, `start_desired` respawns it in-process on the same audit
+    /// ledger path (the rotate/update shape). That respawn used to panic
+    /// at the audit sink's single-writer claim — session-era tasks
+    /// outlived the graceful shutdown — until the teardown completion fix
+    /// ((internal design notes);
+    /// engine-level regression:
+    /// `respawn_after_agent_sessions_reclaims_the_ledger_claim`).
+    #[tokio::test]
+    async fn shutdown_all_preserves_start_intent() {
+        let stack = stack_with_mesh_site(pending_renewal()).await;
+        let manager = &stack.manager;
+
+        manager.start(&stack.hub_id).expect("hub start");
+        wait_for(
+            manager,
+            &stack.hub_id,
+            |s| matches!(s, NodeState::Running),
+            "Running",
+        )
+        .await;
+        manager.start(&stack.lan_b_id).expect("lan-b start");
+        manager.start(&stack.lan_a_id).expect("lan-a start");
+        connected(manager, &stack.lan_b_id).await;
+        connected(manager, &stack.lan_a_id).await;
+
+        // The starts persisted their intent: all desired.
+        manager.settle().await;
+        {
+            let persisted = stack
+                .persisted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            assert!(persisted.iter().all(|e| e.desired_running));
+        }
+
+        // App quit: engines down, every node Stopped.
+        manager.shutdown_all().await;
+        for id in [&stack.hub_id, &stack.lan_a_id, &stack.lan_b_id] {
+            wait_for(
+                manager,
+                id,
+                |s| *s == NodeState::Stopped,
+                "Stopped after shutdown_all",
+            )
+            .await;
+        }
+
+        // …but no intent wipe was queued: the last persist still names the
+        // full desired set (the stop_all twin above asserts the opposite).
+        manager.settle().await;
+        {
+            let persisted = stack
+                .persisted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                persisted.iter().all(|e| e.desired_running),
+                "app quit must not clear the start intent"
+            );
+        }
+
+        // And the in-memory flags — the input the next launch's
+        // `start_desired` filters on — survived the shutdown too.
+        assert!(
+            manager.snapshots().iter().all(|s| s.desired_running),
+            "the desired set must still be named after app quit"
+        );
+
+        // The relaunch the original test skipped: the hub has served two
+        // agent sessions, so the in-process respawn below is exactly the
+        // shape that tripped the audit ledger's single-writer claim before
+        // the teardown completion fix (whole-process abort). The hub
+        // returns to Running and both agents re-register (their steady
+        // state is Connected, as in the first half above).
+        manager.start_desired();
+        wait_for(
+            manager,
+            &stack.hub_id,
+            |s| matches!(s, NodeState::Running),
+            "Running after relaunch",
+        )
+        .await;
+        connected(manager, &stack.lan_a_id).await;
+        connected(manager, &stack.lan_b_id).await;
+    }
+
     /// The 2026-10-07 bug, machine-locked: a policy PUBLISHED at the hub
     /// reaches a GUI-managed agent with zero touches — no restart, no
     /// Stop→Start, no manual state injection. The whole distribution plane
@@ -4388,6 +4642,9 @@ target_addr = "127.0.0.1:{echo_port}"
         ingress_id: NodeId,
         agent_id: NodeId,
         edge_port: u16,
+        /// The stack's issuer store (survives the forgotten tempdir) —
+        /// hot-channel tests sign generation N+1 policies with it.
+        issuer_dir: PathBuf,
         persisted: Arc<StdMutex<Vec<crate::profile::NodeEntry>>>,
     }
 
@@ -4436,6 +4693,7 @@ service = "default/desktop/web"
         IngressCredentialPack::render(&issuer, &manifest, "edge", 1, &ingress_dir).unwrap();
         let agent_dir = dir.path().join("packs/agent-desktop");
         AgentCredentialPack::render(&issuer, &manifest, "desktop", 1, &agent_dir).unwrap();
+        let issuer_dir = dir.path().join("issuer");
         // Packs must outlive `dir` (the manager reads them at every start).
         std::mem::forget(dir);
 
@@ -4492,6 +4750,7 @@ service = "default/desktop/web"
             ingress_id,
             agent_id,
             edge_port,
+            issuer_dir,
             persisted,
         }
     }
@@ -4524,11 +4783,14 @@ service = "default/desktop/web"
             .unwrap_err();
         assert!(err.contains("loopback"), "wrong error: {err}");
 
-        // The pack is the source of truth for the service set.
-        let err = manager
+        // A preference for an id the pack does not declare is ACCEPTED:
+        // the signed policy may hot-add that service later, and the
+        // preference should apply on arrival (matching the CLI resolver,
+        // which keeps such preferences with a note).
+        manager
             .set_prefs(id, None, None, &[pref("nope", "127.0.0.1:3000")])
-            .unwrap_err();
-        assert!(err.contains("not declared"), "wrong error: {err}");
+            .expect("undeclared id accepted for hot-arrival");
+        manager.settle().await;
 
         // Valid preference: normalized, persisted, and visible in the
         // snapshot as the effective address.
@@ -4650,6 +4912,68 @@ service = "default/desktop/web"
             "traffic must land on the preference's target, got {response:?}"
         );
 
+        // THE live channel (1.3): edit the preference while RUNNING — no
+        // stop, no restart. The address table's change signal re-derives
+        // the egress table; the very next request lands on the new target.
+        let retarget_port = crate::test_util::free_port();
+        let retarget_echo = tokio::net::TcpListener::bind(("127.0.0.1", retarget_port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = retarget_echo.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        manager
+            .set_prefs(
+                &stack.agent_id,
+                None,
+                None,
+                &[pref("web", &format!("127.0.0.1:{retarget_port}"))],
+            )
+            .expect("live address edit on a running agent");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut landed = false;
+        while tokio::time::Instant::now() < deadline {
+            // A distinguishable echo answers from the second backend.
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", stack.edge_port))
+                .await
+                .expect("dial edge listener");
+            sock.write_all(
+                b"GET /live HTTP/1.1\r\nHost: test.local\r\nX-Forwarded-For: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = [0u8; 64];
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await
+                && buf[..n].starts_with(b"GET /live")
+            {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(
+            landed,
+            "a live address edit must retarget traffic without a restart"
+        );
+
         // Clear the preference while stopped → the pack default (a dead
         // port) takes over → the request must NOT round-trip.
         manager.stop(&stack.agent_id).await.expect("agent stop");
@@ -4669,6 +4993,149 @@ service = "default/desktop/web"
         assert!(
             !response.contains("GET /"),
             "the dead default must not answer, got {response:?}"
+        );
+
+        manager.stop_all().await;
+    }
+
+    /// Signs a policy generation and drops it into a pack's `state/policy`
+    /// update channel (the same files `plan apply`'s manual distribution
+    /// and a hub publication land as).
+    fn drop_policy_update(
+        issuer: &IssuerStore,
+        pack_dir: &Path,
+        generation: u64,
+        manifest: &Manifest,
+    ) {
+        let policy = interflow_identity::policy::RuntimePolicy::from_manifest(manifest, generation);
+        let signer = issuer.policy_signer().unwrap();
+        let (bytes, signature) = policy.signed(&signer).unwrap();
+        let dir = pack_dir.join("state/policy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("policy.toml"), bytes).unwrap();
+        std::fs::write(dir.join("policy.sig"), signature).unwrap();
+    }
+
+    /// The expose hot channel, end to end (2026-10-10): a signed
+    /// generation N+1 dropped into both packs' `state/policy` — adding a
+    /// service (carrying its signed default address) and a route for it —
+    /// serves on the RUNNING edge + agent within a watcher period. No pack
+    /// swap, no restart, no machine preference: the signed default IS the
+    /// address source, which is exactly what a policy-only service add
+    /// needs on a machine whose pack was not re-rendered.
+    #[tokio::test]
+    async fn policy_hot_adds_service_and_route_without_restart() {
+        let stack = stack_with_expose_site();
+        let manager = &stack.manager;
+
+        // The hot-added service's backend: an echo on its own port.
+        let api_port = crate::test_util::free_port();
+        let api = tokio::net::TcpListener::bind(("127.0.0.1", api_port))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = api.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        manager.start(&stack.ingress_id).expect("ingress start");
+        wait_for(
+            manager,
+            &stack.ingress_id,
+            |s| matches!(s, NodeState::Running),
+            "Running",
+        )
+        .await;
+        manager.start(&stack.agent_id).expect("agent start");
+        connected(manager, &stack.agent_id).await;
+
+        // Generation 2: the SAME service set (web stays) plus `api` and
+        // its route. The policy replaces tables wholesale — keeping `web`
+        // is what makes the swap an addition, not a removal.
+        let manifest_v2 = Manifest::parse(&format!(
+            r#"
+[realm]
+id = "gui-expose"
+control_endpoint = "127.0.0.1:1"
+[public_tls]
+mode = "frontend-proxy"
+[registrar]
+endpoint = "https://registrar.invalid"
+[ingress.edge]
+workspaces = ["default"]
+listen = "127.0.0.1:1"
+control_listen = "127.0.0.1:1"
+[workspace.default]
+[agent.desktop]
+workspace = "default"
+[[agent.desktop.services]]
+id = "web"
+address = "127.0.0.1:1"
+[[agent.desktop.services]]
+id = "api"
+address = "127.0.0.1:{api_port}"
+[[route]]
+host = "test.local"
+service = "default/desktop/web"
+[[route]]
+host = "api.local"
+service = "default/desktop/api"
+"#
+        ))
+        .unwrap();
+        let issuer = IssuerStore::open(&stack.issuer_dir);
+        let dirs: Vec<PathBuf> = manager
+            .snapshots()
+            .into_iter()
+            .map(|snap| snap.spec.pack_dir)
+            .collect();
+        for dir in &dirs {
+            drop_policy_update(&issuer, dir, 2, &manifest_v2);
+        }
+
+        // The new host serves within a watcher period (agent service set +
+        // edge route table each converge on their own 10s cadence — the
+        // deadline covers both plus margin).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+        let mut served = false;
+        while tokio::time::Instant::now() < deadline {
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", stack.edge_port))
+                .await
+                .expect("dial edge listener");
+            sock.write_all(
+                b"GET /hot HTTP/1.1\r\nHost: api.local\r\nX-Forwarded-For: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = [0u8; 64];
+            if let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await
+                && buf[..n].starts_with(b"GET /hot")
+            {
+                served = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(
+            served,
+            "the hot-added service + route must serve without a restart or pack swap"
         );
 
         manager.stop_all().await;
@@ -4792,6 +5259,202 @@ service = "default/desktop/web"
         );
     }
 
+    /// The consume-time closure: when update_pack's source is one of
+    /// rotate's `-genN` staging directories, the swap's success closes the
+    /// window — the only possible receiver (this node) now holds the
+    /// material, and an identity is one machine, so nothing offline can
+    /// still be waiting for it. A source under any other name is the
+    /// operator's own directory and must survive the update untouched.
+    #[tokio::test]
+    async fn update_pack_closes_the_consumed_staging_directory() {
+        let stack = stack_with_expose_site();
+        let manager = &stack.manager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = IssuerStore::open(dir.path().join("issuer"));
+        issuer.ensure_realm().unwrap();
+        issuer.ensure_workspace("default").unwrap();
+        issuer.ensure_policy_key().unwrap();
+        let manifest = Manifest::parse(&format!(
+            r#"
+[realm]
+id = "gui-expose"
+control_endpoint = "127.0.0.1:{}"
+[public_tls]
+mode = "frontend-proxy"
+[registrar]
+endpoint = "https://registrar.invalid"
+[ingress.edge]
+workspaces = ["default"]
+[workspace.default]
+[agent.desktop]
+workspace = "default"
+[[agent.desktop.services]]
+id = "web"
+address = "127.0.0.1:59999"
+[[route]]
+host = "test.local"
+service = "default/desktop/web"
+"#,
+            crate::test_util::free_port()
+        ))
+        .unwrap();
+        // Generation 2 in the staging name → consumed, the directory closes.
+        let staging = dir.path().join("agent-desktop-gen2");
+        AgentCredentialPack::render(&issuer, &manifest, "desktop", 2, &staging).unwrap();
+        // Generation 3 under an arbitrary name → the operator's own copy.
+        let hand_named = dir.path().join("gen3");
+        AgentCredentialPack::render(&issuer, &manifest, "desktop", 3, &hand_named).unwrap();
+        std::mem::forget(dir);
+
+        let report = manager
+            .update_pack(&stack.agent_id, &staging)
+            .await
+            .expect("update from staging");
+        assert_eq!(report.generation_to, 2);
+        assert!(
+            !staging.exists(),
+            "the consumed staging window closes — the shell must not outlive its only receiver"
+        );
+
+        let report = manager
+            .update_pack(&stack.agent_id, &hand_named)
+            .await
+            .expect("update from a hand-named source");
+        assert_eq!(report.generation_to, 3);
+        assert!(
+            hand_named.join("pack.toml").exists(),
+            "a source under any other name is the operator's own directory — never removed"
+        );
+    }
+
+    /// The "救不回" half of the 2026-10-13 incident, GUI side: update_pack
+    /// carries node-local state across generations — including a renewal
+    /// ledger the CRL has condemned. The next start's load path must shed it
+    /// and serve the new generation's bootstrap identity, keeping the
+    /// quarantine trail. The manual `mv state/credentials …` rescue is gone.
+    #[tokio::test]
+    async fn update_pack_sheds_a_revoked_ledger_it_carried_over() {
+        use interflow_identity::credentials::ActiveCredentialSet;
+        use interflow_identity::issuance::{LeafTtl, generate_csr};
+        use interflow_identity::revocation::{RevocationEntry, build_crl, cert_serial_hex};
+
+        let stack = stack_with_expose_site();
+        let manager = &stack.manager;
+        let agent_dir = manager
+            .snapshots()
+            .into_iter()
+            .find(|s| s.spec.id == stack.agent_id)
+            .unwrap()
+            .spec
+            .pack_dir
+            .clone();
+
+        // A renewed ledger the node had been running: a fresh leaf from the
+        // SAME issuer (it must chain to the pack's trust bundle), sequence 1
+        // plus pointer.
+        let issuer = IssuerStore::open(&stack.issuer_dir);
+        let pack = CredentialPack::load_runtime(&agent_dir).unwrap();
+        let expected = pack.identities["agent"]["default"].clone();
+        let csr = generate_csr(&expected.principal, &[], false).unwrap();
+        let material = issuer
+            .workspace_issuer("default")
+            .unwrap()
+            .issue_csr(
+                &expected.principal,
+                &[],
+                false,
+                LeafTtl::default_ttl(),
+                &csr.csr_pem,
+            )
+            .unwrap();
+        let dead_serial = cert_serial_hex(&material.chain_pem).unwrap();
+        let ledger = agent_dir.join("state/credentials/sequences/1");
+        std::fs::create_dir_all(&ledger).unwrap();
+        std::fs::write(ledger.join("agent-default.crt"), &material.chain_pem).unwrap();
+        std::fs::write(ledger.join("agent-default.key"), &csr.key_pem).unwrap();
+        std::fs::write(
+            agent_dir.join("state/credentials/current.json"),
+            r#"{"sequence": 1, "updated": "2026-10-13T23:00:00Z"}"#,
+        )
+        .unwrap();
+
+        // Generation 2 from the same issuer (what rotate mints)…
+        let gen2 = stack.issuer_dir.parent().unwrap().join("gen2-pack");
+        let manifest = Manifest::parse(&format!(
+            r#"
+[realm]
+id = "gui-expose"
+control_endpoint = "127.0.0.1:{}"
+[public_tls]
+mode = "frontend-proxy"
+[registrar]
+endpoint = "https://registrar.invalid"
+[ingress.edge]
+workspaces = ["default"]
+[workspace.default]
+[agent.desktop]
+workspace = "default"
+[[agent.desktop.services]]
+id = "web"
+address = "127.0.0.1:59999"
+[[route]]
+host = "test.local"
+service = "default/desktop/web"
+"#,
+            crate::test_util::free_port()
+        ))
+        .unwrap();
+        AgentCredentialPack::render(&issuer, &manifest, "desktop", 2, &gen2).unwrap();
+        let gen2_identity = cert_serial_hex(
+            &std::fs::read_to_string(gen2.join("identity/agent-default.crt")).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(gen2_identity, dead_serial);
+
+        // …and the CRL the renewal scheduler would drop into state/crls,
+        // condemning the ledger the update is about to carry over.
+        let crl = build_crl(
+            &issuer.workspace_issuer("default").unwrap(),
+            &[RevocationEntry {
+                serial: dead_serial.clone(),
+                issuer: "workspace/default".to_owned(),
+                reason: "key-compromise".to_owned(),
+                revoked_at: "2026-10-13T23:24:00Z".to_owned(),
+                pack_digest: None,
+            }],
+            1,
+        )
+        .unwrap();
+        let live_crls = agent_dir.join("state/crls");
+        std::fs::create_dir_all(&live_crls).unwrap();
+        std::fs::write(live_crls.join("workspace-default.crl.pem"), &crl).unwrap();
+
+        let report = manager
+            .update_pack(&stack.agent_id, &gen2)
+            .await
+            .expect("update in place");
+        assert_eq!(report.generation_to, 2);
+
+        // The carried ledger is dead on arrival: the load path a start uses
+        // must shed it and serve generation 2's bootstrap identity instead.
+        let updated = CredentialPack::load_runtime(&agent_dir).unwrap();
+        assert_eq!(updated.metadata.generation, 2);
+        let active = ActiveCredentialSet::load_or_bootstrap(&updated).unwrap();
+        assert_eq!(
+            active.entries["agent-default"].serial, gen2_identity,
+            "the fresh generation's bootstrap identity is served, not the dead ledger"
+        );
+        let prefix: String = dead_serial.chars().take(8).collect();
+        assert!(
+            agent_dir
+                .join("state/credentials/quarantined")
+                .join(format!("1-{prefix}"))
+                .is_dir(),
+            "the dead ledger is quarantined on disk as the audit trail"
+        );
+    }
+
     /// ④ of the QUIC-switch GUI consolidation: a pack directory that was
     /// cleared or moved aside (e.g. while re-organizing the dist tree) must
     /// not block the update — the swap IS the repair, and the report falls
@@ -4868,5 +5531,89 @@ service = "default/desktop/web"
             .find(|s| s.spec.id == stack.agent_id)
             .unwrap();
         assert_eq!(snapshot.spec.pack_digest, installed.pack_digest);
+    }
+
+    #[tokio::test]
+    async fn update_pack_refuses_a_strict_generation_downgrade() {
+        let stack = stack_with_expose_site();
+        let manager = &stack.manager;
+        let agent_dir = manager
+            .snapshots()
+            .into_iter()
+            .find(|s| s.spec.id == stack.agent_id)
+            .unwrap()
+            .spec
+            .pack_dir
+            .clone();
+
+        // Generation 2 of the same identity (same issuer discipline as the
+        // swap test above: a fresh issuer would change the identity).
+        let dir = tempfile::tempdir().unwrap();
+        let issuer = IssuerStore::open(dir.path().join("issuer"));
+        issuer.ensure_realm().unwrap();
+        issuer.ensure_workspace("default").unwrap();
+        issuer.ensure_policy_key().unwrap();
+        let manifest = Manifest::parse(&format!(
+            r#"
+[realm]
+id = "gui-expose"
+control_endpoint = "127.0.0.1:{}"
+[public_tls]
+mode = "frontend-proxy"
+[registrar]
+endpoint = "https://registrar.invalid"
+[ingress.edge]
+workspaces = ["default"]
+[workspace.default]
+[agent.desktop]
+workspace = "default"
+[[agent.desktop.services]]
+id = "web"
+address = "127.0.0.1:59999"
+[[route]]
+host = "test.local"
+service = "default/desktop/web"
+"#,
+            crate::test_util::free_port()
+        ))
+        .unwrap();
+        let gen2 = dir.path().join("gen2");
+        AgentCredentialPack::render(&issuer, &manifest, "desktop", 2, &gen2).unwrap();
+        std::mem::forget(dir);
+        manager.update_pack(&stack.agent_id, &gen2).await.unwrap();
+
+        // The swap kept generation 1 as `<pack_dir>.previous`; feeding it
+        // back used to install silently (the GUI's downgrade button, the
+        // apply convergence, any caller). The refusal must land BEFORE the
+        // stop/swap touch anything.
+        let gen1 = PathBuf::from(format!("{}.previous", agent_dir.display()));
+        assert!(
+            gen1.join("pack.toml").is_file(),
+            "fixture: the swap must have kept generation 1 as .previous"
+        );
+        let err = manager
+            .update_pack(&stack.agent_id, &gen1)
+            .await
+            .expect_err("a strict downgrade must be refused");
+        assert!(err.contains("downgrade refused"), "unexpected error: {err}");
+        assert!(
+            err.contains("--allow-downgrade"),
+            "the error must point at the deliberate path: {err}"
+        );
+
+        // Untouched: the install still runs generation 2, cache included.
+        assert_eq!(
+            CredentialPack::load_runtime(&agent_dir)
+                .unwrap()
+                .metadata
+                .generation,
+            2
+        );
+        let snapshot = manager
+            .snapshots()
+            .into_iter()
+            .find(|s| s.spec.id == stack.agent_id)
+            .unwrap();
+        assert_eq!(snapshot.spec.generation, 2);
     }
 }

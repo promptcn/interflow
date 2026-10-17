@@ -3,7 +3,7 @@ import { useT } from "../i18n";
 import { Select } from "./ui";
 
 /// The remembered deployment-context picker — one widget that used to exist
-/// as three near-identical native selects (DeployOverview, ManifestEditor,
+/// as three near-identical native selects (the manifest editor, the issue
 /// IssuePackDialog), each hand-parsing the same composite
 /// `manifest|issuer|out` string.
 export function contextKey(c: { manifest: string; issuer: string; out: string }): string {

@@ -20,11 +20,11 @@ fault-injection = []
 workspace = true
 
 [dependencies]
-interflow-contract = { path = "../contract", version = "0.8" }
+interflow-contract.workspace = true
 
 # Compile-time build identity — the QUIC Hello declares the running build so
 # the hub can keep a machine-checkable fleet view (which binary is each agent)
-interflow-buildinfo = { path = "../buildinfo", version = "0.8" }
+interflow-buildinfo.workspace = true
 
 # Async runtime
 tokio = { workspace = true }
@@ -110,7 +110,7 @@ criterion = { version = "0.8", default-features = false, features = ["async_toki
 proptest = "1.7"
 # Self-signed certificates for the TLS min-version handshake test (the single
 # rcgen implementation; core keeps issuance out of its production graph)
-interflow-certs = { path = "../certs", version = "0.8" }
+interflow-certs.workspace = true
 # Paused clock (start_paused) for unit tests to deterministically verify the INCOMING_SEND_TIMEOUT path
 tokio = { workspace = true, features = ["test-util"] }
 # Audit rotation/persistence unit tests: isolated segment directories

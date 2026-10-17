@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # Ephemeral runners gain nothing from incremental sessions (rust-cache does
+  # not restore them); also belt-and-braces for the profile.dev
+  # incremental=false that is the real invariant.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   product-language:
@@ -21,9 +25,46 @@ jobs:
   version-contract:
     runs-on: ubuntu-24.04
     steps:
+      # Full history: the changelog-debt guard diffs everything since the
+      # commit that introduced the newest versioned CHANGELOG section.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: enforce version and rotation model
         run: python3 scripts/check_version_contract.py
+      - name: enforce changelog accumulation
+        run: python3 scripts/check_changelog_debt.py
+
+  # The production-build discipline (scripts/lib/build_guard.sh):
+  # self-test fixture (tree refusal, escape hatches, suffixing, content
+  # gates, ship, provenance manifest) + a real dirty-tree refusal against
+  # build-linux.sh. The guard runs before any tool check, so the refusal
+  # case costs no compile time; p7zip-full feeds the nsis content-gate
+  # fixtures (the dmg gate is macOS-only and skips itself here).
+  build-guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: guard self-test (tree discipline, content gates, ship, manifest)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q p7zip-full
+          bash scripts/lib/build_guard.sh --self-test
+      - name: dirty tree refuses production build (fast fail, escape hatch named)
+        run: |
+          echo "scratch" > dirty-probe.txt
+          if bash scripts/build-linux.sh x86_64 > guard-out.log 2>&1; then
+            echo "build-linux.sh succeeded on a dirty tree — the guard did not hold:"
+            cat guard-out.log
+            exit 1
+          fi
+          grep -q -- "--allow-dirty" guard-out.log || {
+            echo "the refusal does not name the escape hatch:"
+            cat guard-out.log
+            exit 1
+          }
+          echo "refused as expected:"
+          cat guard-out.log
 
   machete:
     runs-on: ubuntu-24.04
@@ -61,6 +102,7 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     services:
       pebble:
         image: ghcr.io/letsencrypt/pebble:latest
@@ -85,17 +127,50 @@ jobs:
       # the pebble environment contract live in ONE script — the same one
       # scripts/export_public.sh runs against the exported tree before
       # committing (public-CI parity), so the workflow and the export can
-      # never drift apart. Stages tee full output to a log and, on failure,
-      # surface ::error:: annotations: anonymous API readers cannot download
-      # run logs, but annotations ARE public — this is the failure-visibility
-      # channel for outside collaborators. Stages 1/2/4/5 run under
-      # cargo-nextest (per-test process isolation + cross-binary parallelism;
-      # installed above), doc tests on libtest. Integration tests run in
-      # parallel: every listener binds `:0` and reads its actual address
-      # from readiness signals (hub/agent handles, EdgeReady); stages split
-      # per crate so a failure names the crate.
-      - name: test stages
-        run: bash scripts/ci_test_stages.sh
+      # never drift apart. This job selects its stage subset by argument;
+      # the mesh e2e stage runs in the parallel test-mesh-e2e job (the
+      # timing-sensitive tier, isolated so starved-runner flakes stop
+      # moving wall-clock budgets — 2026-10-11 starvation backlog). Stages
+      # tee full output to a log and, on failure, surface ::error::
+      # annotations: anonymous API readers cannot download run logs, but
+      # annotations ARE public — this is the failure-visibility channel for
+      # outside collaborators. Stages 1/2/4/5 run under cargo-nextest
+      # (per-test process isolation + cross-binary parallelism; installed
+      # above), doc tests on libtest. Integration tests run in parallel:
+      # every listener binds `:0` and reads its actual address from
+      # readiness signals (hub/agent handles, EdgeReady); stages split per
+      # crate so a failure names the crate.
+      - name: test stages (lib/bins/doc/rest)
+        run: bash scripts/ci_test_stages.sh lib bins doc rest
+
+  test-mesh-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      pebble:
+        image: ghcr.io/letsencrypt/pebble:latest
+        ports:
+          - 14000:14000
+        env:
+          PEBBLE_VA_NOSLEEP: "1"
+          PEBBLE_VA_ALWAYS_VALID: "1"
+          PEBBLE_WFE_NONCEREJECT: "0"
+    env:
+      INTERFLOW_PEBBLE: https://127.0.0.1:14000/dir
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # Mesh e2e isolated in its own job (parallel with `test`): the suite
+      # is wall-clock-bound on real timers and starved on this 2vCPU runner
+      # — three rounds of budget relaxation (8s→30s→60s) proved load-moving
+      # is not convergence. The stage script caps nextest to --jobs 1 on
+      # <= 2-core runners (isolation over wall-clock); see its header.
+      - name: test stages (mesh e2e)
+        run: bash scripts/ci_test_stages.sh mesh
 
   gui:
     name: gui (tauri)

@@ -58,9 +58,13 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let manager = manager(&app);
-                    manager.stop_all().await;
-                    // Flush the final persist + Stopped events before the
-                    // runtime dies with the app (settle = drain barrier).
+                    // Engines down, start intent preserved: quitting the app
+                    // is not a stop request, so the next launch (upgrade
+                    // reopen, shell:startup reboot) restores the desired
+                    // set instead of landing every node Stopped.
+                    manager.shutdown_all().await;
+                    // Flush the final state events before the runtime dies
+                    // with the app (settle = drain barrier).
                     manager.settle().await;
                     app.exit(0);
                 });

@@ -275,6 +275,7 @@ impl AgentClient {
         // one runs none, and no surface can forget the spawn
         // Extracted before `self` moves into the supervisor.
         let policy_plane = self.config.policy.clone();
+        let policy_service_addresses = self.config.service_addresses.clone();
         let policy_transport = self.config.agent.transport;
         let policy_log_name = self.config.agent.effective_log_name().to_string();
         let policy_client = self.clone();
@@ -316,6 +317,7 @@ impl AgentClient {
                 &policy_tracker,
                 policy_transport,
                 policy_log_name,
+                policy_service_addresses,
             )
         });
 
@@ -417,7 +419,7 @@ impl AgentClient {
                     slot.clone(),
                     attempt_token.clone(),
                     Arc::clone(&death_note),
-                    OUT_OF_TREE_PROBE,
+                    ProbeParams::from(&self.config.liveness_probe),
                     node.clone(),
                 ) => Waited::ProbeFired,
             };
@@ -1432,9 +1434,11 @@ fn cancellation_attribution(
     }
 }
 
-/// Tuning of the out-of-tree liveness probe. Production runs
-/// [`OUT_OF_TREE_PROBE`]; tests construct millisecond-scale instances so
-/// the verdict cascades run fast without sleeping.
+/// Tuning of the out-of-tree liveness probe. Production runs the
+/// `[liveness_probe]` defaults (`LivenessProbeConfig` — 15s tick / 30s
+/// demand cadence / 15s deadline / 3 strikes); tests compress the same
+/// knobs at assembly time so detection-latency assertions derive from the
+/// timers the test itself configures.
 #[derive(Debug, Clone, Copy)]
 struct ProbeParams {
     /// Passive-tier tick: aligned with the default heartbeat interval, so a
@@ -1461,14 +1465,19 @@ struct ProbeParams {
     demand_strikes: u32,
 }
 
-/// Production probe tuning: 15s passive tick / 30s demanding cadence / 15s
-/// hard deadline / 3 strikes.
-const OUT_OF_TREE_PROBE: ProbeParams = ProbeParams {
-    tick: Duration::from_secs(15),
-    demand_every: Duration::from_secs(30),
-    demand_deadline: Duration::from_secs(15),
-    demand_strikes: 3,
-};
+/// The configured probe tuning: `[liveness_probe]` seconds → durations.
+/// The production defaults live in [`crate::config::LivenessProbeConfig`];
+/// this is the single wiring point between the config face and the probe.
+impl From<&crate::config::LivenessProbeConfig> for ProbeParams {
+    fn from(cfg: &crate::config::LivenessProbeConfig) -> Self {
+        Self {
+            tick: Duration::from_secs(cfg.tick_secs),
+            demand_every: Duration::from_secs(cfg.demand_every_secs),
+            demand_deadline: Duration::from_secs(cfg.demand_deadline_secs),
+            demand_strikes: cfg.demand_strikes,
+        }
+    }
+}
 
 /// One out-of-tree silence check: pure arithmetic over the transport
 /// backend's ledger (task-independent by construction, see

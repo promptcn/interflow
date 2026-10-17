@@ -6,7 +6,7 @@ resolver = "2"
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.11.0"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -31,6 +31,32 @@ dirs = "6"
 # Cross-platform advisory file locks (flock / LockFileEx) — the audit
 # ledger's single-writer guard across processes
 fs2 = "0.4"
+# Machine-owned state storage (issuer bookkeeping db, GUI prefs db). Bundled
+# builds the bundled SQLite amalgamation via cc — the workspace's first C
+# dependency, exercised through the zig (musl) / xwin (windows) cross paths.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Line diff for `plan diff` (declaration vs applied snapshot) — pure Rust.
+similar = "3.2"
+
+# Internal crates — path-only specs, declared once here so members inherit
+# with `interflow-x.workspace = true`. Nothing is published to crates.io (the
+# source export is the distribution), so no version literal exists to drift
+# from the workspace version — the v0.11.0 bump left 39 stale member-manifest
+# pins and broke every cargo invocation at HEAD (fixed in c458728).
+# If publishing ever starts, add `version` HERE (one file) and flip the
+# version-contract guard's path-only rule to value-match.
+interflow-buildinfo = { path = "crates/buildinfo" }
+interflow-certs = { path = "crates/certs" }
+interflow-cli = { path = "crates/cli" }
+interflow-contract = { path = "crates/contract" }
+interflow-core = { path = "crates/core" }
+interflow-expose = { path = "crates/expose" }
+interflow-identity = { path = "crates/identity" }
+interflow-mesh = { path = "crates/mesh" }
+interflow-registrar = { path = "crates/registrar" }
+interflow-renewal = { path = "crates/renewal" }
+interflow-testkit = { path = "crates/testkit" }
+interflow-util = { path = "crates/util" }
 
 # ============================================================================
 # Lints — applied uniformly via [workspace.lints]; sub-crates inherit with `[lints] workspace = true`
@@ -107,5 +133,31 @@ inherits = "release"
 debug = true
 strip = "none"
 
+# No incremental compilation: with it on, every changed-code cargo invocation
+# (rust-analyzer check-on-save, nextest/clippy loops) minted a fresh session
+# dir under target/debug/incremental — 1025 sessions / 29GB in a single day of
+# heavy work (2026-10-11), and nothing in the toolchain GCs them (cargo's
+# auto-GC covers only ~/.cargo; cargo-sweep's --maxsize never touches
+# incremental/). A profile is read by every entry point (RA, cargo aliases,
+# tauri dev, raw cargo), unlike a justfile hook. For an interactive session
+# that would benefit from incremental (e.g. tight cargo run loops on the gui
+# crate), opt back in per invocation: CARGO_INCREMENTAL=1 cargo …
 [profile.dev]
 debug = "limited"
+incremental = false
+
+# Dependencies carry no DWARF (the bulk of test-binary size); workspace
+# crates keep line-tables-only above, so backtraces still name dependency
+# frames. To debug inside a dependency, use the opt-in profile instead of
+# editing this section: cargo test/run --profile dep-debug.
+[profile.dev.package."*"]
+debug = false
+
+# Opt-in: full debug info everywhere (dependency DWARF restored on top of
+# the trimmed dev profile). Costs a separate artifact set only while used;
+# nextest takes it via `--cargo-profile dep-debug`.
+[profile.dep-debug]
+inherits = "dev"
+debug = true
+[profile.dep-debug.package."*"]
+debug = true

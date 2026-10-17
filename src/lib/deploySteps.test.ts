@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { ChangeStateDto, ManifestSummaryDto } from "../api";
+import type { AgentRoleDto, ChangeStateDto, ManifestSummaryDto } from "../api";
 import { buildNextSteps, rememberContext, withBlankSiblingsFilled } from "./deploySteps";
 
 /// A key-returning t: assertions stay copy-independent while interpolated
@@ -7,8 +7,30 @@ import { buildNextSteps, rememberContext, withBlankSiblingsFilled } from "./depl
 const t = (key: string, params?: Record<string, string | number>) =>
   params === undefined ? key : `${key} ${JSON.stringify(params)}`;
 
-const agents = (n: number) =>
-  Array.from({ length: n }, (_, i) => ({ node: `agent-${i}` })) as ManifestSummaryDto["agents"];
+/// One declared agent — the role the faces read plus the two content
+/// counts the ladder reads (declared services, mesh rules).
+const agent = (
+  role: AgentRoleDto,
+  opts: { services?: number; rules?: number } = {},
+): ManifestSummaryDto["agents"][number] => ({
+  node: "web",
+  workspace: "main",
+  role,
+  transport: null,
+  services: Array.from({ length: opts.services ?? 0 }, (_, i) => ({
+    id: `svc-${i}`,
+    address: "127.0.0.1:9000",
+  })),
+  mesh_ingress: Array.from({ length: opts.rules ?? 0 }, (_, i) => ({
+    name: `in-${i}`,
+    listen: "127.0.0.1:9001",
+    protocol: "tcp" as const,
+    target_agent: "web",
+    remote_addr: "10.0.0.1:9002",
+    idle_timeout_secs: null,
+  })),
+  mesh_egress: [],
+});
 
 const baseInput = () => ({
   t,
@@ -16,14 +38,14 @@ const baseInput = () => ({
   loaded: true,
   parseError: null,
   issues: [] as string[],
-  agents: agents(1),
-  meshAgents: agents(1),
+  agents: [agent("mesh", { rules: 1 })],
   dirty: false,
   changeState: { kind: "applied", generation: 3 } as ChangeStateDto,
   onChooseManifest: vi.fn(),
   onOpenManifest: vi.fn(),
   onIssueNode: vi.fn(),
   onAddStream: vi.fn(),
+  onDeclareService: vi.fn(),
   onSave: vi.fn(),
   onApply: vi.fn(),
 });
@@ -53,8 +75,7 @@ describe("buildNextSteps — the two no-document failure classes", () => {
     const steps = buildNextSteps({
       ...input,
       loaded: false,
-      agents: agents(0),
-      meshAgents: agents(0),
+      agents: [],
     });
     expect(steps).toHaveLength(1);
     expect(steps[0].text).toContain("overview.stepLoad");
@@ -63,22 +84,32 @@ describe("buildNextSteps — the two no-document failure classes", () => {
 });
 
 describe("buildNextSteps — the loaded ladder", () => {
-  it("walks issues → first node → first stream → save → apply in order, wiring each action", () => {
+  it("walks issues → first node → first stream → save → apply in order, wiring each action with its label", () => {
     const input = baseInput();
     const steps = buildNextSteps({
       ...input,
       issues: ["no hub", "no route"],
-      agents: agents(0),
-      meshAgents: agents(0),
+      agents: [agent("mixed")],
       dirty: true,
       changeState: null,
     });
-    expect(steps.map((s) => s.done)).toEqual([false, false, false, false, false]);
+    // The declared mixed agent completes the first-node step and lights
+    // both content faces; the content itself is still missing.
+    expect(steps.map((s) => s.done)).toEqual([false, true, false, false, false, false]);
     expect(steps[0].action).toBe(input.onOpenManifest);
-    expect(steps[1].action).toBe(input.onIssueNode);
+    expect(steps[1].action).toBeUndefined();
     expect(steps[2].action).toBe(input.onAddStream);
-    expect(steps[3].action).toBe(input.onSave);
-    expect(steps[4].action).toBe(input.onApply);
+    expect(steps[3].action).toBe(input.onDeclareService);
+    expect(steps[4].action).toBe(input.onSave);
+    expect(steps[5].action).toBe(input.onApply);
+    expect(steps.map((s) => s.actionLabel)).toEqual([
+      "overview.editManifestAction",
+      undefined,
+      "overview.go",
+      "overview.go",
+      "manifest.save",
+      "dep.publish",
+    ]);
   });
 
   it("marks everything done for a valid, applied deployment (no actions left)", () => {
@@ -86,6 +117,111 @@ describe("buildNextSteps — the loaded ladder", () => {
     expect(steps.map((s) => s.done)).toEqual([true, true, true, true, true]);
     expect(steps.every((s) => s.action === undefined)).toBe(true);
     expect(steps[4].text).toContain("overview.stepApplied");
+  });
+
+  it("a loaded document with semantic issues walks the ISSUES step — never the syntax branch (the OverviewView masquerade regression)", () => {
+    const input = baseInput();
+    const steps = buildNextSteps({ ...input, issues: ["no hub declared"] });
+    expect(steps[0].text).toContain("overview.stepIssues");
+    expect(steps[0].text).toContain("no hub declared");
+    expect(steps[0].text).not.toContain("overview.stepFixSyntax");
+    expect(steps[0].action).toBe(input.onOpenManifest);
+    expect(steps).toHaveLength(5); // the ladder continues past issues
+  });
+});
+
+describe("buildNextSteps — the content steps follow the deployment's shape", () => {
+  it("a mesh deployment keeps the stream step and shows no service step", () => {
+    const input = baseInput();
+    const steps = buildNextSteps({ ...input, agents: [agent("mesh")] });
+    const texts = steps.map((s) => s.text);
+    expect(texts).toContain(t("overview.stepFirstStream"));
+    expect(texts).not.toContain(t("overview.stepFirstService"));
+    const stream = steps.find((s) => s.text === t("overview.stepFirstStream"))!;
+    expect(stream.done).toBe(false);
+    expect(stream.action).toBe(input.onAddStream);
+  });
+
+  it("an expose deployment swaps the stream step for the service step — the un-completable step never hangs", () => {
+    const input = baseInput();
+    const steps = buildNextSteps({ ...input, agents: [agent("expose")] });
+    const texts = steps.map((s) => s.text);
+    expect(texts).not.toContain(t("overview.stepFirstStream"));
+    expect(texts).toContain(t("overview.stepFirstService"));
+    const service = steps.find((s) => s.text === t("overview.stepFirstService"))!;
+    expect(service.done).toBe(false);
+    expect(service.action).toBe(input.onDeclareService);
+  });
+
+  it("the steps complete on their own declared content (services; mesh rules)", () => {
+    const steps = buildNextSteps({
+      ...baseInput(),
+      agents: [agent("expose", { services: 1 }), agent("mesh", { rules: 1 })],
+    });
+    const byText = (key: string) => steps.find((s) => s.text === t(key))!;
+    expect(byText("overview.stepFirstService").done).toBe(true);
+    expect(byText("overview.stepFirstStream").done).toBe(true);
+  });
+
+  it("a mixed deployment shows both content steps, stream first (the nav's order)", () => {
+    const steps = buildNextSteps({ ...baseInput(), agents: [agent("mixed")] });
+    const texts = steps.map((s) => s.text);
+    expect(texts).toHaveLength(6);
+    expect(texts.indexOf(t("overview.stepFirstNode"))).toBeLessThan(texts.indexOf(t("overview.stepFirstStream")));
+    expect(texts.indexOf(t("overview.stepFirstStream"))).toBeLessThan(texts.indexOf(t("overview.stepFirstService")));
+    expect(texts.indexOf(t("overview.stepFirstService"))).toBeLessThan(texts.indexOf(t("overview.stepSave")));
+  });
+
+  it("zero agents leave the face undetermined — only the first-node step shows, claiming nothing else", () => {
+    const input = baseInput();
+    const steps = buildNextSteps({ ...input, agents: [] });
+    const texts = steps.map((s) => s.text);
+    expect(texts).not.toContain(t("overview.stepFirstStream"));
+    expect(texts).not.toContain(t("overview.stepFirstService"));
+    expect(texts).toHaveLength(4); // issues → first node → save → apply
+    expect(steps[1].action).toBe(input.onIssueNode);
+    expect(steps[1].actionLabel).toBe("dep.overview.issueNode");
+  });
+});
+
+describe("buildNextSteps — the ghost-button invariant", () => {
+  it("every not-done step with an action carries its label — an empty-label pill never renders", () => {
+    const steps = buildNextSteps({
+      ...baseInput(),
+      issues: ["no hub"],
+      agents: [agent("mixed")],
+      dirty: true,
+      changeState: null,
+    });
+    const acting = steps.filter((s) => s.action !== undefined && !s.done);
+    expect(acting.length).toBeGreaterThan(0);
+    for (const step of acting) {
+      expect(step.actionLabel, `step "${step.text}" has an action but no label`).toBeTruthy();
+    }
+  });
+
+  it("an omitted callback renders no action at all", () => {
+    const steps = buildNextSteps({
+      ...baseInput(),
+      onChooseManifest: undefined,
+      onOpenManifest: undefined,
+      onIssueNode: undefined,
+      onAddStream: undefined,
+      onDeclareService: undefined,
+      onSave: undefined,
+      onApply: undefined,
+      issues: ["no hub"],
+      agents: [agent("mixed")],
+      dirty: true,
+      changeState: null,
+    });
+    expect(steps.every((s) => s.action === undefined)).toBe(true);
+  });
+
+  it("busy disables exactly the save/apply actions (the in-flight no-go is stated, not swallowed)", () => {
+    const steps = buildNextSteps({ ...baseInput(), dirty: true, changeState: null, busy: true });
+    const disabled = steps.filter((s) => s.disabled === true);
+    expect(disabled.map((s) => s.text)).toEqual([t("overview.stepSave"), t("overview.changeUnknown")]);
   });
 });
 

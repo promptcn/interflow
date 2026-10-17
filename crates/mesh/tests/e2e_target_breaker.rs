@@ -148,12 +148,17 @@ async fn open_until_rejected(
     let started = std::time::Instant::now();
     let mut tls = open_inner_tls(inj, sid, target).await;
     let mut probe = [0u8; 1];
-    // Generous budget: on slow shared CI runners the storm's inner-TLS
-    // handshakes starve the rejection round trip far past the sub-second
-    // healthy case (same lesson as the self-heal suite's watchdog budgets;
-    // 8s was observed flaking on a 2vCPU runner, 2026-09-30; 30s then
-    // flaked the same way once the mesh suite grew to 140 e2e — 2026-10-10).
-    let _ = tokio::time::timeout(Duration::from_secs(60), tls.read(&mut probe))
+    // Budget derivation (a function of the test's own timers, not a
+    // number moved until green): the rejecting Close rides
+    // ingress→hub→egress behind this test's own dial storm — the b3 case
+    // bounds a full sequence at < 10s, so intra-test worst case ≈ 10s × 3
+    // isolation margin = 30s. The serialized mesh tier (ci_test_stages.sh
+    // caps --jobs 1 on <= 2-core runners, 2026-10-11 starvation backlog)
+    // is what keeps the derivation valid: cross-test load no longer stacks
+    // on the intra-test storm. The retired 8s→30s→60s ladder was exactly
+    // that stacking — three rounds of moving the threshold instead of
+    // removing the contention.
+    let _ = tokio::time::timeout(Duration::from_secs(30), tls.read(&mut probe))
         .await
         .expect("timed out waiting for the rejecting Close")
         .expect_err("dead target must close the inner stream");

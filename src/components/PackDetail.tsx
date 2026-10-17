@@ -3,23 +3,31 @@ import { ArrowLeft } from "lucide-react";
 import { type DeployPackDto } from "../api";
 import { useT } from "../i18n";
 import {
+  packDistributeSource,
+  packUpdateAction,
+  packUpdateSource,
+  type PackIdentity,
+} from "../lib/packStatus";
+import {
+  Badge,
   Button,
   ConfirmDialog,
   Hint,
   InfoRow,
   Input,
-  Kbd,
   KindBadge,
   PassphraseDialog,
   SectionPanel,
 } from "./ui";
 
-/// One issued pack, one level below the grid. Identity and generation state
-/// up top; the lifecycle actions grouped by intent (distribute / maintain /
-/// destructive) instead of the old five-button wall. Destructive and
-/// secret-asking steps get real dialogs, not window.prompt/confirm.
+/// One identity, one level below the grid. The page speaks the identity's
+/// whole truth: the current material up top, the local node's relation to
+/// it, the distribution surface (the open window when there is one, else
+/// the current material), and the lifecycle actions grouped by intent.
+/// Destructive and secret-asking steps get real dialogs, not
+/// window.prompt/confirm.
 export default function PackDetail({
-  pack,
+  identity,
   busy,
   onBack,
   onUpdateLocal,
@@ -28,14 +36,14 @@ export default function PackDetail({
   onRotate,
   onRevoke,
 }: {
-  pack: DeployPackDto;
+  identity: PackIdentity;
   busy: boolean;
   onBack: () => void;
-  onUpdateLocal: () => void;
+  onUpdateLocal: (pack: DeployPackDto) => void;
   onSeal: (pack: DeployPackDto, target: string, passphrase: string) => Promise<void>;
-  onCopyInstallCommand: () => void;
-  onRotate: () => void;
-  onRevoke: () => void;
+  onCopyInstallCommand: (pack: DeployPackDto) => void;
+  onRotate: (pack: DeployPackDto) => void;
+  onRevoke: (pack: DeployPackDto) => void;
 }) {
   // Seal flow: pick the target file, then ask for the passphrase in a real
   // dialog (the recipient enters the same one on import).
@@ -43,27 +51,27 @@ export default function PackDetail({
   const [revoking, setRevoking] = useState(false);
   const { t } = useT();
 
+  const { current, window } = identity;
+  const distribute = packDistributeSource(identity);
+  const updateSource = packUpdateSource(identity);
+
   const pickSealTarget = async () => {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const target = await save({
-      title: t("packDetail.sealAs", { name: pack.dir_name }),
-      defaultPath: `${pack.dir_name}.iflowpack`,
+      title: t("packDetail.sealAs", { name: distribute.dir_name }),
+      defaultPath: `${distribute.dir_name}.iflowpack`,
     });
     if (typeof target === "string") setSealTarget(target);
   };
 
-  // Same rule as the overview grid: a higher generation OR a different
-  // content digest means the dist pack differs from what the local node
-  // runs (a re-applied manifest re-renders the same generation with new
-  // content).
-  const updateAvailable =
-    !!pack.local_node &&
-    (pack.local_node.generation < pack.generation || pack.local_node.digest !== pack.digest);
+  // Same rule as the overview grid (packUpdateAction): generations move
+  // forward only — a lower generation is a downgrade and renders NO action
+  // at all, not even the reinstall branch (that door was the bug's second
+  // face: the button relabeled but still downgraded on click).
+  const action = packUpdateAction(updateSource);
 
   const updateTitle =
-    updateAvailable && (pack.local_node?.generation ?? 0) >= pack.generation
-      ? t("pack.updateTitleContent")
-      : t("pack.updateTitle");
+    action === "content" ? t("pack.updateTitleContent") : t("pack.updateTitle");
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto">
@@ -71,67 +79,93 @@ export default function PackDetail({
         <Button variant="link" size="sm" onClick={onBack}>
           <ArrowLeft className="size-4" />
           {t("packDetail.backPacks")}
-          <Kbd>Esc</Kbd>
         </Button>
-        <h2 className="m-0 text-xl font-semibold">{pack.dir_name}</h2>
-        <KindBadge kind={pack.kind} />
+        <h2 className="m-0 text-xl font-semibold">{current.node}</h2>
+        <KindBadge kind={current.kind} />
+        {window && (
+          <Hint text={current.local_node ? t("pack.windowUpdateTitle") : t("pack.windowDistributeTitle")}>
+            <Badge tone="accent">
+              {t(current.local_node ? "pack.windowUpdateBadge" : "pack.windowDistributeBadge", {
+                gen: window.generation,
+              })}
+            </Badge>
+          </Hint>
+        )}
       </div>
 
       <div className="flex min-h-0 flex-col gap-3">
         <SectionPanel
           title={t("packDetail.identity")}
-          hint={t("packDetail.fromPath", { path: pack.path })}
+          hint={t("packDetail.fromPath", { path: current.path })}
         >
           <InfoRow label={t("packDetail.principal")}>
-            <Hint text={pack.principal}>
-              <Input value={pack.principal} readOnly />
+            <Hint text={identity.principal}>
+              <Input value={identity.principal} readOnly />
             </Hint>
           </InfoRow>
           <InfoRow label={t("packDetail.generation")}>
             <span className="text-small text-fg-3">
-              {t("pack.genExpires", { gen: pack.generation, expires: pack.expires })}
+              {t("pack.genExpires", { gen: current.generation, expires: current.expires })}
             </span>
           </InfoRow>
-          {pack.local_node && (
+          {current.local_node && (
             <InfoRow label={t("packDetail.localNode")}>
-              <span className="text-small text-fg-3">{pack.local_node.name}</span>
+              <span className="text-small text-fg-3">{current.local_node.name}</span>
             </InfoRow>
           )}
         </SectionPanel>
 
-        {pack.local_node && (
+        {current.local_node && (
           <SectionPanel title={t("packDetail.localNode")}>
-            <div className="flex flex-wrap gap-2">
-              <Hint text={updateTitle}>
-                <Button
-                  variant={updateAvailable ? "primary" : "secondary"}
-                  disabled={busy}
-                  onClick={onUpdateLocal}
-                >
-                  {updateAvailable
-                    ? pack.local_node.generation < pack.generation
+            {action === "downgrade" ? (
+              <span className="text-small text-fg-3">
+                {t("pack.downgradeHint", {
+                  local: current.local_node.generation,
+                  pack: updateSource.generation,
+                })}
+              </span>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                <Hint text={updateTitle}>
+                  <Button
+                    variant={action === "reinstall" ? "secondary" : "primary"}
+                    disabled={busy}
+                    onClick={() => onUpdateLocal(updateSource)}
+                  >
+                    {action === "upgrade"
                       ? t("packDetail.updateToGen", {
-                          name: pack.local_node.name,
-                          gen: pack.generation,
+                          name: current.local_node.name,
+                          gen: updateSource.generation,
                         })
-                      : t("packDetail.updateName", { name: pack.local_node.name })
-                    : t("packDetail.reinstallInto", { name: pack.local_node.name })}
-                </Button>
-              </Hint>
-            </div>
+                      : action === "content"
+                        ? t("packDetail.updateName", { name: current.local_node.name })
+                        : t("packDetail.reinstallInto", { name: current.local_node.name })}
+                  </Button>
+                </Hint>
+              </div>
+            )}
           </SectionPanel>
         )}
 
         <SectionPanel title={t("packDetail.distribute")}>
+          <InfoRow label={t("packDetail.distributeFrom")}>
+            <Hint text={distribute.path}>
+              <span className="truncate font-mono text-small text-fg-3">
+                {distribute.dir_name} · gen {distribute.generation}
+              </span>
+            </Hint>
+          </InfoRow>
           <div className="flex flex-wrap gap-2">
             <Button onClick={() => void pickSealTarget()}>{t("packDetail.sealButton")}</Button>
-            <Button onClick={onCopyInstallCommand}>{t("packDetail.copyInstall")}</Button>
+            <Button onClick={() => onCopyInstallCommand(distribute)}>
+              {t("packDetail.copyInstall")}
+            </Button>
           </div>
         </SectionPanel>
 
         <SectionPanel title={t("packDetail.maintenance")}>
           <div className="flex flex-wrap gap-2">
-            <Button disabled={busy} onClick={onRotate}>
+            <Button disabled={busy} onClick={() => onRotate(current)}>
               {t("packDetail.rotate")}
             </Button>
             <Button variant="danger" onClick={() => setRevoking(true)}>
@@ -143,7 +177,7 @@ export default function PackDetail({
 
       {sealTarget !== null && (
         <PassphraseDialog
-          title={t("packDetail.sealTitle", { name: pack.dir_name })}
+          title={t("packDetail.sealTitle", { name: distribute.dir_name })}
           description={t("packDetail.sealDesc")}
           confirmLabel={t("packDetail.sealConfirm")}
           generate
@@ -151,21 +185,21 @@ export default function PackDetail({
           onConfirm={async (passphrase) => {
             const target = sealTarget;
             setSealTarget(null);
-            await onSeal(pack, target, passphrase);
+            await onSeal(distribute, target, passphrase);
           }}
         />
       )}
 
       {revoking && (
         <ConfirmDialog
-          title={t("packDetail.revokeTitle", { name: pack.dir_name })}
+          title={t("packDetail.revokeTitle", { name: current.node })}
           message={t("packDetail.revokeMessage")}
           confirmLabel={t("packDetail.revokeConfirm")}
           danger
           onClose={() => setRevoking(false)}
           onConfirm={() => {
             setRevoking(false);
-            onRevoke();
+            onRevoke(current);
           }}
         />
       )}

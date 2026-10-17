@@ -1,7 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
-import { api } from "./api";
+import { api, type GuiPrefsDto } from "./api";
 import { I18nProvider, type Lang } from "./i18n";
 import { initTheme } from "./theme";
 import "./theme.css";
@@ -13,8 +13,10 @@ import "./theme.css";
 async function boot() {
   initTheme();
   let initialLang: Lang = "en";
+  let loadedPrefs: GuiPrefsDto | null = null;
   try {
-    initialLang = (await api.guiPrefsLoad()).language;
+    loadedPrefs = await api.guiPrefsLoad();
+    initialLang = loadedPrefs.language;
   } catch {
     // Default stands.
   }
@@ -26,7 +28,10 @@ async function boot() {
         // Also rebuilds the Rust-rendered tray; a persist failure keeps
         // the session's choice live.
         persist={(lang) => {
-          api.guiPrefsSave(lang).catch((e) => console.error("failed to persist language:", e));
+          const prefs = loadedPrefs ?? { language: lang, current_deployment: null };
+          api
+            .guiPrefsSave({ ...prefs, language: lang })
+            .catch((e) => console.error("failed to persist language:", e));
         }}
       >
         <App />

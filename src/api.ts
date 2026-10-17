@@ -12,7 +12,7 @@ import type {
   AddNodeParams,
   DeployContextDto,
   EditActionDto,
-  GuiLanguageDto,
+  GuiPrefsDto,
   IssueNodeParams,
   ListenerStatusDto,
   LogLine,
@@ -37,10 +37,19 @@ export type {
   ChangeStateDto,
   CreateNodeDto,
   CredentialHealthDto,
+  DeploymentDto,
   DeployContextDto,
   DeployPackDto,
   EditActionDto,
   EditedManifestDto,
+  FleetDto,
+  FleetNodeDto,
+  LocalFaceDto,
+  PublishKindDto,
+  PublishResultDto,
+  ServiceFaceDto,
+  StreamDto,
+  StreamStatusDto,
   GuiLanguageDto,
   GuiPrefsDto,
   HubAgentRowDto,
@@ -116,8 +125,8 @@ export const api = {
   deployMeshTemplate: (params: MeshTemplateParams) =>
     unwrap(commands.deployMeshTemplate(params)),
   deployReadText: (path: string) => unwrap(commands.deployReadText(path)),
-  deployWriteText: (path: string, text: string) =>
-    unwrap(commands.deployWriteText(path, text)),
+  deployWriteText: (path: string, text: string, expectedDigest: string | null) =>
+    unwrap(commands.deployWriteText(path, text, expectedDigest)),
   // The deployments root (one deployment = one realm-named folder under
   // it, fixed inner layout interflow.toml/issuer/dist) — placeholders and
   // the create flow's starting folder.
@@ -170,9 +179,24 @@ export const api = {
     unwrap(commands.deploySealToDownloads(packDir, passphrase)),
   deployPrefsLoad: () => unwrap(commands.deployPrefsLoad()),
   deployPrefsSave: (recent: DeployContextDto[]) => unwrap(commands.deployPrefsSave(recent)),
-  // GUI-wide preferences (interface language — shared with the tray).
+  // GUI-wide preferences (interface language + the current deployment —
+  // shared with the tray). The prefs object round-trips whole so a
+  // language switch never drops the remembered deployment.
   guiPrefsLoad: () => unwrap(commands.guiPrefsLoad()),
-  guiPrefsSave: (language: GuiLanguageDto) => unwrap(commands.guiPrefsSave(language)),
+  guiPrefsSave: (prefs: GuiPrefsDto) => unwrap(commands.guiPrefsSave(prefs)),
+  // Deployment-as-root-object (2026-10-11 IA): discovery, the composed
+  // fleet read model, and the one-click publish orchestration.
+  deploymentList: () => unwrap(commands.deploymentList()),
+  deploymentCurrent: () => unwrap(commands.deploymentCurrent()),
+  deploymentSetCurrent: (root: string) => unwrap(commands.deploymentSetCurrent(root)),
+  fleetOverview: (manifest: string, issuer: string, includeHub: boolean) =>
+    unwrap(commands.fleetOverview(manifest, issuer, includeHub)),
+  deploymentPublish: (
+    manifest: string,
+    issuer: string,
+    out: string,
+    manifestText: string | null,
+  ) => unwrap(commands.deploymentPublish(manifestText, manifest, issuer, out)),
 };
 
 /// Listeners resolve to an unlisten fn (App keeps them for cleanup).

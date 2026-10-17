@@ -117,6 +117,17 @@ pub struct AgentConfig {
     /// `[transport]` (see [`crate::config::transport`]).
     #[serde(default)]
     pub transport: AgentTransportConfig,
+    /// The supervisor's out-of-tree liveness probe tuning — the last line of
+    /// death detection (see [`crate::agent::client`]'s probe docs). Defaults
+    /// keep the probe a pure backstop: worst-case demanding-tier detection ≈
+    /// `demand_every + strikes × (tick + demand_deadline)` ≈ 105–135s,
+    /// strictly above every in-tree sensor. Compressing these timers is
+    /// primarily a test-assembly concern (the e2e lifecycle matrix's
+    /// clock-compression discipline: waits must derive from the timers the
+    /// test itself configures); an operator lowering them accepts a probe
+    /// that can race ahead of the in-tree death lines.
+    #[serde(default)]
+    pub liveness_probe: LivenessProbeConfig,
     /// The signed-policy plane: when present, [`crate::agent::AgentClient`]'s
     /// start path runs the policy watcher intrinsically (the node-local
     /// `state/policy` channel + the hub's control-plane conditional pull,
@@ -127,6 +138,18 @@ pub struct AgentConfig {
     /// watcher and the one that forgot shipped silently
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyPlaneConfig>,
+    /// The expose face's node-side address table. Present exactly on
+    /// expose agents (the client installs it with the pack defaults +
+    /// machine preferences); its presence switches the policy watcher to
+    /// the service derivation — egress rules come from the policy's
+    /// service list × this table's resolution instead of the mesh tables.
+    /// Shared with the embedder: the write end is the live override
+    /// channel (the GUI's address edit), the read end re-derives on every
+    /// policy generation AND every override change. Never serialized —
+    /// it is runtime state riding a config struct (AgentConfig is
+    /// program-memory only; no file schema to grow).
+    #[serde(skip)]
+    pub service_addresses: Option<crate::config::ServiceAddresses>,
     /// Logging.
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -143,6 +166,72 @@ pub struct AgentConfig {
 pub struct PolicyPlaneConfig {
     /// The credential pack directory.
     pub pack_dir: std::path::PathBuf,
+}
+
+/// Out-of-tree liveness probe tuning (the supervisor-frame backstop of
+/// death detection — the monitor must not share fate with the monitored).
+///
+/// Every value is in **seconds**. The defaults are the production tuning
+/// (15s passive tick / 30s demanding cadence / 15s hard deadline / 3
+/// strikes); the e2e lifecycle matrix compresses them at assembly time so
+/// detection-latency assertions derive from the timers the test itself
+/// configures instead of multi-minute wall clocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LivenessProbeConfig {
+    /// Passive-tier tick: how often the probe reads the transport backend's
+    /// task-independent receive ledger (a wedged task tree shows up as a
+    /// frozen ledger).
+    #[serde(default = "default_probe_tick_secs")]
+    pub tick_secs: u64,
+    /// Demanding-tier cadence: one answer-required roundtrip per this
+    /// interval, always on. Note the roundtrip's own deadline is awaited
+    /// inline, so a deadline larger than this cadence simply stretches the
+    /// effective cadence to the deadline.
+    #[serde(default = "default_probe_demand_every_secs")]
+    pub demand_every_secs: u64,
+    /// Hard deadline for one demanding roundtrip — independent of the
+    /// transport backend's internal timers.
+    #[serde(default = "default_probe_demand_deadline_secs")]
+    pub demand_deadline_secs: u64,
+    /// Consecutive unanswered demands before the death verdict.
+    #[serde(default = "default_probe_demand_strikes")]
+    pub demand_strikes: u32,
+}
+
+impl Default for LivenessProbeConfig {
+    fn default() -> Self {
+        Self {
+            tick_secs: default_probe_tick_secs(),
+            demand_every_secs: default_probe_demand_every_secs(),
+            demand_deadline_secs: default_probe_demand_deadline_secs(),
+            demand_strikes: default_probe_demand_strikes(),
+        }
+    }
+}
+
+/// Passive-tier tick default: aligned with the default heartbeat interval
+/// (worst-case passive detection = budget + one tick).
+const fn default_probe_tick_secs() -> u64 {
+    15
+}
+
+/// Demanding-tier cadence default (answer-required roundtrip every 30s).
+const fn default_probe_demand_every_secs() -> u64 {
+    30
+}
+
+/// Demanding roundtrip hard deadline default.
+const fn default_probe_demand_deadline_secs() -> u64 {
+    15
+}
+
+/// Consecutive unanswered demands before the verdict default. Worst-case
+/// detection ≈ 105–135s at the defaults — the same order as the h2 poll
+/// watchdog and above the in-tree 75s stall line, keeping the probe a pure
+/// backstop rather than a racing sensor.
+const fn default_probe_demand_strikes() -> u32 {
+    3
 }
 
 /// Agent-side transport tuning: h2 keepalive plus the QUIC endpoint
@@ -189,7 +278,9 @@ impl Default for AgentConfig {
             tls: None,
             inner_tls: InnerTlsConfig::default(),
             transport: AgentTransportConfig::default(),
+            liveness_probe: LivenessProbeConfig::default(),
             policy: None,
+            service_addresses: None,
             logging: LoggingConfig::default(),
         }
     }

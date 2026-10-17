@@ -343,3 +343,106 @@ fn revoke_then_rotate_embeds_the_deny_list_snapshot() {
         "a missing offline snapshot fails loud: {err}"
     );
 }
+
+/// The apply gate's trust-freshness probe (2026-10-13 fix): a revoke that
+/// moved the deny list after the packs rendered must break the no-op —
+/// "already applied" is also a claim about the trust face. The second
+/// apply re-renders every pack so `trust/crls/` picks the deny list up;
+/// the third converges back to a true no-op.
+#[test]
+fn revoke_then_apply_rerenders_the_trust_snapshot() {
+    let dir = tempfile::tempdir().expect("tempdir").keep();
+    let (manifest, issuer, _) = apply(&dir);
+    let gen1 = dir.join("dist/packs/agent-desktop");
+
+    // Revoke without --manifest: the hub push is skipped with an honest
+    // note, and the next hint names the real remaining path.
+    let revoked = run_ok(&[
+        "revoke",
+        "--issuer",
+        &issuer,
+        "--pack",
+        &gen1.display().to_string(),
+        "--reason",
+        "superseded",
+    ]);
+    assert!(
+        revoked.stdout.contains("no --manifest given"),
+        "the skipped push is narrated: {}",
+        revoked.stdout
+    );
+    assert!(
+        revoked.stdout.contains("plan apply"),
+        "the next hint names the gate-sensed path: {}",
+        revoked.stdout
+    );
+
+    let out = dir.join("dist").display().to_string();
+
+    // The gate: revoke moved the deny list, so the manifest-unchanged
+    // branch must NOT answer "nothing to do".
+    let second = run_ok(&[
+        "plan",
+        "apply",
+        "--manifest",
+        &manifest,
+        "--issuer",
+        &issuer,
+        "--out",
+        &out,
+    ]);
+    assert!(
+        !second.stdout.contains("nothing to do"),
+        "a moved deny list breaks the no-op: {}",
+        second.stdout
+    );
+    assert!(
+        second.stdout.contains("stale trust snapshot"),
+        "the probe's narration: {}",
+        second.stdout
+    );
+    assert!(
+        second.stdout.contains("embedded revocation snapshot"),
+        "the re-render embeds the fresh CRLs: {}",
+        second.stdout
+    );
+
+    // The re-rendered pack's embedded snapshot covers the revoked serial —
+    // the semantic comparison the gate performs, verified end to end.
+    let list: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("issuer/revocations.json")).unwrap(),
+    )
+    .unwrap();
+    let serial = list["entries"][0]["serial"].as_str().unwrap().to_owned();
+    let stem = list["entries"][0]["issuer"]
+        .as_str()
+        .unwrap()
+        .replace('/', "-");
+    let crl = std::fs::read_to_string(dir.join(format!(
+        "dist/packs/agent-desktop/trust/crls/{stem}.crl.pem"
+    )))
+    .unwrap();
+    assert_eq!(
+        interflow_identity::revocation::crl_revokes_serial(&crl, &serial).unwrap(),
+        Some(true),
+        "the re-rendered snapshot revokes the recorded serial"
+    );
+
+    // Convergence: with the tree in sync again, the third apply is a true
+    // no-op.
+    let third = run_ok(&[
+        "plan",
+        "apply",
+        "--manifest",
+        &manifest,
+        "--issuer",
+        &issuer,
+        "--out",
+        &out,
+    ]);
+    assert!(
+        third.stdout.contains("nothing to do"),
+        "the fresh tree converges back to no-op: {}",
+        third.stdout
+    );
+}

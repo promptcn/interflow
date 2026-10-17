@@ -225,11 +225,32 @@ pub fn build_tls_plane(
     roots: &[TenantTrustRoot],
     min_version: crate::tls::TlsMinVersion,
 ) -> Result<TlsPlane> {
+    build_tls_plane_with_acceptor_crls(cert_path, key_path, roots, &[], min_version)
+}
+
+/// [`build_tls_plane`] with CRLs attached to the HANDSHAKE acceptor (in
+/// addition to the per-tenant derivation verifiers, which always carry
+/// their own CRLs through [`TenantTrustRoot`]).
+///
+/// The hot-reload writer's entry point: a swapped plane built this way
+/// rejects revoked credentials at the handshake itself, while the per-
+/// tenant derivation keeps enforcing whatever CRLs each root carries.
+/// The all-or-nothing rule (every tenant must have a CRL, else pass an
+/// empty slice) lives with the builder — see
+/// [`super::server::build_mtls_server_config_with_roots_and_crls`].
+pub fn build_tls_plane_with_acceptor_crls(
+    cert_path: &str,
+    key_path: &str,
+    roots: &[TenantTrustRoot],
+    acceptor_crls: &[CertificateRevocationListDer<'static>],
+    min_version: crate::tls::TlsMinVersion,
+) -> Result<TlsPlane> {
     let verifier = Arc::new(TenantVerifier::new(roots)?);
-    let config = std::sync::Arc::new(super::server::build_mtls_server_config_with_roots(
+    let config = std::sync::Arc::new(super::server::build_mtls_server_config_with_roots_and_crls(
         cert_path,
         key_path,
         &verifier.merged_roots(),
+        acceptor_crls,
         min_version,
     )?);
     Ok(TlsPlane {

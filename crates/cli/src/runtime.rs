@@ -11,6 +11,7 @@
 //! concrete values into engine types — the topology-default resolution that
 //! used to live here moved into the renderer.
 
+use crate::outln;
 use interflow_core::error::{InterflowError, Result};
 use interflow_core::security::{ProxyProtocolConfig, ProxyProtocolMode, XffMode};
 use interflow_expose::edge::{
@@ -177,7 +178,7 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
         &std::collections::BTreeMap::new(),
     )?;
     let mut handle = interflow_expose::client::start(&args)?;
-    println!(
+    outln!(
         "agent {} started: {} service(s) → {}",
         pack.metadata.node,
         pack.node_config.services.len(),
@@ -395,6 +396,19 @@ pub fn build_edge_config(
         public_tls,
         control_dispatch_host: pack.node_config.control_dispatch_host.clone(),
         identity_offline: pack.metadata.identity_mode == IdentityMode::Offline,
+        // The signed-policy plane, mirroring the mesh hub's wiring: the
+        // trust bundle's policy key, the node-local update channel, the
+        // pack's embedded snapshot, and the authoritative floor — the
+        // control endpoint serves policy to agents, accepts publications
+        // when reachable, and the edge hot-swaps routes on verified
+        // generations (2026-10-10 expose hot channel).
+        policy: Some(interflow_mesh::config::PolicyAdminConfig {
+            verifier_key_hex: Some(pack.trust.metadata.policy_key.clone()),
+            state_policy_dir: Some(pack_dir.join("state").join("policy")),
+            embedded_policy_dir: Some(pack_dir.join("policy")),
+            generation: pack.policy.generation,
+            pack_dir: Some(pack_dir.to_path_buf()),
+        }),
         ..EdgeConfig::default()
     })
 }
@@ -431,10 +445,12 @@ pub fn build_agent_args(
         .map_err(pack_error)?;
     let control_anchor = trust_dir.join("control.crt");
     let ingress_anchor = trust_dir.join(format!("workspace-{workspace}.crt"));
-    let services = resolve_local_services(&pack.node_config.services, service_overrides)?;
+    let service_addresses =
+        resolve_service_addresses(&pack.node_config.services, service_overrides)?;
     Ok(interflow_expose::client::ExposeArgs {
         log_name: None,
-        services,
+        service_addresses,
+        pack_dir: Some(pack_dir.to_path_buf()),
         hub_url: normalize_endpoint(&pack.metadata.control_endpoint),
         agent_id: pack.metadata.node.clone(),
         client_cert: Some(cert.display().to_string()),
@@ -447,46 +463,49 @@ pub fn build_agent_args(
     })
 }
 
-/// Resolves each declared service to its effective dial target: a
-/// machine-local preference wins, the pack default (`node.toml`) fills the
-/// rest. Strict `SocketAddr` parsing — never string surgery on `:` — with
-/// the service id and the value's origin in the error. Overrides for ids
-/// the pack no longer declares are ignored with a warning (the pack is the
-/// source of truth for the service set; rotate may drop services).
-fn resolve_local_services(
+/// Builds the node-side address table: one default per declared service
+/// (`node.toml`), the machine's preferences as overrides. Strict
+/// `SocketAddr` parsing — never string surgery on `:` — with the service
+/// id and the value's origin in the error. Preferences for ids the pack
+/// does not declare are KEPT (with a note): the signed policy may hot-add
+/// that service later, and the preference should apply on arrival.
+fn resolve_service_addresses(
     declared: &[interflow_identity::pack::NodeService],
     overrides: &std::collections::BTreeMap<String, String>,
-) -> Result<Vec<interflow_expose::client::LocalService>> {
-    for id in overrides.keys() {
+) -> Result<interflow_mesh::config::ServiceAddresses> {
+    let mut defaults = Vec::with_capacity(declared.len());
+    for service in declared {
+        let addr: SocketAddr = service.address.parse().map_err(|e| {
+            InterflowError::config(format!(
+                "service {:?} has an invalid default address {:?} (pack default) — expected \
+                 <ip>:<port> (e.g. 127.0.0.1:3000)",
+                service.id, service.address
+            ))
+            .with_source(e)
+        })?;
+        defaults.push((service.id.clone(), addr));
+    }
+    let mut table = Vec::with_capacity(overrides.len());
+    for (id, raw) in overrides {
         if !declared.iter().any(|s| &s.id == id) {
             tracing::warn!(
-                "ignoring address preference for service {id:?} — the pack does not \
-                 declare it (a rotation may have removed it)"
+                "keeping address preference for service {id:?} though the pack does not \
+                 declare it — it applies if the policy hot-adds the service (a rotation may \
+                 also have removed it)"
             );
         }
+        let addr: SocketAddr = raw.parse().map_err(|e| {
+            InterflowError::config(format!(
+                "service {id:?} has an invalid address {raw:?} (local preference) — expected \
+                 <ip>:<port> (e.g. 127.0.0.1:3000)"
+            ))
+            .with_source(e)
+        })?;
+        table.push((id.clone(), addr));
     }
-    declared
-        .iter()
-        .map(|service| {
-            let (raw, origin, overridden) = match overrides.get(&service.id) {
-                Some(address) => (address.as_str(), "local preference", true),
-                None => (service.address.as_str(), "pack default", false),
-            };
-            let target_addr: SocketAddr = raw.parse().map_err(|e| {
-                InterflowError::config(format!(
-                    "service {:?} has an invalid address {raw:?} ({origin}) — expected \
-                     <ip>:<port> (e.g. 127.0.0.1:3000)",
-                    service.id
-                ))
-                .with_source(e)
-            })?;
-            Ok(interflow_expose::client::LocalService {
-                id: service.id.clone(),
-                target_addr,
-                overridden,
-            })
-        })
-        .collect()
+    Ok(interflow_mesh::config::ServiceAddresses::new(
+        defaults, table,
+    ))
 }
 
 /// Unix/Windows shutdown signal with the conventional exit code.
@@ -520,7 +539,8 @@ pub fn normalize_endpoint(endpoint: &str) -> String {
 mod tests {
     use super::{
         NodeEdgeConfig, resolve_acme_http_listen, resolve_control_proxy_protocol,
-        resolve_effective_transport, resolve_local_services, resolve_quic_listen, resolve_xff_mode,
+        resolve_effective_transport, resolve_quic_listen, resolve_service_addresses,
+        resolve_xff_mode,
     };
     use interflow_core::security::{ProxyProtocolMode, XffMode};
     use interflow_identity::pack::NodeService;
@@ -550,34 +570,38 @@ mod tests {
     /// service dials its pack default.
     #[test]
     fn no_overrides_use_pack_defaults() {
-        let services = resolve_local_services(&declared(), &BTreeMap::new()).unwrap();
-        assert_eq!(services[0].id, "web");
-        assert_eq!(services[0].target_addr.port(), 3000);
-        assert_eq!(services[1].id, "api");
-        assert_eq!(services[1].target_addr.port(), 9000);
+        let services = resolve_service_addresses(&declared(), &BTreeMap::new())
+            .unwrap()
+            .resolved();
+        let port_of = |id: &str| {
+            services
+                .iter()
+                .find(|(sid, _, _)| sid == id)
+                .map(|(_, addr, _)| addr.port())
+        };
+        assert_eq!(port_of("web"), Some(3000));
+        assert_eq!(port_of("api"), Some(9000));
         assert!(
-            !services.iter().any(|s| s.overridden),
+            !services.iter().any(|(_, _, overridden)| *overridden),
             "pack defaults are not overrides"
         );
     }
 
     /// A preference replaces only its own service's target — the one-step
-    /// port change this whole feature exists for.
+    /// port change this whole feature exists for (and the LIVE channel's
+    /// input shape since 2026-10-10, not just a startup resolution).
     #[test]
     fn override_replaces_only_its_service() {
-        let services =
-            resolve_local_services(&declared(), &overrides(&[("web", "127.0.0.1:5173")])).unwrap();
-        assert_eq!(services[0].target_addr.port(), 5173);
-        assert!(
-            services[0].overridden,
-            "the origin tag travels with the resolved service"
-        );
-        assert_eq!(
-            services[1].target_addr.port(),
-            9000,
-            "api keeps its default"
-        );
-        assert!(!services[1].overridden);
+        let table =
+            resolve_service_addresses(&declared(), &overrides(&[("web", "127.0.0.1:5173")]))
+                .unwrap();
+        let services = table.resolved();
+        let web = services.iter().find(|(sid, _, _)| sid == "web").unwrap();
+        assert_eq!(web.1.port(), 5173);
+        assert!(web.2, "the origin tag travels with the resolved service");
+        let api = services.iter().find(|(sid, _, _)| sid == "api").unwrap();
+        assert_eq!(api.1.port(), 9000, "api keeps its default");
+        assert!(!api.2);
     }
 
     /// A garbage default now fails loudly naming the service — the old
@@ -586,7 +610,7 @@ mod tests {
     fn invalid_address_fails_naming_the_service_and_origin() {
         let mut services = declared();
         services[0].address = "localhost:3000".into();
-        let err = resolve_local_services(&services, &BTreeMap::new()).unwrap_err();
+        let err = resolve_service_addresses(&services, &BTreeMap::new()).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("web") && msg.contains("pack default"),
@@ -594,21 +618,27 @@ mod tests {
         );
 
         let err =
-            resolve_local_services(&declared(), &overrides(&[("web", "::1:443")])).unwrap_err();
+            resolve_service_addresses(&declared(), &overrides(&[("web", "::1:443")])).unwrap_err();
         assert!(err.to_string().contains("local preference"), "{err}");
     }
 
-    /// Overrides for ids the pack no longer declares are inert (a rotation
-    /// may have removed them); the declared ones still resolve.
+    /// Preferences for ids the pack does not declare are KEPT — the hot
+    /// channel applies them when the policy adds the service later; the
+    /// declared ones still resolve.
     #[test]
-    fn unknown_override_ids_are_ignored() {
-        let services = resolve_local_services(
+    fn unknown_override_ids_are_kept_for_hot_arrival() {
+        let table = resolve_service_addresses(
             &declared(),
             &overrides(&[("gone", "127.0.0.1:1"), ("api", "127.0.0.1:8443")]),
         )
         .unwrap();
-        assert_eq!(services.len(), 2);
-        assert_eq!(services[1].target_addr.port(), 8443);
+        let services = table.resolved();
+        assert_eq!(services.len(), 3, "the undeclared preference rides along");
+        let api = services.iter().find(|(sid, _, _)| sid == "api").unwrap();
+        assert_eq!(api.1.port(), 8443);
+        // It resolves the moment the policy hot-adds the id — with or
+        // without a signed default (the override IS an address).
+        assert_eq!(table.resolve("gone", None).unwrap().port(), 1);
     }
 
     /// A canonical [edge] section: the render-time-resolved values the

@@ -120,6 +120,14 @@ pub fn load_crl(path: &str) -> Result<CertificateRevocationListDer<'static>> {
         .map_err(|e| InterflowError::config(format!("failed to parse CRL {path}")).with_source(e))
 }
 
+/// [`load_crl`] for in-memory PEM text — the live-lane counterpart (the
+/// CRL hot-distribution channel chooses from bytes already read, not from
+/// a path it would re-open).
+pub fn load_crl_from_pem(pem: &str) -> Result<CertificateRevocationListDer<'static>> {
+    CertificateRevocationListDer::from_pem_slice(pem.as_bytes())
+        .map_err(|e| InterflowError::config("failed to parse CRL PEM".to_string()).with_source(e))
+}
+
 /// Builds a `TlsAcceptor` with mTLS enabled (client certificate validation).
 ///
 /// - `cert_path` / `key_path`: the hub server certificate
@@ -164,15 +172,42 @@ pub(crate) fn build_mtls_server_config_with_roots(
     client_roots: &RootCertStore,
     min_version: TlsMinVersion,
 ) -> Result<TlsServerConfig> {
+    build_mtls_server_config_with_roots_and_crls(
+        cert_path,
+        key_path,
+        client_roots,
+        &[],
+        min_version,
+    )
+}
+
+/// [`build_mtls_server_config_with_roots`] with CRLs attached to the
+/// HANDSHAKE verifier — revocation enforced at the mTLS handshake itself,
+/// not only at the post-handshake per-tenant derivation.
+///
+/// The all-or-nothing rule is the caller's: rustls's default
+/// unknown-status policy denies, so the merged-root acceptor may carry
+/// CRLs only when EVERY tenant in the table has one (otherwise a tenant
+/// without a CRL would read as "revocation status unknown" and its chains
+/// would be denied at the handshake). `crls` empty = the plain acceptor.
+pub(crate) fn build_mtls_server_config_with_roots_and_crls(
+    cert_path: &str,
+    key_path: &str,
+    client_roots: &RootCertStore,
+    crls: &[CertificateRevocationListDer<'static>],
+    min_version: TlsMinVersion,
+) -> Result<TlsServerConfig> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
 
-    let verifier =
-        tokio_rustls::rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots.clone()))
-            .build()
-            .map_err(|e| {
-                InterflowError::config("failed to build client verifier".to_string()).with_source(e)
-            })?;
+    let mut verifier_builder =
+        tokio_rustls::rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots.clone()));
+    if !crls.is_empty() {
+        verifier_builder = verifier_builder.with_crls(crls.to_vec());
+    }
+    let verifier = verifier_builder.build().map_err(|e| {
+        InterflowError::config("failed to build client verifier".to_string()).with_source(e)
+    })?;
 
     let mut config =
         TlsServerConfig::builder_with_protocol_versions(min_version.supported_versions())
@@ -253,6 +288,26 @@ pub fn extract_leaf_validity_from_chain(certs: &[CertificateDer]) -> Option<(i64
         validity.not_before.timestamp(),
         validity.not_after.timestamp(),
     ))
+}
+
+/// Extracts the leaf certificate's serial as canonical lowercase hex.
+///
+/// The same spelling `interflow_identity::revocation::cert_serial_hex`
+/// produces (DER leading sign byte stripped) and CRL membership compares
+/// against. The hub-side input for revocation sweeps (the hub sees the
+/// connecting certificate and nothing else); `None` means no certificate /
+/// parse failure, in which case the sweep simply has no input for this
+/// chain.
+pub fn extract_leaf_serial_from_chain(certs: &[CertificateDer]) -> Option<String> {
+    let leaf = certs.first()?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;
+    let serial = parsed.raw_serial();
+    let canonical = if serial.first() == Some(&0) {
+        &serial[1..]
+    } else {
+        serial
+    };
+    Some(hex::encode(canonical))
 }
 
 /// Reads the leaf certificate's subject CN from a PEM file.

@@ -4,6 +4,8 @@
 
 pub mod manifest_edit;
 pub mod node_install;
+pub mod out;
 pub mod plan;
 pub mod render;
 pub mod runtime;
+pub mod stale_exec;

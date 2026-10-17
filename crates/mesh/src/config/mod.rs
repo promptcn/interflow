@@ -8,12 +8,14 @@
 
 pub mod agent;
 pub mod hub;
+pub mod service_addresses;
 pub mod transport;
 pub mod validate;
 
 pub use agent::{
     AgentConfig, AgentInfo, ControlConfig, EgressRule, EgressTarget, IngressRule, InnerTlsConfig,
-    PolicyPlaneConfig, SecurityConfig, TlsConfig as AgentTlsConfig, TransportKind,
+    LivenessProbeConfig, PolicyPlaneConfig, SecurityConfig, TlsConfig as AgentTlsConfig,
+    TransportKind,
 };
 pub use hub::{
     AclConfig, AclRule, AuthConfig, HeartbeatConfig, HubConfig, HubQuicConfig, HubSecurityConfig,
@@ -22,5 +24,6 @@ pub use hub::{
 };
 pub use interflow_core::config::LoggingConfig;
 pub use interflow_core::telemetry::LogFormat;
+pub use service_addresses::ServiceAddresses;
 pub use transport::{AgentQuicConfig, H2TransportConfig};
 pub use validate::{ConfigError, ConfigErrorList, validate_hub};

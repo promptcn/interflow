@@ -1,6 +1,10 @@
-[alias]
-ci = "fmt --all -- --check && clippy --all-targets -- -D warnings && test --all-features"
-lint = "clippy --all-targets -- -D warnings"
+# No [alias] section on purpose: the old `cargo ci` / `cargo lint` aliases
+# were a second, drifting CI definition — they ran libtest (tripping the
+# bare-libtest runtime gate) and skipped the justfile's python guards and
+# _gc-target hook. The justfile is the single source of truth; `just ci`
+# / `just lint`. (Note: cargo aliases cannot shell out — the `!` prefix
+# idea from rust-lang/cargo#7852 never shipped — so delegation aliases are
+# not an option either.)
 
 [build]
 # Pipelined compilation speeds up the build by emitting .rlib early.

@@ -69,7 +69,7 @@ fn bench_expose_rps(c: &mut Criterion) {
 
 mod setup {
     use super::*;
-    use interflow_expose::client::{ExposeArgs, LocalService};
+    use interflow_expose::client::ExposeArgs;
     use interflow_expose::edge::{
         ControlEndpointTls, EdgeConfig, IngressPrincipal, Route, WorkspaceTrust,
     };
@@ -143,11 +143,11 @@ mod setup {
         let (client_cert, client_key) = certs.client_paths();
         let client_args = ExposeArgs {
             log_name: None,
-            services: vec![LocalService {
-                id: "web".into(),
-                target_addr: echo_addr,
-                overridden: false,
-            }],
+            service_addresses: interflow_mesh::config::ServiceAddresses::of(
+                &[("web", echo_addr)],
+                &[],
+            ),
+            pack_dir: None,
             hub_url: format!("https://127.0.0.1:{hub_port}"),
             agent_id: "expose-test".into(),
             client_cert: Some(client_cert.display().to_string()),

@@ -1,12 +1,9 @@
-//! Deploy-pane path persistence: the recent manifest/issuer/out triples.
-//!
-//! A file of its own on purpose — `profile.toml` is owned by the node
-//! manager through snapshot-style load-modify-save, so a deploy section
-//! bolted onto it would be clobbered by the next node mutation. Same
-//! conventions as the profile (structural shape, atomic write, 0600).
+//! Deploy-pane path persistence: the recent manifest/issuer/out triples,
+//! in the GUI's prefs db ([`crate::prefs`], `deploy_recent` table). The
+//! frontend owns dedupe/promotion and the cap; this layer stores the list
+//! most-recent-first, one row per triple.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// One remembered deployment context — the three paths travel as a triple
 /// so switching between deployments (e.g. the expose and mesh faces) is one
@@ -25,58 +22,20 @@ pub struct DeployPrefs {
     pub recent: Vec<DeployContext>,
 }
 
-fn prefs_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|base| base.join("interflow").join("deploy.toml"))
-}
-
-/// Loads the remembered contexts; a missing or unreadable file is simply
-/// empty (paths fall back to their defaults — never worth a dialog).
+/// Loads the remembered contexts; an unreadable db is simply empty (paths
+/// fall back to their defaults — never worth a dialog).
 pub fn load() -> DeployPrefs {
-    let Some(path) = prefs_path() else {
-        return DeployPrefs::default();
-    };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return DeployPrefs::default();
-    };
-    toml::from_str(&raw).unwrap_or_default()
+    match crate::prefs::PrefsDb::open() {
+        Ok(db) => db.deploy(),
+        Err(e) => {
+            tracing::warn!(node = "gui", "deploy prefs unreadable: {e}");
+            DeployPrefs::default()
+        }
+    }
 }
 
-/// Persists the contexts atomically (0600 — config hygiene, same as the
-/// profile).
+/// Persists the contexts (one transaction).
 pub fn save(prefs: &DeployPrefs) -> Result<(), String> {
-    let Some(path) = prefs_path() else {
-        return Err("cannot resolve the user config directory".to_string());
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    let text = toml::to_string_pretty(prefs).map_err(|e| format!("serialize deploy prefs: {e}"))?;
-    interflow_util::atomic_write(
-        &path,
-        text.as_bytes(),
-        interflow_util::WriteMode::PreserveOr(0o600),
-    )
-    .map_err(|e| format!("write {}: {e}", path.display()))
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod tests {
-    use super::*;
-
-    /// Round-trip through the real config-directory shape: structural TOML,
-    /// unknown keys rejected loudly (the profile convention).
-    #[test]
-    fn prefs_round_trip_and_reject_unknown_keys() {
-        let prefs = DeployPrefs {
-            recent: vec![DeployContext {
-                manifest: "~/interflow.toml".into(),
-                issuer: "~/interflow-issuer".into(),
-                out: "~/interflow-dist".into(),
-            }],
-        };
-        let text = toml::to_string_pretty(&prefs).unwrap();
-        assert_eq!(toml::from_str::<DeployPrefs>(&text).unwrap(), prefs);
-        assert!(toml::from_str::<DeployPrefs>("bogus_key = 1\n").is_err());
-    }
+    let mut db = crate::prefs::PrefsDb::open().map_err(|e| e.to_string())?;
+    db.save_deploy(prefs).map_err(|e| e.to_string())
 }

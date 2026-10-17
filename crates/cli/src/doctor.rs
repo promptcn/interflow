@@ -5,6 +5,7 @@
 //! a concrete fix for every ✘.
 
 use clap::Subcommand;
+use interflow_cli::outln;
 use interflow_identity::pack::{CredentialPack, PackKind};
 use interflow_identity::policy::PolicyService;
 use sha2::{Digest, Sha256};
@@ -12,6 +13,8 @@ use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::doctor_link::LinkArgs;
 
 #[derive(Subcommand)]
 pub enum DoctorCommand {
@@ -54,6 +57,19 @@ pub enum DoctorCommand {
         #[arg(long)]
         identity: Option<String>,
     },
+    /// Detect engine processes still running a replaced binary — the
+    /// disk-swap trap (换盘不换进程): `node install` restarts only its own
+    /// unit, so a binary swapped under ANOTHER unit keeps serving the old
+    /// build until someone restarts it. Read-only; run it any time after
+    /// handling binaries by hand.
+    Stale,
+    /// The three-layer link diagnostic — authentication (DNS, TCP/UDP
+    /// split, mTLS, clock), authorization (watermarks, CRL), data plane
+    /// (one real request) — with the handbook's readings attached.
+    Link {
+        #[command(flatten)]
+        args: LinkArgs,
+    },
 }
 
 impl DoctorCommand {
@@ -65,8 +81,88 @@ impl DoctorCommand {
             Self::Route { host, pack } => check_route(&host, &pack),
             Self::Trust { pack } => check_trust(&pack),
             Self::Issuer { dir, identity } => check_issuer_backup(&dir, identity.as_deref()),
+            Self::Stale => check_stale_exec(),
+            Self::Link { args } => args.run(),
         }
     }
+}
+
+/// The disk-swap reading shared by [`Self::Stale`] and `check_node`:
+/// findings are a ✘ with the restart commands as the fix; a clean scan is
+/// a ✔ on Linux and a `·` platform note elsewhere (never a fake clean).
+// Off Linux the section cannot fail (no /proc) — the wrap is for the
+// Linux error path.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+fn stale_disk_section() -> interflow_core::error::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let findings = interflow_cli::stale_exec::detect_stale_engine_processes(
+            std::path::Path::new(interflow_cli::render::ENGINE_BIN_DIR),
+        );
+        if findings.is_empty() {
+            outln!(
+                "✔ every running engine process matches the disk under {}",
+                interflow_cli::render::ENGINE_BIN_DIR
+            );
+            return Ok(());
+        }
+        outln!(
+            "✘ {} engine process(es) still run a replaced binary (binary swapped, process \
+             never restarted):",
+            findings.len()
+        );
+        for finding in &findings {
+            outln!("  · {}", finding.describe());
+        }
+        outln!();
+        outln!("Diagnosis:");
+        outln!(
+            "  replacing a file on disk does nothing to the process already running it — the \
+             kernel keeps the old code mapped until the unit restarts."
+        );
+        outln!(
+            "  `node install` restarts only its own unit, so a binary swapped under another \
+             unit (the edge unit execs interflow-cli; mesh units exec interflow-mesh) keeps \
+             serving the old build."
+        );
+        outln!();
+        outln!("Fix:");
+        let mut targets: Vec<&str> = findings.iter().filter_map(|f| f.restart_target()).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            outln!("  no product unit owns the stale process(es) — restart them by pid.");
+        } else {
+            let commands: Vec<String> = targets
+                .iter()
+                .map(|u| format!("systemctl restart {u}"))
+                .collect();
+            outln!("  {}", commands.join(" && "));
+            outln!(
+                "  (or let the next `node install --restart-units` do it; verify afterwards \
+                 with `interflow-cli doctor stale`)"
+            );
+        }
+        Err(interflow_core::error::InterflowError::config(
+            "engine processes still run a replaced binary",
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        outln!("· disk-swap check: Linux-only (/proc exe scan) — skipped on this platform");
+        Ok(())
+    }
+}
+
+/// `doctor stale` — the standalone disk-swap reading; see
+/// [`DoctorCommand::Stale`].
+fn check_stale_exec() -> interflow_core::error::Result<()> {
+    outln!("Interflow doctor — disk-swap detection (换盘不换进程)");
+    outln!();
+    stale_disk_section()?;
+    outln!();
+    outln!("All checks passed.");
+    Ok(())
 }
 
 /// The issuer store's backup health: configuration → versions → currency →
@@ -78,17 +174,17 @@ fn check_issuer_backup(
     identity: Option<&str>,
 ) -> interflow_core::error::Result<()> {
     use interflow_identity::backup as store_backup;
-    println!("Interflow doctor — issuer store backup");
+    outln!("Interflow doctor — issuer store backup");
     let status = store_backup::status(dir).map_err(interflow_cli::runtime::pack_error)?;
     let Some(cfg) = status.config else {
-        println!(
+        outln!(
             "✘ issuer store {} has no backup configuration",
             dir.display()
         );
-        println!("  every CA key in it exists in exactly one copy — losing the directory");
-        println!("  means re-issuing the entire mesh from a fresh root");
-        println!("Fix:");
-        println!(
+        outln!("  every CA key in it exists in exactly one copy — losing the directory");
+        outln!("  means re-issuing the entire mesh from a fresh root");
+        outln!("Fix:");
+        outln!(
             "  interflow-cli issuer backup init --dir {} (or re-run plan apply)",
             dir.display()
         );
@@ -96,10 +192,10 @@ fn check_issuer_backup(
             "issuer store is not backed up",
         ));
     };
-    println!("✔ backup configured → {}", cfg.backup_dir.display());
+    outln!("✔ backup configured → {}", cfg.backup_dir.display());
     if status.versions.is_empty() {
-        println!("✘ no backup version has landed yet");
-        println!(
+        outln!("✘ no backup version has landed yet");
+        outln!(
             "Fix: interflow-cli issuer backup now --dir {}",
             dir.display()
         );
@@ -107,7 +203,7 @@ fn check_issuer_backup(
             "issuer store backup is configured but empty",
         ));
     }
-    println!(
+    outln!(
         "✔ {} version(s) (newest: {})",
         status.versions.len(),
         status.versions.last().map_or_else(
@@ -119,13 +215,17 @@ fn check_issuer_backup(
         )
     );
     if status.same_device == Some(true) {
-        println!("· backup dir shares the disk with the store — one disk failure takes both;");
-        println!("  point `--backup-dir` at a second medium when you can");
+        outln!("· backup dir shares the disk with the store — one disk failure takes both;");
+        outln!(
+            "  move it to a second medium when you can: interflow-cli issuer backup relocate \
+             --dir {} --backup-dir <second-medium>",
+            dir.display()
+        );
     }
     if !status.newest_is_current {
-        println!("✘ the store changed since the last successful backup");
-        println!("  (a checkpoint failed, or backups were pruned past it)");
-        println!(
+        outln!("✘ the store changed since the last successful backup");
+        outln!("  (a checkpoint failed, or backups were pruned past it)");
+        outln!(
             "Fix: interflow-cli issuer backup now --dir {}",
             dir.display()
         );
@@ -133,7 +233,7 @@ fn check_issuer_backup(
             "issuer store backup is stale",
         ));
     }
-    println!("✔ newest backup matches the current store content");
+    outln!("✔ newest backup matches the current store content");
     if let Some(identity_spec) = identity {
         // Trial-decrypt: the Schrödinger's-backup check — a backup nobody
         // has ever restored from is only presumed good.
@@ -155,55 +255,55 @@ fn check_issuer_backup(
         };
         let report =
             store_backup::verify(newest, &identity).map_err(interflow_cli::runtime::pack_error)?;
-        println!(
+        outln!(
             "✔ drill: newest backup decrypts and parses — {} member(s), {} cert(s), {} key file(s)",
             report.members.len(),
             report.certs.len(),
             report.key_files
         );
     } else {
-        println!("· drill: pass --identity <offline-key-file> to trial-decrypt the newest backup");
+        outln!("· drill: pass --identity <offline-key-file> to trial-decrypt the newest backup");
     }
-    println!("All checks passed.");
+    outln!("All checks passed.");
     Ok(())
 }
 
 fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core::error::Result<()> {
-    println!("Interflow doctor");
+    outln!("Interflow doctor");
     // Load failures are diagnosed in identity terms.
     let pack = match CredentialPack::load_runtime(pack_dir) {
         Ok(pack) => pack,
         Err(e) => {
-            println!(
+            outln!(
                 "✘ Credential Pack at {} failed validation",
                 pack_dir.display()
             );
-            println!();
-            println!("Diagnosis:");
-            println!("  {e}");
-            println!();
-            println!("Fix:");
-            println!("  re-issue with `interflow-cli plan apply` (or `interflow-cli rotate`)");
+            outln!();
+            outln!("Diagnosis:");
+            outln!("  {e}");
+            outln!();
+            outln!("Fix:");
+            outln!("  re-issue with `interflow-cli plan apply` (or `interflow-cli rotate`)");
             return Err(
                 interflow_core::error::InterflowError::config("doctor failed").with_source(e),
             );
         }
     };
     let kind_ok = pack.metadata.kind == expected;
-    println!(
+    outln!(
         "Realm {} · {} {}",
         pack.metadata.realm,
         pack.metadata.kind.as_str(),
         pack.metadata.node
     );
-    println!();
-    println!("✔ Pack digest verified ({})", pack.pack_digest);
+    outln!();
+    outln!("✔ Pack digest verified ({})", pack.pack_digest);
 
     if !kind_ok {
-        println!();
-        println!("Diagnosis: this pack belongs to another node role.");
+        outln!();
+        outln!("Diagnosis: this pack belongs to another node role.");
         let mesh_role = pack.metadata.kind == PackKind::Hub || pack.node_config.mesh.is_some();
-        println!(
+        outln!(
             "Fix: start it with `{}`",
             interflow_cli::render::node_exec_start(
                 pack.metadata.kind,
@@ -218,11 +318,12 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
     let primary = pack
         .primary_identity()
         .map_err(interflow_cli::runtime::pack_error)?;
-    println!(
+    outln!(
         "✔ Identity {} (generation {})",
-        primary.principal, pack.metadata.generation
+        primary.principal,
+        pack.metadata.generation
     );
-    println!("  bootstrap expires {}", pack.metadata.expires);
+    outln!("  bootstrap expires {}", pack.metadata.expires);
     if let Ok(active) =
         interflow_identity::credentials::ActiveCredentialSet::load_or_bootstrap(&pack)
     {
@@ -264,27 +365,27 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
                     .to_string(),
             ),
         };
-        println!("{glyph} Active credentials expire {expiry_text} ({remaining} left{action})");
+        outln!("{glyph} Active credentials expire {expiry_text} ({remaining} left{action})");
         match pack.metadata.registrar_endpoint.as_deref() {
-            Some(endpoint) => println!("  registrar: {endpoint}"),
-            None => println!("  registrar: none (offline tier — rotate manually before expiry)"),
+            Some(endpoint) => outln!("  registrar: {endpoint}"),
+            None => outln!("  registrar: none (offline tier — rotate manually before expiry)"),
         }
     }
-    println!(
+    outln!(
         "  principal URI SAN verified: {}",
         primary.uri_san.as_deref().unwrap_or("(missing)")
     );
-    println!(
+    outln!(
         "✔ Trust bundle verified ({})",
         pack.trust
             .digest()
             .map_err(interflow_cli::runtime::pack_error)?
     );
-    println!(
+    outln!(
         "✔ Runtime policy verified ({} route(s))",
         pack.policy.routes.len()
     );
-    println!("  policy signature verified against the realm policy key");
+    outln!("  policy signature verified against the realm policy key");
     // Role-specific wiring.
     match pack.metadata.kind {
         PackKind::Ingress => {
@@ -292,29 +393,29 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
                 .ingress_identities()
                 .map_err(interflow_cli::runtime::pack_error)?;
             for (workspace, entry) in principals {
-                println!(
+                outln!(
                     "✔ Workspace authorization {workspace} via {}",
                     entry.principal
                 );
             }
             match pack.node_config.public_tls.as_str() {
-                "acme" => println!("✔ Public TLS: automatic ACME (ensure 80/443 reachable)"),
+                "acme" => outln!("✔ Public TLS: automatic ACME (ensure 80/443 reachable)"),
                 "frontend-proxy" => {
-                    println!("✔ Public TLS: frontend proxy (X-Forwarded-For enabled)");
+                    outln!("✔ Public TLS: frontend proxy (X-Forwarded-For enabled)");
                     xff_precheck(&pack)?;
                 }
                 "manual" => {
-                    println!("  note: manual public TLS — certificates are your responsibility");
+                    outln!("  note: manual public TLS — certificates are your responsibility");
                 }
                 _ => {}
             }
         }
         PackKind::Agent => {
             for service in &pack.node_config.services {
-                println!("✔ Service {} at {}", service.id, service.address);
+                outln!("✔ Service {} at {}", service.id, service.address);
             }
             if let Some(mesh) = &pack.node_config.mesh {
-                println!("  hub: {}", mesh.hub_endpoint);
+                outln!("  hub: {}", mesh.hub_endpoint);
                 // Rules display from the AUTHORITATIVE policy face —
                 // node.toml carries dial info only.
                 for rule in pack
@@ -323,9 +424,12 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
                     .iter()
                     .filter(|s| s.source_agent == pack.metadata.node)
                 {
-                    println!(
+                    outln!(
                         "✔ Mesh forward {} listening {} → agent {} at {}",
-                        rule.name, rule.listen, rule.target_agent, rule.remote_addr
+                        rule.name,
+                        rule.listen,
+                        rule.target_agent,
+                        rule.remote_addr
                     );
                 }
                 for offer in pack
@@ -339,35 +443,39 @@ fn check_node(pack_dir: &std::path::Path, expected: PackKind) -> interflow_core:
                         .as_deref()
                         .or(offer.target_addr.as_deref())
                         .unwrap_or("");
-                    println!(
+                    outln!(
                         "✔ Mesh serve {} at {} (offered to peers)",
-                        offer.name, authorization
+                        offer.name,
+                        authorization
                     );
                 }
             }
         }
         PackKind::Hub => {
             if let Some(listen) = &pack.node_config.listen {
-                println!("✔ Hub listening on {listen}");
+                outln!("✔ Hub listening on {listen}");
             }
             // The tenant trust table: every workspace the hub admits.
             for name in pack.trust.metadata.issuers.keys() {
                 if let Some(workspace) = name.strip_prefix("workspace/") {
-                    println!("✔ Admits workspace {workspace} (issuer-anchored)");
+                    outln!("✔ Admits workspace {workspace} (issuer-anchored)");
                 }
             }
-            println!(
+            outln!(
                 "✔ Admission policy: {} signed mesh stream(s)",
                 pack.policy.mesh.len()
             );
             let hub_renewal = pack.identities.get("hub").and_then(|m| m.values().next());
             if let Some(entry) = hub_renewal {
-                println!("✔ Renewal principal {}", entry.principal);
+                outln!("✔ Renewal principal {}", entry.principal);
             }
         }
     }
-    println!();
-    println!("All checks passed.");
+    // The disk-swap reading rides every node check too (read-only; a ✔ on
+    // Linux, a platform note elsewhere).
+    stale_disk_section()?;
+    outln!();
+    outln!("All checks passed.");
     Ok(())
 }
 
@@ -415,60 +523,60 @@ fn xff_precheck(pack: &CredentialPack) -> interflow_core::error::Result<()> {
     let Some(host) = pack.policy.routes.first().map(|r| r.host.clone()) else {
         return Ok(());
     };
-    println!("  XFF precheck (frontend proxy):");
+    outln!("  XFF precheck (frontend proxy):");
     // Probe A — only continue when fail-closed is confirmed armed, otherwise
     // probe B's failure could mean anything.
     let armed = match probe_direct_no_xff(&listen, &host) {
         DirectOutcome::Refused => {
-            println!("    · skipped: nothing listening on {listen} — start the ingress and re-run");
+            outln!("    · skipped: nothing listening on {listen} — start the ingress and re-run");
             return Ok(());
         }
         DirectOutcome::Denied => {
-            println!("    ✔ fail-closed armed: a direct no-header probe was rejected");
+            outln!("    ✔ fail-closed armed: a direct no-header probe was rejected");
             true
         }
         DirectOutcome::Answered(status) => {
-            println!(
+            outln!(
                 "    note: a direct no-header probe got `{status}` — XFF enforcement looks \
                  inactive for this topology"
             );
             false
         }
         DirectOutcome::Timeout => {
-            println!("    note: direct probe timed out — inconclusive");
+            outln!("    note: direct probe timed out — inconclusive");
             false
         }
     };
     match probe_via_proxy(&host, 443) {
         ProxyOutcome::Refused => {
-            println!(
+            outln!(
                 "    · proxy probe skipped: nothing on 127.0.0.1:443 — wire nginx in when ready"
             );
         }
         ProxyOutcome::Answered { status, from_nginx } => {
             let via = if from_nginx { " (via nginx)" } else { "" };
-            println!("    ✔ proxy chain live{via}: `{status}` — X-Forwarded-For injected");
+            outln!("    ✔ proxy chain live{via}: `{status}` — X-Forwarded-For injected");
         }
         ProxyOutcome::UpstreamClosed => {
             if armed {
-                println!("    ✘ the proxy reached the ingress but the stream was closed:");
-                println!("      the fronting proxy does NOT inject X-Forwarded-For");
-                println!();
-                println!("      Fix (nginx):");
-                println!("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;");
-                println!("      in the {host} server block — see the rendered");
-                println!("      nginx/http/interflow-vhost-*.conf from interflow-cli plan apply");
+                outln!("    ✘ the proxy reached the ingress but the stream was closed:");
+                outln!("      the fronting proxy does NOT inject X-Forwarded-For");
+                outln!();
+                outln!("      Fix (nginx):");
+                outln!("        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;");
+                outln!("      in the {host} server block — see the rendered");
+                outln!("      nginx/http/interflow-vhost-*.conf from interflow-cli plan apply");
                 return Err(interflow_core::error::InterflowError::config(
                     "fronting proxy does not inject X-Forwarded-For",
                 ));
             }
-            println!("    note: proxy closed the stream without a response — inconclusive");
+            outln!("    note: proxy closed the stream without a response — inconclusive");
         }
         ProxyOutcome::TlsFailed(reason) => {
-            println!("    note: TLS to 127.0.0.1:443 failed ({reason}) — is the front live?");
+            outln!("    note: TLS to 127.0.0.1:443 failed ({reason}) — is the front live?");
         }
         ProxyOutcome::Timeout => {
-            println!("    note: proxy probe timed out — inconclusive");
+            outln!("    note: proxy probe timed out — inconclusive");
         }
     }
     Ok(())
@@ -618,31 +726,31 @@ fn insecure_client_config() -> rustls::ClientConfig {
 fn check_route(host: &str, pack_dir: &std::path::Path) -> interflow_core::error::Result<()> {
     let pack =
         CredentialPack::load_runtime(pack_dir).map_err(interflow_cli::runtime::pack_error)?;
-    println!("Route {host}");
-    println!();
+    outln!("Route {host}");
+    outln!();
     let Some(route) = pack
         .policy
         .routes
         .iter()
         .find(|r| r.host.eq_ignore_ascii_case(host))
     else {
-        println!(
+        outln!(
             "✘ No route for {host} in the signed policy (generation {})",
             pack.policy.generation
         );
-        println!();
-        println!("Diagnosis: the ingress policy predates this hostname.");
-        println!(
+        outln!();
+        outln!("Diagnosis: the ingress policy predates this hostname.");
+        outln!(
             "Fix: add [[route]] to the manifest, then `interflow-cli plan apply` and restart the ingress."
         );
         return Err(interflow_core::error::InterflowError::config(
             "route not found",
         ));
     };
-    println!("✔ Route policy entry: {} → {}", route.host, route.service);
+    outln!("✔ Route policy entry: {} → {}", route.host, route.service);
     let Some(service) = find_service(&pack.policy.services, &route.service) else {
-        println!("✘ Route references unknown service {}", route.service);
-        println!("Fix: declare [[agent.<node>.services]] and re-apply.");
+        outln!("✘ Route references unknown service {}", route.service);
+        outln!("Fix: declare [[agent.<node>.services]] and re-apply.");
         return Err(interflow_core::error::InterflowError::config(
             "unknown service",
         ));
@@ -658,27 +766,30 @@ fn check_route(host: &str, pack_dir: &std::path::Path) -> interflow_core::error:
         .iter()
         .find(|s| s.id == service.id);
     match declared {
-        Some(s) => println!(
+        Some(s) => outln!(
             "✔ Service {} (declared by agent {}) — default address {} (a local \
              preference on the agent machine may override it)",
-            service.id, service.agent, s.address
+            service.id,
+            service.agent,
+            s.address
         ),
         None if pack.metadata.kind == interflow_identity::pack::PackKind::Agent => {
-            println!(
+            outln!(
                 "✘ Service {} is signed but missing from node.toml",
                 service.id
             );
-            println!(
+            outln!(
                 "Fix: re-run `interflow-cli plan apply` — the pack's policy and node halves drifted."
             );
             return Err(interflow_core::error::InterflowError::config(
                 "service missing from node.toml",
             ));
         }
-        None => println!(
+        None => outln!(
             "✔ Service {} (declared by agent {}) — dial target resolved on the agent \
              machine (pack default or a local preference)",
-            service.id, service.agent
+            service.id,
+            service.agent
         ),
     }
     let authorized = pack
@@ -687,60 +798,60 @@ fn check_route(host: &str, pack_dir: &std::path::Path) -> interflow_core::error:
         .iter()
         .any(|a| a.workspace == service.workspace);
     if !authorized {
-        println!(
+        outln!(
             "✘ Ingress is not authorized for workspace {}",
             service.workspace
         );
-        println!("Fix: add the workspace to [ingress.<node>].workspaces and re-apply.");
+        outln!("Fix: add the workspace to [ingress.<node>].workspaces and re-apply.");
         return Err(interflow_core::error::InterflowError::config(
             "workspace not authorized",
         ));
     }
-    println!(
+    outln!(
         "✔ Ingress principal authorized for workspace {}",
         service.workspace
     );
     if host.parse::<std::net::IpAddr>().is_err() {
-        println!("  DNS check: point {host} at this ingress's public address");
+        outln!("  DNS check: point {host} at this ingress's public address");
     }
     if pack.node_config.public_tls == "acme" {
-        println!("  ACME: the ingress terminates HTTPS itself");
-        println!(
+        outln!("  ACME: the ingress terminates HTTPS itself");
+        outln!(
             "    - ports 80 (HTTP-01 + redirect) and 443 (TLS-ALPN-01 + traffic) must reach it directly — no front proxy in front"
         );
-        println!(
+        outln!(
             "    - certificates/issues renew automatically; cache lives under state/acme in the pack directory"
         );
         if let Some(email) = &pack.node_config.public_tls_email {
-            println!("    - account contact: {email}");
+            outln!("    - account contact: {email}");
         }
         if pack.node_config.public_tls_directory != interflow_util::LETS_ENCRYPT_PRODUCTION {
-            println!(
+            outln!(
                 "    - directory override: {}",
                 pack.node_config.public_tls_directory
             );
         }
     }
-    println!();
-    println!("Route checks passed.");
+    outln!();
+    outln!("Route checks passed.");
     Ok(())
 }
 
 fn check_trust(pack_dir: &std::path::Path) -> interflow_core::error::Result<()> {
     let pack = CredentialPack::load(pack_dir).map_err(interflow_cli::runtime::pack_error)?;
-    println!("Trust Bundle (realm {})", pack.trust.metadata.realm);
-    println!();
+    outln!("Trust Bundle (realm {})", pack.trust.metadata.realm);
+    outln!();
     pack.trust
         .verify_fingerprints()
         .map_err(interflow_cli::runtime::pack_error)?;
     for (name, fingerprint) in &pack.trust.metadata.issuers {
-        println!("✔ {name}: {fingerprint}");
+        outln!("✔ {name}: {fingerprint}");
     }
-    println!(
+    outln!(
         "  policy key: {}",
         &pack.trust.metadata.policy_key[..16.min(pack.trust.metadata.policy_key.len())]
     );
-    println!(
+    outln!(
         "  generation: {} (digest {})",
         pack.trust.metadata.generation,
         pack.trust
@@ -756,12 +867,12 @@ fn check_trust(pack_dir: &std::path::Path) -> interflow_core::error::Result<()> 
         if entry.path().extension().is_some_and(|e| e == "pem") {
             let name = entry.file_name().into_string().unwrap_or_default();
             if name.contains("crl") {
-                println!("✔ CRL present: {name}");
+                outln!("✔ CRL present: {name}");
             }
         }
     }
-    println!();
-    println!("Trust checks passed.");
+    outln!();
+    outln!("Trust checks passed.");
     Ok(())
 }
 
@@ -771,15 +882,15 @@ pub fn identity_inspect(
 ) -> interflow_core::error::Result<()> {
     let pack = CredentialPack::load(pack_dir).map_err(interflow_cli::runtime::pack_error)?;
     let summary = pack.summary();
-    println!("Identity: {}", product_path(&pack, &summary.identity));
-    println!("Kind: {}", summary.kind.as_str());
+    outln!("Identity: {}", product_path(&pack, &summary.identity));
+    outln!("Kind: {}", summary.kind.as_str());
     if let Some(workspace) = &summary.workspace {
-        println!("Workspace: {workspace}");
+        outln!("Workspace: {workspace}");
     }
-    println!("Node: {}", summary.node);
-    println!("Realm: {}", summary.realm);
-    println!("Credential generation: {}", summary.generation);
-    println!("Bootstrap expires: {}", summary.expires);
+    outln!("Node: {}", summary.node);
+    outln!("Realm: {}", summary.realm);
+    outln!("Credential generation: {}", summary.generation);
+    outln!("Bootstrap expires: {}", summary.expires);
     let active = interflow_identity::credentials::ActiveCredentialSet::load_or_bootstrap(&pack)
         .map_err(interflow_cli::runtime::pack_error)?;
     let expiry = active
@@ -790,20 +901,20 @@ pub fn identity_inspect(
         pack.metadata.leaf_ttl_secs,
         interflow_identity::expiry::now_unix(),
     );
-    println!(
+    outln!(
         "Active credentials expire: {} ({} left, {})",
         expiry,
         interflow_identity::expiry::format_remaining(health.remaining_secs),
         health.phase.as_str()
     );
     match pack.metadata.registrar_endpoint.as_deref() {
-        Some(endpoint) => println!("Registrar: {endpoint}"),
-        None => println!("Registrar: none (offline tier — rotate with `interflow-cli rotate`)"),
+        Some(endpoint) => outln!("Registrar: {endpoint}"),
+        None => outln!("Registrar: none (offline tier — rotate with `interflow-cli rotate`)"),
     }
-    println!("Pack digest: {}", summary.pack_digest);
+    outln!("Pack digest: {}", summary.pack_digest);
     if expert {
-        println!("Embedded Trust / Policy generation: {}", summary.generation);
-        println!();
+        outln!("Embedded Trust / Policy generation: {}", summary.generation);
+        outln!();
         for buckets in pack.identities.values() {
             for entry in buckets.values() {
                 let der = interflow_identity::pem_certs(entry.cert_pem.as_bytes())
@@ -811,23 +922,23 @@ pub fn identity_inspect(
                     .into_iter()
                     .next();
                 if let Some(der) = der {
-                    println!(
+                    outln!(
                         "SPKI fingerprint: sha256:{} ({})",
                         hex::encode(Sha256::digest(&der)),
                         entry.principal
                     );
                 }
-                println!("Certificate chain (leaf first):");
+                outln!("Certificate chain (leaf first):");
                 for (i, der) in interflow_identity::pem_certs(entry.cert_pem.as_bytes())
                     .map_err(interflow_cli::runtime::pack_error)?
                     .into_iter()
                     .enumerate()
                 {
-                    println!("  #{i}: {} bytes (DER)", der.len());
+                    outln!("  #{i}: {} bytes (DER)", der.len());
                 }
             }
         }
-        println!("Policy signature: {} bytes", pack.policy_signature.len());
+        outln!("Policy signature: {} bytes", pack.policy_signature.len());
     }
     Ok(())
 }

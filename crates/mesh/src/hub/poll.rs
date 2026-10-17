@@ -46,7 +46,10 @@ impl HubService {
             // this self-healing path in particular).
             // The identity binding check above already passed, so the
             // authentication level is equivalent to /register.
-            self.implicit_re_register(&agent_key).await
+            match self.implicit_re_register(&agent_key).await {
+                Ok(arc) => arc,
+                Err(denied) => return Ok(*denied),
+            }
         };
         if state_arc.read().await.circuit != circuit {
             return Ok(text_response(StatusCode::UNAUTHORIZED, "Circuit mismatch"));
@@ -107,6 +110,7 @@ impl HubService {
             waker_slot,
             self.state.clone(),
             agent_key.clone(),
+            circuit,
         );
         // ChunkHygiene enforces the h2 body chunking invariants (no empty
         // non-final chunks, small chunks coalesced to ≥256B — see

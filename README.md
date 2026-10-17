@@ -33,8 +33,9 @@ You declare **Ingress / Agent / Service / Route**; identities, trust, and
 signed routing policy ship inside self-describing Credential Packs — no
 certificate paths anywhere. Workspaces share one ingress with per-workspace
 issuers and cross-workspace deny by default. See the deployment guide for packs, rotation, revocation, `doctor`, and
-the registrar; see the versioning guide for the product-version /
-format-version / generation model.
+the registrar; see
+[documentation/versioning.md](documentation/versioning.md)
+for the product-version / format-version / generation model.
 
 A multiplexed tunnel with mTLS by default: it carries both TCP byte streams
 and UDP datagrams over a single custom frame protocol (fixed 41-byte binary header, flags-carried direction/origin, opaque raw tokens, reason codes) that runs on two
@@ -159,6 +160,7 @@ interflow/
 │   └── testkit/    ← dev-only test/bench harness
 ├── src/, src-tauri/ ← Tauri 2 GUI (unified node manager: expose agents, mesh agents, hubs, and ingresses side by side, each from a Credential Pack — each node is an identity, not a machine, and the GUI manages any number of them on its host)
 ├── examples/      ← generic, runnable scenario examples
+├── documentation/ ← published documentation: versioning & rotation policy
 └── Cargo.toml     ← workspace root
 ```
 

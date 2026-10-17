@@ -19,6 +19,7 @@ use crate::node::{NodeKind, NodeSnapshot, NodeState, PackInfo};
 use interflow_identity::manifest::{AgentTransport, MeshEgressRule, MeshIngressRule, MeshProtocol};
 use interflow_mesh::config::TransportKind;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// One service an agent node declares, with the address the agent will
 /// actually dial (pack default unless a machine-local preference overrides
@@ -479,6 +480,11 @@ pub struct NodeInfo {
     /// running) — `None` for other kinds or a stopped node. This is what
     /// is REALLY listening, not what the policy wants.
     pub listeners: Option<Vec<ListenerStatusDto>>,
+    /// The deployment this node's pack belongs to (`<root>/dist/packs/…`
+    /// reverse-resolved); `None` for sealed imports and packs outside any
+    /// deployment tree — the cross-link the new IA's fleet/machine views
+    /// navigate by.
+    pub deployment: Option<DeploymentRefDto>,
 }
 
 impl From<NodeSnapshot> for NodeInfo {
@@ -555,6 +561,51 @@ impl From<NodeSnapshot> for NodeInfo {
             // listeners-plane view (live reconciler table; stopped nodes
             // carry no reading).
             listeners: None,
+            // Pure filesystem probe on the pack directory — the deployment
+            // the pack was rendered into, for the fleet/machine cross-links.
+            deployment: crate::deployment::deployment_of_pack(Path::new(&snapshot.spec.pack_dir))
+                .map(|d| DeploymentRefDto {
+                    name: d.name,
+                    root: d.root.display().to_string(),
+                }),
+        }
+    }
+}
+
+/// The deployment a node/pack belongs to — the new IA's navigation anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct DeploymentRefDto {
+    /// The deployment folder's name (the realm id, by convention).
+    pub name: String,
+    /// The deployment folder's absolute path.
+    pub root: String,
+}
+
+/// One discovered deployment folder (`deployment_list`) — the switcher's
+/// row and the open-deployment flow's unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct DeploymentDto {
+    pub name: String,
+    pub root: String,
+    pub manifest_path: String,
+    /// The issuer store (`<root>/issuer`); present once an apply has run.
+    pub issuer_path: String,
+    /// The dist tree (`<root>/dist`) packs render into.
+    pub out_path: String,
+    pub has_issuer: bool,
+    pub has_dist: bool,
+}
+
+impl From<crate::deployment::DeploymentDir> for DeploymentDto {
+    fn from(d: crate::deployment::DeploymentDir) -> Self {
+        Self {
+            name: d.name,
+            root: d.root.display().to_string(),
+            manifest_path: d.manifest.display().to_string(),
+            issuer_path: d.issuer.display().to_string(),
+            out_path: d.out.display().to_string(),
+            has_issuer: d.has_issuer,
+            has_dist: d.has_dist,
         }
     }
 }
@@ -667,8 +718,9 @@ pub enum ChangeStateDto {
     NeverApplied,
     /// The manifest matches the applied state exactly.
     Applied { generation: u32 },
-    /// Only the policy face moved (mesh rules, idle budgets) — the next
-    /// apply takes the policy-only fast path (hot, ≤10s to the fleet).
+    /// Only the policy face moved (mesh rules, services, routes, idle
+    /// budgets) — the next apply takes the policy-only fast path (hot,
+    /// ≤10s to the fleet, every node kind).
     PolicyEditsPending,
     /// The identity/trust/dial face changed — the next apply re-renders
     /// every pack.
@@ -680,6 +732,9 @@ pub enum ChangeStateDto {
 /// `GET /policy/floor` — all facts the hub already holds).
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct HubOverviewDto {
+    /// The answering hub's manifest-declared name (`None` = an older hub
+    /// that does not self-report).
+    pub hub: Option<String>,
     /// The anti-rollback floor (includes absorbed node watermarks).
     pub floor: u32,
     /// What the hub actually serves; `None` = this hub cannot report it.
@@ -687,6 +742,177 @@ pub struct HubOverviewDto {
     /// Every registered fleet member with presence and last-pulled
     /// watermark.
     pub agents: Vec<HubAgentRowDto>,
+}
+
+/// The deployment-scoped composed read model (2026-10-10 IA) — ONE command
+/// backing the 总览/流/服务 views: the declared desired state (manifest
+/// summary), the bookkeeping change classification, the hub's fleet face
+/// (optional — never let hub latency hold the local view hostage), and the
+/// joins that make each declared node answer "is it here, is it running,
+/// is it converged".
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct FleetDto {
+    pub summary: ManifestSummaryDto,
+    pub change_state: ChangeStateDto,
+    /// The hub's operator overview; `None` = not requested or unreachable
+    /// (the caller decides whether to dial — `include_hub`).
+    pub hub: Option<HubOverviewDto>,
+    /// One row per DECLARED node (manifest truth): agents, hubs,
+    /// ingresses.
+    pub nodes: Vec<FleetNodeDto>,
+    /// The 流 view's rows: every declared mesh ingress stream, joined with
+    /// its live listener state and convergence.
+    pub streams: Vec<StreamDto>,
+    /// The 服务 view's rows: every declared expose service, joined with
+    /// this machine's effective address.
+    pub services: Vec<ServiceFaceDto>,
+    /// Local nodes whose packs do NOT belong to this deployment (sealed
+    /// imports, other deployments) — the 节点 view completes from these.
+    pub local_only: Vec<NodeInfo>,
+}
+
+/// One declared node as the fleet table shows it.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct FleetNodeDto {
+    /// The declared kind (manifest face): agent / hub / ingress.
+    pub kind: NodeKindDto,
+    pub name: String,
+    /// The workspace (agents); `None` for hubs and ingresses.
+    pub workspace: Option<String>,
+    /// This machine's face (`None` = the node does not run here).
+    pub local: Option<LocalFaceDto>,
+    /// The hub's face (`None` = no hub overview / the node is not an
+    /// agent registered there).
+    pub remote: Option<RemoteFaceDto>,
+}
+
+/// The local-machine face of a declared node: what the NodeManager knows.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct LocalFaceDto {
+    /// The NodeManager id (the 节点 view's navigation target).
+    pub id: String,
+    pub state: NodeStateDto,
+    pub desired_running: bool,
+    /// The installed pack's generation (display cache).
+    pub generation: u32,
+    /// The policy plane's applied generation (mesh/expose agents;
+    /// `None` = no watcher face, e.g. a stopped node or a hub).
+    pub policy_generation: Option<u32>,
+    /// Live listener states (mesh agents, running; else empty).
+    pub listeners: Vec<ListenerStatusDto>,
+}
+
+/// The hub's face of a declared agent.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct RemoteFaceDto {
+    /// `registered ≠ reachable` — presence as the hub answers it.
+    pub online: bool,
+    /// The generation this agent last pulled; `None` = no completed pull.
+    pub seen_generation: Option<u32>,
+}
+
+/// A stream row's live status. Local bind state is definitive when the
+/// source node runs here; convergence answers "has the fleet taken the
+/// current policy"; `Unknown` is honest (a remote source's bind state is
+/// not observable from here — the row then leans on its remote face).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamStatusDto {
+    /// A local listener is bound and serving this rule.
+    Serving,
+    /// The local listener exists but its bind failed (down; the error
+    /// rides the listener face).
+    Down,
+    /// The policy generation is still propagating (hub serving above the
+    /// source node's seen/applied generation).
+    CatchingUp,
+    /// No local face and no convergence answer — render from the remote
+    /// face instead of guessing.
+    Unknown,
+}
+
+/// One mesh stream (the 流 view's row): a cross-machine pairing object —
+/// the source agent's listen rule AND the target's remote, joined with
+/// everything live about it.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct StreamDto {
+    /// The source agent (where the loopback listener runs).
+    pub agent: String,
+    /// The stream's name (rule identity on the source agent).
+    pub name: String,
+    pub listen: String,
+    pub protocol: MeshProtocolDto,
+    pub target_agent: String,
+    pub remote_addr: String,
+    pub idle_timeout_secs: Option<u32>,
+    pub status: StreamStatusDto,
+    /// The actually-bound address, port materialized (`:0` picks show the
+    /// real port) — `None` = not bound, or no local face to observe it.
+    pub bound_addr: Option<String>,
+    /// The last bind failure verbatim (`None` = healthy or unobservable) —
+    /// the 流 row's down reason (gui.md's "挂了看原因").
+    pub last_error: Option<String>,
+    /// The local NodeManager id of the source agent (`None` = it does not
+    /// run on this machine) — the 节点 view cross-link.
+    pub source_node_id: Option<String>,
+}
+
+/// One expose service (the 服务 view's row): the declared id + default
+/// address, joined with this machine's effective dial target.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct ServiceFaceDto {
+    pub agent: String,
+    pub workspace: String,
+    pub id: String,
+    /// The manifest-declared default — the signed default since the hot
+    /// channel (what a machine without a local preference dials).
+    pub default_address: String,
+    /// This machine's effective address (`None` = the agent does not run
+    /// here).
+    pub effective_address: Option<String>,
+    /// The effective address came from a machine-local preference.
+    pub overridden: bool,
+    /// The local NodeManager id of the serving agent.
+    pub local_node_id: Option<String>,
+}
+
+/// What a publish did (the 发布 button's single backend entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum PublishKindDto {
+    /// Only the policy face moved — every node hot-applies within a
+    /// watcher period; no pack was touched.
+    PolicyOnly,
+    /// The identity/dial face moved — packs re-rendered; local stale
+    /// packs were swapped in place (running nodes restarted).
+    FullRender,
+    /// Nothing to do (the idempotent gate).
+    NoOp,
+}
+
+/// `deployment_publish`'s result: the apply report plus the orchestration
+/// the old flow left to the operator (which local nodes were converged,
+/// which were swapped, what needs manual attention).
+#[derive(Debug, Clone, Serialize, specta::Type)]
+pub struct PublishResultDto {
+    pub kind: PublishKindDto,
+    pub apply: ApplyReportDto,
+    /// Node names this publish converged WITHOUT touching (policy-only:
+    /// every local node of the deployment is hot).
+    pub hot_nodes: Vec<String>,
+    /// Node names whose local packs were swapped in place (full render;
+    /// running ones restarted per their start intent).
+    pub updated_nodes: Vec<String>,
+    /// `(node name, error)` — a failed pack swap never fails the publish
+    /// itself; the row stays stale and the operator re-runs update.
+    pub failed_updates: Vec<NodeUpdateFailureDto>,
+}
+
+/// One pack-swap failure, phrased for the fleet table's row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct NodeUpdateFailureDto {
+    pub node: String,
+    pub error: String,
 }
 
 /// One fleet member's row in a [`HubOverviewDto`].
@@ -887,6 +1113,7 @@ impl From<interflow_cli::plan::ChangeState> for ChangeStateDto {
 impl From<interflow_mesh::hub::policy::HubOverview> for HubOverviewDto {
     fn from(o: interflow_mesh::hub::policy::HubOverview) -> Self {
         Self {
+            hub: o.hub,
             floor: u32::try_from(o.floor).unwrap_or(u32::MAX),
             serving: o.serving.and_then(|g| u32::try_from(g).ok()),
             agents: o
@@ -922,6 +1149,11 @@ pub struct DeployPackDto {
     pub digest: String,
     pub expires: String,
     pub principal: String,
+    /// One of rotate's `-gen<N>` staging outputs (named by `plan::rotate`
+    /// for distribution; kept after the local node consumes it) — the UI
+    /// badges these instead of letting them sit visually equal to the
+    /// identity's base pack.
+    pub is_staging: bool,
     /// The local node added from this pack's identity, if any — the
     /// "update this local node to this generation" hook (P1-2).
     pub local_node: Option<LocalNodeRefDto>,
@@ -952,6 +1184,7 @@ pub struct UpdatedNodeDto {
 impl From<crate::deploy::DeployPack> for DeployPackDto {
     fn from(pack: crate::deploy::DeployPack) -> Self {
         Self {
+            is_staging: pack.is_staging,
             dir_name: pack.dir_name,
             path: pack.path.display().to_string(),
             kind: pack.kind.into(),
@@ -1556,10 +1789,28 @@ pub enum EditActionDto {
         agent: String,
         name: String,
     },
+    /// In-place rename (position, decor, comments preserved); the taken /
+    /// missing / blank-name rejections ride the valid→valid funnel.
+    RenameMeshIngress {
+        agent: String,
+        from: String,
+        to: String,
+    },
     UpsertMeshEgress(MeshEgressEditDto),
     RemoveMeshEgress {
         agent: String,
         name: String,
+    },
+    RenameMeshEgress {
+        agent: String,
+        from: String,
+        to: String,
+    },
+    /// Service rename with the `[[route]]` cascade (refs follow the id).
+    RenameService {
+        agent: String,
+        from: String,
+        to: String,
     },
     UpsertRoute(RouteEditDto),
     RemoveRoute {
@@ -1682,6 +1933,9 @@ impl From<EditActionDto> for interflow_cli::manifest_edit::ManifestEdit {
             EditActionDto::RemoveMeshIngress { agent, name } => {
                 Self::RemoveMeshIngress { agent, name }
             }
+            EditActionDto::RenameMeshIngress { agent, from, to } => {
+                Self::RenameMeshIngress { agent, from, to }
+            }
             EditActionDto::UpsertMeshEgress(edit) => Self::UpsertMeshEgress(MeshEgressEdit {
                 agent: edit.agent,
                 name: edit.name,
@@ -1692,6 +1946,12 @@ impl From<EditActionDto> for interflow_cli::manifest_edit::ManifestEdit {
             }),
             EditActionDto::RemoveMeshEgress { agent, name } => {
                 Self::RemoveMeshEgress { agent, name }
+            }
+            EditActionDto::RenameMeshEgress { agent, from, to } => {
+                Self::RenameMeshEgress { agent, from, to }
+            }
+            EditActionDto::RenameService { agent, from, to } => {
+                Self::RenameService { agent, from, to }
             }
             EditActionDto::UpsertRoute(edit) => Self::UpsertRoute(RouteEdit {
                 host: edit.host,
@@ -1737,6 +1997,34 @@ pub struct DeployContextDto {
 pub struct DeployDefaultsDto {
     /// Absolute deployments root (home-based, e.g. `~/interflow-deployments`).
     pub root: String,
+}
+
+/// `deploy_read_text` payload: the document text plus its freshness token
+/// (sha256 of the bytes on disk). Saving hands the token back; a mismatch
+/// is a conflict, never a silent overwrite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct DeployTextDto {
+    pub text: String,
+    pub digest: String,
+}
+
+/// `deploy_write_text` outcome. `Conflict` carries the CURRENT on-disk
+/// document so the editor's reload-or-keep choice needs no second round
+/// trip — the other writer's edit is already in the payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SaveManifestOutcomeDto {
+    Saved {
+        /// The freshness token of what was just written — the next save's
+        /// expected digest.
+        digest: String,
+    },
+    Conflict {
+        /// What the disk holds now (the winning writer's version).
+        text: String,
+        /// Its freshness token — adopting the disk version adopts this.
+        digest: String,
+    },
 }
 
 /// `deploy_prefs_load/save` payload: the recent deployment contexts, most
@@ -1794,9 +2082,12 @@ impl From<GuiLanguageDto> for crate::gui_prefs::Lang {
 /// `gui_prefs_load` payload: GUI-wide preferences. The language is shared
 /// with the Rust-rendered surfaces (tray, user-facing command errors), so
 /// one switch flips every surface at once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub struct GuiPrefsDto {
     pub language: GuiLanguageDto,
+    /// The deployment the app opens into (root folder path); `None` on
+    /// first run. Round-trips whole so a language switch never drops it.
+    pub current_deployment: Option<String>,
 }
 
 /// `node-state` event payload: which node transitioned to what.

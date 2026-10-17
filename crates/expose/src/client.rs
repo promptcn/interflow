@@ -58,11 +58,25 @@ pub fn service_log_summary(services: &[LocalService]) -> String {
 /// Arguments needed to build the expose client.
 #[derive(Clone)]
 pub struct ExposeArgs {
-    /// Local services (id + effective address); when routing by host, the
-    /// edge names the service id in the Open frame and this agent resolves
-    /// it against these rules. The list is non-empty; the first rule is the
-    /// `Default`-selector fallback.
-    pub services: Vec<LocalService>,
+    /// The node-side address table: pack-rendered defaults × machine-local
+    /// overrides (see [`ServiceAddresses`]). When routing by host, the edge
+    /// names the service id in the Open frame and this agent resolves it
+    /// against the rules derived from this table. The resolved view is
+    /// non-empty; the first rule is the `Default`-selector fallback.
+    ///
+    /// The embedder keeps a clone for the live override channel: an edit
+    /// (`set_override`) re-derives the egress table without touching the
+    /// session — established streams drain, the next Open dials the new
+    /// target.
+    pub service_addresses: interflow_mesh::config::ServiceAddresses,
+    /// The Credential Pack directory. `Some` arms the signed-policy plane:
+    /// the watcher derives the service set from every verified policy
+    /// generation (hot adds/removes through the state channel or hub
+    /// pulls), re-derives on override edits, and applies the pack's
+    /// effective policy once at arm so a restart picks up state-channel
+    /// updates without a pack swap. `None` (in-memory embedders — tests,
+    /// the soak harness) keeps the render-time table static.
+    pub pack_dir: Option<std::path::PathBuf>,
     /// Hub URL.
     pub hub_url: String,
     /// Local agent_id — must equal the client certificate's CN (the hub binds
@@ -109,6 +123,20 @@ impl ExposeArgs {
     pub fn effective_log_name(&self) -> &str {
         self.log_name.as_deref().unwrap_or(&self.agent_id)
     }
+
+    /// The resolved service view (id, effective address, override origin)
+    /// — the startup line's shape and the embedders' read model.
+    pub fn resolved_services(&self) -> Vec<LocalService> {
+        self.service_addresses
+            .resolved()
+            .into_iter()
+            .map(|(id, target_addr, overridden)| LocalService {
+                id,
+                target_addr,
+                overridden,
+            })
+            .collect()
+    }
 }
 
 /// fd soft-limit raise (unix): baseline headroom for a long-running network proxy,
@@ -154,9 +182,10 @@ fn raise_nofile_limit(_node: &str) {}
 /// Must be called from within a Tokio runtime context (the underlying
 /// [`AgentClient::start`] spawns the supervisor); it panics otherwise.
 pub fn start(args: &ExposeArgs) -> Result<AgentHandle, interflow_core::error::InterflowError> {
-    if args.services.is_empty() {
+    let services = args.resolved_services();
+    if services.is_empty() {
         return Err(interflow_core::error::InterflowError::config(
-            "ExposeArgs.services must not be empty (the pack must declare at least one \
+            "the service address table must not be empty (the pack must declare at least one \
              [[agent.*.services]] entry)",
         ));
     }
@@ -164,10 +193,11 @@ pub fn start(args: &ExposeArgs) -> Result<AgentHandle, interflow_core::error::In
     raise_nofile_limit(args.effective_log_name());
     tracing::info!(
         node = %args.effective_log_name(),
+        policy_plane = args.pack_dir.is_some(),
         "expose client starting (build {}): local services [{}] → hub {} (transport={}, \
          agent_id={})",
         interflow_buildinfo::BUILD_TAG,
-        service_log_summary(&args.services),
+        service_log_summary(&services),
         args.hub_url,
         match args.transport {
             TransportKind::H2 => "h2",
@@ -218,11 +248,14 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
 
     // One rule per service, named by the service id: the edge's
     // `TargetSelector::Service(id)` resolves against these names, making the
-    // id→address mapping explicit instead of positional.
-    let mut egress: Vec<EgressRule> = Vec::with_capacity(args.services.len());
-    for service in &args.services {
+    // id→address mapping explicit instead of positional. This is the
+    // render-time seed; with the policy plane armed the watcher's arm-time
+    // apply makes the signed service set authoritative within the first
+    // tick (and every generation after).
+    let mut egress: Vec<EgressRule> = Vec::new();
+    for service in args.resolved_services() {
         egress.push(EgressRule {
-            name: service.id.clone(),
+            name: service.id,
             target: EgressTarget::Addr(service.target_addr),
             target_protocol: StreamProto::Tcp,
             udp_idle_timeout_secs: None,
@@ -239,6 +272,13 @@ fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error:
             ..AgentInfo::default()
         },
         egress,
+        policy: args
+            .pack_dir
+            .as_ref()
+            .map(|dir| interflow_mesh::config::PolicyPlaneConfig {
+                pack_dir: dir.clone(),
+            }),
+        service_addresses: Some(args.service_addresses.clone()),
         control: ControlConfig {
             enabled: false,
             ..ControlConfig::default()
@@ -310,11 +350,11 @@ mod tests {
     fn args(transport: TransportKind, hub_url: &str, hub_quic_addr: Option<&str>) -> ExposeArgs {
         ExposeArgs {
             log_name: None,
-            services: vec![LocalService {
-                id: "web".into(),
-                target_addr: "127.0.0.1:3000".parse().unwrap(),
-                overridden: false,
-            }],
+            service_addresses: interflow_mesh::config::ServiceAddresses::of(
+                &[("web", "127.0.0.1:3000".parse().unwrap())],
+                &[],
+            ),
+            pack_dir: None,
             hub_url: hub_url.to_string(),
             agent_id: "a".into(),
             client_cert: None,

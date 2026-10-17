@@ -1,8 +1,27 @@
 import { useState } from "react";
-import { api, formatRemainingSecs, kindBlurb, leafPhase, type AddNodeParams, type PackInspection, type Transport } from "../api";
+import {
+  api,
+  formatRemainingSecs,
+  kindBlurb,
+  leafPhase,
+  type AddNodeParams,
+  type PackInspection,
+  type Transport,
+} from "../api";
 import { useT } from "../i18n";
 import { cn } from "../lib/utils";
-import { Button, DialogFooter, DialogTitle, Field, Input, KindBadge, Modal, SegmentedControl } from "./ui";
+import {
+  Button,
+  DialogFooter,
+  DialogTitle,
+  Field,
+  Hint,
+  InfoHint,
+  Input,
+  KindBadge,
+  Modal,
+  SegmentedControl,
+} from "./ui";
 
 /// The add-a-node flow: pick a pack directory (or import a sealed
 /// `.iflowpack`), inspect it through the same funnel the start path uses,
@@ -63,7 +82,10 @@ export default function AddNodeDialog({
     setInspection(null);
     setBusy(true);
     try {
-      const imported = await api.deployInstallSealed(sealedPath.trim(), passphrase);
+      const imported = await api.deployInstallSealed(
+        sealedPath.trim(),
+        passphrase,
+      );
       setPackDir(imported.pack_dir);
       applyInspection(imported.inspection);
     } catch (e) {
@@ -107,7 +129,10 @@ export default function AddNodeDialog({
       const params: AddNodeParams = {
         pack_dir: packDir.trim(),
         transport: isAgent && transport !== packDefault ? transport : null,
-        hub_quic_addr: isAgent && transport === "quic" && hubQuicAddr.trim() !== "" ? hubQuicAddr.trim() : null,
+        hub_quic_addr:
+          isAgent && transport === "quic" && hubQuicAddr.trim() !== ""
+            ? hubQuicAddr.trim()
+            : null,
       };
       const created = await api.addNode(params);
       await onAdded(created.id);
@@ -138,7 +163,11 @@ export default function AddNodeDialog({
               className="flex-1"
             />
             <Button onClick={pickPackDir}>{t("common.browse")}</Button>
-            <Button variant="primary" disabled={busy || packDir.trim() === ""} onClick={inspect}>
+            <Button
+              variant="primary"
+              disabled={busy || packDir.trim() === ""}
+              onClick={inspect}
+            >
               {busy ? "…" : t("addNode.inspect")}
             </Button>
           </div>
@@ -195,9 +224,10 @@ export default function AddNodeDialog({
       {inspection && (
         <div className="flex flex-col gap-2.5 rounded-lg border border-line bg-bg-3 p-3">
           <div className="flex items-center gap-2">
-            <KindBadge kind={inspection.kind} />
+            <Hint text={kindBlurb(inspection.kind, t)}>
+              <KindBadge kind={inspection.kind} />
+            </Hint>
             <strong>{inspection.name}</strong>
-            <span className="text-small text-fg-3">— {kindBlurb(inspection.kind, t)}</span>
           </div>
           <dl className="m-0 grid grid-cols-[130px_1fr] gap-x-2.5 gap-y-1 text-base">
             <dt className="text-fg-3">{t("addNode.identity")}</dt>
@@ -207,11 +237,15 @@ export default function AddNodeDialog({
                 ? t("addNode.listensOn")
                 : t("addNode.connectsTo")}
             </dt>
-            <dd className="m-0 break-all">{inspection.listen ?? inspection.control_endpoint}</dd>
+            <dd className="m-0 break-all">
+              {inspection.listen ?? inspection.control_endpoint}
+            </dd>
             {inspection.services.length > 0 && (
               <>
                 <dt className="text-fg-3">{t("addNode.services")}</dt>
-                <dd className="m-0 break-all">{inspection.services.join(", ")}</dd>
+                <dd className="m-0 break-all">
+                  {inspection.services.join(", ")}
+                </dd>
               </>
             )}
             {(inspection.mesh_ingress > 0 || inspection.mesh_egress > 0) && (
@@ -232,12 +266,15 @@ export default function AddNodeDialog({
                   className={cn(
                     "m-0",
                     leafPhase(inspection.credential) === "warn" && "text-warn",
-                    leafPhase(inspection.credential) === "critical" && "text-critical",
+                    leafPhase(inspection.credential) === "critical" &&
+                      "text-critical",
                   )}
                 >
                   {inspection.credential.not_after} ·{" "}
                   {t("addNode.timeLeft", {
-                    time: formatRemainingSecs(inspection.credential.remaining_secs),
+                    time: formatRemainingSecs(
+                      inspection.credential.remaining_secs,
+                    ),
                   })}
                 </dd>
               </>
@@ -258,9 +295,11 @@ export default function AddNodeDialog({
                   ]}
                   onChange={setTransport}
                 />
-                <span className="text-small text-fg-3" title={t("prefs.transportPersistTitle")}>
-                  {t("prefs.packDefaultHint", { value: inspection.transport ?? "h2" })}
-                </span>
+                <InfoHint
+                  text={t("prefs.transportPersistTitle", {
+                    value: inspection.transport ?? "h2",
+                  })}
+                />
               </div>
               {transport === "quic" && (
                 <Field label={t("prefs.hubQuicAddr")}>
@@ -284,7 +323,9 @@ export default function AddNodeDialog({
       )}
 
       {error && (
-        <div className="text-base whitespace-pre-wrap text-critical">{error}</div>
+        <div className="text-base whitespace-pre-wrap text-critical">
+          {error}
+        </div>
       )}
 
       <DialogFooter>

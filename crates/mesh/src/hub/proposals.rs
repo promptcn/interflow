@@ -1018,6 +1018,7 @@ mod tests {
         crate::config::ServerConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             node_name: None,
+            hub_name: None,
             proxy_protocol: interflow_core::security::ProxyProtocolConfig::default(),
         }
     }
@@ -1130,6 +1131,7 @@ target_cidr = "127.0.0.0/8"
             config: Arc::new(tokio::sync::RwLock::new(empty_hub_config())),
             active_streams: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             tls_plane: Arc::new(std::sync::RwLock::new(Arc::new(plane))),
+            crl_channel: None,
             limits: HubLimits {
                 max_streams_per_agent: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 max_streams_total: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1144,6 +1146,7 @@ target_cidr = "127.0.0.0/8"
             proposals: Some(Arc::new(ProposalStore::load(Some(proposals_path)).unwrap())),
             stale_watermark_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             expiry_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            evicted_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             conn_tracker: Arc::new(interflow_core::security::ConnTracker::new(0, 0)),
             tasks: tokio_util::task::TaskTracker::new(),
             shutdown: tokio_util::sync::CancellationToken::new(),

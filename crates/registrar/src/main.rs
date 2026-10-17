@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "interflow-registrar", version)]
+#[command(name = "interflow-registrar", version = interflow_buildinfo::VERSION_WITH_TAG)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

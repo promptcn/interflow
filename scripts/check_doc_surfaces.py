@@ -60,6 +60,11 @@ RETIRED_TERMS = (
     "--gateway-cert",
     "--gateway-ca",
     "pki import",
+    # Issuer-store bookkeeping retired its JSON file face (2026-10-11, the
+    # manifest-sqlite-pivot form B): the binding and applied accounting live
+    # in `<issuer>/store.db`; product docs must not teach the old files.
+    "binding.json",
+    "applied.json",
 )
 
 # Engine-level config shape: legitimate in the expert reference and the
@@ -69,11 +74,12 @@ MESH_ONLY_TERMS = ("[[auth.tenants]]",)
 # Product docs: every retired surface, plus engine-only shapes.
 PRODUCT_TARGETS: tuple[tuple[Path, tuple[str, ...]], ...] = (
     (Path("README.md"), RETIRED_TERMS + MESH_ONLY_TERMS),
+    (Path("CHANGELOG.md"), RETIRED_TERMS + MESH_ONLY_TERMS),
     (Path("examples"), RETIRED_TERMS + MESH_ONLY_TERMS),
     (Path("docs/identity-first.md"), RETIRED_TERMS + MESH_ONLY_TERMS),
     (Path("docs/deployment.md"), RETIRED_TERMS + MESH_ONLY_TERMS),
     (Path("docs/config-reference.md"), RETIRED_TERMS),
-    (Path("docs/versioning.md"), RETIRED_TERMS + MESH_ONLY_TERMS),
+    (Path("documentation/versioning.md"), RETIRED_TERMS + MESH_ONLY_TERMS),
     (Path("crates/mesh/dev-examples"), RETIRED_TERMS),
 )
 

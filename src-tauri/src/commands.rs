@@ -12,11 +12,12 @@
 use crate::SharedState;
 use crate::contract::{
     AddNodeParams, AddedNodeDto, ApplyReportDto, ChangeStateDto, ControlProposalDto,
-    DeployContextDto, DeployDefaultsDto, DeployPackDto, DeployPrefsDto, EditActionDto,
-    EditedManifestDto, GuiLanguageDto, GuiPrefsDto, HubOverviewDto, ImportedPackDto,
+    DeployContextDto, DeployDefaultsDto, DeployPackDto, DeployPrefsDto, DeploymentDto,
+    EditActionDto, EditedManifestDto, FleetDto, GuiPrefsDto, HubOverviewDto, ImportedPackDto,
     IssueNodeParams, LocalNodeRefDto, ManifestSummaryDto, ManifestTemplateParams,
-    MeshTemplateParams, NodeInfo, NodePrefs, PackInspection, ProposalSubmitOutcomeDto,
-    SealedPackDto, StreamProposalRequestDto, UpdatedNodeDto, VersionInfo,
+    MeshTemplateParams, NodeInfo, NodePrefs, NodeUpdateFailureDto, PackInspection,
+    ProposalSubmitOutcomeDto, PublishKindDto, PublishResultDto, SealedPackDto,
+    StreamProposalRequestDto, UpdatedNodeDto, VersionInfo,
 };
 use crate::deploy;
 use crate::i18n;
@@ -176,7 +177,10 @@ pub async fn stop_all_nodes(state: State<'_, SharedState>) -> Result<(), String>
     Ok(())
 }
 
-/// Updates an agent node's runtime preferences (stopped nodes only).
+/// Updates an agent node's runtime preferences. Service addresses apply
+/// live on a running expose agent (the egress table re-derives; no
+/// restart); transport and the hub QUIC address stay stopped-only — the
+/// dial face must re-connect.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be deserialized by value
@@ -280,17 +284,21 @@ pub fn deploy_manifest_template(params: ManifestTemplateParams) -> Result<String
     ))
 }
 
-/// Reads a manifest (or any text file the deploy pane edits). A missing
-/// file is named in the user's language — the read-failure class the
-/// Overview must be able to tell apart from a TOML syntax error.
+/// Reads the manifest (or any text file the deploy pane edits) with its
+/// freshness token — the digest Saving hands back for the changed-on-disk
+/// check. A missing file is named in the user's language — the
+/// read-failure class the Overview must be able to tell apart from a TOML
+/// syntax error.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
-pub fn deploy_read_text(path: String) -> Result<String, String> {
+pub fn deploy_read_text(path: String) -> Result<crate::contract::DeployTextDto, String> {
     let path = expanded(&path);
-    std::fs::read_to_string(&path).map_err(|e| {
+    let document = interflow_cli::manifest_edit::read_manifest(&path).map_err(|e| {
         let s = i18n::current();
-        if e.kind() == std::io::ErrorKind::NotFound {
+        if let interflow_core::error::InterflowError::Io(source) = &e
+            && source.kind() == std::io::ErrorKind::NotFound
+        {
             return i18n::render(s.err_not_found, &[("path", &path.display().to_string())]);
         }
         i18n::render(
@@ -300,27 +308,62 @@ pub fn deploy_read_text(path: String) -> Result<String, String> {
                 ("err", &e.to_string()),
             ],
         )
+    })?;
+    Ok(crate::contract::DeployTextDto {
+        text: document.text,
+        digest: document.digest,
     })
 }
 
 /// Saves the deploy pane's manifest text back to its path — the editor's
-/// single write path, with the same discipline a structured append has:
-/// one silent `.bak` generation, then the atomic replace.
+/// single write path, now with the changed-on-disk guard: `expected_digest`
+/// is the freshness token from the read; a mismatch is NOT an error string
+/// but a `Conflict` outcome carrying the current disk document (the
+/// editor offers reload-or-keep; last-writer-wins clobbering is gone).
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
-pub fn deploy_write_text(path: String, text: String) -> Result<(), String> {
+pub fn deploy_write_text(
+    path: String,
+    text: String,
+    expected_digest: Option<String>,
+) -> Result<crate::contract::SaveManifestOutcomeDto, String> {
     let path = expanded(&path);
-    interflow_cli::manifest_edit::save_manifest(&path, &text).map_err(|e| {
-        let s = i18n::current();
-        i18n::render(
-            s.err_write,
-            &[
-                ("path", &path.display().to_string()),
-                ("err", &e.to_string()),
-            ],
-        )
-    })
+    let write =
+        interflow_cli::manifest_edit::save_manifest(&path, &text, expected_digest.as_deref());
+    let Err(e) = write else {
+        return Ok(crate::contract::SaveManifestOutcomeDto::Saved {
+            digest: interflow_util::sha256_hex(text.as_bytes()),
+        });
+    };
+    if matches!(e, interflow_core::error::InterflowError::Conflict { .. }) {
+        // Hand back what the disk holds now — the reload choice is one
+        // round trip. A read failure here degrades to the plain error.
+        return match interflow_cli::manifest_edit::read_manifest(&path) {
+            Ok(current) => Ok(crate::contract::SaveManifestOutcomeDto::Conflict {
+                text: current.text,
+                digest: current.digest,
+            }),
+            Err(read_err) => {
+                let s = i18n::current();
+                Err(i18n::render(
+                    s.err_read,
+                    &[
+                        ("path", &path.display().to_string()),
+                        ("err", &read_err.to_string()),
+                    ],
+                ))
+            }
+        };
+    }
+    let s = i18n::current();
+    Err(i18n::render(
+        s.err_write,
+        &[
+            ("path", &path.display().to_string()),
+            ("err", &e.to_string()),
+        ],
+    ))
 }
 
 /// The deployments root backing the deploy pane's placeholders and the
@@ -467,6 +510,7 @@ pub async fn deploy_apply(
             &out,
             false,
             &interflow_cli::plan::BackupInitOptions::default(),
+            false,
         )
         .map(ApplyReportDto::from)
         .map_err(|e| e.to_string())
@@ -729,7 +773,10 @@ pub async fn deploy_rotate(
     .map_err(|e| e.to_string())?
 }
 
-/// Revokes a pack (deny list + CRL).
+/// Revokes a pack (deny list + CRL). The node-owned renewal ledger is
+/// deliberately OUTSIDE the GUI's revocation domain: killing a running
+/// node's runtime credential is a CLI operator action
+/// (`revoke --include-active-credentials`), never a one-click button.
 #[tauri::command]
 #[specta::specta]
 pub async fn deploy_revoke(
@@ -739,7 +786,7 @@ pub async fn deploy_revoke(
 ) -> Result<Vec<String>, String> {
     let (issuer, pack) = (expanded(&issuer), expanded(&pack));
     tauri::async_runtime::spawn_blocking(move || {
-        interflow_cli::plan::revoke(&issuer, &pack, &reason).map_err(|e| e.to_string())
+        interflow_cli::plan::revoke(&issuer, &pack, &reason, None, false).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -927,24 +974,289 @@ pub fn deploy_prefs_save(recent: Vec<DeployContextDto>) -> Result<(), String> {
 #[specta::specta]
 #[allow(clippy::unnecessary_wraps)] // Tauri command shape (load never fails)
 pub fn gui_prefs_load() -> Result<GuiPrefsDto, String> {
+    let prefs = crate::gui_prefs::load();
     Ok(GuiPrefsDto {
-        language: crate::gui_prefs::load().language.into(),
+        language: prefs.language.into(),
+        current_deployment: prefs.current_deployment,
     })
 }
 
-/// Persists the interface language and rebuilds the tray in place — one
-/// switch flips every surface (window, tray, command errors) at once.
+/// Persists the GUI-wide preferences (language + the current deployment)
+/// and rebuilds the tray in place — one switch flips every surface (window,
+/// tray, command errors) at once.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters are deserialized by value
-pub fn gui_prefs_save(app: tauri::AppHandle, language: GuiLanguageDto) -> Result<(), String> {
-    crate::gui_prefs::save(crate::gui_prefs::GuiPrefs {
-        language: language.into(),
+pub fn gui_prefs_save(app: tauri::AppHandle, prefs: GuiPrefsDto) -> Result<(), String> {
+    crate::gui_prefs::save(&crate::gui_prefs::GuiPrefs {
+        language: prefs.language.into(),
+        current_deployment: prefs.current_deployment,
     })?;
     if let Some(tray) = app.tray_by_id("main") {
         crate::tray::refresh(&app, &tray);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Deployment-as-root-object commands (2026-10-10 IA): discovery, current
+// selection, the composed fleet read model, and the one-click publish.
+// ---------------------------------------------------------------------------
+
+/// Lists the deployments under `~/interflow-deployments` (name-sorted). A
+/// missing root is an empty list — the first-run onboarding entry, not an
+/// error.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::unnecessary_wraps)] // Tauri command shape
+pub fn deployment_list() -> Result<Vec<DeploymentDto>, String> {
+    Ok(crate::deployment::discover()
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+/// The deployment the app opens into (persisted in `gui.toml`); `None` on
+/// first run or when the remembered folder vanished. The path is returned
+/// UNVALIDATED-but-existing — the caller decides how to present a stale
+/// pick (re-onboard, not an error dialog).
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::unnecessary_wraps)] // Tauri command shape
+pub fn deployment_current() -> Result<Option<DeploymentDto>, String> {
+    let root = crate::gui_prefs::load().current_deployment;
+    Ok(root
+        .as_deref()
+        .and_then(|r| crate::deployment::DeploymentDir::probe(std::path::Path::new(r)))
+        .map(Into::into))
+}
+
+/// Opens (and persists) the current deployment. The folder must be a
+/// deployment (an `interflow.toml`); the error names the path in the
+/// user's language.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
+pub fn deployment_set_current(
+    app: tauri::AppHandle,
+    root: String,
+) -> Result<DeploymentDto, String> {
+    let root = expanded(&root);
+    let deployment = crate::deployment::DeploymentDir::probe(&root).ok_or_else(|| {
+        let s = i18n::current();
+        i18n::render(
+            s.err_not_deployment,
+            &[("path", &root.display().to_string())],
+        )
+    })?;
+    let mut prefs = crate::gui_prefs::load();
+    prefs.current_deployment = Some(root.display().to_string());
+    crate::gui_prefs::save(&prefs)?;
+    if let Some(tray) = app.tray_by_id("main") {
+        crate::tray::refresh(&app, &tray);
+    }
+    Ok(deployment.into())
+}
+
+/// The deployment-scoped composed read model — ONE round trip backing the
+/// 总览/流/服务 views: declared state + change classification + (when
+/// `include_hub`) the hub's fleet face + every local join. The hub dial is
+/// opt-in so hub latency can never hold the local view hostage.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
+pub async fn fleet_overview(
+    state: State<'_, SharedState>,
+    manifest: String,
+    issuer: String,
+    include_hub: bool,
+) -> Result<FleetDto, String> {
+    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    let issuer_for_hub = issuer.clone();
+    let manifest_for_hub = manifest.clone();
+    let hub = if include_hub {
+        tauri::async_runtime::spawn_blocking(move || {
+            interflow_cli::plan::hub_overview(&manifest_for_hub, &issuer_for_hub)
+                .ok()
+                .flatten()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+
+    // Local faces + bookkeeping classification in one blocking batch.
+    let manifest_for_state = manifest.clone();
+    let issuer_for_state = issuer.clone();
+    let (summary, change_state) = tauri::async_runtime::spawn_blocking(move || {
+        let text = std::fs::read_to_string(&manifest_for_state)
+            .map_err(|e| format!("{}: {e}", manifest_for_state.display()))?;
+        let summary = interflow_cli::manifest_edit::summarize(&text)
+            .map_err(|e| interflow_cli::manifest_edit::error_chain(&e))?;
+        let change_state =
+            interflow_cli::plan::change_state(&manifest_for_state, &issuer_for_state)
+                .map_err(|e| e.to_string())?;
+        Ok::<_, String>((summary, change_state))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let nodes = node_infos(&manager(&state)?);
+    Ok(crate::fleet::compose(
+        summary.into(),
+        change_state.into(),
+        hub.map(Into::into),
+        nodes,
+    ))
+}
+
+/// The 发布 button's single backend entry: save (when the editor hands
+/// over text) → apply (the watermark-aware funnel; the policy-only fast
+/// path when only rules/services/routes moved) → converge the local fleet
+/// (policy-only: every local node hot-applies within a watcher period;
+/// full render: every STALE local pack is swapped in place and running
+/// nodes restart per their captured intent). Returns the classification
+/// the status bar states plainly: what went hot, what restarted, what
+/// needs a manual re-run.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
+pub async fn deployment_publish(
+    state: State<'_, SharedState>,
+    manifest_text: Option<String>,
+    manifest: String,
+    issuer: String,
+    out: String,
+) -> Result<PublishResultDto, String> {
+    let (manifest, issuer, out) = (expanded(&manifest), expanded(&issuer), expanded(&out));
+    // 1. Auto-save escape hatch: the GUI's publish flow pre-saves through
+    //    the changed-on-disk guard (deploy_write_text) and reaches this
+    //    with no text; the parameter stays for callers that hand a document
+    //    over wholesale, and saves unconditionally on their behalf.
+    if let Some(text) = &manifest_text {
+        interflow_cli::manifest_edit::save_manifest(&manifest, text, None)
+            .map_err(|e| interflow_cli::manifest_edit::error_chain(&e))?;
+    }
+
+    // 2. The pre-apply classification (never minted, never dialed) decides
+    //    the orchestration shape.
+    let manifest_for_state = manifest.clone();
+    let issuer_for_state = issuer.clone();
+    let kind = tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::plan::change_state(&manifest_for_state, &issuer_for_state)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // 3. Apply.
+    let (manifest_for_apply, issuer_for_apply, out_for_apply) =
+        (manifest.clone(), issuer.clone(), out.clone());
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::plan::apply(
+            &manifest_for_apply,
+            &issuer_for_apply,
+            &out_for_apply,
+            false,
+            &interflow_cli::plan::BackupInitOptions::default(),
+            false,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // 4. Converge the local fleet. The scope is the deployment the manifest
+    //    belongs to — every managed node whose pack renders into this dist
+    //    tree.
+    let manager = manager(&state)?;
+    let deployment = crate::deployment::DeploymentDir::containing(&manifest);
+    let mut hot_nodes = Vec::new();
+    let mut updated_nodes = Vec::new();
+    let mut failed_updates = Vec::new();
+    let mut owned: Vec<crate::contract::NodeInfo> = Vec::new();
+    for info in node_infos(&manager) {
+        let in_scope = deployment.as_ref().is_some_and(|d| {
+            info.deployment
+                .as_ref()
+                .is_some_and(|n| n.root == d.root.display().to_string())
+        });
+        if in_scope {
+            owned.push(info);
+        }
+    }
+
+    match kind {
+        interflow_cli::plan::ChangeState::PolicyEditsPending => {
+            // Hot: nothing to touch — the watcher plane converges each node
+            // within its own period.
+            for info in &owned {
+                hot_nodes.push(info.name.clone());
+            }
+        }
+        interflow_cli::plan::ChangeState::NeverApplied
+        | interflow_cli::plan::ChangeState::IdentityEditsPending => {
+            // Packs were (re)rendered: swap every STALE local pack in place;
+            // `update_pack` stops, swaps, and restores the start intent.
+            let dist_packs = tauri::async_runtime::spawn_blocking({
+                let out = out.clone();
+                move || crate::deploy::list_packs(&out)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+            for info in owned {
+                // Several dist packs can share an identity once rotate's
+                // `-genN` staging directories accumulate beside the base
+                // pack; converging on the FIRST match could pick a stale
+                // staging and (pre-gate) silently downgrade the node. Take
+                // the newest generation for the identity — convergence
+                // moves forward only, like every install surface.
+                let dist = dist_packs
+                    .iter()
+                    .filter(|pack| pack.principal == info.principal.clone().unwrap_or_default())
+                    .max_by_key(|pack| pack.generation);
+                let Some(dist) = dist else {
+                    continue;
+                };
+                let node = manager
+                    .snapshots()
+                    .into_iter()
+                    .find(|snap| snap.spec.id == info.id);
+                let Some(snapshot) = node else {
+                    continue;
+                };
+                if snapshot.spec.pack_digest == dist.digest {
+                    // Already current (an earlier update landed): converged
+                    // untouched.
+                    hot_nodes.push(info.name.clone());
+                    continue;
+                }
+                match manager.update_pack(&info.id, &dist.path).await {
+                    Ok(_) => updated_nodes.push(info.name.clone()),
+                    Err(e) => failed_updates.push(NodeUpdateFailureDto {
+                        node: info.name.clone(),
+                        error: e,
+                    }),
+                }
+            }
+        }
+        interflow_cli::plan::ChangeState::Applied { .. } => {
+            // The idempotent gate said no-op — nothing to converge.
+        }
+    }
+
+    Ok(PublishResultDto {
+        kind: match kind {
+            interflow_cli::plan::ChangeState::PolicyEditsPending => PublishKindDto::PolicyOnly,
+            interflow_cli::plan::ChangeState::Applied { .. } => PublishKindDto::NoOp,
+            _ => PublishKindDto::FullRender,
+        },
+        apply: report.into(),
+        hot_nodes,
+        updated_nodes,
+        failed_updates,
+    })
 }
 
 #[cfg(test)]

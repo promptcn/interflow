@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Single source of the public-export trim patterns for README.md / justfile.
+"""Single source of the public-export trim patterns for README.md / justfile,
+plus the commit-time no-wrap rule for docs/ references.
 
-docs/ never exports, and some private-only tooling must not appear in the
-public tree — the exporter rewrites those references in the PUBLISHED copies
-instead of maintaining two documents. This module is the one place those
-transformations live:
+docs/ never exports (documentation/ is the born-public directory that ships
+verbatim, guard-enforced by check_version_contract.py), and some
+private-only tooling must not appear in the public tree — the exporter
+rewrites those references in the PUBLISHED copies instead of maintaining
+two documents. This module is the one place those transformations live:
 
 - export_public.sh applies them to the exported copies (`--apply-readme` /
   `--apply-justfile`).
 - `just ci` and the export preflight dry-run `--verify` against the PRIVATE
   tree so pattern drift fails at commit time, not at export time (a pattern
   once drifted for days because nothing checked it between exports).
+- `--verify` also enforces the no-wrap rule below, for the same
+  commit-time reason: the strip pass's comment surgery is line-oriented,
+  so a wrapped docs/ path is a shape it cannot strip.
 
 Each pattern must match its private source EXACTLY once. `--verify` is a
 private-tree check by design: the published copies have the patterns applied
@@ -19,10 +24,80 @@ and will not match.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# The strip pass in export_public.sh rewrites docs/ references in exported
+# source comments with line-oriented regex surgery: a reference whose path
+# wraps across lines survives as a fragment and reddens export gate 5 — the
+# 2026-10-17 v0.11.0 export died on eight wrapped refs that had drifted in
+# unnoticed since the previous export. This rule fails the wrap at commit
+# time, over exactly the strip pass's scope. Out of scope: the guard/tool
+# scripts gate 5 exempts (their pattern data and exemption lists
+# legitimately name archive paths) and the private-only scripts that never
+# export at all.
+WRAP_SCOPE_ROOTS = (
+    "THREAT_MODEL.md",
+    "SECURITY.md",
+    "Cargo.toml",
+    "Dockerfile",
+    "deny.toml",
+    ".gitleaks.toml",
+    "crates",
+    "src",
+    "src-tauri",
+    "scripts",
+    ".github",
+)
+WRAP_SCOPE_EXEMPT_SCRIPTS = {
+    "export_public.sh",       # private-only: is the strip pass itself
+    "release_public.sh",      # private-only release tooling
+    "bump_version.py",        # private-only release tooling
+    "check_config_reference.py",  # private-only guard (subject never exports)
+    "check_private_tests.py",     # private-only guard (subject never exports)
+    "check_version_contract.py",  # shipped, gate-5 exempt (pattern data)
+    "check_product_language.py",  # shipped, gate-5 exempt (scan targets)
+    "check_doc_surfaces.py",      # shipped, gate-5 exempt (scan targets)
+    "check_changelog_debt.py",    # shipped, gate-5 exempt (path denylist)
+    "export_trim.py",             # this file (trim-pattern data)
+}
+WRAPPED_REF = re.compile(r"docs/[A-Za-z0-9_.\-/]+")
+
+
+def wrapped_ref_violations(root: Path) -> list[str]:
+    findings: list[str] = []
+    for name in WRAP_SCOPE_ROOTS:
+        base = root / name
+        if base.is_file():
+            paths = [base]
+        elif base.is_dir():
+            paths = [p for p in base.rglob("*") if p.is_file()]
+        else:
+            continue
+        for path in paths:
+            rel = path.relative_to(root)
+            if rel.parts[0] == "scripts" and rel.name in WRAP_SCOPE_EXEMPT_SCRIPTS:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                for match in WRAPPED_REF.finditer(line):
+                    # A sentence period after the path is greedy-matched too
+                    # (the class includes '.'); trim it before judging.
+                    path = match.group(0).rstrip(".")
+                    if not path.endswith(".md"):
+                        findings.append(
+                            f"{rel.as_posix()}:{lineno}: docs/ reference wraps — the "
+                            "path must reach .md on one line (the export strip pass "
+                            "is line-oriented surgery; a wrapped ref ships as a "
+                            "fragment and fails the export gate)"
+                        )
+    return findings
 
 # (name, old, new) — applied to the public copy of README.md.
 README_TRIMS = [
@@ -30,17 +105,17 @@ README_TRIMS = [
         "layout-tree",
         "├── examples/      ← generic, runnable scenario examples\n"
         "├── deployments/   ← environment-specific deployment configs (private)\n"
-        "├── docs/          ← backlog (research / TODO) / development (implementation notes) / product (decision records)\n",
-        "├── examples/      ← generic, runnable scenario examples\n",
+        "├── docs/          ← backlog (research / TODO) / development (implementation notes) / product (decision records)\n"
+        "├── documentation/ ← published documentation: versioning & rotation policy\n",
+        "├── examples/      ← generic, runnable scenario examples\n"
+        "├── documentation/ ← published documentation: versioning & rotation policy\n",
     ),
     (
-        "quickstart-doc-guides",
+        "quickstart-identity-first",
         "See\n[docs/identity-first.md](docs/identity-first.md) for packs, rotation,\n"
-        "revocation, `doctor`, and the registrar; see [docs/versioning.md](docs/versioning.md)\n"
-        "for the product-version / format-version / generation model.",
+        "revocation, `doctor`, and the registrar;",
         "See the deployment guide for packs, rotation, revocation, `doctor`, and\n"
-        "the registrar; see the versioning guide for the product-version /\n"
-        "format-version / generation model.",
+        "the registrar;",
     ),
     (
         "adr-binary-size",
@@ -73,8 +148,8 @@ README_TRIMS = [
 # config-reference and private-tests guards drive private-side scripts
 # against private-side subjects (docs/, deployments/ — neither exports), so
 # the recipes and their `ci` dependencies drop out of the public tree;
-# version-contract reads docs/versioning.md (also private, ci dependency
-# only — the recipe body ships and the public workflow job runs it).
+# version-contract reads documentation/versioning.md, which ships with the
+# export, so its recipe stays fully functional in both trees.
 JUSTFILE_TRIMS = [
     (
         "config-reference-recipe",
@@ -96,9 +171,19 @@ JUSTFILE_TRIMS = [
         "",
     ),
     (
+        "export-trim-recipe",
+        "# Export-trim pattern drift guard: the README/justfile trim patterns must\n"
+        "# match the private sources exactly once, or the trim stage would fail\n"
+        "# mid-export (also run by export_public.sh preflight; the recipe drops out\n"
+        "# of the public justfile, whose README/justfile carry the patterns applied).\n"
+        "export-trim:\n"
+        "    python3 scripts/export_trim.py --verify\n",
+        "",
+    ),
+    (
         "ci-line",
-        "ci: fmt-check lint test private-tests config-reference version-contract product-language doc-surfaces\n",
-        "ci: fmt-check lint test product-language doc-surfaces\n",
+        "ci: fmt-check lint test private-tests config-reference version-contract changelog-debt product-language doc-surfaces export-trim\n",
+        "ci: fmt-check lint test changelog-debt product-language doc-surfaces\n",
     ),
 ]
 
@@ -126,10 +211,14 @@ def verify(private_root: Path) -> int:
             if n != 1:
                 failures += 1
             print(f"{'OK' if n == 1 else 'MISMATCH':8} {file_name}: {name}: {n} match(es)")
+    wraps = wrapped_ref_violations(private_root)
+    for finding in wraps:
+        print(f"MISMATCH  {finding}")
+        failures += 1
     if failures:
-        print("FAIL: export trim patterns drifted from the private sources — update export_trim.py together with README.md/justfile")
+        print("FAIL: export trim patterns drifted from the private sources (or a docs/ reference wraps) — update export_trim.py together with README.md/justfile, and keep docs/ paths on one line")
         return 1
-    print("export trim patterns verified: each matches the private tree exactly once")
+    print("export trim patterns verified: each matches the private tree exactly once; no wrapped docs/ references")
     return 0
 
 

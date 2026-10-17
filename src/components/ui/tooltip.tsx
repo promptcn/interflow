@@ -1,5 +1,6 @@
 import type { ReactElement } from "react";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
+import { Info } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 /// One TooltipProvider at the app root; Hint wraps any single trigger
@@ -39,5 +40,31 @@ export function Hint({
         </TooltipPrimitive.Content>
       </TooltipPrimitive.Portal>
     </TooltipPrimitive.Root>
+  );
+}
+
+/// The ⓘ affordance: one-line concept explanations ride its hover/focus
+/// instead of being permanent chrome — shared by SectionPanel heads and
+/// dialog titles (the density pass's rule for explanatory copy).
+export function InfoHint({
+  text,
+  className,
+}: {
+  text: string;
+  className?: string;
+}) {
+  return (
+    <Hint text={text}>
+      <button
+        type="button"
+        aria-label={text}
+        className={cn(
+          "inline-flex shrink-0 items-center rounded-sm p-0.5 text-fg-3 transition-colors hover:text-fg-2",
+          className,
+        )}
+      >
+        <Info size={13} />
+      </button>
+    </Hint>
   );
 }

@@ -8,6 +8,11 @@
 //!   (CN mismatch) is rejected
 //! - T12 disconnect self-healing: QUIC connection drops → eviction → recovery
 //!   after re-registration
+//! - Stale-watcher guard (2026-10-11): a death signal armed for a superseded
+//!   registration must not evict its re-registered successor — compressed
+//!   graceful-close shape and the real kill-without-close-frame shape (hub
+//!   30s idle timeout), both against a same-identity replace-in-place
+//!   re-registration
 //! - Regressions (backlog §1.7 regression-coverage audit, 2026-09-14): the
 //!   QUIC Close-frame `_close_` sentinel (both paths — synchronous rejection
 //!   and teardown back-fill, a59e0a7 — previously covered only by the soak
@@ -424,6 +429,239 @@ async fn quic_disconnect_evicts_and_recovers() {
 }
 
 // ---------------------------------------------------------------------------
+// Stale-watcher guard (2026-10-11 stale-watcher incident): a death signal
+// armed against one registration must not evict its successor
+// ---------------------------------------------------------------------------
+
+/// A connection-lost watcher armed for registration A must be voided when a
+/// same-identity re-registration B has taken the registry entry over in
+/// place (replace-in-place reuses the very session Arc — only the circuit
+/// rotation distinguishes the successor).
+///
+/// Before the fix the watcher's `Arc::ptr_eq` guard could not see the
+/// takeover and severed the live successor: registry entry removed, streams
+/// swept, data plane black-holed while the agent stayed green (the home-win
+/// incident shape). Compressed timeline: a graceful close of the superseded
+/// connection wakes the watcher within seconds instead of the production 30s
+/// idle timeout — the guard decision is identical either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_stale_watcher_voids_eviction_after_reregister() {
+    use interflow_testkit::metrics_harness::{counter_value, init_tracing, wait_counter_at_least};
+
+    init_tracing();
+    let (echo_addr, _echo) = echo_server().await;
+    let _hub = spawn_hub(hub_quic_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
+
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
+    egress_cfg.egress = vec![EgressRule {
+        name: "echo".to_string(),
+        target: EgressTarget::Addr(echo_addr),
+        target_protocol: StreamProto::Tcp,
+        udp_idle_timeout_secs: None,
+    }];
+
+    // A: the first registration (its connection will be superseded)
+    let handle_a = {
+        let client = interflow_mesh::agent::AgentClient::new(egress_cfg.clone()).expect("build A");
+        client.start()
+    };
+    wait_counter_at_least(
+        "interflow_quic_agents_registered",
+        1,
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
+    ingress_cfg.ingress = vec![IngressRule {
+        name: "to-egress".to_string(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        listen_protocol: StreamProto::Tcp,
+        target_agent: "egress".to_string(),
+        remote_addr: Some(echo_addr.to_string()),
+        idle_timeout_secs: None,
+        udp_per_ip_pps: 0,
+        udp_per_ip_bytes_per_sec: 0,
+        udp_egress_bytes_per_sec: 0,
+    }];
+    let _ingress = spawn_agent(ingress_cfg);
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
+
+    let payload = b"pre-takeover";
+    let resp = tcp_echo_retry(ingress_addr, payload, Duration::from_secs(15))
+        .await
+        .expect("round trip through registration A");
+    assert_eq!(resp, payload);
+
+    // B: same identity → replace-in-place takeover (the registry Arc is
+    // reused, the circuit rotates). The counter reaches 3 only with B: A +
+    // the ingress agent + B.
+    let handle_b = {
+        let client = interflow_mesh::agent::AgentClient::new(egress_cfg).expect("build B");
+        client.start()
+    };
+    wait_counter_at_least(
+        "interflow_quic_agents_registered",
+        3,
+        Duration::from_secs(15),
+    )
+    .await;
+
+    // A's connection closes; its watcher wakes armed with A's circuit
+    let _ = handle_a.shutdown_graceful().await;
+
+    // The eviction must be VOIDED (circuit rotated), not honored: positive
+    // proof the watcher fired and was discarded, negative proof nothing was
+    // evicted.
+    wait_counter_at_least(
+        "interflow_hub_agent_eviction_voided{reason=\"quic_connection_closed\"}",
+        1,
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(
+        counter_value("interflow_hub_agent_evicted{reason=\"quic_connection_closed\"}"),
+        0,
+        "the stale watcher evicted the re-registered session"
+    );
+
+    // The successor session's data plane keeps working (the incident's
+    // symptom was exactly this round trip black-holing while the agent-side
+    // health stayed green)
+    let payload = b"post-void";
+    let resp = tcp_echo_retry(ingress_addr, payload, Duration::from_secs(15))
+        .await
+        .expect("round trip through registration B after the stale watcher was voided");
+    assert_eq!(resp, payload);
+    let _ = handle_b;
+}
+
+/// Real-shape variant of the stale-watcher guard: the superseded connection
+/// dies WITHOUT a close frame (production: process kill during an upgrade),
+/// so the hub's watcher only wakes at the 30s quinn idle timeout — by then
+/// the same-identity successor has long taken over. The re-registered
+/// session must survive across the eviction moment (≥60s window from
+/// re-registration) with zero `quic_connection_closed` evictions.
+///
+/// Runtime ~65s BY DESIGN: the idle/keepalive timers are compressible via
+/// `[transport.quic]` (see testkit's `quic_transport_compressed` — the
+/// lifecycle matrix's row-4 case does exactly that), but this anchor
+/// deliberately keeps production timers: its point is to cross the REAL
+/// 30s idle moment, the exact production shape of the incident. Do not
+/// compress this one; compress a sibling instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_reregistered_session_survives_stale_watcher_idle_timeout() {
+    use interflow_testkit::impair::{ImpairConfig, UdpImpairProxy};
+    use interflow_testkit::metrics_harness::{counter_value, init_tracing, wait_counter_at_least};
+
+    init_tracing();
+    let (echo_addr, _echo) = echo_server().await;
+    let _hub = spawn_hub(hub_quic_config(0, certs(), Vec::new())).await;
+    let hub_port = _hub.local_addr().expect("hub bound").port();
+
+    // A behind a pass-through impairment proxy (zero latency, zero loss —
+    // until it is shut down, cutting the path without a close frame)
+    let hub_udp: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
+    let proxy = UdpImpairProxy::spawn(
+        hub_udp,
+        ImpairConfig {
+            one_way_delay: Duration::ZERO,
+            ..ImpairConfig::default()
+        },
+    )
+    .await
+    .expect("impair proxy");
+
+    let mut egress_cfg = agent_quic_config("egress", hub_port, certs());
+    egress_cfg.egress = vec![EgressRule {
+        name: "echo".to_string(),
+        target: EgressTarget::Addr(echo_addr),
+        target_protocol: StreamProto::Tcp,
+        udp_idle_timeout_secs: None,
+    }];
+    let mut cfg_a = egress_cfg.clone();
+    cfg_a.agent.hub_quic_addr = Some(proxy.local_addr().to_string());
+    let _handle_a = {
+        let client = interflow_mesh::agent::AgentClient::new(cfg_a).expect("build A");
+        client.start()
+    };
+    wait_counter_at_least(
+        "interflow_quic_agents_registered",
+        1,
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let mut ingress_cfg = agent_quic_config("ingress", hub_port, certs());
+    ingress_cfg.ingress = vec![IngressRule {
+        name: "to-egress".to_string(),
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        listen_protocol: StreamProto::Tcp,
+        target_agent: "egress".to_string(),
+        remote_addr: Some(echo_addr.to_string()),
+        idle_timeout_secs: None,
+        udp_per_ip_pps: 0,
+        udp_per_ip_bytes_per_sec: 0,
+        udp_egress_bytes_per_sec: 0,
+    }];
+    let _ingress = spawn_agent(ingress_cfg);
+    let ingress_addr = _ingress
+        .wait_ingress_addr("to-egress", Duration::from_secs(15))
+        .await
+        .expect("ingress listener bound");
+
+    // B: same identity, direct connection → replace-in-place takeover (the
+    // counter reaches 3 only with B: A + the ingress agent + B)
+    let _handle_b = {
+        let client = interflow_mesh::agent::AgentClient::new(egress_cfg).expect("build B");
+        client.start()
+    };
+    wait_counter_at_least(
+        "interflow_quic_agents_registered",
+        3,
+        Duration::from_secs(15),
+    )
+    .await;
+
+    // Cut A's path: no CONNECTION_CLOSE reaches the hub, so A's watcher
+    // wakes only at the hub's 30s idle timeout — long after B took over
+    proxy.shutdown().await;
+    let blackhole_at = tokio::time::Instant::now();
+
+    // Round trips across the eviction moment (t=0, 15, 30, 45, 60s): the
+    // watcher fires around t=30s and must be voided each time it ever fires
+    for attempt in 0.. {
+        let payload = format!("survival-{attempt}").into_bytes();
+        let resp = tcp_echo_retry(ingress_addr, &payload, Duration::from_secs(15))
+            .await
+            .expect("round trip must keep working across the stale watcher's wake-up");
+        assert_eq!(resp, payload);
+        assert_eq!(
+            counter_value("interflow_hub_agent_evicted{reason=\"quic_connection_closed\"}"),
+            0,
+            "the stale watcher evicted the re-registered session"
+        );
+        if blackhole_at.elapsed() >= Duration::from_secs(60) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+
+    // The watcher DID fire (at the 30s idle timeout) and was voided —
+    // positive proof, not just the absence of an eviction
+    wait_counter_at_least(
+        "interflow_hub_agent_eviction_voided{reason=\"quic_connection_closed\"}",
+        1,
+        Duration::from_secs(20),
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // Regressions (backlog §1.7 regression-coverage audit, 2026-09-14): Close
 // sentinel + silent-death detection
 // ---------------------------------------------------------------------------
@@ -572,12 +810,13 @@ async fn quic_target_agent_disconnect_tears_down_source_client_connections() {
 /// CONNECTION_CLOSE delivered), an idle QUIC agent must not linger in
 /// Connected. The existing acceptance (e2e_hub_shutdown.rs) covers only the
 /// graceful-shutdown path; this case uses a UDP black hole to produce a silent
-/// death, covering the quinn idle timeout (30s) + keepalive (10s) constant
-/// wiring (core quic.rs:43/45) and the independent `closed()` observer.
+/// death, covering the quinn idle timeout (30s) + keepalive (10s) wiring and
+/// the independent `closed()` observer.
 /// Before the fix (the read loop exiting silently with no observer to end the
 /// session), it stayed Connected forever — this case must fail. Runtime
-/// ~35-45s: the constants are hardcoded in core and cannot be injected at the
-/// integration-test tier.
+/// ~35-45s BY DESIGN: production timers kept for the same reason as the
+/// stale-watcher real-shape anchor above (the compressed variants live in
+/// the lifecycle matrix).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_hub_silent_death_idle_agent_leaves_connected() {
     use interflow_mesh::agent::AgentState;

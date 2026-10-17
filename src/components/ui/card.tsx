@@ -1,10 +1,12 @@
 import type { ReactNode } from "react";
 import { cn } from "../../lib/utils";
+import { InfoHint } from "./tooltip";
 
 /// One titled block of a detail page: the unit that replaced the old
 /// everything-in-one-form pane. Elevated surface (bg-2) over the page
-/// (bg-1); the head carries the one-line rule of the section; `grow`
-/// lets a section take the page's leftover height (the logs).
+/// (bg-1); `grow` lets a section take the page's leftover height (the logs).
+/// `hint` rides an ⓘ beside the title (hover/focus to reveal) — the
+/// one-line rule stays available without being permanent chrome.
 export function SectionPanel({
   title,
   hint,
@@ -32,10 +34,17 @@ export function SectionPanel({
         <h3 className="text-small font-semibold uppercase tracking-[0.05em] text-fg-3">
           {title}
         </h3>
-        {hint && <span className="text-small text-fg-3">{hint}</span>}
-        {actions && <span className="ml-auto flex items-center gap-2">{actions}</span>}
+        {hint && <InfoHint text={hint} className="-my-1 self-center" />}
+        {actions && (
+          <span className="ml-auto flex items-center gap-2">{actions}</span>
+        )}
       </div>
-      <div className={cn("flex min-w-0 flex-col gap-2 p-4", grow && "min-h-0 flex-1")}>
+      <div
+        className={cn(
+          "flex min-w-0 flex-col gap-2 p-4",
+          grow && "min-h-0 flex-1",
+        )}
+      >
         {children}
       </div>
     </section>

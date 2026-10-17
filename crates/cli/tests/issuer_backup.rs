@@ -31,6 +31,24 @@ fn run_output(args: &[&str]) -> String {
     stdout
 }
 
+/// [`run_output`] with an explicit working directory — the CWD-independence
+/// drill: the same command run from different directories must agree.
+fn run_output_in(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new(bin())
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("spawn interflow");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "interflow {args:?} (cwd {}) failed:\nstdout: {stdout}\nstderr: {}",
+        cwd.display(),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    stdout
+}
+
 fn run_fail(args: &[&str]) -> String {
     let output = Command::new(bin())
         .args(args)
@@ -208,6 +226,39 @@ fn apply_configures_backups_and_the_loss_branch_recovers() {
         .ensure_workspace("default")
         .expect("restored workspace pair validates");
 
+    // The restored store carries NO backup configuration — the old machine's
+    // absolute backup_dir never travels
+    assert!(
+        restore_out.contains("backup config never travels"),
+        "restore must say backups are not configured:\n{restore_out}"
+    );
+    assert!(
+        restore_out.contains(&identity.recipient),
+        "restore prints the reusable recipient for copy-paste:\n{restore_out}"
+    );
+    let restored_str = restored.display().to_string();
+    let status_out = run_fail(&["issuer", "backup", "status", "--dir", &restored_str]);
+    assert!(
+        status_out.contains("no backup configuration"),
+        "restored store must read as unconfigured, not as the old machine's path:\n{status_out}"
+    );
+    // Re-arm backups with the SAME recovery identity the operator holds.
+    run_output(&[
+        "issuer",
+        "backup",
+        "init",
+        "--dir",
+        &restored_str,
+        "--recipient",
+        &identity.recipient,
+    ]);
+    run_output(&["issuer", "backup", "now", "--dir", &restored_str]);
+    let status_out = run_output(&["issuer", "backup", "status", "--dir", &restored_str]);
+    assert!(
+        status_out.contains("newest backup matches the current store content"),
+        "re-armed backups are healthy:\n{status_out}"
+    );
+
     // A wrong identity must not open the backup (fail closed, loud).
     let wrong = interflow_identity::backup::generate_identity().expect("wrong identity");
     let wrong_file = dir.path().join("wrong-identity.txt");
@@ -220,4 +271,190 @@ fn apply_configures_backups_and_the_loss_branch_recovers() {
         "--identity",
         &wrong_file.display().to_string(),
     ]);
+}
+
+#[test]
+fn backup_configuration_is_cwd_independent_end_to_end() {
+    // The exact 2026-10-10 invocation shape that planted the CWD bug:
+    // init run FROM the deployment tree root with RELATIVE --dir and
+    // --backup-dir. What lands on disk must be the absolute (v2) location,
+    // and every later command must agree no matter where it runs from —
+    // (internal design notes).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let deploy_root = dir.path().join("deploy");
+    std::fs::create_dir_all(&deploy_root).expect("mkdir deploy root");
+    let identity = interflow_identity::backup::generate_identity().expect("identity");
+
+    let init_out = run_output_in(
+        &deploy_root,
+        &[
+            "issuer",
+            "backup",
+            "init",
+            "--dir",
+            "issuer",
+            "--backup-dir",
+            "issuer-backups",
+            "--recipient",
+            &identity.recipient,
+        ],
+    );
+    assert!(
+        init_out.contains("backups configured"),
+        "init announces the configured location:\n{init_out}"
+    );
+
+    let backup_json =
+        std::fs::read_to_string(deploy_root.join("issuer").join("backup.json")).expect("read");
+    let cfg: interflow_identity::backup::BackupConfig =
+        serde_json::from_str(&backup_json).expect("parse backup.json");
+    assert_eq!(cfg.version, 2, "new configurations are v2");
+    assert!(
+        cfg.backup_dir.is_absolute(),
+        "the stored location is absolute, not the relative input: {backup_json}"
+    );
+
+    // Checkpoint from the deployment root…
+    run_output_in(
+        &deploy_root,
+        &["issuer", "backup", "now", "--dir", "issuer"],
+    );
+
+    // …and status from a foreign CWD (the test harness's own directory)
+    // with an absolute --dir: same store, same versions, green currency.
+    let issuer_abs = deploy_root.join("issuer").display().to_string();
+    let status_out = run_output(&["issuer", "backup", "status", "--dir", &issuer_abs]);
+    assert!(
+        status_out.contains("newest backup matches the current store content"),
+        "status from a foreign CWD must see the versions:\n{status_out}"
+    );
+    assert!(status_out.contains("backup dir:"), "{status_out}");
+
+    // A third CWD (the tempdir itself, not the deploy root) agrees.
+    let status_again = run_output_in(
+        dir.path(),
+        &["issuer", "backup", "status", "--dir", &issuer_abs],
+    );
+    assert!(
+        status_again.contains("newest backup matches the current store content"),
+        "{status_again}"
+    );
+}
+
+fn count_versions(backup_dir: &Path) -> usize {
+    std::fs::read_dir(backup_dir)
+        .expect("backup dir readable")
+        .filter_map(std::result::Result::ok)
+        .filter(|e| {
+            let path = e.path();
+            path.extension().is_some_and(|ext| ext == "age")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("issuer-"))
+        })
+        .count()
+}
+
+#[test]
+fn relocate_moves_backups_to_a_second_medium_end_to_end() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let issuer = dir.path().join("issuer");
+    let issuer_str = issuer.display().to_string();
+    let first = dir.path().join("first-medium");
+    let second = dir.path().join("second-medium");
+    let identity = interflow_identity::backup::generate_identity().expect("identity");
+    let identity_file = dir.path().join("identity.txt");
+    std::fs::write(&identity_file, &identity.secret).expect("identity file");
+
+    run_output(&[
+        "issuer",
+        "backup",
+        "init",
+        "--dir",
+        &issuer_str,
+        "--backup-dir",
+        &first.display().to_string(),
+        "--recipient",
+        &identity.recipient,
+    ]);
+    run_output(&["issuer", "backup", "now", "--dir", &issuer_str]);
+    let first_versions = count_versions(&first);
+    assert!(first_versions >= 1, "a version landed in the first medium");
+
+    // The sanctioned second-medium move.
+    let out = run_output(&[
+        "issuer",
+        "backup",
+        "relocate",
+        "--dir",
+        &issuer_str,
+        "--backup-dir",
+        &second.display().to_string(),
+    ]);
+    assert!(
+        out.contains("first backup in the new location"),
+        "relocate checkpoints immediately:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("{first_versions} prior version(s) remain in")),
+        "relocate narrates the preserved history:\n{out}"
+    );
+
+    // Status now tracks the second medium, green currency.
+    let status_out = run_output(&["issuer", "backup", "status", "--dir", &issuer_str]);
+    assert!(
+        status_out.contains("newest backup matches the current store content"),
+        "{status_out}"
+    );
+    let second_canonical = second.canonicalize().expect("second medium canonical");
+    assert!(
+        status_out.contains(&second_canonical.display().to_string()),
+        "status reports the NEW location:\n{status_out}"
+    );
+    assert_eq!(
+        count_versions(&first),
+        first_versions,
+        "the old medium keeps its history untouched"
+    );
+
+    // The preserved history stays readable by the SAME recovery identity.
+    let verify_out = run_output(&[
+        "issuer",
+        "verify",
+        "--backup",
+        &newest_backup(&first).display().to_string(),
+        "--identity",
+        &identity_file.display().to_string(),
+    ]);
+    assert!(
+        verify_out.contains("decrypts and parses cleanly"),
+        "{verify_out}"
+    );
+
+    // Re-running init on the now-configured store stays refused, pointing
+    // at the two sanctioned mutations instead. The refusal goes to stderr.
+    let refusal = Command::new(bin())
+        .args([
+            "issuer",
+            "backup",
+            "init",
+            "--dir",
+            &issuer_str,
+            "--recipient",
+            &identity.recipient,
+        ])
+        .output()
+        .expect("spawn interflow");
+    assert!(!refusal.status.success(), "init must stay one-time");
+    let refusal_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refusal.stdout),
+        String::from_utf8_lossy(&refusal.stderr)
+    );
+    assert!(
+        refusal_text.contains("issuer backup rekey")
+            && refusal_text.contains("issuer backup relocate"),
+        "the refusal names both sanctioned paths:\n{refusal_text}"
+    );
 }

@@ -24,11 +24,16 @@ pub mod manifest;
 pub mod pack;
 pub mod policy;
 pub mod revocation;
+mod state_db;
 pub mod timestamp;
 pub mod trust;
 
 pub use manifest::{Manifest, RouteConfig, ServiceConfig};
-pub use pack::load::PackSummary;
+pub use pack::load::{
+    PackSummary, PackTreeStale, RevocationIdentity, pack_digest_of, pack_generation_of,
+    pack_node_and_generation_of, probe_pack_format, scan_active_credentials,
+    scan_revocation_identities,
+};
 pub use pack::render::{AgentCredentialPack, HubCredentialPack, IngressCredentialPack};
 pub use pack::{CredentialPack, IdentityEntry, PackKind, PackMetadata};
 pub use trust::{TrustBundle, TrustBundleMetadata};
@@ -109,6 +114,21 @@ pub enum Error {
         /// Root cause, if any.
         #[source]
         source: Option<BoxError>,
+    },
+
+    /// The active credential sequence is revoked by the CRL the pack
+    /// carries — a control-flow signal, not a generic failure:
+    /// [`credentials::ActiveCredentialSet::load_or_bootstrap`] quarantines
+    /// the dead sequence and falls back to the (still-valid) bootstrap
+    /// identities instead of surfacing it.
+    #[error(
+        "renewed credential {serial} (sequence {sequence}) is revoked by the CRL this pack carries"
+    )]
+    CredentialRevoked {
+        /// The sequence directory the revoked credential lives in.
+        sequence: u64,
+        /// Credential serial (hex).
+        serial: String,
     },
 }
 

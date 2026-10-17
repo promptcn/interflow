@@ -8,7 +8,7 @@
 //! the connection would close — so a clean round trip per host proves the
 //! per-workspace wiring end to end.
 
-use interflow_expose::client::{ExposeArgs, LocalService};
+use interflow_expose::client::ExposeArgs;
 use interflow_expose::edge::{
     ControlEndpointTls, EdgeConfig, IngressPrincipal, Route, WorkspaceTrust,
 };
@@ -95,15 +95,18 @@ async fn routes_select_their_own_workspace_session() {
         let (cert, key) = certs.client_paths();
         let args = ExposeArgs {
             log_name: None,
-            services: vec![LocalService {
-                id: "web".to_string(),
-                target_addr: if workspace == "test-a" {
-                    echo_a
-                } else {
-                    echo_b
-                },
-                overridden: false,
-            }],
+            service_addresses: interflow_mesh::config::ServiceAddresses::of(
+                &[(
+                    "web",
+                    if workspace == "test-a" {
+                        echo_a
+                    } else {
+                        echo_b
+                    },
+                )],
+                &[],
+            ),
+            pack_dir: None,
             hub_url: format!("https://127.0.0.1:{hub_port}"),
             client_cert: Some(cert.display().to_string()),
             client_key: Some(key.display().to_string()),

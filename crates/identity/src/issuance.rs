@@ -26,7 +26,20 @@ use time::{Duration, OffsetDateTime};
 pub const CA_VALIDITY_DAYS: i64 = 3650;
 
 pub const DEFAULT_LEAF_TTL_SECONDS: u64 = 24 * 60 * 60;
+/// Registrar-tier lower bound. Test builds only (the `short-leaf-ttl`
+/// feature, enabled exclusively through dev-dependencies — never through a
+/// production dependency) lower it to 30s so credential-lifecycle e2e can
+/// cross the 50% renewal threshold in real time; production builds keep
+/// the 1h floor.
+#[cfg(not(feature = "short-leaf-ttl"))]
 pub const MIN_LEAF_TTL_SECONDS: u64 = 60 * 60;
+#[cfg(feature = "short-leaf-ttl")]
+pub const MIN_LEAF_TTL_SECONDS: u64 = 30;
+/// The range as written into validation messages (tracks the cfg'd floor).
+#[cfg(not(feature = "short-leaf-ttl"))]
+const LEAF_TTL_RANGE_TEXT: &str = "1h and 365d";
+#[cfg(feature = "short-leaf-ttl")]
+const LEAF_TTL_RANGE_TEXT: &str = "30s and 365d";
 /// Registrar-mode upper bound: credentials renew unattended, so they stay
 /// short-lived.
 pub const MAX_LEAF_TTL_SECONDS: u64 = 24 * 60 * 60;
@@ -49,7 +62,7 @@ impl LeafTtl {
         assert!(
             duration >= Duration::seconds(MIN_LEAF_TTL_SECONDS as i64)
                 && duration <= Duration::seconds(ABSOLUTE_MAX_LEAF_TTL_SECONDS as i64),
-            "leaf TTL must be between 1h and 365d"
+            "leaf TTL must be between {LEAF_TTL_RANGE_TEXT}"
         );
         Self(duration)
     }
@@ -59,13 +72,14 @@ impl LeafTtl {
         Self(Duration::seconds(DEFAULT_LEAF_TTL_SECONDS as i64))
     }
 
-    /// Creates a TTL from seconds, returning an error outside 1h–365d.
+    /// Creates a TTL from seconds, returning an error outside the accepted
+    /// range.
     pub fn from_seconds(seconds: i64) -> Result<Self> {
         if !(MIN_LEAF_TTL_SECONDS as i64..=ABSOLUTE_MAX_LEAF_TTL_SECONDS as i64).contains(&seconds)
         {
-            return Err(crate::Error::issuance(
-                "leaf TTL must be between 1h and 365d".to_owned(),
-            ));
+            return Err(crate::Error::issuance(format!(
+                "leaf TTL must be between {LEAF_TTL_RANGE_TEXT}"
+            )));
         }
         Ok(Self(Duration::seconds(seconds)))
     }
@@ -310,15 +324,35 @@ fn err(context: &'static str) -> impl Fn(rcgen::Error) -> Error {
 // Issuer store (operator machine layout)
 // ---------------------------------------------------------------------------
 
-/// The file the store's manifest binding lives in (see [`StoreBinding`]).
-const BINDING_FILE: &str = "binding.json";
-const APPLIED_FILE: &str = "applied.json";
+/// How one recorded applied state came about — the applied history's kind
+/// column (`plan apply` full render, the policy-only fast path, a node
+/// `rotate`, or the one-time absorb of the legacy `applied.json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppliedKind {
+    FullRender,
+    PolicyOnly,
+    Rotate,
+    AbsorbedLegacy,
+}
+
+impl AppliedKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullRender => "full-render",
+            Self::PolicyOnly => "policy-only",
+            Self::Rotate => "rotate",
+            Self::AbsorbedLegacy => "absorbed-legacy",
+        }
+    }
+}
 
 /// What `plan apply` last put into the world — the diff base that lets the
 /// next apply distinguish "the manifest's identity face changed" (re-render
 /// packs) from "only the mesh rule face changed" (sign + publish a policy
-/// update; no identity is re-signed). Stored in the issuer store next to
-/// the binding contract.
+/// update; no identity is re-signed). Stored in the issuer store's
+/// bookkeeping db ([`crate::state_db`]) next to the binding contract, with
+/// the applied declaration text snapshotted alongside (the `plan diff`
+/// baseline).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppliedState {
     /// sha256 of the manifest with every agent's mesh rule lists emptied —
@@ -389,7 +423,8 @@ impl StoreBinding {
 /// <root>/
 ///   realm-issuer.crt|.key      # signs control endpoint identities
 ///   policy-signing.key|.pub    # ed25519 runtime-policy signer
-///   binding.json               # the one-realm / one-manifest contract
+///   store.db                   # bookkeeping: store id, binding, applied
+///                              # state + applied declaration history
 ///   backup.json                # automatic-backup configuration (public)
 ///   workspaces/<ws>-issuer.crt|.key
 /// ```
@@ -586,51 +621,33 @@ impl IssuerStore {
         )
     }
 
+    /// The store's stable id (minted when its db was created; `None`
+    /// before the first write created one). Identifies the store in
+    /// operator output regardless of where the directory sits or moves.
+    pub fn store_uuid(&self) -> Result<Option<String>> {
+        match crate::state_db::StateDb::open_existing(&self.root)? {
+            Some(db) => db.store_uuid().map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Reads the store's manifest binding, if any. Stores created before
     /// bindings existed have none — the next `plan apply`/`rotate` records
     /// one.
     pub fn binding(&self) -> Result<Option<StoreBinding>> {
-        let path = self.root.join(BINDING_FILE);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(Error::Io {
-                    path: path.display().to_string(),
-                    source: e,
-                });
-            }
-        };
-        serde_json::from_str(&text).map(Some).map_err(|e| {
-            Error::issuance(format!(
-                "issuer store {} has a malformed {BINDING_FILE} — inspect it, or rebind \
-                 deliberately by re-running with the allow-shared override",
-                self.root.display()
-            ))
-            .with_source(e)
-        })
+        match crate::state_db::StateDb::open_existing(&self.root)? {
+            Some(db) => db.binding(),
+            None => Ok(None),
+        }
     }
 
-    /// Records (or refreshes) the store's manifest binding, atomically:
-    /// the write lands via a temp file + rename, so a crash never leaves a
-    /// half-written contract behind.
+    /// Records (or refreshes) the store's manifest binding — one
+    /// transaction in the store's `store.db`, so a GUI-embedded apply and
+    /// a terminal `rotate` racing on the same directory serialize instead
+    /// of clobbering each other's check-then-write sequence.
     pub fn record_binding(&self, binding: &StoreBinding) -> Result<()> {
-        std::fs::create_dir_all(&self.root).map_err(|e| Error::Io {
-            path: self.root.display().to_string(),
-            source: e,
-        })?;
-        let text = serde_json::to_string_pretty(binding)
-            .map_err(|e| Error::issuance("binding serialization".to_string()).with_source(e))?;
-        let final_path = self.root.join(BINDING_FILE);
-        let tmp = self.root.join(format!(".{BINDING_FILE}.tmp"));
-        std::fs::write(&tmp, text).map_err(|e| Error::Io {
-            path: tmp.display().to_string(),
-            source: e,
-        })?;
-        std::fs::rename(&tmp, &final_path).map_err(|e| Error::Io {
-            path: final_path.display().to_string(),
-            source: e,
-        })?;
+        let mut db = crate::state_db::StateDb::open_or_create(&self.root)?;
+        db.record_binding(binding)?;
         self.checkpoint()?;
         Ok(())
     }
@@ -638,45 +655,35 @@ impl IssuerStore {
     /// What `plan apply` last put into the world (the diff base for the
     /// policy-only fast path). `None` before the first apply.
     pub fn applied_state(&self) -> Result<Option<AppliedState>> {
-        let path = self.root.join(APPLIED_FILE);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(Error::Io {
-                    path: path.display().to_string(),
-                    source: e,
-                });
-            }
-        };
-        serde_json::from_str(&text).map(Some).map_err(|e| {
-            Error::issuance(format!(
-                "issuer store {} has a malformed {APPLIED_FILE} — delete it and re-run apply",
-                self.root.display()
-            ))
-            .with_source(e)
-        })
+        match crate::state_db::StateDb::open_existing(&self.root)? {
+            Some(db) => db.applied_state(),
+            None => Ok(None),
+        }
     }
 
-    /// Records the applied state, atomically (temp + rename).
-    pub fn record_applied(&self, state: &AppliedState) -> Result<()> {
-        std::fs::create_dir_all(&self.root).map_err(|e| Error::Io {
-            path: self.root.display().to_string(),
-            source: e,
-        })?;
-        let text = serde_json::to_string_pretty(state).map_err(|e| {
-            Error::issuance("applied-state serialization".to_string()).with_source(e)
-        })?;
-        let final_path = self.root.join(APPLIED_FILE);
-        let tmp = self.root.join(format!(".{APPLIED_FILE}.tmp"));
-        std::fs::write(&tmp, text).map_err(|e| Error::Io {
-            path: tmp.display().to_string(),
-            source: e,
-        })?;
-        std::fs::rename(&tmp, &final_path).map_err(|e| Error::Io {
-            path: final_path.display().to_string(),
-            source: e,
-        })?;
+    /// The declaration text as it stood at the last recorded applied
+    /// state — the baseline `plan diff` compares the live manifest
+    /// against. `None` before the first apply, or for a state absorbed
+    /// from the legacy `applied.json` (no snapshot existed to keep).
+    pub fn applied_manifest_text(&self) -> Result<Option<String>> {
+        match crate::state_db::StateDb::open_existing(&self.root)? {
+            Some(db) => db.applied_manifest_text(),
+            None => Ok(None),
+        }
+    }
+
+    /// Records the applied state, snapshots the declaration text
+    /// (`manifest_text` — the drift baseline), and appends the submission
+    /// to the applied history; one transaction, then the backup
+    /// checkpoint.
+    pub fn record_applied(
+        &self,
+        state: &AppliedState,
+        manifest_text: Option<&str>,
+        kind: AppliedKind,
+    ) -> Result<()> {
+        let mut db = crate::state_db::StateDb::open_or_create(&self.root)?;
+        db.record_applied(state, manifest_text, kind.as_str())?;
         self.checkpoint()?;
         Ok(())
     }

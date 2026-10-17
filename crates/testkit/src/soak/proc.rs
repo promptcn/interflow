@@ -31,6 +31,7 @@ pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) ->
         server: ServerConfig {
             listen_addr: listen,
             node_name: None,
+            hub_name: None,
             proxy_protocol: Default::default(),
         },
         auth: AuthConfig {

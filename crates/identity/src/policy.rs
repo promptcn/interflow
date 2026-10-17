@@ -57,18 +57,27 @@ pub struct PolicyRoute {
     pub service: String,
 }
 
-/// A declared service. The policy signs only the service **id** — where the
-/// agent dials (`address`) is node-side by design: the pack's `node.toml`
-/// carries the manifest-issued default and a machine-local preference may
-/// override it (expose addresses are "where this machine's own traffic
-/// lands", never a cross-machine authorization). Compare `PolicyMeshStream`
-/// , whose `remote_addr` stays signed (an authorization pair).
+/// A declared service. The **id** is the only authorization fact; the
+/// optional `address` is the issuer-supplied **default dial target** — a
+/// convenience hint, never binding: the node's machine-local preference
+/// always wins (expose addresses are "where this machine's own traffic
+/// lands", never a cross-machine authorization). Compare
+/// `PolicyMeshStream`, whose `remote_addr` stays signed as an actual
+/// authorization pair. Carrying the default lets a policy-only service add
+/// reach nodes whose packs were not re-rendered — a new id would otherwise
+/// arrive with no address anywhere on the machine.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyService {
     pub workspace: String,
     pub agent: String,
     pub id: String,
+    /// Default dial target (`host:port`) from the manifest. Absent only on
+    /// policies signed before the field existed (schema evolution — old
+    /// readers fail-closed on the new key, per the `deny_unknown_fields`
+    /// doctrine; see documentation/versioning.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -145,6 +154,7 @@ impl RuntimePolicy {
                     workspace: config.workspace.clone(),
                     agent: agent.clone(),
                     id: service.id.clone(),
+                    address: Some(service.address.clone()),
                 });
             }
         }
@@ -274,12 +284,17 @@ impl RuntimePolicy {
     }
 
     /// Enforces anti-rollback: `persisted` is the highest generation this node
-    /// has ever accepted.
+    /// has ever accepted. The comparison goes through the watermark-floor
+    /// half of the generational-handle contract
+    /// ([`interflow_contract::generation::floor_epoch`]) — the same single
+    /// compare-before-mutate implementation every rotation guard shares.
     pub fn check_not_rollback(&self, persisted: u64) -> Result<()> {
-        if self.generation < persisted {
+        if let interflow_contract::generation::Verdict::Superseded(floor) =
+            interflow_contract::generation::floor_epoch(&self.generation, &persisted)
+        {
             return Err(Error::policy(format!(
                 "policy generation {} is older than the highest previously seen generation \
-                 {persisted} — refusing rollback",
+                 {floor} — refusing rollback",
                 self.generation
             )));
         }
@@ -444,10 +459,15 @@ udp_idle_timeout_secs = 90
         assert_eq!(parsed, policy);
     }
 
-    /// The policy signs service **ids** only — where the agent dials is
-    /// node-side (pack default + machine-local preference).
+    /// The address rides the signed policy as the issuer's **default dial
+    /// target** — non-authoritative (the machine-local preference always
+    /// wins node-side), but present: a policy-only service add must reach
+    /// nodes whose packs were not re-rendered. The 2026-09-23 demotion
+    /// removed it because pack re-renders carried the default anyway; the
+    /// hot channel removes that carrier, so the default travels the one
+    /// signed channel that remains.
     #[test]
-    fn services_carry_no_address() {
+    fn services_carry_the_default_address() {
         let manifest = crate::manifest::Manifest::parse(
             r#"
 [realm]
@@ -471,31 +491,35 @@ address = "127.0.0.1:3000"
         .unwrap();
         let policy = RuntimePolicy::from_manifest(&manifest, 1);
         assert_eq!(policy.services.len(), 1);
+        assert_eq!(
+            policy.services[0].address.as_deref(),
+            Some("127.0.0.1:3000")
+        );
         let bytes = policy.to_bytes().unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains("id = \"web\""));
-        assert!(!text.contains("address"), "policy must not sign addresses");
+        let parsed = RuntimePolicy::parse(&bytes).unwrap();
+        assert_eq!(
+            parsed.services[0].address.as_deref(),
+            Some("127.0.0.1:3000"),
+            "the default survives the signed round trip"
+        );
     }
 
-    /// The signed policy face is strict (`deny_unknown_fields`, since
-    /// 2026-10-10): packs rendered before the address demotion carry
-    /// `address` keys in their signed policy.toml — those bytes are
-    /// rejected here, and the nodes must re-render (FORMAT_VERSION stays
-    /// put: the epoch is redefined in place, the realm re-renders packs).
+    /// Policies signed before the address field existed (the 2026-09-23
+    /// demotion era) parse with the default absent — `#[serde(default)]`
+    /// on the new field keeps legacy bytes readable node-side; the
+    /// fail-closed edge stays one-directional (old binaries reject new
+    /// policies, never the reverse).
     #[test]
-    fn retired_address_key_is_rejected() {
-        let old_shape = r#"
+    fn legacy_policy_without_address_parses() {
+        let legacy = r#"
 generation = 1
 routes = []
-services = [{ workspace = "a", agent = "lan-a", id = "web", address = "127.0.0.1:3000" }]
+services = [{ workspace = "a", agent = "lan-a", id = "web" }]
 ingress_authorizations = []
 mesh = []
 "#;
-        let err = RuntimePolicy::parse(old_shape.as_bytes()).unwrap_err();
-        assert!(
-            err.to_string().contains("address"),
-            "the retired key must be named in the rejection: {err}"
-        );
+        let parsed = RuntimePolicy::parse(legacy.as_bytes()).unwrap();
+        assert_eq!(parsed.services[0].address, None);
     }
 
     /// A typo'd top-level key fails loudly instead of signing past it.

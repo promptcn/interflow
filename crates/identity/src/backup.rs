@@ -33,6 +33,26 @@ pub const DEFAULT_RETENTION: u32 = 20;
 /// Backup file name prefix; versions sort lexicographically because the
 /// embedded timestamp is fixed-width.
 const NAME_PREFIX: &str = "issuer-";
+/// backup.json format versions — a **local migration counter**, not a
+/// format epoch (documentation/versioning.md#local-migration-counters): the
+/// file lives on one operator machine, this binary is its only writer, and
+/// v1 bytes on operators' disks must keep loading, so reads normalize old
+/// shapes in memory instead of failing closed. The guard registers this
+/// counter by name in its `LOCAL_MIGRATION_COUNTERS` list; this anchor
+/// citation is the declaration's other half.
+///
+/// v1 (no `version` field on disk) is the original shape: `backup_dir`
+/// stored exactly as the configure-time caller passed it — CWD-relative
+/// when the operator ran from the deployment tree, so every later read
+/// silently depended on process CWD. v2 pins the invariant: `backup_dir`
+/// is absolute (canonicalized at configure time). See
+/// (internal design notes).
+const CONFIG_VERSION_LEGACY: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
+
+fn legacy_config_version() -> u32 {
+    CONFIG_VERSION_LEGACY
+}
 
 // ---------------------------------------------------------------------------
 // Identity (offline) and configuration
@@ -73,9 +93,22 @@ fn parse_identity(identity: &str) -> Result<age::x25519::Identity> {
     })
 }
 
+/// The public recipient half of an offline recovery identity. Restore prints
+/// it so the operator can re-arm backups with `backup init --recipient` and
+/// keep using the one identity they already stored — the recipient is public
+/// data (it lives in every `backup.json`), so printing it leaks nothing.
+pub fn recipient_of(identity_secret: &str) -> Result<String> {
+    Ok(parse_identity(identity_secret)?.to_public().to_string())
+}
+
 /// The persisted backup configuration (`<store>/backup.json`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackupConfig {
+    /// Format version; absent in old files means v1 (see
+    /// [`CONFIG_VERSION_LEGACY`]). Reads normalize v1 shapes in memory and
+    /// stamp v2 on the next write.
+    #[serde(default = "legacy_config_version")]
+    pub version: u32,
     /// age X25519 recipient (`age1...`) backups encrypt to.
     pub recipient: String,
     /// Directory the versioned `issuer-*.age` checkpoints land in. Point it
@@ -88,25 +121,76 @@ pub struct BackupConfig {
     pub initialized_at: String,
 }
 
-/// Reads the store's backup configuration. `Ok(None)` = not configured
-/// (checkpoints are no-ops); a malformed file is an error, never a silent
-/// backup disable.
+/// Reads the store's backup configuration, normalized: v1 shapes are
+/// resolved in memory (see [`load_config`]), so every consumer is
+/// CWD-independent. `Ok(None)` = not configured (checkpoints are no-ops); a
+/// malformed file is an error, never a silent backup disable.
 pub fn config(store_root: &Path) -> Result<Option<BackupConfig>> {
+    Ok(load_config(store_root)?.map(|(cfg, _)| cfg))
+}
+
+/// [`config`] plus the "on-disk file differs from the normalized shape"
+/// flag. The writing paths ([`checkpoint`], [`rekey`]) use it to persist
+/// the normalization; readers never write.
+///
+/// The one v1 quirk worth an invariant: a v1 relative `backup_dir` is
+/// anchored to the store root's PARENT — the sibling layout of
+/// [`default_backup_dir`], which is the only shape that ever produced a
+/// relative value (`plan apply` / default `init` run from the deployment
+/// tree, where store and backups sit as siblings). That frozen v1 meaning
+/// is applied here so reads never depend on process CWD; the bytes on disk
+/// stay untouched, so the currency hash cannot drift from the newest
+/// version just because someone ran `status` from `~`.
+fn load_config(store_root: &Path) -> Result<Option<(BackupConfig, bool)>> {
     let path = store_root.join(BACKUP_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).map(Some).map_err(|e| {
-            Error::issuance(format!(
-                "issuer store has a malformed {BACKUP_FILE} — backups are NOT running; fix \
-                     or remove the file and re-run `interflow-cli issuer backup init`"
-            ))
-            .with_source(e)
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(Error::Io {
-            path: path.display().to_string(),
-            source: e,
-        }),
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::Io {
+                path: path.display().to_string(),
+                source: e,
+            });
+        }
+    };
+    let mut cfg: BackupConfig = serde_json::from_str(&text).map_err(|e| {
+        Error::issuance(format!(
+            "issuer store has a malformed {BACKUP_FILE} — backups are NOT running; fix \
+                 or remove the file and re-run `interflow-cli issuer backup init`"
+        ))
+        .with_source(e)
+    })?;
+    let mut migrated = false;
+    if cfg.version < CONFIG_VERSION {
+        if cfg.backup_dir.is_relative() {
+            let anchor = store_root
+                .canonicalize()
+                .unwrap_or_else(|_| store_root.to_owned());
+            let Some(parent) = anchor.parent() else {
+                return Err(Error::issuance(format!(
+                    "backup_dir \"{}\" is relative and the store root {} has no parent to anchor \
+                     it against — fix the file and re-run `interflow-cli issuer backup init`",
+                    cfg.backup_dir.display(),
+                    store_root.display()
+                )));
+            };
+            cfg.backup_dir = parent.join(&cfg.backup_dir);
+        }
+        cfg.version = CONFIG_VERSION;
+        migrated = true;
+    } else if cfg.backup_dir.is_relative() {
+        // The v2 invariant is broken — a hand-edit, not a legacy shape.
+        // Fail closed rather than guess an anchor for a file that promised
+        // not to need one.
+        return Err(Error::issuance(format!(
+            "{} declares format version {} but stores a relative backup_dir \"{}\" — the on-disk \
+             value must be absolute; fix the file and re-run `interflow-cli issuer backup init`",
+            path.display(),
+            cfg.version,
+            cfg.backup_dir.display()
+        )));
     }
+    Ok(Some((cfg, migrated)))
 }
 
 /// Default backup directory: a sibling of the store root
@@ -119,9 +203,63 @@ pub fn default_backup_dir(store_root: &Path) -> PathBuf {
     store_root.with_file_name(format!("{name}-backups"))
 }
 
+/// Canonicalizes `path`, or — when it does not exist yet — canonicalizes
+/// its deepest existing ancestor and re-appends the missing tail. Without
+/// this, a symlinked temp root (macOS `/var` → `/private/var`) splits one
+/// tree across two spellings and the nesting check below compares
+/// `/private/var/.../store` against `/var/.../store/inside` — a mismatch
+/// that lets a nested dir slip through.
+fn anchored(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    for ancestor in path.ancestors().skip(1) {
+        if let Ok(canonical) = ancestor.canonicalize() {
+            let tail = path.strip_prefix(ancestor).unwrap_or(path);
+            return canonical.join(tail);
+        }
+    }
+    path.to_owned()
+}
+
+/// Validates and anchors a backup directory target for writing: refuses
+/// nesting inside the store, creates the directory so writability fails
+/// here (not at the first checkpoint), and returns the canonical absolute
+/// path the v2 config stores.
+fn resolve_backup_dir(store_root: &Path, backup_dir: &Path) -> Result<PathBuf> {
+    // A backup dir inside the store would tuck the copies into the thing
+    // they protect (and recurse into the tar).
+    let root_canon = anchored(store_root);
+    let backup_canon = anchored(backup_dir);
+    if backup_canon.starts_with(&root_canon) {
+        return Err(Error::issuance(format!(
+            "backup directory {} must live OUTSIDE the issuer store {} — otherwise one disk \
+             loss takes both",
+            backup_dir.display(),
+            store_root.display()
+        )));
+    }
+    std::fs::create_dir_all(backup_dir).map_err(|e| Error::Io {
+        path: backup_dir.display().to_string(),
+        source: e,
+    })?;
+    // The dir exists now, so this canonicalize succeeds where the nesting
+    // pre-check above could only fall back to raw text. Stored absolute on
+    // purpose: a relative backup_dir is a CWD-dependent config, and CWD is
+    // process state, not store state — it must not survive the invocation
+    // that created it.
+    Ok(match backup_dir.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(_) => std::env::current_dir()
+            .map(|cwd| cwd.join(backup_dir))
+            .unwrap_or_else(|_| backup_dir.to_owned()),
+    })
+}
+
 /// Writes the backup configuration (one-time; refuses to overwrite —
-/// rekeying is [`rekey`]). Creates the backup directory so writability
-/// fails here, not at the first checkpoint.
+/// changing the key is [`rekey`], moving the directory is [`relocate`]).
+/// Creates the backup directory so writability fails here, not at the first
+/// checkpoint.
 pub fn configure(
     store_root: &Path,
     recipient: &str,
@@ -131,40 +269,23 @@ pub fn configure(
     if config(store_root)?.is_some() {
         return Err(Error::issuance(format!(
             "{} already configures backups — use `interflow-cli issuer backup rekey` to change \
-             the key (old backups stay readable by the old identity)",
+             the key (old backups stay readable by the old identity), or `interflow-cli issuer \
+             backup relocate --backup-dir <dir>` to move the target directory",
             store_root.join(BACKUP_FILE).display()
         )));
     }
     parse_recipient(recipient)?;
-    // A backup dir inside the store would tuck the copies into the thing
-    // they protect (and recurse into the tar).
-    let root_canon = store_root
-        .canonicalize()
-        .unwrap_or_else(|_| store_root.to_owned());
-    let backup_canon = backup_dir
-        .canonicalize()
-        .unwrap_or_else(|_| backup_dir.to_owned());
-    if backup_canon.starts_with(&root_canon) {
-        return Err(Error::issuance(format!(
-            "backup directory {} must live OUTSIDE the issuer store {} — otherwise one disk \
-             loss takes both",
-            backup_dir.display(),
-            store_root.display()
-        )));
-    }
     if retention == 0 {
         return Err(Error::issuance(
             "backup retention must keep at least one version".to_owned(),
         ));
     }
-    std::fs::create_dir_all(backup_dir).map_err(|e| Error::Io {
-        path: backup_dir.display().to_string(),
-        source: e,
-    })?;
+    let stored_dir = resolve_backup_dir(store_root, backup_dir)?;
     let initialized_at = rfc3339_now()?;
     let cfg = BackupConfig {
+        version: CONFIG_VERSION,
         recipient: recipient.trim().to_owned(),
-        backup_dir: backup_dir.to_owned(),
+        backup_dir: stored_dir,
         retention,
         initialized_at,
     };
@@ -186,6 +307,24 @@ pub fn rekey(store_root: &Path, new_recipient: &str) -> Result<BackupConfig> {
     parse_recipient(new_recipient)?;
     cfg.recipient = new_recipient.trim().to_owned();
     cfg.initialized_at = rfc3339_now()?;
+    write_config(store_root, &cfg)?;
+    Ok(cfg)
+}
+
+/// Moves the backup target directory, keeping recipient and retention.
+/// Prior versions stay in the old directory — readable by the same recovery
+/// identity, untouched by the new directory's retention — while new
+/// checkpoints land in the new one. This is the sanctioned way to point
+/// backups at a second medium (the doctor hint's destination).
+pub fn relocate(store_root: &Path, backup_dir: &Path) -> Result<BackupConfig> {
+    let Some(mut cfg) = config(store_root)? else {
+        return Err(Error::issuance(
+            "issuer store has no backup configuration — run `interflow-cli issuer backup init` \
+             first"
+                .to_owned(),
+        ));
+    };
+    cfg.backup_dir = resolve_backup_dir(store_root, backup_dir)?;
     write_config(store_root, &cfg)?;
     Ok(cfg)
 }
@@ -236,9 +375,20 @@ pub enum Checkpoint {
 /// zeroed), so the content hash — and with it the version name — is a pure
 /// function of file contents and modes.
 pub fn checkpoint(store_root: &Path) -> Result<Checkpoint> {
-    let Some(cfg) = config(store_root)? else {
+    let Some((cfg, migrated)) = load_config(store_root)? else {
         return Ok(Checkpoint::Unconfigured);
     };
+    // The bookkeeping db lives under the store root and rides along in the
+    // tar — flush its WAL first so the plain file copy carries every
+    // committed row (the sidecar files themselves are skipped below).
+    crate::state_db::wal_checkpoint(store_root)?;
+    if migrated {
+        // Persist the normalized config BEFORE hashing: the migration is a
+        // store change like any other, and the version this checkpoint
+        // writes must cover it — never a side-channel edit that silently
+        // stales the newest backup against the store it just recorded.
+        write_config(store_root, &cfg)?;
+    }
     let files = collect_files(store_root, &cfg.backup_dir)?;
     let tar_bytes = build_tar(&files)?;
     let hash8 = interflow_util::sha256_hex(&tar_bytes)[..8].to_owned();
@@ -264,33 +414,66 @@ pub fn checkpoint(store_root: &Path) -> Result<Checkpoint> {
     Ok(Checkpoint::Written { path })
 }
 
+/// The version-name timestamp format. Compile-time on purpose (the `time`
+/// `macros` feature): the writer ([`timestamp_compact`]) and the reader
+/// ([`parse_name_timestamp`]) share one description and cannot drift, so
+/// every name this tool emits parses back.
+const COMPACT_TIMESTAMP: &[time::format_description::BorrowedFormatItem] =
+    time::macros::format_description!("[year][month][day]T[hour][minute][second]Z");
+
 /// `20261009T153000Z` — fixed width and human-readable in listings. The
-/// format string is static; if parsing or formatting ever fails, the unix
-/// timestamp keeps names unique. Version ORDERING never depends on the
-/// name (see [`Version::modified`]).
+/// description is compile-time, so formatting an in-range datetime cannot
+/// fail; the unix-seconds fallback only guarantees a checkpoint never
+/// aborts for want of a name. Ordering DOES depend on the name:
+/// [`parse_name_timestamp`] accepts both emitted shapes, so every name
+/// written here stays orderable.
 fn timestamp_compact(now: OffsetDateTime) -> String {
-    match time::format_description::parse_borrowed::<2>(
-        "[year][month][day]T[hour][minute][second]Z",
-    ) {
-        Ok(format) => now
-            .format(&format)
-            .unwrap_or_else(|_| now.unix_timestamp().to_string()),
+    match now.format(&COMPACT_TIMESTAMP) {
+        Ok(stamp) => stamp,
         Err(_) => now.unix_timestamp().to_string(),
     }
+}
+
+/// `issuer-<timestamp>-<hash8>.age` → the `<timestamp>` as an instant.
+/// Accepts both shapes [`timestamp_compact`] can emit (the fixed-width
+/// compact form and its unix-seconds fallback), so any name this tool
+/// wrote is orderable. `None` means a foreign file, not a version.
+///
+/// The compact form carries no `[offset]` component — the trailing `Z` is
+/// a literal — so it parses as a `PrimitiveDateTime` that is then pinned
+/// to UTC (the names are minted from `now_utc`).
+fn parse_name_timestamp(stem: &str) -> Option<OffsetDateTime> {
+    let middle = stem.strip_prefix(NAME_PREFIX)?.rsplit_once('-')?.0;
+    if let Ok(stamp) = time::PrimitiveDateTime::parse(middle, &COMPACT_TIMESTAMP) {
+        return Some(stamp.assume_utc());
+    }
+    middle
+        .parse::<i64>()
+        .ok()
+        .and_then(|secs| OffsetDateTime::from_unix_timestamp(secs).ok())
 }
 
 struct Version {
     path: PathBuf,
     hash8: String,
-    /// Last-write time — the honest "newest" signal. Name sorting alone
-    /// mis-orders two versions written inside the same second (the hash in
-    /// the name is content, not an ordering).
+    /// The instant parsed from the file name's embedded timestamp — the
+    /// ordering key. Unlike mtime it travels with the file through copies,
+    /// syncs and unpacks (the recovery scenario this subsystem exists
+    /// for); unlike the hash it is an ordering, not content.
+    timestamp: OffsetDateTime,
+    /// Last-write time — tiebreak ONLY, ordering two checkpoints written
+    /// inside the same second (the name's second-resolution timestamp
+    /// cannot; the hash in the name is content, not an ordering).
     modified: std::time::SystemTime,
 }
 
-/// All versions, oldest first, ordered by (mtime, name) — the newest
-/// version is the most recently written one even inside a one-second burst
-/// of checkpoints.
+/// All versions, oldest first, ordered by (name timestamp, mtime, name).
+/// The file name's timestamp is the primary key: mtime is file-system
+/// state that any copy/sync/unpack resets (a `cp -r` of the backup dir
+/// collapses every mtime onto one instant and made "newest" a coin toss —
+/// (internal design notes)), while the name
+/// is part of the artifact. mtime only breaks same-second ties, which is
+/// the one thing the name cannot express.
 fn list_versions(backup_dir: &Path) -> Result<Vec<Version>> {
     let entries = match std::fs::read_dir(backup_dir) {
         Ok(entries) => entries,
@@ -314,32 +497,40 @@ fn list_versions(backup_dir: &Path) -> Result<Vec<Version>> {
         if !(name.starts_with(NAME_PREFIX) && name.ends_with(".age")) {
             continue;
         }
+        let stem = name.trim_end_matches(".age");
+        let Some(timestamp) = parse_name_timestamp(stem) else {
+            tracing::warn!("skipping foreign file in backup dir: {name}");
+            continue;
+        };
         let meta = entry.metadata().map_err(|e| Error::Io {
             path: entry.path().display().to_string(),
             source: e,
         })?;
         // issuer-<timestamp>-<hash8>.age → hash8 is the last dash group.
-        let hash8 = name
-            .trim_end_matches(".age")
-            .rsplit('-')
-            .next()
-            .unwrap_or_default()
-            .to_owned();
+        let hash8 = stem.rsplit('-').next().unwrap_or_default().to_owned();
         versions.push(Version {
             path: entry.path(),
             hash8,
+            timestamp,
             modified: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
         });
     }
     versions.sort_by(|a, b| {
-        a.modified
-            .cmp(&b.modified)
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.modified.cmp(&b.modified))
             .then_with(|| a.path.cmp(&b.path))
     });
     Ok(versions)
 }
 
 /// The newest `issuer-*.age` version.
+/// Number of versioned checkpoints currently in `backup_dir` (0 when the
+/// directory is absent) — CLI narration for [`relocate`].
+pub fn version_count(backup_dir: &Path) -> usize {
+    list_versions(backup_dir).map_or(0, |versions| versions.len())
+}
+
 fn newest_version(backup_dir: &Path) -> Result<Option<Version>> {
     Ok(list_versions(backup_dir)?.pop())
 }
@@ -376,7 +567,10 @@ struct FileEntry {
 /// Collects every regular file under `root`, sorted by relative path. The
 /// issuer store is regular files only; a symlink or anything else in there
 /// is unexpected and fails the checkpoint rather than silently diverging
-/// from what restore would write.
+/// from what restore would write. The bookkeeping db's WAL sidecars
+/// (`store.db-wal` / `store.db-shm`) are skipped: transient by design, and
+/// the db is flushed whole by [`crate::state_db::wal_checkpoint`] before
+/// the walk.
 fn collect_files(root: &Path, skip_dir: &Path) -> Result<Vec<FileEntry>> {
     let mut files = Vec::new();
     walk(root, root, skip_dir, &mut files)?;
@@ -407,6 +601,11 @@ fn walk(root: &Path, dir: &Path, skip_dir: &Path, out: &mut Vec<FileEntry>) -> R
             .canonicalize()
             .unwrap_or_else(|_| skip_dir.to_owned());
         if path.canonicalize().is_ok_and(|p| p == canonical_skip) {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && matches!(name, "store.db-wal" | "store.db-shm")
+        {
             continue;
         }
         let rel = path
@@ -653,6 +852,16 @@ pub fn restore(backup_file: &Path, identity: &str, to_dir: &Path) -> Result<Rest
         source: e,
     })?;
     for file in &files {
+        // The backup configuration is machine-local state: its backup_dir is
+        // an absolute path from the machine that wrote it, so carrying it
+        // over would point this machine's checkpoints at a directory that
+        // has nothing to do with it (or silently create it when restore
+        // validation triggers a checkpoint). The restored store is
+        // "unconfigured" by design — the same shape as a freshly created
+        // one; `issuer backup init` re-arms backups for THIS machine.
+        if file.rel == BACKUP_FILE {
+            continue;
+        }
         let path = to_dir.join(&file.rel);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Io {
@@ -737,6 +946,7 @@ pub fn status(store_root: &Path) -> Result<BackupStatus> {
         .into_iter()
         .map(|v| v.path)
         .collect();
+    crate::state_db::wal_checkpoint(store_root)?;
     let files = collect_files(store_root, &cfg.backup_dir)?;
     let tar_bytes = build_tar(&files)?;
     let current_hash8 = interflow_util::sha256_hex(&tar_bytes)[..8].to_owned();
@@ -1038,6 +1248,94 @@ mod tests {
     }
 
     #[test]
+    fn recipient_of_derives_the_public_key() {
+        let identity = generate_identity().unwrap();
+        assert_eq!(recipient_of(&identity.secret).unwrap(), identity.recipient);
+        assert!(recipient_of("AGE-SECRET-KEY-1not-a-key").is_err());
+    }
+
+    #[test]
+    fn restore_strips_the_backup_configuration() {
+        let (_guard, root, identity) = configured_store("strip");
+        IssuerStore::open(&root).ensure_realm().unwrap();
+        let backup_dir = status(&root).unwrap().config.unwrap().backup_dir;
+        let newest = list_versions(&backup_dir).unwrap().pop().unwrap().path;
+
+        let to = root.parent().unwrap().join("stripped-restored");
+        restore(&newest, &identity.secret, &to).unwrap();
+
+        // The restored store is "unconfigured" — the old machine's absolute
+        // backup_dir never travels.
+        assert!(
+            config(&to).unwrap().is_none(),
+            "backup.json must not survive a restore"
+        );
+        assert!(!to.join(BACKUP_FILE).exists());
+        // Restore validation fires ensure_* hooks → best-effort checkpoints
+        // are no-ops against an unconfigured store, never writes into the
+        // OLD machine's directory.
+        assert_eq!(checkpoint(&to).unwrap(), Checkpoint::Unconfigured);
+        assert_eq!(
+            list_versions(&backup_dir).unwrap().len(),
+            1,
+            "restore must not checkpoint into the old machine's backup dir"
+        );
+        // The store itself is fully intact.
+        IssuerStore::open(&to).ensure_realm().unwrap();
+    }
+
+    #[test]
+    fn relocate_moves_the_target_and_keeps_prior_versions() {
+        let (_guard, root, identity) = configured_store("relocate");
+        IssuerStore::open(&root).ensure_realm().unwrap();
+        let old_dir = status(&root).unwrap().config.unwrap().backup_dir;
+        let old_versions = list_versions(&old_dir).unwrap().len();
+        assert!(old_versions >= 1);
+
+        let new_dir = root.parent().unwrap().join("relocate-second-medium");
+        let cfg = relocate(&root, &new_dir).unwrap();
+        assert_eq!(cfg.backup_dir, new_dir.canonicalize().unwrap());
+        assert_eq!(
+            cfg.recipient,
+            status(&root).unwrap().config.unwrap().recipient
+        );
+
+        // The checkpoint right after the move lands in the NEW directory.
+        assert!(matches!(
+            checkpoint(&root).unwrap(),
+            Checkpoint::Written { path } if path.starts_with(new_dir.canonicalize().unwrap())
+        ));
+        // Prior versions stay behind, readable by the SAME identity.
+        assert_eq!(
+            list_versions(&old_dir).unwrap().len(),
+            old_versions,
+            "relocate never touches the old directory"
+        );
+        let old_newest = list_versions(&old_dir).unwrap().pop().unwrap().path;
+        assert!(verify(&old_newest, &identity.secret).is_ok());
+        // Retention now prunes the new directory only — the old history is
+        // out of the pruning loop by construction.
+        let status_now = status(&root).unwrap();
+        assert!(status_now.newest_is_current);
+        assert_eq!(status_now.versions.len(), 1);
+    }
+
+    #[test]
+    fn relocate_refuses_unconfigured_and_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare");
+        assert!(
+            relocate(&bare, &dir.path().join("anywhere")).is_err(),
+            "relocate requires an existing configuration"
+        );
+        let (_guard, root, _identity) = configured_store("relocate-nest");
+        assert!(
+            relocate(&root, &root.join("inside")).is_err(),
+            "a backup dir inside the store is refused exactly like configure"
+        );
+    }
+
+    #[test]
     fn malformed_backup_config_is_loud_not_silent() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("broken-cfg");
@@ -1046,6 +1344,214 @@ mod tests {
         assert!(
             config(&root).is_err(),
             "a corrupt backup.json must not silently disable backups"
+        );
+    }
+
+    fn set_mtime(path: &Path, at: std::time::SystemTime) {
+        let file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.set_modified(at).unwrap();
+    }
+
+    /// The store exactly as the 2026-10-10 deployments stood when the CWD
+    /// bug was found: v1 backup.json with a raw relative backup_dir, its
+    /// sibling backup dir already populated, and (for the read-only test)
+    /// a newest version whose hash covers those very bytes.
+    fn legacy_v1_store(tag: &str) -> (tempfile::TempDir, PathBuf, GeneratedIdentity) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(tag);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(dir.path().join(format!("{tag}-backups"))).unwrap();
+        let identity = generate_identity().unwrap();
+        std::fs::write(root.join("realm-issuer.crt"), b"a store file").unwrap();
+        std::fs::write(
+            root.join(BACKUP_FILE),
+            serde_json::json!({
+                "recipient": identity.recipient,
+                "backup_dir": format!("{tag}-backups"),
+                "retention": DEFAULT_RETENTION,
+                "initialized_at": "2026-10-10T04:20:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (dir, root, identity)
+    }
+
+    #[test]
+    fn legacy_v1_relative_backup_dir_resolves_on_read_without_writing() {
+        let (dir, root, identity) = legacy_v1_store("legacy-ro");
+        // The version a pre-fix binary would have left: hash over the
+        // store exactly as it stands (v1 bytes included), in the sibling
+        // dir the deployment-tree operator meant.
+        let backup_dir = dir.path().join("legacy-ro-backups");
+        let files = collect_files(&root, &backup_dir).unwrap();
+        let tar_bytes = build_tar(&files).unwrap();
+        let hash8 = interflow_util::sha256_hex(&tar_bytes)[..8].to_owned();
+        let ciphertext =
+            encrypt_to(&parse_recipient(&identity.recipient).unwrap(), &tar_bytes).unwrap();
+        std::fs::write(
+            backup_dir.join(format!("{NAME_PREFIX}20261010T042000Z-{hash8}.age")),
+            ciphertext,
+        )
+        .unwrap();
+
+        let bytes_before = std::fs::read(root.join(BACKUP_FILE)).unwrap();
+        let s = status(&root).unwrap();
+        let cfg = s.config.as_ref().unwrap();
+        assert_eq!(cfg.version, CONFIG_VERSION);
+        assert!(
+            cfg.backup_dir.is_absolute(),
+            "the v1 relative value is anchored to the store's parent"
+        );
+        assert_eq!(
+            cfg.backup_dir.canonicalize().unwrap(),
+            backup_dir.canonicalize().unwrap()
+        );
+        assert_eq!(s.versions.len(), 1);
+        assert!(
+            s.newest_is_current,
+            "reads never rewrite backup.json — the currency hash cannot drift from the newest \
+             version just because someone ran from another CWD"
+        );
+        assert_eq!(
+            std::fs::read(root.join(BACKUP_FILE)).unwrap(),
+            bytes_before,
+            "status is read-only"
+        );
+    }
+
+    #[test]
+    fn checkpoint_persists_the_v2_migration_inside_its_hash() {
+        let (_dir, root, _identity) = legacy_v1_store("migrate");
+        let (cfg, migrated) = load_config(&root).unwrap().unwrap();
+        assert!(migrated, "the v1 shape is normalized in memory");
+        assert!(cfg.backup_dir.is_absolute());
+
+        assert!(matches!(
+            checkpoint(&root).unwrap(),
+            Checkpoint::Written { .. }
+        ));
+        let on_disk: BackupConfig =
+            serde_json::from_str(&std::fs::read_to_string(root.join(BACKUP_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(on_disk.version, CONFIG_VERSION);
+        assert!(on_disk.backup_dir.is_absolute());
+        assert!(
+            status(&root).unwrap().newest_is_current,
+            "the migration was persisted BEFORE hashing — the checkpoint that wrote it covers \
+             it, with no stale window and no follow-up runbook step"
+        );
+    }
+
+    #[test]
+    fn v2_relative_backup_dir_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("v2rel");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(BACKUP_FILE),
+            serde_json::json!({
+                "version": CONFIG_VERSION,
+                "recipient": "age1placeholder",
+                "backup_dir": "relative-backups",
+                "retention": DEFAULT_RETENTION,
+                "initialized_at": "2026-10-12T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = config(&root).unwrap_err().to_string();
+        assert!(
+            err.contains("relative backup_dir"),
+            "a broken v2 invariant is loud, not guessed: {err}"
+        );
+    }
+
+    #[test]
+    fn configure_stores_an_absolute_v2_backup_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("abscfg");
+        let backup_dir = dir.path().join("abscfg-backups");
+        let identity = generate_identity().unwrap();
+        let cfg = configure(&root, &identity.recipient, &backup_dir, DEFAULT_RETENTION).unwrap();
+        assert_eq!(cfg.version, CONFIG_VERSION);
+        assert!(cfg.backup_dir.is_absolute());
+        let on_disk: BackupConfig =
+            serde_json::from_str(&std::fs::read_to_string(root.join(BACKUP_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(on_disk.version, CONFIG_VERSION);
+        assert!(on_disk.backup_dir.is_absolute());
+        // The relative-ARG shape (init run from the deployment tree root)
+        // is exercised end-to-end by the CLI integration test — a unit
+        // test cannot spawn with a foreign CWD.
+    }
+
+    #[test]
+    fn newest_orders_by_name_timestamp_and_survives_mtime_resets() {
+        let (_guard, root, identity) = configured_store("mtimereset");
+        IssuerStore::open(&root).ensure_realm().unwrap();
+        let s0 = status(&root).unwrap();
+        assert!(s0.newest_is_current);
+        let backup_dir = s0.config.clone().unwrap().backup_dir;
+        let current_hash8 = s0.current_hash8.clone().unwrap();
+
+        // A decoy with an OLDER name timestamp carrying today's content —
+        // what a synced-in copy of last week's backup looks like.
+        let files = collect_files(&root, &backup_dir).unwrap();
+        let tar_bytes = build_tar(&files).unwrap();
+        let ciphertext =
+            encrypt_to(&parse_recipient(&identity.recipient).unwrap(), &tar_bytes).unwrap();
+        let decoy = backup_dir.join(format!("{NAME_PREFIX}20261010T042000Z-deadbeef.age"));
+        std::fs::write(&decoy, &ciphertext).unwrap();
+
+        // `cp -r` without -p: mtimes become per-file copy instants in
+        // arbitrary order — here the OLDEST version lands with the
+        // FRESHEST mtime, the exact field condition that made newest point
+        // at the 10-10 decoy and report a false stale.
+        let reset =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        for v in list_versions(&backup_dir).unwrap() {
+            set_mtime(&v.path, reset);
+        }
+        set_mtime(&decoy, reset + std::time::Duration::from_secs(86_400));
+        assert!(
+            status(&root).unwrap().newest_is_current,
+            "newest must follow the name timestamp, not the reset mtime"
+        );
+        assert_eq!(
+            newest_version(&backup_dir).unwrap().unwrap().hash8,
+            current_hash8
+        );
+    }
+
+    #[test]
+    fn same_second_versions_order_by_write_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup_dir = dir.path().join("tie-backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let identity = generate_identity().unwrap();
+        let ciphertext = encrypt_to(
+            &parse_recipient(&identity.recipient).unwrap(),
+            b"ordering only",
+        )
+        .unwrap();
+        let a = backup_dir.join(format!("{NAME_PREFIX}20261012T100000Z-aaaaaaaa.age"));
+        let b = backup_dir.join(format!("{NAME_PREFIX}20261012T100000Z-bbbbbbbb.age"));
+        std::fs::write(&a, &ciphertext).unwrap();
+        std::fs::write(&b, &ciphertext).unwrap();
+        let t0 = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        set_mtime(&a, t0);
+        set_mtime(&b, t0 + std::time::Duration::from_secs(1));
+        assert_eq!(
+            newest_version(&backup_dir).unwrap().unwrap().path,
+            b,
+            "the later write wins the same-second tie"
+        );
+        set_mtime(&a, t0 + std::time::Duration::from_secs(2));
+        assert_eq!(
+            newest_version(&backup_dir).unwrap().unwrap().path,
+            a,
+            "mtime is only the tiebreak — reversing mtimes reverses the pair"
         );
     }
 }

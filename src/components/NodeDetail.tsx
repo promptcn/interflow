@@ -8,6 +8,7 @@ import {
   type NodeInfo,
 } from "../api";
 import { useT } from "../i18n";
+import { principalRealm } from "../lib/shellFace";
 import LogView from "./LogView";
 import NodeConfigView from "./NodeConfigView";
 import NodeStatusView from "./NodeStatusView";
@@ -16,7 +17,6 @@ import {
   Badge,
   Button,
   Hint,
-  Kbd,
   KindBadge,
   SectionPanel,
   SegmentedControl,
@@ -27,7 +27,7 @@ export type DetailView = "status" | "config" | "logs";
 
 interface Props {
   node: NodeInfo;
-  // View state lives in App (the DeployFace precedent): Esc climbs
+  // View state lives in App: Esc climbs
   // view → overview, and opening a node always lands on Status — the
   // monitoring view is never polluted by the previous browse path.
   view: DetailView;
@@ -120,10 +120,26 @@ export default function NodeDetail({
         <Button variant="link" size="sm" onClick={onBack}>
           <ArrowLeft className="size-4" />
           {t("nodeDetail.allNodes")}
-          <Kbd>Esc</Kbd>
         </Button>
         <StateDot state={node.state} size="md" />
         <h2 className="m-0 text-xl font-semibold">{node.name}</h2>
+        {principalRealm(node.principal) && (
+          <span className="font-mono text-micro text-fg-3">
+            {principalRealm(node.principal)}
+          </span>
+        )}
+        {/* The owning deployment (pack-path reverse resolution) — the
+            cross-deployment host view's answer to "who manages this
+            node"; a signed pack without one is a local sealed import. */}
+        {node.deployment !== null ? (
+          <Hint text={node.deployment.root}>
+            <span className="font-mono text-micro text-fg-3">@ {node.deployment.name}</span>
+          </Hint>
+        ) : (
+          node.principal !== null && (
+            <span className="text-micro text-fg-3">{t("nodeDetail.localImport")}</span>
+          )
+        )}
         <KindBadge kind={node.kind} />
       </div>
 

@@ -18,9 +18,12 @@ mod commands;
 mod contract;
 mod deploy;
 mod deploy_prefs;
+mod deployment;
+mod fleet;
 mod gui_prefs;
 mod i18n;
 mod node;
+mod prefs;
 mod profile;
 mod tracing_capture;
 mod tray;
@@ -83,6 +86,11 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::deploy_prefs_save,
             commands::gui_prefs_load,
             commands::gui_prefs_save,
+            commands::deployment_list,
+            commands::deployment_current,
+            commands::deployment_set_current,
+            commands::fleet_overview,
+            commands::deployment_publish,
         ])
         .events(tauri_specta::collect_events![
             contract::NodeStateEvent,

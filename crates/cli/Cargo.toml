@@ -15,16 +15,16 @@ name = "interflow_cli"
 path = "src/lib.rs"
 
 [dependencies]
-interflow-identity = { path = "../identity", version = "0.8" }
-interflow-core = { path = "../core", version = "0.8" }
-interflow-mesh = { path = "../mesh", version = "0.8" }
-interflow-expose = { path = "../expose", version = "0.8" }
+interflow-identity.workspace = true
+interflow-core.workspace = true
+interflow-mesh.workspace = true
+interflow-expose.workspace = true
 # sd_notify readiness (run_agent fires READY for Type=notify units)
-interflow-util = { path = "../util", version = "0.8" }
+interflow-util.workspace = true
 # Shared renewal scheduler (pack lifecycle beside the engine)
-interflow-renewal = { path = "../renewal", version = "0.8" }
+interflow-renewal.workspace = true
 # `--version` build tag — same const as `interflow-mesh version`
-interflow-buildinfo = { path = "../buildinfo", version = "0.8" }
+interflow-buildinfo.workspace = true
 
 tokio = { workspace = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -38,14 +38,15 @@ time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
+similar = { workspace = true }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-interflow-registrar = { path = "../registrar", version = "0.8" }
-interflow-renewal = { path = "../renewal", version = "0.8" }
+interflow-registrar.workspace = true
+interflow-renewal.workspace = true
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 # In-process hub hosting for the apply e2e (policy_apply_hub_reinstall.rs)
 tokio-util = { workspace = true }

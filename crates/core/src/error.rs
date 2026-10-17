@@ -42,6 +42,17 @@ pub enum InterflowError {
     #[error("task join error: {0}")]
     JoinError(#[from] tokio::task::JoinError),
 
+    /// Optimistic-concurrency conflict: the target changed between the
+    /// caller's read and this write, so the caller's freshness token is
+    /// stale. Re-read and reconcile — retrying the same write can never
+    /// succeed (the editor changed-on-disk guard; the same answer k8s
+    /// `resourceVersion` converges on).
+    #[error("conflict: {message}")]
+    Conflict {
+        /// Human-readable description naming what changed underneath.
+        message: String,
+    },
+
     /// Configuration error (load / validate / assembly failure). Unrecoverable.
     #[error("configuration error: {message}")]
     Config {

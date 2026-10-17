@@ -392,6 +392,15 @@ async fn handle(
 ) -> std::result::Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let path = request.uri().path();
     let method = request.method().clone();
+    // Fault-injection consult (see `crate::fault`): runs before any handler
+    // so the injected failure class is transport/server trouble, not a
+    // semantic rejection. Compiles away when the feature is off.
+    if crate::fault::should_fail(path) {
+        tracing::warn!("registrar injected fault on {path}");
+        return Ok(service_unavailable(
+            "registrar temporarily unavailable (injected fault)",
+        ));
+    }
     let result = match (method.as_str(), path) {
         ("POST", "/v1/enroll") => {
             let body = read_body(request).await;
@@ -515,6 +524,20 @@ fn error<E: std::fmt::Display>(e: E) -> Response<Full<Bytes>> {
     let bytes = Bytes::from(body.to_string());
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .body(Full::new(bytes))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))
+}
+
+/// Fault-injection answer (see `crate::fault`): the failure class under
+/// test is server-side trouble, distinct from the 400s semantic errors
+/// carry — the renewal client sees the same shape as an overloaded
+/// registrar.
+fn service_unavailable(message: &str) -> Response<Full<Bytes>> {
+    let body = serde_json::json!({"error": message});
+    let bytes = Bytes::from(body.to_string());
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
         .header("content-type", "application/json")
         .body(Full::new(bytes))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())))

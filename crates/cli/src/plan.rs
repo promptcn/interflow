@@ -6,30 +6,30 @@
 
 /// The line sink the operations below write to (CLI prints them, the GUI
 /// streams them).
-macro_rules! outln {
+macro_rules! pushln {
     ($lines:expr, $($arg:tt)*) => {
         $lines.push(format!($($arg)*))
     };
 }
 
 use crate::render;
-use interflow_identity::issuance::AppliedState;
 use interflow_identity::issuance::IssuerStore;
 use interflow_identity::issuance::StoreBinding;
+use interflow_identity::issuance::{AppliedKind, AppliedState};
 use interflow_identity::manifest::{Manifest, PublicTlsMode};
-use interflow_identity::pack::CredentialPack;
 use interflow_identity::pack::render::{
     AgentCredentialPack, HubCredentialPack, IngressCredentialPack,
 };
 use interflow_identity::policy::RuntimePolicy;
 use interflow_identity::revocation::{RevocationEntry, RevocationList, build_crl};
+use interflow_identity::{PackTreeStale, pack_digest_of, pack_generation_of, probe_pack_format};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// sha256 of the manifest with every agent's mesh rule lists emptied — the
-/// identity/trust/dial face. `plan apply` diffs this against the applied
-/// state: unchanged face + moved rules = the policy-only fast path (no
-/// re-render, no re-sign).
+/// sha256 of the manifest with every agent's policy-carried lists emptied
+/// (mesh rules, services, routes) — the identity/trust/dial face. `plan
+/// apply` diffs this against the applied state: unchanged face + moved
+/// policy content = the policy-only fast path (no re-render, no re-sign).
 /// Writes a PEM private key with owner-only permissions (the ephemeral
 /// publish credential).
 fn write_private_key_file(path: &Path, pem: &str) -> interflow_core::error::Result<()> {
@@ -51,7 +51,14 @@ fn stripped_manifest_digest(manifest: &Manifest) -> interflow_core::error::Resul
     for agent in stripped.agent.values_mut() {
         agent.mesh_ingress.clear();
         agent.mesh_egress.clear();
+        // Services are policy material too (the signed default address
+        // rides the policy since 2026-10-10), and so are routes: both
+        // hot-apply on every node kind, so they belong to the policy-only
+        // face. A stale pack node.toml default is shadowed by the signed
+        // default in the resolve ladder until the next full render.
+        agent.services.clear();
     }
+    stripped.route.clear();
     let text = serde_json::to_string(&stripped).map_err(|e| {
         interflow_core::error::InterflowError::config("manifest serialization".to_string())
             .with_source(e)
@@ -83,18 +90,26 @@ fn pack_dir_digest(dir: &Path) -> interflow_core::error::Result<String> {
 /// every control-plane call degrades to local watermarks / manual
 /// distribution).
 fn manifest_hub_endpoint(manifest: &Manifest) -> String {
+    if let Some(hub) = manifest.mesh.hub.values().next() {
+        return hub.endpoint.clone();
+    }
+    // Expose-only deployment: the ingress's control endpoint carries the
+    // same policy face (serving to agents, publication to the operator —
+    // the 2026-10-10 wiring). Loopback by default: unreachable from
+    // another machine degrades to guided manual distribution, same as a
+    // mesh hub behind an unreachable address.
     manifest
-        .mesh
-        .hub
+        .ingress
         .values()
         .next()
-        .map(|hub| hub.endpoint.clone())
+        .map(|ingress| ingress.control_listen.clone())
         .unwrap_or_default()
 }
 
 fn apply_policy_only(
     issuer: &IssuerStore,
     manifest: &Manifest,
+    manifest_text: &str,
     prev: &AppliedState,
     out_root: &Path,
     pre_queried_hub: Option<interflow_mesh::hub::policy::PolicyFloorQuery>,
@@ -128,9 +143,9 @@ fn apply_policy_only(
             .map_err(interflow_core::error::InterflowError::Io)?;
         std::fs::write(bundle_dir.join("policy.sig"), &signature)
             .map_err(interflow_core::error::InterflowError::Io)?;
-        outln!(
+        pushln!(
             lines,
-            "✔ policy-only change: mesh rules moved, identity face unchanged — signed policy              generation {generation} (no pack re-rendered, no identity re-signed)"
+            "✔ policy-only change: rules / services / routes moved, identity face unchanged — signed              policy generation {generation} (no pack re-rendered, no identity re-signed)"
         );
         match publish_with_ephemeral_credential(
             issuer,
@@ -146,7 +161,7 @@ fn apply_policy_only(
                 break;
             }
             PublishResult::Conflict(hub_floor) if attempt == 0 => {
-                outln!(
+                pushln!(
                     lines,
                     "  hub floor is generation {hub_floor} (advanced since the pre-flight query) —                      re-signing at {} and retrying",
                     hub_floor + 1
@@ -159,7 +174,7 @@ fn apply_policy_only(
         }
     }
     if !published {
-        outln!(
+        pushln!(
             lines,
             "  manual distribution: copy {}/policy.toml + policy.sig into every node's              <pack>/state/policy/ (the reload watcher applies them, ≤10s)",
             bundle_dir.display()
@@ -175,12 +190,16 @@ fn apply_policy_only(
         )
     );
     issuer
-        .record_applied(&AppliedState {
-            stripped_manifest_digest: prev.stripped_manifest_digest.clone(),
-            policy_generation: generation,
-            policy_digest: digest,
-            packs: prev.packs.clone(),
-        })
+        .record_applied(
+            &AppliedState {
+                stripped_manifest_digest: prev.stripped_manifest_digest.clone(),
+                policy_generation: generation,
+                policy_digest: digest,
+                packs: prev.packs.clone(),
+            },
+            Some(manifest_text),
+            AppliedKind::PolicyOnly,
+        )
         .map_err(crate::runtime::pack_error)?;
     Ok(generation)
 }
@@ -340,7 +359,7 @@ fn publish_with_ephemeral_credential(
     })();
     match outcome {
         Ok(interflow_mesh::hub::policy::PublishOutcome::Published { generation }) => {
-            outln!(
+            pushln!(
                 lines,
                 "  published to hub {endpoint} → generation {generation}; online agents hot-apply"
             );
@@ -350,7 +369,7 @@ fn publish_with_ephemeral_credential(
             current_generation,
         }) => PublishResult::Conflict(current_generation),
         Ok(interflow_mesh::hub::policy::PublishOutcome::Rejected { status, detail }) => {
-            outln!(
+            pushln!(
                 lines,
                 "  hub {endpoint} REFUSED the bundle (HTTP {status}: {detail}) — check the \
                  hub's trust anchor / control principal; falling back to manual distribution"
@@ -358,11 +377,127 @@ fn publish_with_ephemeral_credential(
             PublishResult::Rejected
         }
         Err(e) => {
-            outln!(
+            pushln!(
                 lines,
                 "  hub {endpoint} unreachable ({e}) — falling back to manual distribution"
             );
             PublishResult::Unreachable
+        }
+    }
+}
+
+/// Reads the issuer store's current CRL files (`<issuer>/<stem>.crl.pem`,
+/// the naming `revoke` writes) — the material the CRL push lane
+/// distributes. Empty when no revocation was ever recorded.
+fn issuer_crl_material(issuer_dir: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut crls = std::collections::BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(issuer_dir) else {
+        return crls;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(stem) = file_name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".crl.pem"))
+        else {
+            continue;
+        };
+        if let Ok(pem) = std::fs::read_to_string(entry.path()) {
+            crls.insert(stem.to_owned(), pem);
+        }
+    }
+    crls
+}
+
+/// Pushes the issuer's current CRLs to the hub's `PUT /crls` — the
+/// revocation lane's emergency leg. The hub hot-swaps its verification
+/// plane onto the pushed set: revoked credentials are rejected on new
+/// connections within seconds (no restart) and any live session holding
+/// one is evicted. Best-effort with honest narration, exactly like the
+/// policy publish.
+fn publish_crls_with_ephemeral_credential(
+    issuer: &IssuerStore,
+    realm: &str,
+    endpoint: &str,
+    crls: &std::collections::BTreeMap<String, String>,
+    lines: &mut Vec<String>,
+) {
+    use interflow_mesh::hub::crl::PublishCrlsOutcome;
+    if endpoint.is_empty() {
+        pushln!(
+            lines,
+            "  this manifest names no hub endpoint — CRL push skipped; the hub picks the \
+             revocation up at its next pack install"
+        );
+        return;
+    }
+    let outcome = (|| {
+        let cred = ControlCredential::mint(issuer, realm)?;
+        let payload = crls.clone();
+        cred.call(endpoint, move |ep, ca, cert, key| {
+            let crls = payload;
+            async move {
+                interflow_mesh::hub::crl::publish_crls(&ep, &ca, &cert, &key, &crls).await
+            }
+        })
+    })();
+    let numbers = |map: &std::collections::BTreeMap<String, u64>| {
+        map.iter()
+            .map(|(stem, n)| format!("{stem}→{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match outcome {
+        Ok(PublishCrlsOutcome::Applied {
+            numbers: map,
+            evicted,
+        }) => {
+            pushln!(
+                lines,
+                "  pushed CRLs to hub {endpoint} ({}) — the hub rejects the revoked \
+                 credentials on new connections now, no restart",
+                numbers(&map)
+            );
+            if !evicted.is_empty() {
+                pushln!(
+                    lines,
+                    "  evicted live session(s) holding revoked credentials: {}",
+                    evicted.join(", ")
+                );
+            }
+        }
+        Ok(PublishCrlsOutcome::RollbackConflict { current }) => {
+            pushln!(
+                lines,
+                "  hub {endpoint} REFUSED the CRLs as a rollback (its counters: {}) — the \
+                 issuer store sits BEHIND the hub; investigate before re-recording",
+                numbers(&current)
+            );
+        }
+        Ok(PublishCrlsOutcome::Rejected {
+            status: 404,
+            detail,
+        }) => {
+            pushln!(
+                lines,
+                "  hub {endpoint} has no CRL face (HTTP 404: {detail}) — an older hub \
+                 build; enforce via node install + restart, and upgrade the hub to close \
+                 the gap"
+            );
+        }
+        Ok(PublishCrlsOutcome::Rejected { status, detail }) => {
+            pushln!(
+                lines,
+                "  hub {endpoint} REFUSED the CRLs (HTTP {status}: {detail}) — check the \
+                 hub's trust anchor / control principal"
+            );
+        }
+        Err(e) => {
+            pushln!(
+                lines,
+                "  hub {endpoint} unreachable ({e}) — the revocation is NOT enforced at \
+                 the hub yet; re-run revoke with --manifest (or plan apply) once reachable"
+            );
         }
     }
 }
@@ -444,7 +579,7 @@ fn policy_mint_floor(
         .max(dist_floor)
         .max(hub.as_ref().map_or(0, |w| w.floor));
     if floor > 0 {
-        outln!(
+        pushln!(
             lines,
             "  policy generation continues above the highest observed watermark {floor} \
              (issuer bookkeeping {bookkeeping}, dist artifacts {dist_floor}, hub floor {}, hub serving {})",
@@ -578,6 +713,147 @@ const fn policy_no_op_verdict(w: &PolicyWatermarks) -> GateVerdict {
     GateVerdict::NoOp
 }
 
+/// The pack directories THIS manifest would render, sorted — the shared
+/// enumeration of the gate's tree probes (format freshness, trust
+/// freshness).
+fn expected_pack_dirs(manifest: &Manifest) -> Vec<String> {
+    let mut expected: Vec<String> = Vec::new();
+    for node in manifest.mesh.hub.keys() {
+        expected.push(format!("hub-{node}"));
+    }
+    for node in manifest.ingress.keys() {
+        expected.push(format!("ingress-{node}"));
+    }
+    for node in manifest.agent.keys() {
+        expected.push(format!("agent-{node}"));
+    }
+    expected.sort();
+    expected
+}
+
+/// The apply gate's pack-tree probe: walks the pack directories THIS
+/// manifest would render and reports the first one that is not in the
+/// current pack format. "Already applied" is a claim about the observable
+/// output tree — a pack the strict loader would refuse (a retired vintage,
+/// a damaged pack.toml, a wiped dist) means the tree is not applied,
+/// whatever the bookkeeping remembers, so the manifest "unchanged" branch
+/// must not short-circuit. Packs of nodes no longer in the manifest are
+/// deliberately not probed: apply does not render them, and their vintage
+/// must not block a legitimate no-op.
+fn stale_pack_in_tree(out_root: &Path, manifest: &Manifest) -> Option<(String, PackTreeStale)> {
+    expected_pack_dirs(manifest).into_iter().find_map(|dir| {
+        probe_pack_format(&out_root.join("packs").join(&dir)).map(|reason| (dir, reason))
+    })
+}
+
+/// Why the gate's trust-freshness probe called a pack's embedded
+/// revocation snapshot stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustSnapshotStale {
+    /// The pack carries no `trust/crls/<stem>.crl.pem` for an issuer the
+    /// deny list holds entries under.
+    MissingCrl { issuer: String },
+    /// The embedded CRL parses but does not revoke a serial the deny list
+    /// attributes to its issuer — a revoke moved after this pack rendered.
+    SerialNotEmbedded { issuer: String, serial: String },
+    /// The embedded CRL failed to read or parse — a damaged snapshot
+    /// re-renders (self-heal) rather than failing the gate.
+    UnreadableCrl { issuer: String, detail: String },
+}
+
+impl TrustSnapshotStale {
+    fn narrate(&self) -> String {
+        match self {
+            Self::MissingCrl { issuer } => {
+                format!("no embedded CRL for {issuer} while the deny list holds entries")
+            }
+            Self::SerialNotEmbedded { issuer, serial } => format!(
+                "issuer {issuer} revoked serial {serial} after this pack rendered — the \
+                 snapshot predates the revoke"
+            ),
+            Self::UnreadableCrl { issuer, detail } => {
+                format!("the embedded CRL for {issuer} is unreadable ({detail})")
+            }
+        }
+    }
+}
+
+/// The apply gate's trust-freshness probe: the issuer's deny list vs the
+/// CRL snapshot each rendered pack embeds. "Already applied" is also a
+/// claim about the TRUST face — a revoke that moved the deny list after
+/// the packs were rendered leaves every node still admitting the revoked
+/// credential, whatever the policy bookkeeping remembers, so the
+/// manifest-unchanged branch must not short-circuit.
+///
+/// The comparison is semantic (does each pack's embedded CRL revoke every
+/// deny-list serial of its issuer), never bytewise: an embedded CRL is
+/// re-signed with fresh timestamps at every render, so equal bytes are
+/// impossible even in perfect sync. Registrar-tier deployments read their
+/// CRL from the live `state/crls` lane instead and are not probed.
+fn stale_trust_snapshot_in_tree(
+    issuer_dir: &Path,
+    out_root: &Path,
+    manifest: &Manifest,
+) -> interflow_core::error::Result<Option<(String, TrustSnapshotStale)>> {
+    use interflow_identity::revocation::crl_revokes_serial;
+    if manifest.identity.mode != interflow_identity::manifest::IdentityMode::Offline {
+        return Ok(None);
+    }
+    let list = RevocationList::load(issuer_dir).map_err(crate::runtime::pack_error)?;
+    if list.entries.is_empty() {
+        return Ok(None);
+    }
+    let mut by_issuer: std::collections::BTreeMap<String, Vec<&RevocationEntry>> =
+        std::collections::BTreeMap::new();
+    for entry in &list.entries {
+        by_issuer
+            .entry(entry.issuer.clone())
+            .or_default()
+            .push(entry);
+    }
+    for dir in expected_pack_dirs(manifest) {
+        let pack = out_root.join("packs").join(&dir);
+        for (issuer_name, entries) in &by_issuer {
+            let crl_path = pack
+                .join("trust")
+                .join("crls")
+                .join(format!("{}.crl.pem", issuer_name.replace('/', "-")));
+            let Ok(text) = std::fs::read_to_string(&crl_path) else {
+                return Ok(Some((
+                    dir,
+                    TrustSnapshotStale::MissingCrl {
+                        issuer: issuer_name.clone(),
+                    },
+                )));
+            };
+            for entry in entries {
+                match crl_revokes_serial(&text, &entry.serial) {
+                    Ok(Some(true)) => {}
+                    Ok(_) => {
+                        return Ok(Some((
+                            dir,
+                            TrustSnapshotStale::SerialNotEmbedded {
+                                issuer: issuer_name.clone(),
+                                serial: entry.serial.clone(),
+                            },
+                        )));
+                    }
+                    Err(e) => {
+                        return Ok(Some((
+                            dir,
+                            TrustSnapshotStale::UnreadableCrl {
+                                issuer: issuer_name.clone(),
+                                detail: e.to_string(),
+                            },
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Enforces the issuer store's trust-root isolation contract at every entry
 /// point that mints material (`plan apply`, `plan rotate`; the GUI deploy
 /// page rides the same functions):
@@ -608,9 +884,14 @@ fn enforce_store_binding(
             issuer
                 .record_binding(&next)
                 .map_err(crate::runtime::pack_error)?;
-            outln!(
+            let store_id = issuer
+                .store_uuid()
+                .map_err(crate::runtime::pack_error)?
+                .unwrap_or_default();
+            pushln!(
                 lines,
-                "  issuer store bound to realm {} (manifest {})",
+                "  issuer store {} bound to realm {} (manifest {})",
+                store_id,
                 next.realm,
                 next.manifest_path
             );
@@ -641,7 +922,7 @@ fn enforce_store_binding(
                 )));
             }
             if current.manifest_path != next.manifest_path {
-                outln!(
+                pushln!(
                     lines,
                     "  re-bound issuer store to {} (--issuer-allow-shared)",
                     next.manifest_path
@@ -776,7 +1057,7 @@ pub fn validate(manifest_path: &Path) -> interflow_core::error::Result<Vec<Strin
     let mut lines = Vec::new();
     let manifest = Manifest::load(manifest_path).map_err(crate::runtime::pack_error)?;
     let services = manifest.service_index();
-    outln!(
+    pushln!(
         lines,
         "✔ manifest {} is valid: realm {}, {} workspace(s), {} agent(s), {} service(s), \
          {} route(s), {} ingress(es), {} mesh hub(s), {} mesh stream(s)",
@@ -795,11 +1076,11 @@ pub fn validate(manifest_path: &Path) -> interflow_core::error::Result<Vec<Strin
             .sum::<usize>(),
     );
     for route in &manifest.route {
-        outln!(lines, "  route {} → {}", route.host, route.service);
+        pushln!(lines, "  route {} → {}", route.host, route.service);
     }
     for (agent, cfg) in &manifest.agent {
         for rule in &cfg.mesh_ingress {
-            outln!(
+            pushln!(
                 lines,
                 "  mesh    {agent}/{} → {} at {}",
                 rule.name,
@@ -808,7 +1089,7 @@ pub fn validate(manifest_path: &Path) -> interflow_core::error::Result<Vec<Strin
             );
         }
         for rule in &cfg.mesh_egress {
-            outln!(
+            pushln!(
                 lines,
                 "  mesh    {agent}/{} serves {} ({})",
                 rule.name,
@@ -821,11 +1102,11 @@ pub fn validate(manifest_path: &Path) -> interflow_core::error::Result<Vec<Strin
         }
     }
     match manifest.public_tls.mode {
-        PublicTlsMode::Acme => outln!(lines, "  public TLS: ACME (automatic)"),
+        PublicTlsMode::Acme => pushln!(lines, "  public TLS: ACME (automatic)"),
         PublicTlsMode::FrontendProxy => {
-            outln!(lines, "  public TLS: frontend proxy (config rendered)");
+            pushln!(lines, "  public TLS: frontend proxy (config rendered)");
         }
-        PublicTlsMode::Manual => outln!(lines, "  public TLS: manual (expert)"),
+        PublicTlsMode::Manual => pushln!(lines, "  public TLS: manual (expert)"),
     }
     Ok(lines)
 }
@@ -858,8 +1139,9 @@ pub enum ChangeState {
     /// The manifest matches the applied state exactly (`generation` is the
     /// live bookkeeping generation).
     Applied { generation: u64 },
-    /// Only the policy face moved (mesh rules, idle budgets) — the next
-    /// apply takes the policy-only fast path.
+    /// Only the policy face moved (mesh rules, services, routes, idle
+    /// budgets) — the next apply takes the policy-only fast path; every
+    /// node kind hot-applies within a watcher period.
     PolicyEditsPending,
     /// The identity/trust/dial face changed — the next apply re-renders
     /// every pack.
@@ -892,6 +1174,74 @@ pub fn change_state(
     } else {
         Ok(ChangeState::PolicyEditsPending)
     }
+}
+
+/// The drift view — `plan diff`, the declaration-vs-applied review face
+/// (the same shape `kubectl diff` answers for submitted-vs-live).
+///
+/// The classification ([`change_state`]) headlines; the body is a line
+/// diff of the declaration against the exact text the last apply
+/// snapshotted, so what the next `plan apply` would change reads line by
+/// line before anything is minted. Stores whose applied state predates
+/// snapshots (absorbed from the legacy `applied.json`) classify but carry
+/// no text to diff — one apply records the baseline.
+pub fn diff(manifest_path: &Path, issuer_dir: &Path) -> interflow_core::error::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let state = change_state(manifest_path, issuer_dir)?;
+    match state {
+        ChangeState::NeverApplied => {
+            pushln!(
+                lines,
+                "never applied — the next `plan apply` performs the full first render"
+            );
+            return Ok(lines);
+        }
+        ChangeState::Applied { generation } => pushln!(
+            lines,
+            "the declaration matches the applied state (policy generation {generation}) — \
+             nothing to apply"
+        ),
+        ChangeState::PolicyEditsPending => pushln!(
+            lines,
+            "policy-face edits pending — the next `plan apply` takes the policy-only fast \
+             path (no pack re-rendered, no identity re-signed)"
+        ),
+        ChangeState::IdentityEditsPending => pushln!(
+            lines,
+            "identity-face edits pending — the next `plan apply` re-renders every pack"
+        ),
+    }
+    let issuer = IssuerStore::open(issuer_dir);
+    let Some(applied_text) = issuer
+        .applied_manifest_text()
+        .map_err(crate::runtime::pack_error)?
+    else {
+        pushln!(
+            lines,
+            "no declaration snapshot exists for the applied state (it predates snapshots) — \
+             apply once to record the drift baseline"
+        );
+        return Ok(lines);
+    };
+    let current = std::fs::read_to_string(manifest_path)
+        .map_err(interflow_core::error::InterflowError::Io)?;
+    let text_diff = similar::TextDiff::from_lines(&applied_text, &current);
+    let mut buf = Vec::new();
+    {
+        let mut unified = text_diff.unified_diff();
+        unified.context_radius(3).header("applied", "declaration");
+        unified.to_writer(&mut buf)?;
+    }
+    let body: Vec<String> = String::from_utf8_lossy(&buf)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    if body.is_empty() {
+        pushln!(lines, "no textual drift against the applied declaration");
+    } else {
+        lines.extend(body);
+    }
+    Ok(lines)
 }
 
 /// Lists the hub's stream-proposal queue (the operator's approve/reject
@@ -1000,9 +1350,11 @@ pub fn approve_proposal(
         .unwrap_or(&proposal.requester)
         .to_owned();
 
-    // 2. The same pure edit the form editor applies.
-    let text = std::fs::read_to_string(manifest_path)
-        .map_err(interflow_core::error::InterflowError::Io)?;
+    // 2. The same pure edit the form editor applies. The freshness token
+    // captured here rides to the save — an editor saving over this file
+    // mid-approval surfaces as a conflict, not a clobber.
+    let document = crate::manifest_edit::read_manifest(manifest_path)?;
+    let text = document.text;
     let issues_before = crate::manifest_edit::summarize(&text)
         .map(|s| s.issues)
         .unwrap_or_default();
@@ -1066,7 +1418,7 @@ pub fn approve_proposal(
     // 4. The one write path, then 5. the ordinary apply (default backup
     // init: an already-configured store passes through silently).
     if !already_live {
-        crate::manifest_edit::save_manifest(manifest_path, &next_text)?;
+        crate::manifest_edit::save_manifest(manifest_path, &next_text, Some(&document.digest))?;
     }
     let report = apply(
         manifest_path,
@@ -1074,6 +1426,7 @@ pub fn approve_proposal(
         out_root,
         allow_shared,
         &BackupInitOptions::default(),
+        false,
     )?;
 
     // 6. Record the decision (idempotent at the hub; a failed notify
@@ -1103,6 +1456,32 @@ pub fn hub_overview(
     manifest_path: &Path,
     issuer_dir: &Path,
 ) -> interflow_core::error::Result<Option<interflow_mesh::hub::policy::HubOverview>> {
+    Ok(
+        with_hub_control_credential(manifest_path, issuer_dir, |ep, ca, cert, key| async move {
+            interflow_mesh::hub::policy::query_hub_overview(&ep, &ca, &cert, &key).await
+        })?
+        .map(|(_, overview)| overview),
+    )
+}
+
+/// The shared plumbing behind every CLI operator query against a running
+/// hub.
+///
+/// Load the manifest, mint a throwaway control credential from the issuer
+/// store, run one query on the credential's dedicated runtime. Returns
+/// `(hub_endpoint, query_result)` — the endpoint rides along so persisted
+/// artifacts (the steady-state snapshot among them) record WHERE the
+/// picture was captured. `None` = the manifest names no hub endpoint.
+pub fn with_hub_control_credential<T, F, Fut>(
+    manifest_path: &Path,
+    issuer_dir: &Path,
+    query: F,
+) -> interflow_core::error::Result<Option<(String, T)>>
+where
+    F: FnOnce(String, PathBuf, PathBuf, PathBuf) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = interflow_core::error::Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
     let manifest = Manifest::load(manifest_path).map_err(crate::runtime::pack_error)?;
     let endpoint = manifest_hub_endpoint(&manifest);
     if endpoint.is_empty() {
@@ -1111,10 +1490,8 @@ pub fn hub_overview(
     let issuer = IssuerStore::open(issuer_dir);
     issuer.ensure_realm().map_err(crate::runtime::pack_error)?;
     let cred = ControlCredential::mint(&issuer, &manifest.realm.id)?;
-    let overview = cred.call(&endpoint, |ep, ca, cert, key| async move {
-        interflow_mesh::hub::policy::query_hub_overview(&ep, &ca, &cert, &key).await
-    })?;
-    Ok(Some(overview))
+    let out = cred.call(&endpoint, query)?;
+    Ok(Some((endpoint, out)))
 }
 
 /// How `plan apply` initializes the issuer-store backup on first touch of
@@ -1157,47 +1534,50 @@ fn ensure_backup_configured(
         .backup_dir
         .clone()
         .unwrap_or_else(|| store_backup::default_backup_dir(issuer_dir));
-    let generated = if let Some(recipient) = &opts.recipient {
-        store_backup::configure(
+    // The returned config carries the canonicalized backup dir — the one
+    // absolute location every later run from any CWD will use; that is
+    // what gets announced, not the input path.
+    let (cfg, generated) = if let Some(recipient) = &opts.recipient {
+        let cfg = store_backup::configure(
             issuer_dir,
             recipient,
             &backup_dir,
             store_backup::DEFAULT_RETENTION,
         )
         .map_err(crate::runtime::pack_error)?;
-        None
+        (cfg, None)
     } else {
         let identity = store_backup::generate_identity().map_err(crate::runtime::pack_error)?;
-        store_backup::configure(
+        let cfg = store_backup::configure(
             issuer_dir,
             &identity.recipient,
             &backup_dir,
             store_backup::DEFAULT_RETENTION,
         )
         .map_err(crate::runtime::pack_error)?;
-        Some(identity)
+        (cfg, Some(identity))
     };
-    outln!(
+    pushln!(
         lines,
         "✔ issuer store backup configured — every change now checkpoints an encrypted, \
          versioned copy to {}",
-        backup_dir.display()
+        cfg.backup_dir.display()
     );
     if let Some(identity) = generated {
-        outln!(
+        pushln!(
             lines,
             "  ┌─ ONE-TIME RECOVERY IDENTITY — store it OFFLINE (password manager / printed) ─┐"
         );
-        outln!(lines, "  │ {}", identity.secret);
-        outln!(
+        pushln!(lines, "  │ {}", identity.secret);
+        pushln!(
             lines,
             "  │ It is the ONLY key that can restore backups. It is never stored on this"
         );
-        outln!(
+        pushln!(
             lines,
             "  │ machine; losing it makes every backup permanently unreadable."
         );
-        outln!(
+        pushln!(
             lines,
             "  └──────────────────────────────────────────────────────────────────────────┘"
         );
@@ -1207,7 +1587,7 @@ fn ensure_backup_configured(
                 format!("{}\n", identity.secret).as_bytes(),
                 interflow_util::WriteMode::Set(0o600),
             )?;
-            outln!(
+            pushln!(
                 lines,
                 "  recovery identity also written to {} (0600) — move that medium offline",
                 out.display()
@@ -1223,9 +1603,14 @@ pub fn apply(
     out_root: &Path,
     allow_shared: bool,
     backup: &BackupInitOptions,
+    force_rerender: bool,
 ) -> interflow_core::error::Result<ApplyReport> {
     let mut lines = Vec::new();
-    let manifest = Manifest::load(manifest_path).map_err(crate::runtime::pack_error)?;
+    // One read feeds both the parsed struct and the declaration snapshot
+    // recorded with the applied state — the two cannot diverge mid-apply.
+    let manifest_text = std::fs::read_to_string(manifest_path)
+        .map_err(interflow_core::error::InterflowError::from)?;
+    let manifest = Manifest::parse(&manifest_text).map_err(crate::runtime::pack_error)?;
     enforce_store_binding(
         issuer_dir,
         &manifest,
@@ -1253,93 +1638,142 @@ pub fn apply(
     // publish; no pack is re-rendered, no identity is re-signed, no
     // endpoint is touched.
     let stripped_now = stripped_manifest_digest(&manifest)?;
-    if let Some(prev) = issuer.applied_state().map_err(crate::runtime::pack_error)?
+    if force_rerender {
+        pushln!(
+            lines,
+            "⚠ --force-rerender: the no-op gate is skipped — every pack re-renders above the \
+             watermarks (generation continuity preserved)"
+        );
+    } else if let Some(prev) = issuer.applied_state().map_err(crate::runtime::pack_error)?
         && prev.stripped_manifest_digest == stripped_now
     {
-        let candidate = RuntimePolicy::from_manifest(&manifest, prev.policy_generation);
-        let candidate_digest = format!(
-            "sha256:{}",
-            interflow_util::sha256_hex(&candidate.to_bytes().map_err(crate::runtime::pack_error)?)
-        );
-        if candidate_digest == prev.policy_digest {
-            // Watermark-aware no-op gate (2026-10-06 fix): a digest match
-            // alone no longer proves "applied" — the bookkeeping may sit
-            // below a split it cannot see (node state mirrors, a
-            // reinstalled hub, another operator's higher publish). Only
-            // when EVERY observable watermark — including, since the
-            // 2026-10-07 fix, what the hub actually SERVES — agrees with
-            // the bookkeeping is this a true no-op; otherwise the same
-            // manifest is re-published ABOVE the watermarks — exactly what
-            // the hub's inverted-watermark WARN tells the operator to do
-            let endpoint = manifest_hub_endpoint(&manifest);
-            let watermarks = PolicyWatermarks {
-                bookkeeping: prev.policy_generation,
-                dist: dist_policy_floor(out_root),
-                hub: hub_watermarks_with_ephemeral_credential(
-                    &issuer,
-                    &manifest.realm.id,
-                    &endpoint,
-                ),
-            };
-            match policy_no_op_verdict(&watermarks) {
-                GateVerdict::NoOp => {
-                    outln!(
-                        lines,
-                        "✔ manifest already applied — policy generation {} is live, nothing to do",
-                        prev.policy_generation
-                    );
-                    if !endpoint.is_empty() && watermarks.hub.is_none() {
-                        outln!(
-                            lines,
-                            "  hub {endpoint} unreachable — its serving generation was not \
-                             verified; re-run apply once the hub is reachable"
-                        );
-                    } else if watermarks.hub.is_some_and(|hub| hub.serving.is_none()) {
-                        outln!(
-                            lines,
-                            "  hub {endpoint} did not report its serving generation (an older \
-                             hub build) — serving was not verified; upgrade the hub to close \
-                             the gap"
-                        );
-                    }
-                    return Ok(ApplyReport {
-                        lines,
-                        generation: prev.policy_generation,
-                    });
-                }
-                GateVerdict::Republish(divergence) => {
-                    outln!(
-                        lines,
-                        "✔ manifest unchanged, but the watermarks diverge from the issuer \
-                         bookkeeping (bookkeeping {}, dist artifacts {}, hub floor {}, hub \
-                         serving {}) — {} — re-publishing above the watermarks to reconcile",
-                        watermarks.bookkeeping,
-                        watermarks.dist,
-                        watermarks
-                            .hub
-                            .map_or_else(|| "unreachable".to_string(), |hub| hub.floor.to_string()),
-                        watermarks.hub.map_or_else(
-                            || "unreachable".to_string(),
-                            |hub| hub
-                                .serving
-                                .map_or_else(|| "not reported".to_string(), |s| s.to_string())
-                        ),
-                        divergence.narrate()
-                    );
-                    let generation = apply_policy_only(
+        // Pack-tree freshness (2026-10-12 fix): a digest match plus agreeing
+        // watermarks still says nothing about the PACK format vintage. A
+        // stale pack tree (retired format, missing pack.toml) is not
+        // "applied" in any useful sense — and the policy-only path would
+        // leave it stale forever. Fall through to the full render, which
+        // re-renders every pack above the watermarks; the fresh tree then
+        // converges back to no-ops.
+        if let Some((pack_dir, reason)) = stale_pack_in_tree(out_root, &manifest) {
+            pushln!(
+                lines,
+                "✔ manifest unchanged, but packs/{pack_dir} is stale — {} — re-rendering every \
+                 pack above the watermarks to the current format",
+                reason.narrate()
+            );
+        } else if let Some((pack_dir, reason)) =
+            stale_trust_snapshot_in_tree(issuer_dir, out_root, &manifest)?
+        {
+            // The trust twin of the format probe above: a revoke that moved
+            // the deny list since the packs rendered means the tree is not
+            // "applied" in any security sense — fall through to the full
+            // render so every pack re-embeds the current CRL snapshot (the
+            // hub, if reachable, additionally receives the push below).
+            pushln!(
+                lines,
+                "✔ manifest unchanged, but packs/{pack_dir} carries a stale trust snapshot — \
+                 {} — re-rendering every pack so trust/crls/ picks up the issuer's current \
+                 deny list",
+                reason.narrate()
+            );
+        } else {
+            let candidate = RuntimePolicy::from_manifest(&manifest, prev.policy_generation);
+            let candidate_digest = format!(
+                "sha256:{}",
+                interflow_util::sha256_hex(
+                    &candidate.to_bytes().map_err(crate::runtime::pack_error)?
+                )
+            );
+            if candidate_digest == prev.policy_digest {
+                // Watermark-aware no-op gate (2026-10-06 fix): a digest match
+                // alone no longer proves "applied" — the bookkeeping may sit
+                // below a split it cannot see (node state mirrors, a
+                // reinstalled hub, another operator's higher publish). Only
+                // when EVERY observable watermark — including, since the
+                // 2026-10-07 fix, what the hub actually SERVES — agrees with
+                // the bookkeeping is this a true no-op; otherwise the same
+                // manifest is re-published ABOVE the watermarks — exactly what
+                // the hub's inverted-watermark WARN tells the operator to do
+                let endpoint = manifest_hub_endpoint(&manifest);
+                let watermarks = PolicyWatermarks {
+                    bookkeeping: prev.policy_generation,
+                    dist: dist_policy_floor(out_root),
+                    hub: hub_watermarks_with_ephemeral_credential(
                         &issuer,
-                        &manifest,
-                        &prev,
-                        out_root,
-                        watermarks.hub,
-                        &mut lines,
-                    )?;
-                    return Ok(ApplyReport { lines, generation });
+                        &manifest.realm.id,
+                        &endpoint,
+                    ),
+                };
+                match policy_no_op_verdict(&watermarks) {
+                    GateVerdict::NoOp => {
+                        pushln!(
+                            lines,
+                            "✔ manifest already applied — policy generation {} is live, nothing to do",
+                            prev.policy_generation
+                        );
+                        if !endpoint.is_empty() && watermarks.hub.is_none() {
+                            pushln!(
+                                lines,
+                                "  hub {endpoint} unreachable — its serving generation was not \
+                                 verified; re-run apply once the hub is reachable"
+                            );
+                        } else if watermarks.hub.is_some_and(|hub| hub.serving.is_none()) {
+                            pushln!(
+                                lines,
+                                "  hub {endpoint} did not report its serving generation (an older \
+                                 hub build) — serving was not verified; upgrade the hub to close \
+                                 the gap"
+                            );
+                        }
+                        return Ok(ApplyReport {
+                            lines,
+                            generation: prev.policy_generation,
+                        });
+                    }
+                    GateVerdict::Republish(divergence) => {
+                        pushln!(
+                            lines,
+                            "✔ manifest unchanged, but the watermarks diverge from the issuer \
+                             bookkeeping (bookkeeping {}, dist artifacts {}, hub floor {}, hub \
+                             serving {}) — {} — re-publishing above the watermarks to reconcile",
+                            watermarks.bookkeeping,
+                            watermarks.dist,
+                            watermarks.hub.map_or_else(
+                                || "unreachable".to_string(),
+                                |hub| hub.floor.to_string()
+                            ),
+                            watermarks.hub.map_or_else(
+                                || "unreachable".to_string(),
+                                |hub| hub
+                                    .serving
+                                    .map_or_else(|| "not reported".to_string(), |s| s.to_string())
+                            ),
+                            divergence.narrate()
+                        );
+                        let generation = apply_policy_only(
+                            &issuer,
+                            &manifest,
+                            &manifest_text,
+                            &prev,
+                            out_root,
+                            watermarks.hub,
+                            &mut lines,
+                        )?;
+                        return Ok(ApplyReport { lines, generation });
+                    }
                 }
             }
+            let generation = apply_policy_only(
+                &issuer,
+                &manifest,
+                &manifest_text,
+                &prev,
+                out_root,
+                None,
+                &mut lines,
+            )?;
+            return Ok(ApplyReport { lines, generation });
         }
-        let generation = apply_policy_only(&issuer, &manifest, &prev, out_root, None, &mut lines)?;
-        return Ok(ApplyReport { lines, generation });
     }
 
     // Generation continuity (2026-10-06 fix): the identity face changed, so
@@ -1435,7 +1869,7 @@ pub fn apply(
                 break;
             }
             PublishResult::Conflict(hub_floor) if attempt == 0 => {
-                outln!(
+                pushln!(
                     lines,
                     "  hub floor is generation {hub_floor} (advanced since the pre-flight                      query) — re-rendering packs at {} and retrying",
                     hub_floor + 1
@@ -1451,11 +1885,28 @@ pub fn apply(
         }
     }
     if !published {
-        outln!(
+        pushln!(
             lines,
             "  manual distribution: copy {}/policy.toml + policy.sig into every node's              <pack>/state/policy/ (the reload watcher applies them, ≤10s)",
             out_root.join("policy").display()
         );
+    }
+    // Close the staging windows this render supersedes: the bases now sit at
+    // `render_generation`, minted above every staging watermark (the floor
+    // scans them), so every surviving `-genN` directory of the rendered
+    // nodes is strictly older than its base — the same janitor rotate runs
+    // at its close. Until 0.11.x apply re-rendered the bases and forgot the
+    // staging family entirely, which is exactly how consumed shells
+    // accumulated beside advanced bases.
+    let packs_root = out_root.join("packs");
+    for node in manifest.mesh.hub.keys() {
+        sweep_superseded_staging(&mut lines, &packs_root, "hub", node, render_generation);
+    }
+    for node in manifest.ingress.keys() {
+        sweep_superseded_staging(&mut lines, &packs_root, "ingress", node, render_generation);
+    }
+    for node in manifest.agent.keys() {
+        sweep_superseded_staging(&mut lines, &packs_root, "agent", node, render_generation);
     }
     // Offline tier: fold the issuer store's current deny list into every
     // rendered pack as a CRL snapshot (trust/crls/) — the same contract
@@ -1474,14 +1925,25 @@ pub fn apply(
                 pack.metadata.leaf_ttl_secs,
             )?;
         }
-        outln!(
+        pushln!(
             lines,
             "  embedded revocation snapshot in trust/crls/ of every pack (covers every issuer)"
+        );
+        // Deliver the same deny list to the running hub over the control
+        // plane — the offline tier has no pull lane of its own, so the
+        // render pushes: the hub hot-swaps onto the fresh CRLs without a
+        // node install + restart (idempotent by crl_number).
+        publish_crls_with_ephemeral_credential(
+            &issuer,
+            &manifest.realm.id,
+            &endpoint,
+            &issuer_crl_material(issuer_dir),
+            &mut lines,
         );
     }
     if manifest.public_tls.mode == PublicTlsMode::Acme {
         for host in manifest.route.iter().map(|r| r.host.as_str()) {
-            outln!(
+            pushln!(
                 lines,
                 "note: public TLS mode is ACME for {host}: point DNS at the ingress and \
                  ensure ports 80/443 are reachable; if a front proxy occupies them, switch \
@@ -1502,41 +1964,45 @@ pub fn apply(
     }
     let embedded_policy = RuntimePolicy::from_manifest(&manifest, render_generation);
     issuer
-        .record_applied(&AppliedState {
-            stripped_manifest_digest: stripped_now,
-            policy_generation: render_generation,
-            policy_digest: format!(
-                "sha256:{}",
-                interflow_util::sha256_hex(
-                    &embedded_policy
-                        .to_bytes()
-                        .map_err(crate::runtime::pack_error)?
-                )
-            ),
-            packs,
-        })
+        .record_applied(
+            &AppliedState {
+                stripped_manifest_digest: stripped_now,
+                policy_generation: render_generation,
+                policy_digest: format!(
+                    "sha256:{}",
+                    interflow_util::sha256_hex(
+                        &embedded_policy
+                            .to_bytes()
+                            .map_err(crate::runtime::pack_error)?
+                    )
+                ),
+                packs,
+            },
+            Some(&manifest_text),
+            AppliedKind::FullRender,
+        )
         .map_err(crate::runtime::pack_error)?;
 
-    outln!(
+    pushln!(
         lines,
         "✔ applied {} → {}",
         manifest_path.display(),
         out_root.display()
     );
-    outln!(
+    pushln!(
         lines,
         "  issuer store: {} (keep secret — never distribute)",
         issuer_dir.display()
     );
     for node in manifest.mesh.hub.keys() {
-        outln!(
+        pushln!(
             lines,
             "  hub      {node}: {}",
             out_root.join("packs").join(format!("hub-{node}")).display()
         );
     }
     for node in manifest.ingress.keys() {
-        outln!(
+        pushln!(
             lines,
             "  ingress  {node}: {}",
             out_root
@@ -1546,7 +2012,7 @@ pub fn apply(
         );
     }
     for node in manifest.agent.keys() {
-        outln!(
+        pushln!(
             lines,
             "  agent    {node}: {}",
             out_root
@@ -1556,52 +2022,52 @@ pub fn apply(
         );
     }
     if !manifest.mesh.hub.is_empty() || !manifest.ingress.is_empty() {
-        outln!(lines, "deploy, per server:");
-        outln!(
+        pushln!(lines, "deploy, per server:");
+        pushln!(
             lines,
             "  1. copy this dist tree to the server (or just its node's pack + install.sh)"
         );
-        outln!(
+        pushln!(
             lines,
             "  2. sudo bash install.sh   # once per server: user, dirs, bin/ (no units)"
         );
-        outln!(
+        pushln!(
             lines,
             "  3. per node:  sudo interflow-cli node install --pack packs/<kind>-<node>   # pack + unit + enable"
         );
-        outln!(
+        pushln!(
             lines,
             "  or encrypt:  interflow-cli pack seal --pack packs/<kind>-<node> --generate-passphrase"
         );
         if render::has_registrar(&manifest) {
-            outln!(
+            pushln!(
                 lines,
                 "  registrar host: follow the bootstrap in systemd/interflow-registrar.service"
             );
         }
     }
     if manifest.public_tls.mode == PublicTlsMode::FrontendProxy {
-        outln!(
+        pushln!(
             lines,
             "nginx (frontend proxy): hook the fragments in nginx/ into your nginx —"
         );
-        outln!(lines, "  http:   include /etc/nginx/interflow/http/*.conf;");
-        outln!(
+        pushln!(lines, "  http:   include /etc/nginx/interflow/http/*.conf;");
+        pushln!(
             lines,
             "  stream: stream {{ include /etc/nginx/interflow/stream/*.conf; }}   # nginx.conf top level"
         );
-        outln!(
+        pushln!(
             lines,
             "  then reload nginx and verify: interflow-cli doctor ingress --pack <pack>"
         );
     }
     if render::has_registrar(&manifest) {
-        outln!(
+        pushln!(
             lines,
             "registrar server: copy the issuer store to {}/registrar/issuer,",
             render::DEFAULT_INSTALL_ROOT
         );
-        outln!(
+        pushln!(
             lines,
             "  then run the certificate command recorded in systemd/interflow-registrar.service"
         );
@@ -1621,7 +2087,11 @@ pub fn rotate(
     allow_shared: bool,
 ) -> interflow_core::error::Result<Vec<String>> {
     let mut lines = Vec::new();
-    let manifest = Manifest::load(manifest_path).map_err(crate::runtime::pack_error)?;
+    // One read feeds both the parsed struct and the declaration snapshot
+    // recorded with the refreshed applied state.
+    let manifest_text = std::fs::read_to_string(manifest_path)
+        .map_err(interflow_core::error::InterflowError::from)?;
+    let manifest = Manifest::parse(&manifest_text).map_err(crate::runtime::pack_error)?;
     enforce_store_binding(
         issuer_dir,
         &manifest,
@@ -1644,14 +2114,12 @@ pub fn rotate(
             "node must be `ingress/<name>`, `agent/<name>` or `hub/<name>`",
         )
     })?;
+    // The generation number is self-describing in pack.toml and valid across
+    // format vintages — and rotate REPLACES the pack, it does not consume
+    // it, so the strict loader's usability gate has no business here. A
+    // retired-vintage pack stays rotatable.
     let next_generation = match current_pack {
-        Some(path) => {
-            CredentialPack::load(path)
-                .map_err(crate::runtime::pack_error)?
-                .metadata
-                .generation
-                + 1
-        }
+        Some(path) => pack_generation_of(path).map_err(crate::runtime::pack_error)? + 1,
         None => 1,
     };
     let out_dir: PathBuf = out.map_or_else(
@@ -1691,7 +2159,7 @@ pub fn rotate(
             &out_dir,
             pack.metadata.leaf_ttl_secs,
         )?;
-        outln!(
+        pushln!(
             lines,
             "  embedded revocation snapshot in trust/crls/ (covers every issuer)"
         );
@@ -1703,42 +2171,51 @@ pub fn rotate(
     if let Some(applied) = issuer.applied_state().map_err(crate::runtime::pack_error)? {
         let policy = RuntimePolicy::from_manifest(&manifest, next_generation);
         issuer
-            .record_applied(&AppliedState {
-                stripped_manifest_digest: applied.stripped_manifest_digest,
-                policy_generation: next_generation,
-                policy_digest: format!(
-                    "sha256:{}",
-                    interflow_util::sha256_hex(
-                        &policy.to_bytes().map_err(crate::runtime::pack_error)?
-                    )
-                ),
-                packs: applied.packs,
-            })
+            .record_applied(
+                &AppliedState {
+                    stripped_manifest_digest: applied.stripped_manifest_digest,
+                    policy_generation: next_generation,
+                    policy_digest: format!(
+                        "sha256:{}",
+                        interflow_util::sha256_hex(
+                            &policy.to_bytes().map_err(crate::runtime::pack_error)?
+                        )
+                    ),
+                    packs: applied.packs,
+                },
+                Some(&manifest_text),
+                AppliedKind::Rotate,
+            )
             .map_err(crate::runtime::pack_error)?;
     }
-    outln!(
+    pushln!(
         lines,
         "✔ rotated {node} → generation {} at {}",
         next_generation,
         out_dir.display()
     );
     if let Some(old) = current_pack {
-        outln!(
+        pushln!(
             lines,
             "  rollback: the old pack at {} stays valid until its own expiry",
             old.display()
         );
     }
-    outln!(
+    // 方案C: the closing janitorial sweep — this render supersedes every
+    // earlier staging window of the node.
+    if let Some(base) = out_dir.parent() {
+        sweep_superseded_staging(&mut lines, base, kind, name, next_generation);
+    }
+    pushln!(
         lines,
         "  next: distribute the new pack, restart the node, then:"
     );
-    outln!(
+    pushln!(
         lines,
         "    interflow-cli identity inspect --pack {}",
         out_dir.display()
     );
-    outln!(
+    pushln!(
         lines,
         "    interflow-cli doctor {} --pack {}",
         kind,
@@ -1746,6 +2223,63 @@ pub fn rotate(
     );
     let _ = pack;
     Ok(lines)
+}
+
+/// The staging-window janitor shared by rotate and the full-render apply:
+/// staging directories of generations BELOW `floor_generation` for this node
+/// are superseded — remove them so the dist tree (and the GUI Packs view)
+/// does not accumulate consumed shells. Strictly scoped: the directory name
+/// must be exactly this node's staging name at a lower generation, AND the
+/// directory's own pack must agree on node + generation (the lenient probe)
+/// — base packs, other nodes' directories (including look-alike names) and
+/// unreadable candidates are never touched. Best-effort by design: callers
+/// invoke it only after their own success; a failed removal is a warning
+/// line, never a failure.
+fn sweep_superseded_staging(
+    lines: &mut Vec<String>,
+    packs_root: &Path,
+    kind: &str,
+    name: &str,
+    floor_generation: u64,
+) {
+    let staging_prefix = format!("{kind}-{name}-gen");
+    let mut cleaned = Vec::new();
+    let mut warnings = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(packs_root) {
+        for entry in entries.flatten() {
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            let Some(suffix) = dir_name.strip_prefix(&staging_prefix) else {
+                continue;
+            };
+            let Ok(staging_gen) = suffix.parse::<u64>() else {
+                continue;
+            };
+            if staging_gen >= floor_generation {
+                continue;
+            }
+            let agrees = interflow_identity::pack_node_and_generation_of(&entry.path())
+                .is_ok_and(|(node, generation)| node == name && generation == staging_gen);
+            if !agrees {
+                continue;
+            }
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => cleaned.push(dir_name),
+                Err(e) => warnings.push(format!("{dir_name}: {e}")),
+            }
+        }
+    }
+    for dir_name in cleaned {
+        pushln!(
+            lines,
+            "  cleaned staging: {dir_name} (superseded by generation {floor_generation})"
+        );
+    }
+    for warning in warnings {
+        pushln!(
+            lines,
+            "  warning: could not clean superseded staging {warning}"
+        );
+    }
 }
 
 /// Builds a CRL per relevant issuer from the deny list and writes them into
@@ -1801,9 +2335,59 @@ pub fn revoke(
     issuer_dir: &Path,
     pack_dir: &Path,
     reason: &str,
+    manifest_path: Option<&Path>,
+    include_active_credentials: bool,
 ) -> interflow_core::error::Result<Vec<String>> {
     let mut lines = Vec::new();
-    let pack = CredentialPack::load(pack_dir).map_err(crate::runtime::pack_error)?;
+    // The revocation lane reads the certificates directly instead of
+    // CredentialPack::load: everything the deny list needs (serial, issuer
+    // attribution) lives in the certs themselves, and revoking is the one
+    // operation that must work exactly when a pack is NOT usable — a
+    // retired format vintage, a damaged pack.toml, a leaked legacy copy on
+    // a compromised node. The usability gate never blocks the emergency
+    // lane.
+    //
+    // Two revocation domains, owned by different things:
+    // - `identity/*.crt` is the PACK's own bootstrap material — revoking a
+    //   pack always denies it.
+    // - `state/credentials` is the NODE's renewal ledger: it follows the
+    //   node across pack generations (an update carries it over verbatim),
+    //   so the same pointer can equally belong to a live node or to a
+    //   retired archive. Following it implicitly evicted live nodes when
+    //   operators revoked superseded archives (the 2026-10-13 incident);
+    //   the domain is now explicit — `--include-active-credentials` is the
+    //   operator's statement that the node's runtime credential itself
+    //   must die.
+    let mut revoked_identities = interflow_identity::scan_revocation_identities(pack_dir)
+        .map_err(crate::runtime::pack_error)?;
+    let active_credentials = interflow_identity::scan_active_credentials(pack_dir);
+    if include_active_credentials {
+        revoked_identities.extend(active_credentials.iter().cloned());
+    } else if !active_credentials.is_empty() {
+        let mut skipped = Vec::new();
+        for credential in &active_credentials {
+            skipped.push(
+                interflow_identity::revocation::cert_serial_hex(&credential.cert_pem)
+                    .map_err(crate::runtime::pack_error)?,
+            );
+        }
+        pushln!(
+            lines,
+            "⚠ state/credentials serials {skipped:?} NOT revoked — the renewal ledger follows \
+             the NODE, not pack generations (a running node still authenticates with it, \
+             whichever pack directory points at it); revoking it evicts that live node. Pass \
+             --include-active-credentials if killing the node's runtime credential is the \
+             intent."
+        );
+    }
+    if revoked_identities.is_empty() {
+        return Err(interflow_core::error::InterflowError::config(format!(
+            "{} carries no revocable identities (no identity/*.crt found) — refusing to record \
+             an empty revocation",
+            pack_dir.display()
+        )));
+    }
+    let pack_digest = pack_digest_of(pack_dir);
     let issuer = IssuerStore::open(issuer_dir);
     let mut list = RevocationList::load(issuer_dir).map_err(crate::runtime::pack_error)?;
     let now = time::OffsetDateTime::now_utc()
@@ -1814,49 +2398,25 @@ pub fn revoke(
         })?;
     // Record every credential serial carried by the pack.
     let mut by_issuer: BTreeMap<String, Vec<RevocationEntry>> = BTreeMap::new();
-    for buckets in pack.identities.values() {
-        for entry in buckets.values() {
-            let serial = interflow_identity::revocation::cert_serial_hex(&entry.cert_pem)
-                .map_err(crate::runtime::pack_error)?;
-            let issuer_name = match &entry.principal.workspace {
-                Some(ws) => format!("workspace/{ws}"),
-                None => "control".to_owned(),
-            };
-            let record = RevocationEntry {
-                serial,
-                issuer: issuer_name.clone(),
-                reason: reason.to_owned(),
-                revoked_at: now.clone(),
-                pack_digest: Some(pack.pack_digest.clone()),
-            };
-            by_issuer
-                .entry(issuer_name)
-                .or_default()
-                .push(record.clone());
-            list.record(record);
-        }
-    }
-    if let Ok(Some(active)) =
-        interflow_identity::credentials::ActiveCredentialSet::load_existing(&pack)
-    {
-        for credential in active.entries.values() {
-            let issuer_name = match credential.principal.workspace.as_deref() {
-                Some(ws) => format!("workspace/{ws}"),
-                None => "control".to_owned(),
-            };
-            let record = RevocationEntry {
-                serial: credential.serial.clone(),
-                issuer: issuer_name.clone(),
-                reason: reason.to_owned(),
-                revoked_at: now.clone(),
-                pack_digest: Some(pack.pack_digest.clone()),
-            };
-            by_issuer
-                .entry(issuer_name)
-                .or_default()
-                .push(record.clone());
-            list.record(record);
-        }
+    for identity in &revoked_identities {
+        let serial = interflow_identity::revocation::cert_serial_hex(&identity.cert_pem)
+            .map_err(crate::runtime::pack_error)?;
+        let issuer_name = match &identity.principal.workspace {
+            Some(ws) => format!("workspace/{ws}"),
+            None => "control".to_owned(),
+        };
+        let record = RevocationEntry {
+            serial,
+            issuer: issuer_name.clone(),
+            reason: reason.to_owned(),
+            revoked_at: now.clone(),
+            pack_digest: pack_digest.clone(),
+        };
+        by_issuer
+            .entry(issuer_name)
+            .or_default()
+            .push(record.clone());
+        list.record(record);
     }
     list.save(issuer_dir).map_err(crate::runtime::pack_error)?;
     // Regenerate CRLs per affected issuer.
@@ -1872,7 +2432,7 @@ pub fn revoke(
         let path = issuer_dir.join(format!("{}.crl.pem", issuer_name.replace('/', "-")));
         std::fs::write(&path, crl)?;
         let serials: Vec<&str> = entries.iter().map(|e| e.serial.as_str()).collect();
-        outln!(
+        pushln!(
             lines,
             "✔ revoked {serials:?} by {issuer_name}; CRL → {}",
             path.display()
@@ -1881,10 +2441,56 @@ pub fn revoke(
     // The deny list is security state too (a lost deny list resurrects
     // revoked credentials) — checkpoint the store now that it changed.
     issuer.checkpoint().map_err(crate::runtime::pack_error)?;
-    outln!(
+    // The emergency leg: deliver the fresh CRLs to the hub's control plane
+    // (`PUT /crls`). The hub hot-swaps its verification plane onto them —
+    // the revoked credentials are rejected on new connections within
+    // seconds, no restart, and any live session holding one is evicted.
+    // This is the whole point of revoking: the door locks when the
+    // command returns, not after a re-render + node install + restart
+    // chain the operator had to know about.
+    match manifest_path {
+        Some(path) => {
+            // Best-effort: the revocation itself already succeeded — a
+            // manifest that will not parse must not fail the command,
+            // only forfeit the push (narrated).
+            match std::fs::read_to_string(path)
+                .map_err(interflow_core::error::InterflowError::Io)
+                .and_then(|text| Manifest::parse(&text).map_err(crate::runtime::pack_error))
+            {
+                Ok(manifest) => {
+                    let endpoint = manifest_hub_endpoint(&manifest);
+                    publish_crls_with_ephemeral_credential(
+                        &issuer,
+                        &manifest.realm.id,
+                        &endpoint,
+                        &issuer_crl_material(issuer_dir),
+                        &mut lines,
+                    );
+                }
+                Err(e) => {
+                    pushln!(
+                        lines,
+                        "  --manifest {} could not be read ({e}) — CRL push skipped; the                          revocation stands, deliver it via `plan apply` or a re-run with a                          valid manifest",
+                        path.display()
+                    );
+                }
+            }
+        }
+        None => {
+            pushln!(
+                lines,
+                "  no --manifest given — the CRL push to the hub was skipped; re-run with \
+                 --manifest <interflow.toml> for seconds-level enforcement (no hub restart), \
+                 or deliver via `plan apply` below"
+            );
+        }
+    }
+    pushln!(
         lines,
-        "next: re-apply packs so every node picks up the updated trust \
-         (`interflow-cli plan apply`), then verify with `interflow-cli doctor`"
+        "next: `interflow-cli plan apply` re-renders every pack so offline legs pick up the \
+         updated trust/crls/ (the gate senses the moved deny list by itself) — swap the pack \
+         on each offline leg to finish; verify with `interflow-cli doctor link --issuer \
+         <dir> --pack <dir>`"
     );
     Ok(lines)
 }
@@ -2392,6 +2998,7 @@ target_cidr = "127.0.0.0/8"
         &out,
         false,
         &BackupInitOptions::default(),
+        false,
     )
     .unwrap();
     assert_eq!(report.generation, 1, "first apply mints generation 1");
@@ -2404,6 +3011,18 @@ target_cidr = "127.0.0.0/8"
         ChangeState::Applied { generation } => assert_eq!(generation, 1),
         other => panic!("expected Applied(1), got {other:?}"),
     }
+    // The drift view agrees with the bookkeeping: applied, no drift.
+    let drift = diff(&manifest, &issuer).unwrap();
+    assert!(
+        drift
+            .iter()
+            .any(|l| l.contains("matches the applied state")),
+        "{drift:?}"
+    );
+    assert!(
+        drift.iter().any(|l| l.contains("no textual drift")),
+        "{drift:?}"
+    );
 
     // A stream-face edit (the remote port moved): policy-pending.
     std::fs::write(&manifest, mesh_text(11435, "cs-test")).unwrap();
@@ -2411,12 +3030,38 @@ target_cidr = "127.0.0.0/8"
         change_state(&manifest, &issuer).unwrap(),
         ChangeState::PolicyEditsPending
     ));
+    // The drift view headlines the classification and shows the line move.
+    let drift = diff(&manifest, &issuer).unwrap();
+    assert!(
+        drift
+            .iter()
+            .any(|l| l.contains("policy-face edits pending")),
+        "{drift:?}"
+    );
+    assert!(
+        drift.iter().any(|l| l.contains("--- applied"))
+            && drift.iter().any(|l| l.contains("+++ declaration")),
+        "{drift:?}"
+    );
+    assert!(
+        drift
+            .iter()
+            .any(|l| l.contains("-remote_addr = \"127.0.0.1:11434\"")),
+        "{drift:?}"
+    );
+    assert!(
+        drift
+            .iter()
+            .any(|l| l.contains("+remote_addr = \"127.0.0.1:11435\"")),
+        "{drift:?}"
+    );
     let report = apply(
         &manifest,
         &issuer,
         &out,
         false,
         &BackupInitOptions::default(),
+        false,
     )
     .unwrap();
     assert_eq!(report.generation, 2, "policy-only apply mints gen 2");

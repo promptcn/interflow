@@ -16,7 +16,9 @@
 
 use crate::config::AclRule;
 use crate::hub::service::HubService;
-use crate::hub::state::{PeerIdentity, StreamFace, TunnelData, release_stream_slot};
+use crate::hub::state::{
+    PeerIdentity, SessionWitness, StreamFace, TunnelData, release_stream_slot,
+};
 use bytes::Bytes;
 use interflow_core::protocol::{
     CircuitToken, CloseReason, FLAG_E2E, FLAG_RESPONSE, FrameOrigin, FrameType, RouteToken,
@@ -328,18 +330,27 @@ impl HubService {
         }
     }
 
-    /// Evicts by agent_id (entry point for runtime death signals such as
-    /// send timeout). Captures the current entry's Arc and hands it to the
-    /// unified eviction primitive; if the agent re-registers in the
-    /// meantime, the eviction is automatically voided.
+    /// Removes by agent_id (entry point for runtime death signals such as
+    /// send timeout): resolves the registry entry to an armed
+    /// [`SessionWitness`] and hands it to the unified removal funnel. The
+    /// credential is armed at fire time, at the point of resolution — sound
+    /// here because the signal (a send already observed stalled on this very
+    /// entry) travels with the resolution itself; a re-registration between
+    /// arming and the funnel's check still voids the removal.
     pub(crate) async fn evict_agent_by_id(&self, agent_id: &str, reason: &'static str) {
-        let expected = {
+        let session = {
             let agents = self.state.agents.read().await;
             agents.get(agent_id).cloned()
         };
-        if let Some(expected) = expected {
-            crate::hub::heartbeat::evict_agent(&self.state.clone(), agent_id, &expected, reason)
-                .await;
+        if let Some(session) = session {
+            let circuit = session.read().await.circuit;
+            crate::hub::heartbeat::remove_agent_if_current(
+                &self.state,
+                agent_id,
+                SessionWitness { session, circuit },
+                reason,
+            )
+            .await;
         }
     }
 

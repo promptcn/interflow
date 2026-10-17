@@ -13,11 +13,14 @@
 //! - [`heartbeat`] — agent lifecycle (eviction primitive + Ping/Pong heartbeat + `/pong`)
 //! - [`handlers`]  — administrative endpoints such as `/agents`
 //! - [`http`]      — wire contracts of the operator HTTP surface (typed `/agents` response)
+//! - [`snapshot`]  — `GET /snapshot`: the fleet's steady-state picture (upgrade-acceptance data plane)
+//! - [`crl`]       — the CRL hot-distribution channel (`PUT /crls`): plane hot-swap + revocation sweep
 //! - [`state`]     — shared state: `TunnelData`, `AgentSession`, `ActiveStream`, aliases
 //! - TLS certificate/private key loading and file permission checks: `interflow_core::tls`
 
 pub mod accept;
 pub mod control;
+pub mod crl;
 pub mod handle;
 pub mod handlers;
 pub mod heartbeat;
@@ -32,12 +35,18 @@ pub mod routing;
 pub mod server;
 pub use server::HubDispatchHandle;
 pub mod service;
+pub mod snapshot;
 pub mod state;
 pub mod upload;
 
+pub use crl::{CrlChannel, PublishCrlsOutcome, publish_crls};
 pub use handle::{HubHandle, HubLifecycle};
 pub use http::{AgentListEntry, LeafExpiry};
 pub use server::HubServer;
+pub use snapshot::{
+    FLEET_SNAPSHOT_FORMAT_VERSION, FleetSnapshotAgent, FleetSnapshotDoc, FleetSnapshotHub,
+    ServingSource, SnapshotTransport,
+};
 pub use state::{
     ActiveStream, AgentSession, HubLimits, HubState, QuicAgentConn, SharedActiveStreams,
     SharedAgents, SharedHubConfig, SharedStreamCounts, SharedTlsPlane, StreamFace, TunnelData,

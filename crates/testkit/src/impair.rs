@@ -33,7 +33,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -138,6 +138,53 @@ impl DropDecider {
 
 type SharedEvents = Arc<Mutex<Vec<ImpairEvent>>>;
 
+/// One forwarding direction of an impairment proxy.
+///
+/// From the proxy's perspective the proxied client is the agent and the
+/// upstream is the hub (that is the only topology these proxies serve).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Client → upstream (agent → hub).
+    AgentToHub,
+    /// Upstream → client (hub → agent).
+    HubToAgent,
+}
+
+/// Runtime per-direction blackhole control — the **one-way-hang injection
+/// primitive** (the 2026-10-09 one-way-blackhole form: one direction dead,
+/// the other alive, the connection establishment face untouched).
+///
+/// A cut direction silently drops/withholds everything flowing that way:
+/// - UDP: datagrams are not forwarded (a real blackhole);
+/// - TCP: chunks are read and drained but never written (a hang, not a
+///   close — the connection stays ESTABLISHED and the receiver sees
+///   silence, matching "lost segment that never recovers").
+///
+/// Cuts are deliberate test controls driven by the test's own timeline, so
+/// they are not recorded as impairment events (unlike the stochastic
+/// `DropPattern` machinery, which exists to be attributed).
+#[derive(Debug, Default)]
+struct DirectionCuts {
+    agent_to_hub: AtomicBool,
+    hub_to_agent: AtomicBool,
+}
+
+impl DirectionCuts {
+    fn is_cut(&self, dir: Direction) -> bool {
+        match dir {
+            Direction::AgentToHub => self.agent_to_hub.load(Ordering::Relaxed),
+            Direction::HubToAgent => self.hub_to_agent.load(Ordering::Relaxed),
+        }
+    }
+
+    fn set(&self, dir: Direction, cut: bool) {
+        match dir {
+            Direction::AgentToHub => self.agent_to_hub.store(cut, Ordering::Relaxed),
+            Direction::HubToAgent => self.hub_to_agent.store(cut, Ordering::Relaxed),
+        }
+    }
+}
+
 fn record_event(events: &SharedEvents, event: ImpairEvent) {
     events
         .lock()
@@ -158,6 +205,7 @@ pub struct TcpImpairProxy {
     shutdown: CancellationToken,
     task: JoinHandle<()>,
     events: SharedEvents,
+    cuts: Arc<DirectionCuts>,
 }
 
 impl TcpImpairProxy {
@@ -169,6 +217,8 @@ impl TcpImpairProxy {
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
         let task_events = events.clone();
+        let cuts = Arc::new(DirectionCuts::default());
+        let task_cuts = Arc::clone(&cuts);
 
         let task = tokio::spawn(async move {
             loop {
@@ -185,7 +235,8 @@ impl TcpImpairProxy {
                 };
                 let events = task_events.clone();
                 let cfg = cfg.clone();
-                tokio::spawn(relay_tcp(client, up, cfg, events));
+                let cuts = Arc::clone(&task_cuts);
+                tokio::spawn(relay_tcp(client, up, cfg, events, cuts));
             }
         });
 
@@ -194,6 +245,7 @@ impl TcpImpairProxy {
             shutdown,
             task,
             events,
+            cuts,
         })
     }
 
@@ -210,6 +262,17 @@ impl TcpImpairProxy {
             .clone()
     }
 
+    /// Cuts one direction (see [`DirectionCuts`]): chunks keep being read
+    /// and drained but never written — a hang, not a close.
+    pub fn cut(&self, dir: Direction) {
+        self.cuts.set(dir, true);
+    }
+
+    /// Restores a cut direction; the next chunk flows again.
+    pub fn restore(&self, dir: Direction) {
+        self.cuts.set(dir, false);
+    }
+
     /// Shutdown: stop accepting; existing connection pumps end with the task group.
     pub async fn shutdown(self) {
         self.shutdown.cancel();
@@ -223,6 +286,7 @@ async fn relay_tcp(
     upstream: TcpStream,
     cfg: ImpairConfig,
     events: SharedEvents,
+    cuts: Arc<DirectionCuts>,
 ) {
     let (client_rd, client_wr) = client.into_split();
     let (up_rd, up_wr) = upstream.into_split();
@@ -233,9 +297,18 @@ async fn relay_tcp(
         up_wr,
         cfg.one_way_delay,
         Some((cfg.drop, cfg.withhold, cfg.seed, events)),
+        Direction::AgentToHub,
+        cuts.clone(),
     );
     // upstream→client: reverse direction only gets added delay
-    let down_pump = pump_tcp(up_rd, client_wr, cfg.one_way_delay, None);
+    let down_pump = pump_tcp(
+        up_rd,
+        client_wr,
+        cfg.one_way_delay,
+        None,
+        Direction::HubToAgent,
+        cuts,
+    );
 
     let (a, b) = tokio::join!(up_pump, down_pump);
     let _ = (a, b);
@@ -246,12 +319,18 @@ async fn relay_tcp(
 /// Virtual clock: `forward = max(arrival + delay + withhold, previous forward)` —
 /// propagation delay never queues; the only queueing source is the in-order floor
 /// imposed by withheld chunks. EOF is passed through as a half-close.
+///
+/// A cut direction (see [`DirectionCuts`]) switches the pump to drain mode:
+/// chunks are consumed but never written — the sender never blocks and the
+/// receiver sees silence (a hang, not a close).
 #[allow(clippy::too_many_arguments)]
 async fn pump_tcp<R, W>(
     mut rd: R,
     mut wr: W,
     delay: Duration,
     impair: Option<(DropPattern, Duration, u64, SharedEvents)>,
+    dir: Direction,
+    cuts: Arc<DirectionCuts>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -274,6 +353,11 @@ async fn pump_tcp<R, W>(
             Ok(n) => n,
             Err(_) => return,
         };
+        if cuts.is_cut(dir) {
+            // One-way hang: consume and discard (keep the connection
+            // ESTABLISHED and the peer waiting, never signaling EOF).
+            continue;
+        }
         let arrival = Instant::now();
 
         let extra = if decider.should_drop() {
@@ -492,6 +576,7 @@ pub struct UdpImpairProxy {
     data_line: DelayLine,
     return_line: DelayLine,
     queue_capacity: usize,
+    cuts: Arc<DirectionCuts>,
 }
 
 /// Idle timeout for reclaiming NAT entries.
@@ -507,6 +592,7 @@ impl UdpImpairProxy {
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
         let task_events = events.clone();
+        let cuts = Arc::new(DirectionCuts::default());
 
         let data_line = DelayLine::spawn(cfg.queue_capacity, Arc::clone(&front), token.clone());
         let return_line = DelayLine::spawn(cfg.queue_capacity, Arc::clone(&front), token.clone());
@@ -515,11 +601,13 @@ impl UdpImpairProxy {
         // `delay_stats` (both share the same underlying line state).
         let task_data_line = data_line.clone();
         let task_return_line = return_line.clone();
+        let task_cuts = Arc::clone(&cuts);
 
         let task = tokio::spawn(async move {
             let front = front;
             let data_line = task_data_line;
             let return_line = task_return_line;
+            let cuts = task_cuts;
             let mut nat: HashMap<SocketAddr, UdpNatEntry> = HashMap::new();
             let mut decider = DropDecider::new(cfg.drop, cfg.seed);
             let mut sweep = tokio::time::interval(Duration::from_secs(15));
@@ -553,11 +641,12 @@ impl UdpImpairProxy {
                                 // neither). One resident task per NAT entry: bounded by
                                 // the entry count, unlike per-datagram spawn.
                                 let token2 = token.clone();
+                                let cuts2 = Arc::clone(&cuts);
                                 let events = task_events.clone();
-                                let up_task = Arc::clone(&up);
                                 let return_line = return_line.clone();
                                 let delay = cfg.one_way_delay;
                                 let capacity = cfg.queue_capacity;
+                                let up_task = Arc::clone(&up);
                                 tokio::spawn(async move {
                                     let mut b = vec![0u8; 65535];
                                     loop {
@@ -565,6 +654,12 @@ impl UdpImpairProxy {
                                             () = token2.cancelled() => break,
                                             recv = up_task.recv_from(&mut b) => {
                                                 let Ok((n, _)) = recv else { break };
+                                                // One-way hang (hub→agent cut): consume
+                                                // and drop the datagram — a blackhole,
+                                                // not a close.
+                                                if cuts2.is_cut(Direction::HubToAgent) {
+                                                    continue;
+                                                }
                                                 if !return_line.push(delay, b[..n].to_vec(), DelayDest::Front(client)) {
                                                     record_event(
                                                         &events,
@@ -582,6 +677,12 @@ impl UdpImpairProxy {
                                 Arc::clone(&v.insert(UdpNatEntry { upstream: up, last_used: Instant::now() }).upstream)
                             }
                         };
+
+                        // One-way hang (agent→hub cut): a real blackhole —
+                        // the datagram is consumed and never forwarded.
+                        if cuts.is_cut(Direction::AgentToHub) {
+                            continue;
+                        }
 
                         // Data direction: a hit on the decision is a real drop
                         if decider.should_drop() {
@@ -619,6 +720,7 @@ impl UdpImpairProxy {
             data_line,
             return_line,
             queue_capacity,
+            cuts,
         })
     }
 
@@ -643,6 +745,18 @@ impl UdpImpairProxy {
             self.return_line.stats(),
             self.queue_capacity,
         )
+    }
+
+    /// Cuts one direction (see [`DirectionCuts`]): datagrams flowing that
+    /// way are silently dropped while the other direction keeps flowing —
+    /// the one-way-blackhole form.
+    pub fn cut(&self, dir: Direction) {
+        self.cuts.set(dir, true);
+    }
+
+    /// Restores a cut direction; the next datagram flows again.
+    pub fn restore(&self, dir: Direction) {
+        self.cuts.set(dir, false);
     }
 
     /// Shutdown: stop sending and receiving.
@@ -726,5 +840,159 @@ mod tests {
             }
         );
         token.cancel();
+    }
+
+    /// A bound socket playing the "hub": echoes every datagram back to its
+    /// source address.
+    async fn udp_echo_upstream() -> Arc<UdpSocket> {
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let s = Arc::clone(&sock);
+        tokio::spawn(async move {
+            let mut b = vec![0u8; 65535];
+            loop {
+                let Ok((n, from)) = s.recv_from(&mut b).await else {
+                    break;
+                };
+                let _ = s.send_to(&b[..n], from).await;
+            }
+        });
+        sock
+    }
+
+    /// The one-way-hang primitive on the UDP face: a cut direction is a
+    /// total silent blackhole while the other direction (and the NAT
+    /// mapping) stays alive — the 2026-10-09 one-way-blackhole form.
+    #[tokio::test]
+    async fn udp_direction_cut_blackholes_only_that_direction() {
+        let upstream = udp_echo_upstream().await;
+        let proxy = UdpImpairProxy::spawn(
+            upstream.local_addr().unwrap(),
+            ImpairConfig {
+                one_way_delay: Duration::ZERO,
+                ..ImpairConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 64];
+        let silent = Duration::from_millis(300);
+
+        // Control: round trip through both directions.
+        client.send_to(b"ping", proxy.local_addr()).await.unwrap();
+        let (n, _) = tokio::time::timeout(silent, client.recv_from(&mut buf))
+            .await
+            .expect("round trip before any cut")
+            .unwrap();
+        assert_eq!(&buf[..n], b"ping");
+
+        // Cut agent→hub: the echo never sees the datagram, so nothing comes
+        // back — but the reverse direction is provably intact (next case).
+        proxy.cut(Direction::AgentToHub);
+        client
+            .send_to(b"swallowed", proxy.local_addr())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(silent, client.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "agent→hub cut must blackhole the round trip"
+        );
+
+        // Restore agent→hub, cut hub→agent: the echo receives and replies,
+        // but the reply never reaches the client.
+        proxy.restore(Direction::AgentToHub);
+        proxy.cut(Direction::HubToAgent);
+        client
+            .send_to(b"half-duplex", proxy.local_addr())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(silent, client.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "hub→agent cut must swallow the return leg"
+        );
+
+        // Restore: the same NAT mapping round trips again.
+        proxy.restore(Direction::HubToAgent);
+        client.send_to(b"pong", proxy.local_addr()).await.unwrap();
+        let (n, _) = tokio::time::timeout(silent, client.recv_from(&mut buf))
+            .await
+            .expect("round trip after restore")
+            .unwrap();
+        assert_eq!(&buf[..n], b"pong");
+
+        proxy.shutdown().await;
+    }
+
+    /// The one-way-hang primitive on the TCP face: a cut direction drains
+    /// and withholds (a hang, not a close — the connection stays
+    /// established); restore resumes in place.
+    #[tokio::test]
+    async fn tcp_direction_cut_hangs_without_closing() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut b = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut b).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&b[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let proxy = TcpImpairProxy::spawn(
+            upstream,
+            ImpairConfig {
+                one_way_delay: Duration::ZERO,
+                ..ImpairConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut sock = TcpStream::connect(proxy.local_addr()).await.unwrap();
+        sock.write_all(b"ping").await.unwrap();
+        let mut b = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut b))
+            .await
+            .expect("echo before cut")
+            .unwrap();
+        assert_eq!(&b[..n], b"ping");
+
+        // Cut client→upstream: writes are drained (never block, no FIN), the
+        // echo never sees them, so no reply arrives — but the connection is
+        // NOT closed (a further restored exchange proves it stayed up).
+        proxy.cut(Direction::AgentToHub);
+        sock.write_all(b"withheld").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), sock.read(&mut b))
+                .await
+                .is_err(),
+            "cut direction must produce silence, not EOF (read would return Ok(0))"
+        );
+
+        proxy.restore(Direction::AgentToHub);
+        sock.write_all(b"pong").await.unwrap();
+        let n = tokio::time::timeout(Duration::from_millis(500), sock.read(&mut b))
+            .await
+            .expect("echo after restore (connection stayed established)")
+            .unwrap();
+        assert_eq!(&b[..n], b"pong");
+
+        proxy.shutdown().await;
     }
 }

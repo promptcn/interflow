@@ -173,8 +173,17 @@ impl CredentialPack {
             pack_digest: digests_file_digest(dir)?,
         };
         pack.validate_role_binding()?;
+        // An existing active ledger means the node presents renewed leaves,
+        // so the bootstrap identities' expiry is dormant — UNLESS the ledger
+        // is unusable (damaged, or revoked by the CRL the pack carries, in
+        // which case the load path below sheds it and falls back to the
+        // bootstrap material): then the identities are what the node will
+        // actually present, and their expiry must gate the load. Either way
+        // a ledger problem is "no ledger" here, never a load failure — the
+        // self-heal lives in ActiveCredentialSet::load_or_bootstrap.
         let enforce_expiry = enforce_expiry
-            || crate::credentials::ActiveCredentialSet::load_existing(&pack)?.is_none();
+            || crate::credentials::ActiveCredentialSet::load_existing(&pack)
+                .map_or(true, |ledger| ledger.is_none());
         if enforce_expiry {
             pack.validate_expiry()?;
         }
@@ -480,6 +489,203 @@ pub struct PackSummary {
     pub pack_digest: String,
 }
 
+// ---------------------------------------------------------------------------
+// Format probes and the revocation lane
+//
+// The strict loader above is a USABILITY gate: it answers "may a node boot
+// on this pack". Two operators need answers it cannot give — the apply gate
+// ("is the rendered tree still in the current format?") and revocation
+// ("which credentials does this directory carry, regardless of format?").
+// Both are served by the lenient probes below; neither weakens the strict
+// path.
+// ---------------------------------------------------------------------------
+
+/// Why a pack directory's `pack.toml` is not in the current pack format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackTreeStale {
+    /// No pack.toml at all — the directory is not a rendered pack (or a
+    /// render never completed).
+    Missing,
+    /// pack.toml fails the strict metadata parse — a pre-canonical pack
+    /// (before the 2026-10-10 constant-field batch) or a damaged file.
+    Unparseable,
+    /// pack.toml declares a `format_version` the loader no longer accepts.
+    Retired(u8),
+}
+
+impl PackTreeStale {
+    /// The apply-gate narration: what the operator should learn from one
+    /// glance at the re-render line.
+    #[must_use]
+    pub fn narrate(&self) -> String {
+        match self {
+            PackTreeStale::Missing => "pack.toml is missing".to_owned(),
+            PackTreeStale::Unparseable => {
+                "pack.toml does not parse as the current pack format (a retired vintage)".to_owned()
+            }
+            PackTreeStale::Retired(found) => {
+                format!("pack.toml declares retired format_version {found}")
+            }
+        }
+    }
+}
+
+/// Strict metadata probe for the apply gate: does `dir` carry a pack.toml in
+/// the CURRENT format? "Already applied" is a claim about the observable
+/// output tree, so a pack the strict loader would refuse is not "applied" in
+/// any useful sense — the next apply re-renders it. `None` = current.
+#[must_use]
+pub fn probe_pack_format(dir: &Path) -> Option<PackTreeStale> {
+    let path = dir.join("pack.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Some(PackTreeStale::Missing);
+    };
+    let Ok(metadata) = toml::from_str::<PackMetadata>(&text) else {
+        return Some(PackTreeStale::Unparseable);
+    };
+    if metadata.format_version != FORMAT_VERSION {
+        return Some(PackTreeStale::Retired(metadata.format_version));
+    }
+    None
+}
+
+/// One revocable credential as found by the directory scans. Everything the
+/// deny list needs comes from the certificate itself — the serial from the
+/// PEM, the issuer attribution from the URI SAN — so pack.toml vintage is
+/// irrelevant here by design.
+#[derive(Debug, Clone)]
+pub struct RevocationIdentity {
+    pub principal: PrincipalPath,
+    pub cert_pem: String,
+}
+
+/// Scans `identity/*.crt` for revocable credentials: the revocation lane's
+/// front door. Unlike [`CredentialPack::load`] it demands only that the
+/// certificates parse — a pack whose format the strict loader refuses (a
+/// retired vintage, a damaged pack.toml) still carries live credentials the
+/// deny list must reach. Revocation is the emergency lane; it never
+/// inherits the usability gate.
+pub fn scan_revocation_identities(dir: &Path) -> Result<Vec<RevocationIdentity>> {
+    scan_cert_dir(&dir.join("identity"))
+}
+
+/// Scans the active (renewed) credential sequence under
+/// `state/credentials` — the serials a running node actually authenticates
+/// with after renewals superseded its bootstrap identities (the same leg
+/// `ActiveCredentialSet::load_existing` used to feed). Best-effort: no
+/// state channel or unreadable pointer → no entries, never an error that
+/// could block revoking the bootstrap credentials.
+#[must_use]
+pub fn scan_active_credentials(dir: &Path) -> Vec<RevocationIdentity> {
+    // Local shape of credentials.rs' pointer file — only the sequence
+    // number matters here; `updated` is ignored by the tolerant parse.
+    #[derive(serde::Deserialize)]
+    struct ActivePointer {
+        sequence: u64,
+    }
+    let pointer_path = dir.join("state").join("credentials").join("current.json");
+    let Ok(text) = std::fs::read_to_string(&pointer_path) else {
+        return Vec::new();
+    };
+    let Ok(pointer) = serde_json::from_str::<ActivePointer>(&text) else {
+        return Vec::new();
+    };
+    let sequence_dir = dir
+        .join("state")
+        .join("credentials")
+        .join("sequences")
+        .join(pointer.sequence.to_string());
+    scan_cert_dir(&sequence_dir).unwrap_or_default()
+}
+
+fn scan_cert_dir(dir: &Path) -> Result<Vec<RevocationIdentity>> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| Error::Io {
+        path: dir.display().to_string(),
+        source: e,
+    })? {
+        let entry = entry.map_err(|e| Error::Io {
+            path: dir.display().to_string(),
+            source: e,
+        })?;
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "crt") {
+            continue;
+        }
+        let cert_pem = std::fs::read_to_string(&path).map_err(|e| Error::Io {
+            path: path.display().to_string(),
+            source: e,
+        })?;
+        let certs = pem_certs(cert_pem.as_bytes())?;
+        let leaf = certs
+            .first()
+            .ok_or_else(|| Error::pack(format!("{}: no certificate in PEM", path.display())))?;
+        let uri_san = uri_san_from_cert_der(leaf)?.ok_or_else(|| {
+            Error::pack(format!(
+                "{}: certificate carries no principal URI SAN — it cannot be attributed to \
+                 an issuer for revocation",
+                path.display()
+            ))
+        })?;
+        found.push(RevocationIdentity {
+            principal: PrincipalPath::parse_uri(&uri_san)?,
+            cert_pem,
+        });
+    }
+    Ok(found)
+}
+
+/// Lenient generation probe for `rotate`: the next generation number is
+/// self-describing in pack.toml and valid across format vintages — and
+/// rotate REPLACES the pack, it does not consume it, so the strict loader is
+/// neither required nor appropriate there. Still fail-loud when the file is
+/// not parseable TOML or carries no generation at all.
+pub fn pack_generation_of(dir: &Path) -> Result<Generation> {
+    #[derive(serde::Deserialize)]
+    struct GenerationOnly {
+        generation: Generation,
+    }
+    let path = dir.join("pack.toml");
+    let text = std::fs::read_to_string(&path).map_err(|e| Error::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    let probe: GenerationOnly = toml::from_str(&text)
+        .map_err(|e| Error::pack("pack.toml parse".to_string()).with_source(e))?;
+    Ok(probe.generation)
+}
+
+/// Lenient identity probe for rotate's staging cleanup: the candidate
+/// directory's own pack must AGREE on `node` and `generation` before the
+/// janitorial sweep may delete it — a node merely named `<x>-gen<n>` (its
+/// BASE directory looks like another node's staging name) must never lose
+/// its pack to the sweep. Same lenient stance as
+/// [`pack_generation_of`]; a vintage pack.toml without `node` simply fails
+/// the probe and the candidate is left in place.
+pub fn pack_node_and_generation_of(dir: &Path) -> Result<(String, Generation)> {
+    #[derive(serde::Deserialize)]
+    struct NodeAndGeneration {
+        node: String,
+        generation: Generation,
+    }
+    let path = dir.join("pack.toml");
+    let text = std::fs::read_to_string(&path).map_err(|e| Error::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    let probe: NodeAndGeneration = toml::from_str(&text)
+        .map_err(|e| Error::pack("pack.toml parse".to_string()).with_source(e))?;
+    Ok((probe.node, probe.generation))
+}
+
+/// The SHA256SUMS digest as revocation-record provenance, when the file is
+/// intact. Tolerant on purpose: the digest is context for humans, not a
+/// gate — its absence must not block a revocation.
+#[must_use]
+pub fn pack_digest_of(dir: &Path) -> Option<String> {
+    digests_file_digest(dir).ok()
+}
+
 fn verify_digests(dir: &Path) -> Result<()> {
     let sums_path = dir.join("SHA256SUMS");
     let sums = std::fs::read_to_string(&sums_path).map_err(|e| Error::Io {
@@ -544,4 +750,168 @@ fn verify_key_matches_leaf(key_pem: &str, leaf_der: &[u8]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::manifest::Manifest;
+    use crate::pack::render::AgentCredentialPack;
+
+    fn manifest_text() -> String {
+        r#"
+[realm]
+id = "promptcn"
+control_endpoint = "relay.example.com:16666"
+[identity]
+leaf_ttl = "24h"
+[registrar]
+endpoint = "https://registrar.example.com"
+[ingress.edge]
+workspaces = ["main"]
+[workspace.main]
+[agent.desktop]
+workspace = "main"
+[[agent.desktop.services]]
+id = "asr"
+address = "127.0.0.1:8080"
+[[route]]
+host = "asr.example.com"
+service = "main/desktop/asr"
+"#
+        .to_owned()
+    }
+
+    /// A rendered agent pack (current format) plus its pack.toml text.
+    fn rendered_agent_pack(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let issuer = crate::issuance::IssuerStore::open(tmp.path().join("issuer"));
+        issuer.ensure_realm().unwrap();
+        issuer.ensure_workspace("main").unwrap();
+        issuer.ensure_policy_key().unwrap();
+        let manifest = Manifest::parse(&manifest_text()).unwrap();
+        let out = tmp.path().join(tag);
+        AgentCredentialPack::render(&issuer, &manifest, "desktop", 1, &out).unwrap();
+        (tmp, out)
+    }
+
+    /// Rewrites pack.toml into the pre-canonical vintage: the constant-field
+    /// batch of 2026-10-10 made `workspace` (among others) always-present, so
+    /// removing the line turns a current pack into one the strict loader
+    /// refuses — the exact retirement shape the scans must survive.
+    fn deprecate_pack_format(out: &Path) {
+        let text = std::fs::read_to_string(out.join("pack.toml")).unwrap();
+        let legacy = text
+            .lines()
+            .filter(|line| !line.starts_with("workspace"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(out.join("pack.toml"), format!("{legacy}\n")).unwrap();
+    }
+
+    #[test]
+    fn probe_pack_format_classifies_every_stale_shape() {
+        let (_guard, out) = rendered_agent_pack("probe");
+        assert_eq!(probe_pack_format(&out), None, "a current pack is current");
+
+        std::fs::remove_file(out.join("pack.toml")).unwrap();
+        assert_eq!(probe_pack_format(&out), Some(PackTreeStale::Missing));
+
+        let (_guard, out) = rendered_agent_pack("probe-legacy");
+        deprecate_pack_format(&out);
+        assert_eq!(probe_pack_format(&out), Some(PackTreeStale::Unparseable));
+
+        let (_guard, out) = rendered_agent_pack("probe-retired");
+        let text = std::fs::read_to_string(out.join("pack.toml"))
+            .unwrap()
+            .replace("format_version = 1", "format_version = 2");
+        std::fs::write(out.join("pack.toml"), text).unwrap();
+        assert_eq!(probe_pack_format(&out), Some(PackTreeStale::Retired(2)));
+        assert!(PackTreeStale::Retired(2).narrate().contains('2'));
+    }
+
+    #[test]
+    fn revocation_scan_reaches_legacy_format_packs() {
+        let (_guard, out) = rendered_agent_pack("scan");
+        let expected = CredentialPack::load(&out).unwrap();
+        let expected_principal = expected.primary_identity().unwrap().principal.to_string();
+
+        let scanned = scan_revocation_identities(&out).unwrap();
+        assert_eq!(scanned.len(), 1, "the agent pack carries one identity");
+        assert_eq!(scanned[0].principal.to_string(), expected_principal);
+
+        // The retirement lane: the same directory with a pack.toml the
+        // strict loader refuses still yields every revocable credential.
+        deprecate_pack_format(&out);
+        assert!(
+            CredentialPack::load(&out).is_err(),
+            "fixture must be strict-unloadable"
+        );
+        let scanned = scan_revocation_identities(&out).unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].principal.to_string(), expected_principal);
+    }
+
+    #[test]
+    fn active_credential_scan_follows_the_sequence_pointer() {
+        let (_guard, out) = rendered_agent_pack("active");
+        assert!(
+            scan_active_credentials(&out).is_empty(),
+            "no state channel → no active entries"
+        );
+
+        let creds = out.join("state").join("credentials");
+        let seq = creds.join("sequences").join("1");
+        std::fs::create_dir_all(&seq).unwrap();
+        std::fs::copy(
+            out.join("identity").join("agent-main.crt"),
+            seq.join("agent-main.crt"),
+        )
+        .unwrap();
+        std::fs::write(
+            creds.join("current.json"),
+            r#"{"sequence": 1, "updated": "2026-10-12T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let scanned = scan_active_credentials(&out);
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(
+            scanned[0].principal.to_string(),
+            "spiffe://promptcn/main/agent/desktop"
+        );
+
+        // A damaged pointer never blocks the lane — it just yields nothing
+        // (the bootstrap scan carries the revocation).
+        std::fs::write(creds.join("current.json"), "{ not json").unwrap();
+        assert!(scan_active_credentials(&out).is_empty());
+    }
+
+    #[test]
+    fn generation_probe_reads_across_format_vintages() {
+        let (_guard, out) = rendered_agent_pack("gen");
+        assert_eq!(pack_generation_of(&out).unwrap(), 1);
+
+        deprecate_pack_format(&out);
+        assert_eq!(
+            pack_generation_of(&out).unwrap(),
+            1,
+            "rotate must number the next generation from ANY vintage"
+        );
+
+        std::fs::remove_file(out.join("pack.toml")).unwrap();
+        assert!(pack_generation_of(&out).is_err());
+    }
+
+    #[test]
+    fn pack_digest_probe_is_provenance_not_a_gate() {
+        let (_guard, out) = rendered_agent_pack("digest");
+        let digest = pack_digest_of(&out).expect("a rendered pack carries SHA256SUMS");
+        assert!(digest.starts_with("sha256:"));
+        assert_eq!(digest, CredentialPack::load(&out).unwrap().pack_digest);
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(pack_digest_of(empty.path()), None);
+    }
 }

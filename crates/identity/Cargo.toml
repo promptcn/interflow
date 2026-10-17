@@ -10,20 +10,28 @@ license.workspace = true
 name = "interflow_identity"
 path = "src/lib.rs"
 
+[features]
+# Test builds only: lowers the registrar-tier leaf TTL floor
+# (MIN_LEAF_TTL_SECONDS 1h → 30s) so credential-lifecycle e2e can cross the
+# 50% renewal threshold in real time. Enabled exclusively through
+# dev-dependencies (mesh/cli test graphs); a production dependency must
+# never turn it on — the 1h floor is the shipped policy.
+short-leaf-ttl = []
+
 [dependencies]
-interflow-contract = { path = "../contract", version = "0.8" }
+interflow-contract.workspace = true
 # Shared endpoint/authority parsing (SAN extraction, manifest endpoint
 # validation); deliberately NOT interflow-core — identity stays light
-interflow-util = { path = "../util", version = "0.8" }
+interflow-util.workspace = true
 # Render-provenance stamp (`PackMetadata.rendered_by`): compile-time build
 # identity, zero runtime dependencies.
-interflow-buildinfo = { path = "../buildinfo", version = "0.8" }
+interflow-buildinfo.workspace = true
 
 # X.509 issuance with URI SAN support (SPIFFE-like principal paths).
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18"
 rustls-pemfile = "2.2.0"
-time = { version = "0.3", features = ["formatting", "parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 
 # Serialization.
 serde = { workspace = true }
@@ -50,6 +58,11 @@ ipnetwork = "0.21.1"
 # Sealed Credential Packs (.iflowpack = age-encrypted tar).
 age = "0.11"
 tar = "0.4"
+
+# The issuer store's bookkeeping db (binding + applied state + applied
+# history; the manifest-sqlite-pivot form B). Rows map by hand — rusqlite's
+# own serde feature stays out.
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tokio-rustls = "0.26.4"

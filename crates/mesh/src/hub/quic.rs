@@ -34,7 +34,7 @@
     clippy::manual_let_else
 )]
 use crate::hub::state::{
-    AgentSession, HubState, QuicAgentConn, SharedAgents, StreamFace, TunnelData,
+    AgentSession, HubState, QuicAgentConn, SessionWitness, SharedAgents, StreamFace, TunnelData,
 };
 use bytes::{Bytes, BytesMut};
 use interflow_core::error::{InterflowError, Result};
@@ -236,21 +236,29 @@ async fn handle_connection(hub: std::sync::Arc<HubState>, conn: quinn::Connectio
         });
     }
 
-    // Connection-lost watcher: eviction + orphan stream sweep
+    // Connection-lost watcher: removal + orphan stream sweep. The witness is
+    // armed here, before the spawn — it speaks for THIS registration only; a
+    // same-identity re-registration (replace-in-place) rotates the circuit
+    // and voids it at the funnel.
     {
         let agent_id2 = agent_id.clone();
-        let expected = state_arc.clone();
-        let circuit_cleanup = state_arc.read().await.circuit;
+        let witness = SessionWitness {
+            session: state_arc.clone(),
+            circuit: state_arc.read().await.circuit,
+        };
         let conn_watcher = conn.clone();
         let hub_watcher = hub.clone();
         let watcher_tasks = hub_watcher.tasks.clone();
         watcher_tasks.spawn(async move {
             let reason = conn_watcher.closed().await;
-            info!("QUIC agent connection lost: {reason}");
-            crate::hub::heartbeat::evict_agent(
+            info!(
+                "QUIC agent connection lost (circuit={}): {reason}",
+                witness.circuit
+            );
+            crate::hub::heartbeat::remove_agent_if_current(
                 &hub_watcher,
                 &agent_id2,
-                &expected,
+                witness.clone(),
                 "quic_connection_closed",
             )
             .await;
@@ -258,7 +266,7 @@ async fn handle_connection(hub: std::sync::Arc<HubState>, conn: quinn::Connectio
                 .route_leases
                 .write()
                 .await
-                .retain(|_, (lease_circuit, _, _)| *lease_circuit != circuit_cleanup);
+                .retain(|_, (lease_circuit, _, _)| *lease_circuit != witness.circuit);
         });
     }
 
@@ -446,6 +454,7 @@ async fn register_quic_agent(
             agent: agent_id.clone(),
             trusted_gateway: tenant.trusted_gateway,
             leaf_validity_unix: interflow_core::tls::extract_leaf_validity_from_chain(&chain),
+            leaf_serial_hex: interflow_core::tls::extract_leaf_serial_from_chain(&chain),
         });
     };
     let identity = identity?;
@@ -468,6 +477,10 @@ async fn register_quic_agent(
             let mut session = existing.write().await;
             session.install_channels(circuit, Some(quic_conn.clone()));
             session.leaf_validity_unix = identity.leaf_validity_unix;
+            session.leaf_serial = identity
+                .leaf_serial_hex
+                .clone()
+                .map(|serial| (serial, crate::hub::crl::tenant_crl_stem(&identity.tenant)));
             session.build.clone_from(&agent_build);
             drop(session);
             existing.clone()
@@ -476,6 +489,10 @@ async fn register_quic_agent(
                 circuit,
                 Some(quic_conn.clone()),
                 identity.leaf_validity_unix,
+                identity
+                    .leaf_serial_hex
+                    .clone()
+                    .map(|serial| (serial, crate::hub::crl::tenant_crl_stem(&identity.tenant))),
             );
             session.build.clone_from(&agent_build);
             let arc = Arc::new(RwLock::new(session));
@@ -720,10 +737,15 @@ fn spawn_quic_heartbeat(
             };
             if dead {
                 warn!("QUIC agent circuit={ping_source} heartbeat lost (>{deadline:?}), evicting");
-                crate::hub::heartbeat::evict_agent(
+                // Armed from this tick's read — the witness names the exact
+                // registration the Pong outage was observed on.
+                crate::hub::heartbeat::remove_agent_if_current(
                     &hub,
                     &agent_id,
-                    &agent_state,
+                    SessionWitness {
+                        session: agent_state.clone(),
+                        circuit: ping_source,
+                    },
                     "quic_heartbeat_timeout",
                 )
                 .await;
@@ -867,8 +889,11 @@ pub(crate) async fn open_relay_stream(
     ));
 
     // Target-side read pump (return direction; the Open frame was written
-    // directly by this function, no residue)
-    tokio::spawn(relay_reader(
+    // directly by this function, no residue). Tracked + shutdown-responsive
+    // — it holds a full HubState clone, so the audit ledger claim must not
+    // outlive the drain through it (invariant note at the tracker
+    // construction in server.rs).
+    hub.tasks.spawn(relay_reader(
         std::sync::Arc::new(hub.clone()),
         recv,
         BytesMut::new(),
@@ -1564,7 +1589,15 @@ async fn relay_reader(
     }
 
     loop {
-        let n = match rx.read(&mut chunk).await {
+        let n = match tokio::select! {
+            // The hub is draining: the connection (and this stream with it)
+            // is being reset by the listener's endpoint.close — exit now
+            // instead of racing the reset, and skip teardown_stream (there
+            // is no peer left to notify, and the registry dies with the
+            // run). quinn's RecvStream::read is cancel-safe.
+            () = hub.shutdown.cancelled() => return,
+            r = rx.read(&mut chunk) => r,
+        } {
             Ok(Some(n)) => n,
             Ok(None) | Err(_) => break,
         };

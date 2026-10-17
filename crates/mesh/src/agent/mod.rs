@@ -9,6 +9,7 @@ pub mod ingress_listeners;
 pub mod ingress_udp;
 pub mod peer_watch;
 pub mod policy_watch;
+pub mod reconcile_report;
 pub mod restart;
 pub mod rules;
 pub mod ssrf_deny;

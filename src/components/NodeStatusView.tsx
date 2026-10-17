@@ -6,20 +6,21 @@ import {
   formatRemainingSecs,
   isRunning,
   leafPhase,
-  peerLeafPhase,
   policyInverted,
   stateText,
   type NodeInfo,
 } from "../api";
 import { localeOf, useT } from "../i18n";
 import { cn } from "../lib/utils";
-import { Button, Hint, InfoRow, PeerDot, SectionPanel } from "./ui";
+import { Button, Hint, InfoRow, SectionPanel } from "./ui";
 
 /// The detail page's default view: what gets a glance every day — state
-/// and operations, health signals, peers — one screen, no scrolling
+/// and operations, health signals — one screen, no scrolling
 /// (2026-10-09 frequency layering). The health rows moved here from the
 /// old Identity section: warn/critical phases are push-mode exceptions,
-/// and exceptions live where the user lands, not one click away.
+/// and exceptions live where the user lands, not one click away. Peers
+/// moved out to its own view (2026-10-12): peer presence is fleet-level
+/// context, not this node's private status.
 export default function NodeStatusView({
   node,
   onChanged,
@@ -223,54 +224,6 @@ export default function NodeStatusView({
                 )}
               </InfoRow>
             ))
-          )}
-        </SectionPanel>
-      )}
-
-      {node.kind === "mesh_agent" && running && node.peers && (
-        <SectionPanel
-          title={t("nodeDetail.peers")}
-          hint={
-            node.peers.last_ok_unix > 0
-              ? t("nodeDetail.peersUpdated", { ago: formatAgoSecs(node.peers.last_ok_unix) })
-              : undefined
-          }
-        >
-          {node.peers.peers.length === 0 ? (
-            <span className="text-small text-fg-3">{t("nodeDetail.peersNone")}</span>
-          ) : (
-            node.peers.peers.map((peer) => {
-              // Display name: the qualified id's agent part (the listing
-              // is already tenant-scoped, so it is unique in here); the
-              // full id stays one hover away.
-              const shortName = peer.agent.split("/").pop() ?? peer.agent;
-              const leaf = peerLeafPhase(peer);
-              return (
-                <div key={peer.agent} className="flex flex-wrap items-center gap-2.5 text-base">
-                  <PeerDot online={peer.online} />
-                  <Hint text={peer.agent}>
-                    <span className="font-mono text-small">{shortName}</span>
-                  </Hint>
-                  <span className={peer.online ? "text-base" : "text-small text-fg-3"}>
-                    {peer.online ? t("nodeDetail.peerOnline") : t("nodeDetail.peerOffline")}
-                  </span>
-                  {peer.leaf_phase && (
-                    <Hint text={t("nodeDetail.peerLeafTitle")}>
-                      <span
-                        className={cn(
-                          "ml-auto text-small",
-                          leaf === "warn" && "text-warn",
-                          leaf === "critical" && "text-critical",
-                          leaf === null && "text-fg-3",
-                        )}
-                      >
-                        leaf {formatRemainingSecs(peer.leaf_remaining_secs)}
-                      </span>
-                    </Hint>
-                  )}
-                </div>
-              );
-            })
           )}
         </SectionPanel>
       )}

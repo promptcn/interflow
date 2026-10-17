@@ -191,6 +191,26 @@
   }
 }
 
+/* 抽屉(Drawer)进出:160ms 滑入+淡入;时长克制,reduced-motion 全局归零 */
+@keyframes drawer-in {
+  from {
+    transform: translateX(24px);
+    opacity: 0.6;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+@keyframes drawer-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 /* toast 进出(ToastProvider 使用;时长克制) */
 @keyframes toast-in {
   from {

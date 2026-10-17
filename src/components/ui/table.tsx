@@ -24,7 +24,15 @@ export function TBody({ className, ...props }: HTMLAttributes<HTMLTableSectionEl
 }
 
 export function Tr({ className, ...props }: HTMLAttributes<HTMLTableRowElement>) {
-  return <tr className={cn("border-b border-line/60 last:border-b-0", className)} {...props} />;
+  return (
+    <tr
+      className={cn(
+        "border-b border-line/60 transition-colors duration-150 last:border-b-0 hover:bg-bg-hover",
+        className,
+      )}
+      {...props}
+    />
+  );
 }
 
 export function Th({ className, ...props }: ThHTMLAttributes<HTMLTableCellElement>) {
@@ -40,5 +48,5 @@ export function Th({ className, ...props }: ThHTMLAttributes<HTMLTableCellElemen
 }
 
 export function Td({ className, ...props }: TdHTMLAttributes<HTMLTableCellElement>) {
-  return <td className={cn("px-0 py-1.5 pr-2 align-baseline", className)} {...props} />;
+  return <td className={cn("px-0 py-2 pr-2 align-baseline", className)} {...props} />;
 }

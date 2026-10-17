@@ -40,9 +40,11 @@ deployments/**/interflow.toml
 certs/
 !crates/certs/
 
-# editor
+# editor (project-shared VS Code settings tracked; the rest stays local —
+# a negated pattern needs the parent ignored at file level, not directory level)
 .idea/
-.vscode/
+.vscode/*
+!.vscode/settings.json
 .zcode/
 *.swp
 

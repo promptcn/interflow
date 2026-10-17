@@ -21,18 +21,18 @@ path = "src/main.rs"
 fault-injection = ["interflow-core/fault-injection"]
 
 [dependencies]
-interflow-core = { path = "../core", version = "0.8" }
-interflow-contract = { path = "../contract", version = "0.8" }
+interflow-core.workspace = true
+interflow-contract.workspace = true
 # Shared endpoint/authority parsing (QUIC SNI, SSRF host extraction)
-interflow-util = { path = "../util", version = "0.8" }
+interflow-util.workspace = true
 # Shared rcgen issuance + name validation (single implementation behind the
 # identity issuer and the test kit; mesh config validation checks names)
-interflow-certs = { path = "../certs", version = "0.8" }
+interflow-certs.workspace = true
 # Credential Pack bootstrap + renewal (product site-to-site path)
-interflow-identity = { path = "../identity", version = "0.8" }
-interflow-renewal = { path = "../renewal", version = "0.8" }
+interflow-identity.workspace = true
+interflow-renewal.workspace = true
 # Compile-time build identity (`version` output + engine logs)
-interflow-buildinfo = { path = "../buildinfo", version = "0.8" }
+interflow-buildinfo.workspace = true
 
 # Async runtime
 tokio = { workspace = true }
@@ -85,7 +85,16 @@ clap = { version = "4.6", features = ["derive"] }
 # Shared test/bench harness (dev-dependency cycle: testkit depends on mesh,
 # supported by cargo, same pattern as tokio/tokio-test; testkit stays out of the
 # production dependency graph)
-interflow-testkit = { path = "../testkit", version = "0.8", features = ["fault-injection"] }
+interflow-testkit = { workspace = true, features = ["fault-injection"] }
+# Credential-lifecycle e2e: sub-hour leaves (the renewal threshold crossed in
+# real time) and the in-process registrar they renew against. Test builds
+# only — the features never reach production graphs.
+interflow-identity = { workspace = true, features = ["short-leaf-ttl"] }
+interflow-registrar = { workspace = true }
+# rotate-transition e2e drives the REAL rotate path (plan::rotate). Dev-only
+# cycle: cli depends on mesh for its own binaries, never the reverse in
+# production graphs.
+interflow-cli = { workspace = true }
 # paused-clock unit tests (egress send-path health)
 tokio = { workspace = true, features = ["test-util"] }
 # bench: RST-close client sockets (avoids TIME_WAIT, prevents ephemeral port exhaustion
@@ -105,6 +114,8 @@ async-trait = "0.1"
 metrics = "0.24.6"
 # loss_hol bench artifact metadata: RFC 3339 timestamps (no chrono in the bench)
 time = { version = "0.3", features = ["formatting"] }
+# renewal-supervisor e2e: /health wait on the in-process registrar
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 
 # ============================================================================
 # Benchmarks

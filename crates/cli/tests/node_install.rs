@@ -190,6 +190,35 @@ fn re_run_upgrades_and_keeps_previous() {
     );
 }
 
+/// The disk-swap detection's wiring: `--restart-units` parses and rides
+/// the install flow, and a NON-system layout (no units, unprivileged
+/// tests) never surfaces the stale-disk warning — the scan is the system
+/// layout's cross-unit concern. The detection logic itself is unit-tested
+/// over a fake /proc tree in stale_exec.rs.
+#[test]
+fn restart_units_flag_parses_and_non_system_layouts_never_warn_stale() {
+    let deploy = Deployment::apply();
+    let srv = tempfile::tempdir().expect("tempdir");
+    let root = srv.path().display().to_string();
+    let out = run_ok(
+        &[
+            "node",
+            "install",
+            "--pack",
+            &deploy.pack("ingress-edge"),
+            "--root",
+            &root,
+            "--restart-units",
+        ],
+        &[],
+    );
+    assert!(
+        !out.stdout.contains("OLD disk"),
+        "non-system layouts run no units — no stale reading: {}",
+        out.stdout
+    );
+}
+
 #[test]
 fn sealed_iflowpack_installs() {
     let deploy = Deployment::apply();
@@ -376,4 +405,76 @@ fn commit_staged_upgrade_carries_the_state_lineage() {
         b"fresh"
     );
     assert!(!fresh_target.join("state").exists());
+}
+
+/// Installing moves forward only: a pack whose generation is LOWER than
+/// the target's current install is refused by default and needs the
+/// explicit `--allow-downgrade` — the typed rollback path
+#[test]
+fn downgrade_requires_the_allow_downgrade_flag() {
+    let deploy = Deployment::apply();
+    let manifest = deploy.dir.join("interflow.toml").display().to_string();
+    let issuer = deploy.dir.join("issuer").display().to_string();
+
+    // Rotate mints generation 2 into a staging directory beside the base.
+    let base = deploy.pack("ingress-edge");
+    run_ok(
+        &[
+            "rotate",
+            "--manifest",
+            &manifest,
+            "--issuer",
+            &issuer,
+            "ingress/edge",
+            "--pack",
+            &base,
+        ],
+        &[],
+    );
+    let gen2 = deploy.pack("ingress-edge-gen2");
+
+    let srv = tempfile::tempdir().expect("tempdir");
+    let root = srv.path().display().to_string();
+    run_ok(&["node", "install", "--pack", &gen2, "--root", &root], &[]);
+
+    // Feeding the generation-1 pack back must be refused — with the flag
+    // named in the error, before the swap touches anything.
+    let refused = run(&["node", "install", "--pack", &base, "--root", &root], &[]);
+    assert!(!refused.success, "a strict downgrade must be refused");
+    assert!(
+        refused.stderr.contains("downgrade refused"),
+        "must name the refusal: {}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains("--allow-downgrade"),
+        "must point at the deliberate path: {}",
+        refused.stderr
+    );
+
+    // The typed flag is the rollback path; the generation-2 install it
+    // displaced lands in `.previous`.
+    let rollback = run_ok(
+        &[
+            "node",
+            "install",
+            "--pack",
+            &base,
+            "--root",
+            &root,
+            "--allow-downgrade",
+        ],
+        &[],
+    );
+    assert!(
+        rollback.stdout.contains("✔ installed ingress node edge"),
+        "{}",
+        rollback.stdout
+    );
+    assert!(
+        srv.path()
+            .join("packs/ingress-edge.previous/pack.toml")
+            .exists(),
+        "the rolled-over gen-2 install is kept as .previous"
+    );
 }

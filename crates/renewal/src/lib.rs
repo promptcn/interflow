@@ -15,7 +15,10 @@ use interflow_identity::issuance::generate_csr;
 use interflow_identity::pack::{CredentialPack, IdentityEntry};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -135,11 +138,23 @@ async fn refresh_crls(pack: &CredentialPack) -> Result<bool> {
             continue;
         };
         let path = dir.join(format!("{}.crl.pem", issuer_name.replace('/', "-")));
-        let old = std::fs::read(&path).unwrap_or_default();
-        let new = pem.as_bytes();
-        if old.as_slice() != new {
+        // Change detection keys on the RFC 5280 `crl_number`, not the
+        // bytes: the registrar re-signs the CRL on every request (fresh
+        // `this_update`), so byte equality would report "changed" on every
+        // poll and agents would gracefully exit onto a supervisor restart
+        // once a minute. The registrar pins the number until the deny list
+        // moves — "a repeat is no change" (server.rs `crls`).
+        let new_number = interflow_identity::revocation::crl_number(pem).map_err(pack_error)?;
+        let old_number = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|old| interflow_identity::revocation::crl_number(&old).ok());
+        if old_number.as_ref() != Some(&new_number) {
             // CRLs are public data: preserve existing bits, 0644 for new files
-            interflow_util::atomic_write(&path, new, interflow_util::WriteMode::PreserveOr(0o644))?;
+            interflow_util::atomic_write(
+                &path,
+                pem.as_bytes(),
+                interflow_util::WriteMode::PreserveOr(0o644),
+            )?;
             changed = true;
         }
     }
@@ -272,6 +287,17 @@ async fn renew_control_one(
 }
 
 pub async fn renew_all(pack_dir: &Path, force: bool) -> Result<RenewalReport> {
+    renew_all_at(pack_dir, force, SystemClock.now_utc()).await
+}
+
+/// [`renew_all`] with the 50% threshold evaluated at `now` instead of the
+/// real wall clock — the scheduler passes its injected clock's reading so a
+/// crossing observed by the scheduler loop and the renewal decision agree.
+async fn renew_all_at(
+    pack_dir: &Path,
+    force: bool,
+    now: time::OffsetDateTime,
+) -> Result<RenewalReport> {
     let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
     if pack.metadata.identity_mode == interflow_identity::manifest::IdentityMode::Offline {
         return Err(config_error(
@@ -283,9 +309,7 @@ pub async fn renew_all(pack_dir: &Path, force: bool) -> Result<RenewalReport> {
     let entries = expected_entries(&pack);
     let ttl = Duration::from_secs(pack.metadata.leaf_ttl_secs);
     let earliest = active.earliest_expiry().map_err(pack_error)?;
-    let remaining = (earliest - time::OffsetDateTime::now_utc())
-        .whole_seconds()
-        .max(0);
+    let remaining = (earliest - now).whole_seconds().max(0);
     let remaining_u64 = u64::try_from(remaining).unwrap_or_default();
     if !force && Duration::from_secs(remaining_u64) > ttl / 2 {
         return Ok(RenewalReport {
@@ -342,14 +366,74 @@ pub async fn renewal_scheduler(pack_dir: &Path) -> Result<()> {
     renewal_scheduler_with_log_name(pack_dir, None).await
 }
 
-/// [`renewal_scheduler`] with an embedder-supplied log attribution name.
+/// The CRL-change hook: invoked (and awaited) instead of the default
+/// process exit when the pull lane observes new CRL material.
 ///
-/// The GUI hosts several nodes in one process and keys captured lines on
-/// the `node` field, so same-name nodes in different realms/workspaces need
-/// distinct values; `None` = the pack's node name (the CLI/binary default).
-pub async fn renewal_scheduler_with_log_name(
+/// The hub's run wiring passes the TLS-plane hot swap here (revocation
+/// takes effect without a restart); agents and edges keep the default —
+/// their TLS consumption is startup-only, so a material change still
+/// means "gracefully exit and let the supervisor restart onto it".
+pub type CrlChangeHook = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+/// Time source for the renewal scheduler: the wall clock drives the
+/// threshold/warning/expiry math, the monotonic clock drives the CRL
+/// freshness bound, and `sleep` paces the poll loop.
+///
+/// Production runs on [`SystemClock`]; tests inject a fake (the testkit
+/// clock) so threshold crossings, backoff ladders, and staleness bounds play
+/// out deterministically instead of by wall time.
+pub trait Clock: Send + Sync {
+    /// Wall-clock now (UTC).
+    fn now_utc(&self) -> time::OffsetDateTime;
+    /// Monotonic now, as a duration since this clock's own epoch. Only
+    /// differences are meaningful (the freshness bound must not see
+    /// wall-clock jumps).
+    fn monotonic(&self) -> std::time::Duration;
+    /// Sleeps for `duration`.
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
+
+/// The production [`Clock`]: real wall/monotonic time, real tokio sleeps.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_utc(&self) -> time::OffsetDateTime {
+        time::OffsetDateTime::now_utc()
+    }
+
+    fn monotonic(&self) -> std::time::Duration {
+        // Instant has no synthetic constructor, so the epoch is the first
+        // call; every later reading is a positive offset from it.
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        (*EPOCH.get_or_init(std::time::Instant::now)).elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+/// [`renewal_scheduler`] with an embedder-supplied log attribution name
+/// and a CRL-change handler (see [`CrlChangeHook`]).
+pub async fn renewal_scheduler_with_crl_reload(
     pack_dir: &Path,
     log_name: Option<String>,
+    on_crl_change: Option<CrlChangeHook>,
+) -> Result<()> {
+    renewal_scheduler_with_clock(pack_dir, log_name, on_crl_change, Arc::new(SystemClock)).await
+}
+
+/// The scheduler core over an injected [`Clock`] — the seam the scheduler
+/// tests drive (threshold crossings, backoff ladder, staleness bound)
+/// without waiting on wall time.
+pub async fn renewal_scheduler_with_clock(
+    pack_dir: &Path,
+    log_name: Option<String>,
+    on_crl_change: Option<CrlChangeHook>,
+    clock: Arc<dyn Clock>,
 ) -> Result<()> {
     // Offline deployments (pack metadata decides — GUI/CLI wiring stays
     // identical): no registrar to renew against and no freshness bound to
@@ -357,7 +441,7 @@ pub async fn renewal_scheduler_with_log_name(
     {
         let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
         if pack.metadata.identity_mode == interflow_identity::manifest::IdentityMode::Offline {
-            return offline_watch(pack_dir, log_name).await;
+            return offline_watch(pack_dir, log_name, clock).await;
         }
     }
     const BACKOFF: [Duration; 5] = [
@@ -370,7 +454,11 @@ pub async fn renewal_scheduler_with_log_name(
     const CRL_POLL: Duration = Duration::from_secs(60);
     const CRL_STALENESS_BOUND: Duration = Duration::from_hours(1);
     let mut failures = 0usize;
-    let mut last_crl_success = std::time::Instant::now();
+    // When set (after a failed renewal attempt), the earliest wall-clock
+    // moment the next attempt may happen — the backoff ladder. `None` means
+    // only the 50% threshold gates renewal.
+    let mut next_renewal_at: Option<time::OffsetDateTime> = None;
+    let mut last_crl_success = clock.monotonic();
     loop {
         let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
         // Node name for log attribution (see the fn docs above).
@@ -382,7 +470,7 @@ pub async fn renewal_scheduler_with_log_name(
         let threshold = expiry - time::Duration::seconds(half_ttl);
         let warning_ttl = i64::try_from(ttl.as_secs() / 10).unwrap_or(i64::MAX);
         let warning = expiry - time::Duration::seconds(warning_ttl);
-        let now = time::OffsetDateTime::now_utc();
+        let now = clock.now_utc();
         if now >= expiry {
             return Err(InterflowError::connection(
                 "active credential expired — refusing to continue without renewal",
@@ -391,6 +479,14 @@ pub async fn renewal_scheduler_with_log_name(
 
         match refresh_crls(&pack).await {
             Ok(true) => {
+                if let Some(hook) = &on_crl_change {
+                    // The hot path: the material change is applied in
+                    // place (the hub's plane swap); the poll loop carries
+                    // on watching the next interval.
+                    hook().await;
+                    last_crl_success = clock.monotonic();
+                    continue;
+                }
                 tracing::info!(
                     node,
                     "crl_updated: restarting credential verification plane"
@@ -398,11 +494,11 @@ pub async fn renewal_scheduler_with_log_name(
                 return Ok(());
             }
             Ok(false) => {
-                last_crl_success = std::time::Instant::now();
+                last_crl_success = clock.monotonic();
             }
             Err(e) => {
                 tracing::warn!(node, "crl_stale: {e}");
-                if last_crl_success.elapsed() >= CRL_STALENESS_BOUND {
+                if clock.monotonic().saturating_sub(last_crl_success) >= CRL_STALENESS_BOUND {
                     return Err(InterflowError::connection(
                         "CRL freshness bound exceeded — refusing unrevocable credentials",
                     ));
@@ -410,17 +506,25 @@ pub async fn renewal_scheduler_with_log_name(
             }
         }
 
-        if now < threshold {
+        // Renewal opens at the 50% line; after failures the backoff ladder
+        // defers the next *attempt* past it. The sleep is still capped at
+        // CRL_POLL so freshness keeps being enforced (pull lane + staleness
+        // bound) while renewal is backing off — the ladder spaces attempts,
+        // it never spaces CRL polls.
+        let renewal_opens_at = next_renewal_at
+            .filter(|at| *at > threshold)
+            .unwrap_or(threshold);
+        if now < renewal_opens_at {
             let until_renewal = Duration::from_secs(
-                u64::try_from((threshold - now).whole_seconds().max(0)).unwrap_or_default(),
+                u64::try_from((renewal_opens_at - now).whole_seconds().max(0)).unwrap_or_default(),
             );
-            tokio::time::sleep(until_renewal.min(CRL_POLL)).await;
+            clock.sleep(until_renewal.min(CRL_POLL)).await;
             continue;
         }
         if now >= warning {
             tracing::warn!(node, "credential_expiry_warning: less than 10% TTL remains");
         }
-        match renew_all(pack_dir, false).await {
+        match renew_all_at(pack_dir, false, now).await {
             Ok(report) => {
                 tracing::info!(
                     node,
@@ -437,16 +541,34 @@ pub async fn renewal_scheduler_with_log_name(
                 failures += 1;
                 tracing::error!(node, "rotation_failed: {e}");
                 let backoff = BACKOFF[(failures - 1).min(BACKOFF.len() - 1)];
-                tokio::time::sleep(backoff.min(CRL_POLL)).await;
+                next_renewal_at =
+                    Some(now + time::Duration::try_from(backoff).unwrap_or(time::Duration::MAX));
             }
         }
     }
 }
 
+/// [`renewal_scheduler_with_crl_reload`] with the default CRL-change
+/// behavior (exit onto the supervisor restart).
+///
+/// The GUI hosts several nodes in one process and keys captured lines on
+/// the `node` field, so same-name nodes in different realms/workspaces need
+/// distinct values; `None` = the pack's node name (the CLI/binary default).
+pub async fn renewal_scheduler_with_log_name(
+    pack_dir: &Path,
+    log_name: Option<String>,
+) -> Result<()> {
+    renewal_scheduler_with_crl_reload(pack_dir, log_name, None).await
+}
+
 /// The offline twin of the renewal scheduler: nothing renews, nothing is
 /// fetched. Credentials live until their own expiry (fail-closed there,
 /// exactly like the registrar tier); the operator rotates before that.
-async fn offline_watch(pack_dir: &Path, log_name: Option<String>) -> Result<()> {
+async fn offline_watch(
+    pack_dir: &Path,
+    log_name: Option<String>,
+    clock: Arc<dyn Clock>,
+) -> Result<()> {
     const CHECK: Duration = Duration::from_secs(3600);
     let mut warned = false;
     loop {
@@ -454,7 +576,7 @@ async fn offline_watch(pack_dir: &Path, log_name: Option<String>) -> Result<()> 
         let node = log_name.as_deref().unwrap_or(pack.metadata.node.as_str());
         let active = ActiveCredentialSet::load_or_bootstrap(&pack).map_err(pack_error)?;
         let expiry = active.earliest_expiry().map_err(pack_error)?;
-        let now = time::OffsetDateTime::now_utc();
+        let now = clock.now_utc();
         if now >= expiry {
             return Err(InterflowError::connection(
                 "active credential expired — offline credentials do not renew; rotate with \
@@ -483,7 +605,7 @@ async fn offline_watch(pack_dir: &Path, log_name: Option<String>) -> Result<()> 
                     .unwrap_or_default()
             );
         }
-        tokio::time::sleep(CHECK).await;
+        clock.sleep(CHECK).await;
     }
 }
 

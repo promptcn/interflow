@@ -33,7 +33,7 @@
     clippy::expect_used,
     missing_docs
 )]
-use interflow_expose::client::{ExposeArgs, LocalService};
+use interflow_expose::client::ExposeArgs;
 use interflow_expose::edge::{
     ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, Route,
     RouteBreakerPolicy, WorkspaceTrust,
@@ -172,11 +172,11 @@ async fn route_breaker_recovers_after_backend_returns() {
     let (client_cert, client_key) = certs.named_client_cert("expose-breaker-recovery");
     let client_args = ExposeArgs {
         log_name: None,
-        services: vec![LocalService {
-            id: "web".into(),
-            target_addr: format!("127.0.0.1:{backend_port}").parse().unwrap(),
-            overridden: false,
-        }],
+        service_addresses: interflow_mesh::config::ServiceAddresses::of(
+            &[("web", format!("127.0.0.1:{backend_port}").parse().unwrap())],
+            &[],
+        ),
+        pack_dir: None,
         hub_url: format!("https://127.0.0.1:{hub_port}"),
         client_cert: Some(client_cert.display().to_string()),
         client_key: Some(client_key.display().to_string()),

@@ -438,6 +438,22 @@ pub(crate) fn validate_agent(cfg: &AgentConfig) -> Result<(), ConfigErrorList> {
     // (`poll_idle_timeout_secs = 0` and `task_stall_timeout_secs = 0` stay
     // valid: they are the documented explicit "disable" escape hatches.)
 
+    // Out-of-tree liveness probe timers are timeout-class: a 0-second tick /
+    // cadence / deadline, or 0 strikes, is never what anyone wants (compress
+    // toward 1, not toward 0).
+    let probe = &cfg.liveness_probe;
+    if probe.tick_secs == 0 || probe.demand_every_secs == 0 || probe.demand_deadline_secs == 0 {
+        errs.push(ConfigError::Invalid(
+            "[liveness_probe] tick_secs / demand_every_secs / demand_deadline_secs must be >= 1"
+                .to_string(),
+        ));
+    }
+    if probe.demand_strikes == 0 {
+        errs.push(ConfigError::Invalid(
+            "[liveness_probe] demand_strikes must be >= 1".to_string(),
+        ));
+    }
+
     // the open-rate burst bucket must absorb a whole-table stream-creation
     // spike in one go (the same invariant the derived event-channel
     // capacity enforces structurally in core)
@@ -630,6 +646,7 @@ mod tests {
             server: ServerConfig {
                 listen_addr: "127.0.0.1:6666".parse().unwrap(),
                 node_name: None,
+                hub_name: None,
                 proxy_protocol: Default::default(),
             },
             auth: AuthConfig {
@@ -854,6 +871,45 @@ mod tests {
         cfg.agent.poll_idle_timeout_secs = Some(0);
         cfg.agent.task_stall_timeout_secs = Some(0);
         validate_agent(&cfg).expect("documented Some(0) disables stay valid");
+    }
+
+    /// The out-of-tree liveness probe timers are timeout-class: zeros are
+    /// rejected (compress toward 1, not toward 0), every other value shape
+    /// is the operator's call.
+    #[test]
+    fn agent_liveness_probe_zeros_rejected() {
+        for (tick, every, deadline, strikes) in [
+            (0, 30, 15, 3),
+            (15, 0, 15, 3),
+            (15, 30, 0, 3),
+            (15, 30, 15, 0),
+        ] {
+            let mut cfg = base_agent_config();
+            cfg.liveness_probe = crate::config::LivenessProbeConfig {
+                tick_secs: tick,
+                demand_every_secs: every,
+                demand_deadline_secs: deadline,
+                demand_strikes: strikes,
+            };
+            let err = validate_agent(&cfg).expect_err("probe zeros must reject");
+            assert!(
+                err.iter().any(
+                    |e| matches!(e, ConfigError::Invalid(m) if m.contains("[liveness_probe]"))
+                ),
+                "expected [liveness_probe] error for ({tick},{every},{deadline},{strikes})"
+            );
+        }
+
+        // Compressed-but-nonzero tuning (the e2e clock-compression shape)
+        // passes.
+        let mut cfg = base_agent_config();
+        cfg.liveness_probe = crate::config::LivenessProbeConfig {
+            tick_secs: 1,
+            demand_every_secs: 1,
+            demand_deadline_secs: 1,
+            demand_strikes: 2,
+        };
+        validate_agent(&cfg).expect("nonzero compressed probe passes");
     }
 
     /// A fully-materialized e2e-required agent config (files exist on disk)

@@ -207,6 +207,7 @@ where
                 agent: cn,
                 trusted_gateway: tenant_ident.trusted_gateway,
                 leaf_validity_unix: extract_leaf_validity_from_chain(certs),
+                leaf_serial_hex: interflow_core::tls::extract_leaf_serial_from_chain(certs),
             });
         } else {
             warn!("client certificate carries no CN — rejecting (peer={addr})");

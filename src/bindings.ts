@@ -34,7 +34,12 @@ export const commands = {
 	stopNode: (id: string) => typedError<null, string>(__TAURI_INVOKE("stop_node", { id })),
 	/**  Stops every running node (app quit path). */
 	stopAllNodes: () => typedError<null, string>(__TAURI_INVOKE("stop_all_nodes")),
-	/**  Updates an agent node's runtime preferences (stopped nodes only). */
+	/**
+	 *  Updates an agent node's runtime preferences. Service addresses apply
+	 *  live on a running expose agent (the egress table re-derives; no
+	 *  restart); transport and the hub QUIC address stay stopped-only — the
+	 *  dial face must re-connect.
+	 */
 	updateNodePrefs: (id: string, prefs: NodePrefs) => typedError<null, string>(__TAURI_INVOKE("update_node_prefs", { id, prefs })),
 	getRecentLogs: () => typedError<LogLine[], string>(__TAURI_INVOKE("get_recent_logs")),
 	/**
@@ -74,17 +79,21 @@ export const commands = {
 	 */
 	deployDefaults: () => typedError<DeployDefaultsDto, string>(__TAURI_INVOKE("deploy_defaults")),
 	/**
-	 *  Reads a manifest (or any text file the deploy pane edits). A missing
-	 *  file is named in the user's language — the read-failure class the
-	 *  Overview must be able to tell apart from a TOML syntax error.
+	 *  Reads the manifest (or any text file the deploy pane edits) with its
+	 *  freshness token — the digest Saving hands back for the changed-on-disk
+	 *  check. A missing file is named in the user's language — the
+	 *  read-failure class the Overview must be able to tell apart from a TOML
+	 *  syntax error.
 	 */
-	deployReadText: (path: string) => typedError<string, string>(__TAURI_INVOKE("deploy_read_text", { path })),
+	deployReadText: (path: string) => typedError<DeployTextDto, string>(__TAURI_INVOKE("deploy_read_text", { path })),
 	/**
 	 *  Saves the deploy pane's manifest text back to its path — the editor's
-	 *  single write path, with the same discipline a structured append has:
-	 *  one silent `.bak` generation, then the atomic replace.
+	 *  single write path, now with the changed-on-disk guard: `expected_digest`
+	 *  is the freshness token from the read; a mismatch is NOT an error string
+	 *  but a `Conflict` outcome carrying the current disk document (the
+	 *  editor offers reload-or-keep; last-writer-wins clobbering is gone).
 	 */
-	deployWriteText: (path: string, text: string) => typedError<null, string>(__TAURI_INVOKE("deploy_write_text", { path, text })),
+	deployWriteText: (path: string, text: string, expectedDigest: string | null) => typedError<SaveManifestOutcomeDto, string>(__TAURI_INVOKE("deploy_write_text", { path, text, expectedDigest })),
 	/**
 	 *  Creates a new manifest at `path` from generated template text — the
 	 *  write half of the create-deployment flow. Mirrors `interflow-cli
@@ -124,6 +133,11 @@ export const commands = {
 	 *  unreachable / issuer unreadable) surface as the caller's hint text.
 	 */
 	deployHubOverview: (manifest: string, issuer: string) => typedError<{
+	/**
+	 *  The answering hub's manifest-declared name (`None` = an older hub
+	 *  that does not self-report).
+	 */
+	hub: string | null,
 	/**  The anti-rollback floor (includes absorbed node watermarks). */
 	floor: number,
 	/**  What the hub actually serves; `None` = this hub cannot report it. */
@@ -178,7 +192,12 @@ export const commands = {
 	deployUpdateNode: (nodeId: string, sourceDir: string) => typedError<UpdatedNodeDto_Serialize, string>(__TAURI_INVOKE("deploy_update_node", { nodeId, sourceDir })),
 	/**  Rotates one node's credential (issues the next generation). */
 	deployRotate: (manifest: string, issuer: string, node: string, pack: string | null) => typedError<string[], string>(__TAURI_INVOKE("deploy_rotate", { manifest, issuer, node, pack })),
-	/**  Revokes a pack (deny list + CRL). */
+	/**
+	 *  Revokes a pack (deny list + CRL). The node-owned renewal ledger is
+	 *  deliberately OUTSIDE the GUI's revocation domain: killing a running
+	 *  node's runtime credential is a CLI operator action
+	 *  (`revoke --include-active-credentials`), never a one-click button.
+	 */
 	deployRevoke: (issuer: string, pack: string, reason: string) => typedError<string[], string>(__TAURI_INVOKE("deploy_revoke", { issuer, pack, reason })),
 	/**
 	 *  Appends a node to the manifest — the issue wizard's core step, the GUI
@@ -213,10 +232,58 @@ export const commands = {
 	 */
 	guiPrefsLoad: () => typedError<GuiPrefsDto, string>(__TAURI_INVOKE("gui_prefs_load")),
 	/**
-	 *  Persists the interface language and rebuilds the tray in place — one
-	 *  switch flips every surface (window, tray, command errors) at once.
+	 *  Persists the GUI-wide preferences (language + the current deployment)
+	 *  and rebuilds the tray in place — one switch flips every surface (window,
+	 *  tray, command errors) at once.
 	 */
-	guiPrefsSave: (language: GuiLanguageDto) => typedError<null, string>(__TAURI_INVOKE("gui_prefs_save", { language })),
+	guiPrefsSave: (prefs: GuiPrefsDto) => typedError<null, string>(__TAURI_INVOKE("gui_prefs_save", { prefs })),
+	/**
+	 *  Lists the deployments under `~/interflow-deployments` (name-sorted). A
+	 *  missing root is an empty list — the first-run onboarding entry, not an
+	 *  error.
+	 */
+	deploymentList: () => typedError<DeploymentDto[], string>(__TAURI_INVOKE("deployment_list")),
+	/**
+	 *  The deployment the app opens into (persisted in `gui.toml`); `None` on
+	 *  first run or when the remembered folder vanished. The path is returned
+	 *  UNVALIDATED-but-existing — the caller decides how to present a stale
+	 *  pick (re-onboard, not an error dialog).
+	 */
+	deploymentCurrent: () => typedError<{
+	name: string,
+	root: string,
+	manifest_path: string,
+	/**  The issuer store (`<root>/issuer`); present once an apply has run. */
+	issuer_path: string,
+	/**  The dist tree (`<root>/dist`) packs render into. */
+	out_path: string,
+	has_issuer: boolean,
+	has_dist: boolean,
+} | null, string>(__TAURI_INVOKE("deployment_current")),
+	/**
+	 *  Opens (and persists) the current deployment. The folder must be a
+	 *  deployment (an `interflow.toml`); the error names the path in the
+	 *  user's language.
+	 */
+	deploymentSetCurrent: (root: string) => typedError<DeploymentDto, string>(__TAURI_INVOKE("deployment_set_current", { root })),
+	/**
+	 *  The deployment-scoped composed read model — ONE round trip backing the
+	 *  总览/流/服务 views: declared state + change classification + (when
+	 *  `include_hub`) the hub's fleet face + every local join. The hub dial is
+	 *  opt-in so hub latency can never hold the local view hostage.
+	 */
+	fleetOverview: (manifest: string, issuer: string, includeHub: boolean) => typedError<FleetDto_Serialize, string>(__TAURI_INVOKE("fleet_overview", { manifest, issuer, includeHub })),
+	/**
+	 *  The 发布 button's single backend entry: save (when the editor hands
+	 *  over text) → apply (the watermark-aware funnel; the policy-only fast
+	 *  path when only rules/services/routes moved) → converge the local fleet
+	 *  (policy-only: every local node hot-applies within a watcher period;
+	 *  full render: every STALE local pack is swapped in place and running
+	 *  nodes restart per their captured intent). Returns the classification
+	 *  the status bar states plainly: what went hot, what restarted, what
+	 *  needs a manual re-run.
+	 */
+	deploymentPublish: (manifestText: string | null, manifest: string, issuer: string, out: string) => typedError<PublishResultDto, string>(__TAURI_INVOKE("deployment_publish", { manifestText, manifest, issuer, out })),
 };
 
 /** Events */
@@ -301,8 +368,9 @@ export type ChangeStateDto =
 /**  The manifest matches the applied state exactly. */
 { kind: "applied"; generation: number } | 
 /**
- *  Only the policy face moved (mesh rules, idle budgets) — the next
- *  apply takes the policy-only fast path (hot, ≤10s to the fleet).
+ *  Only the policy face moved (mesh rules, services, routes, idle
+ *  budgets) — the next apply takes the policy-only fast path (hot,
+ *  ≤10s to the fleet, every node kind).
  */
 { kind: "policy_edits_pending" } | 
 /**
@@ -405,6 +473,13 @@ export type DeployPackDto = {
 	expires: string,
 	principal: string,
 	/**
+	 *  One of rotate's `-gen<N>` staging outputs (named by `plan::rotate`
+	 *  for distribution; kept after the local node consumes it) — the UI
+	 *  badges these instead of letting them sit visually equal to the
+	 *  identity's base pack.
+	 */
+	is_staging: boolean,
+	/**
 	 *  The local node added from this pack's identity, if any — the
 	 *  "update this local node to this generation" hook (P1-2).
 	 */
@@ -420,29 +495,82 @@ export type DeployPrefsDto = {
 };
 
 /**
+ *  `deploy_read_text` payload: the document text plus its freshness token
+ *  (sha256 of the bytes on disk). Saving hands the token back; a mismatch
+ *  is a conflict, never a silent overwrite.
+ */
+export type DeployTextDto = {
+	text: string,
+	digest: string,
+};
+
+/**
+ *  One discovered deployment folder (`deployment_list`) — the switcher's
+ *  row and the open-deployment flow's unit.
+ */
+export type DeploymentDto = {
+	name: string,
+	root: string,
+	manifest_path: string,
+	/**  The issuer store (`<root>/issuer`); present once an apply has run. */
+	issuer_path: string,
+	/**  The dist tree (`<root>/dist`) packs render into. */
+	out_path: string,
+	has_issuer: boolean,
+	has_dist: boolean,
+};
+
+/**  The deployment a node/pack belongs to — the new IA's navigation anchor. */
+export type DeploymentRefDto = {
+	/**  The deployment folder's name (the realm id, by convention). */
+	name: string,
+	/**  The deployment folder's absolute path. */
+	root: string,
+};
+
+/**
  *  One structured manifest edit — the Form view's whole submission
  *  vocabulary (wire form of `manifest_edit::ManifestEdit`).
  */
-export type EditActionDto = ({ SetRealm: RealmEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ SetPublicTls: PublicTlsEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ SetIdentity: IdentityEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertWorkspace: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never } | ({ RemoveWorkspace: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertHub: HubEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveHub: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertIngress: IngressEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveIngress: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ CreateNode: CreateNodeDto }) & { RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ SetAgentWorkspace: {
+export type EditActionDto = ({ SetRealm: RealmEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ SetPublicTls: PublicTlsEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ SetIdentity: IdentityEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertWorkspace: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never } | ({ RemoveWorkspace: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertHub: HubEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveHub: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertIngress: IngressEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveIngress: string }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ CreateNode: CreateNodeDto }) & { RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ SetAgentWorkspace: {
 	agent: string,
 	workspace: string,
-} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | 
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | 
 /**  `transport: None` returns the agent to the h2 default. */
 ({ SetAgentTransport: {
 	agent: string,
 	transport: Transport | null,
-} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveAgent: string }) & { CreateNode?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertService: ServiceEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertWorkspace?: never } | ({ RemoveService: {
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveAgent: string }) & { CreateNode?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertService: ServiceEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertWorkspace?: never } | ({ RemoveService: {
 	agent: string,
 	id: string,
-} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertMeshIngress: MeshIngressEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveMeshIngress: {
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertMeshIngress: MeshIngressEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveMeshIngress: {
 	agent: string,
 	name: string,
-} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertMeshEgress: MeshEgressEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveMeshEgress: {
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | 
+/**
+ *  In-place rename (position, decor, comments preserved); the taken /
+ *  missing / blank-name rejections ride the valid→valid funnel.
+ */
+({ RenameMeshIngress: {
+	agent: string,
+	from: string,
+	to: string,
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertMeshEgress: MeshEgressEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveMeshEgress: {
 	agent: string,
 	name: string,
-} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertRoute: RouteEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveRoute: {
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RenameMeshEgress: {
+	agent: string,
+	from: string,
+	to: string,
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | 
+/**  Service rename with the `[[route]]` cascade (refs follow the id). */
+({ RenameService: {
+	agent: string,
+	from: string,
+	to: string,
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ UpsertRoute: RouteEditDto }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveRoute?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertService?: never; UpsertWorkspace?: never } | ({ RemoveRoute: {
 	host: string,
-} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveService?: never; RemoveWorkspace?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never };
+} }) & { CreateNode?: never; RemoveAgent?: never; RemoveHub?: never; RemoveIngress?: never; RemoveMeshEgress?: never; RemoveMeshIngress?: never; RemoveService?: never; RemoveWorkspace?: never; RenameMeshEgress?: never; RenameMeshIngress?: never; RenameService?: never; SetAgentTransport?: never; SetAgentWorkspace?: never; SetIdentity?: never; SetPublicTls?: never; SetRealm?: never; UpsertHub?: never; UpsertIngress?: never; UpsertMeshEgress?: never; UpsertMeshIngress?: never; UpsertRoute?: never; UpsertService?: never; UpsertWorkspace?: never };
 
 /**
  *  `deploy_edit_manifest` result: the rewritten document text (the editor's
@@ -452,6 +580,127 @@ export type EditActionDto = ({ SetRealm: RealmEditDto }) & { CreateNode?: never;
 export type EditedManifestDto = {
 	text: string,
 	summary: ManifestSummaryDto,
+};
+
+/**
+ *  The deployment-scoped composed read model (2026-10-10 IA) — ONE command
+ *  backing the 总览/流/服务 views: the declared desired state (manifest
+ *  summary), the bookkeeping change classification, the hub's fleet face
+ *  (optional — never let hub latency hold the local view hostage), and the
+ *  joins that make each declared node answer "is it here, is it running,
+ *  is it converged".
+ */
+export type FleetDto = FleetDto_Serialize | FleetDto_Deserialize;
+
+/**
+ *  The deployment-scoped composed read model (2026-10-10 IA) — ONE command
+ *  backing the 总览/流/服务 views: the declared desired state (manifest
+ *  summary), the bookkeeping change classification, the hub's fleet face
+ *  (optional — never let hub latency hold the local view hostage), and the
+ *  joins that make each declared node answer "is it here, is it running,
+ *  is it converged".
+ */
+export type FleetDto_Deserialize = {
+	summary: ManifestSummaryDto,
+	change_state: ChangeStateDto,
+	/**
+	 *  The hub's operator overview; `None` = not requested or unreachable
+	 *  (the caller decides whether to dial — `include_hub`).
+	 */
+	hub: HubOverviewDto | null,
+	/**
+	 *  One row per DECLARED node (manifest truth): agents, hubs,
+	 *  ingresses.
+	 */
+	nodes: FleetNodeDto_Deserialize[],
+	/**
+	 *  The 流 view's rows: every declared mesh ingress stream, joined with
+	 *  its live listener state and convergence.
+	 */
+	streams: StreamDto[],
+	/**
+	 *  The 服务 view's rows: every declared expose service, joined with
+	 *  this machine's effective address.
+	 */
+	services: ServiceFaceDto[],
+	/**
+	 *  Local nodes whose packs do NOT belong to this deployment (sealed
+	 *  imports, other deployments) — the 节点 view completes from these.
+	 */
+	local_only: NodeInfo_Deserialize[],
+};
+
+/**
+ *  The deployment-scoped composed read model (2026-10-10 IA) — ONE command
+ *  backing the 总览/流/服务 views: the declared desired state (manifest
+ *  summary), the bookkeeping change classification, the hub's fleet face
+ *  (optional — never let hub latency hold the local view hostage), and the
+ *  joins that make each declared node answer "is it here, is it running,
+ *  is it converged".
+ */
+export type FleetDto_Serialize = {
+	summary: ManifestSummaryDto,
+	change_state: ChangeStateDto,
+	/**
+	 *  The hub's operator overview; `None` = not requested or unreachable
+	 *  (the caller decides whether to dial — `include_hub`).
+	 */
+	hub: HubOverviewDto | null,
+	/**
+	 *  One row per DECLARED node (manifest truth): agents, hubs,
+	 *  ingresses.
+	 */
+	nodes: FleetNodeDto_Serialize[],
+	/**
+	 *  The 流 view's rows: every declared mesh ingress stream, joined with
+	 *  its live listener state and convergence.
+	 */
+	streams: StreamDto[],
+	/**
+	 *  The 服务 view's rows: every declared expose service, joined with
+	 *  this machine's effective address.
+	 */
+	services: ServiceFaceDto[],
+	/**
+	 *  Local nodes whose packs do NOT belong to this deployment (sealed
+	 *  imports, other deployments) — the 节点 view completes from these.
+	 */
+	local_only: NodeInfo_Serialize[],
+};
+
+/**  One declared node as the fleet table shows it. */
+export type FleetNodeDto = FleetNodeDto_Serialize | FleetNodeDto_Deserialize;
+
+/**  One declared node as the fleet table shows it. */
+export type FleetNodeDto_Deserialize = {
+	/**  The declared kind (manifest face): agent / hub / ingress. */
+	kind: NodeKindDto,
+	name: string,
+	/**  The workspace (agents); `None` for hubs and ingresses. */
+	workspace: string | null,
+	/**  This machine's face (`None` = the node does not run here). */
+	local: LocalFaceDto_Deserialize | null,
+	/**
+	 *  The hub's face (`None` = no hub overview / the node is not an
+	 *  agent registered there).
+	 */
+	remote: RemoteFaceDto | null,
+};
+
+/**  One declared node as the fleet table shows it. */
+export type FleetNodeDto_Serialize = {
+	/**  The declared kind (manifest face): agent / hub / ingress. */
+	kind: NodeKindDto,
+	name: string,
+	/**  The workspace (agents); `None` for hubs and ingresses. */
+	workspace: string | null,
+	/**  This machine's face (`None` = the node does not run here). */
+	local: LocalFaceDto_Serialize | null,
+	/**
+	 *  The hub's face (`None` = no hub overview / the node is not an
+	 *  agent registered there).
+	 */
+	remote: RemoteFaceDto | null,
 };
 
 /**
@@ -467,6 +716,11 @@ export type GuiLanguageDto = "en" | "zh";
  */
 export type GuiPrefsDto = {
 	language: GuiLanguageDto,
+	/**
+	 *  The deployment the app opens into (root folder path); `None` on
+	 *  first run. Round-trips whole so a language switch never drops it.
+	 */
+	current_deployment: string | null,
 };
 
 /**  One fleet member's row in a [`HubOverviewDto`]. */
@@ -510,6 +764,11 @@ export type HubEditDto = {
  *  `GET /policy/floor` — all facts the hub already holds).
  */
 export type HubOverviewDto = {
+	/**
+	 *  The answering hub's manifest-declared name (`None` = an older hub
+	 *  that does not self-report).
+	 */
+	hub: string | null,
 	/**  The anti-rollback floor (includes absorbed node watermarks). */
 	floor: number,
 	/**  What the hub actually serves; `None` = this hub cannot report it. */
@@ -674,6 +933,43 @@ export type ListenerStatusDto = {
 	bound_addr: string | null,
 	/**  The last bind failure (`null` = healthy). */
 	last_error: string | null,
+};
+
+/**  The local-machine face of a declared node: what the NodeManager knows. */
+export type LocalFaceDto = LocalFaceDto_Serialize | LocalFaceDto_Deserialize;
+
+/**  The local-machine face of a declared node: what the NodeManager knows. */
+export type LocalFaceDto_Deserialize = {
+	/**  The NodeManager id (the 节点 view's navigation target). */
+	id: string,
+	state: NodeStateDto_Deserialize,
+	desired_running: boolean,
+	/**  The installed pack's generation (display cache). */
+	generation: number,
+	/**
+	 *  The policy plane's applied generation (mesh/expose agents;
+	 *  `None` = no watcher face, e.g. a stopped node or a hub).
+	 */
+	policy_generation: number | null,
+	/**  Live listener states (mesh agents, running; else empty). */
+	listeners: ListenerStatusDto[],
+};
+
+/**  The local-machine face of a declared node: what the NodeManager knows. */
+export type LocalFaceDto_Serialize = {
+	/**  The NodeManager id (the 节点 view's navigation target). */
+	id: string,
+	state: NodeStateDto_Serialize,
+	desired_running: boolean,
+	/**  The installed pack's generation (display cache). */
+	generation: number,
+	/**
+	 *  The policy plane's applied generation (mesh/expose agents;
+	 *  `None` = no watcher face, e.g. a stopped node or a hub).
+	 */
+	policy_generation: number | null,
+	/**  Live listener states (mesh agents, running; else empty). */
+	listeners: ListenerStatusDto[],
 };
 
 /**  A local node matching a dist pack's identity (Deploy page cards). */
@@ -944,6 +1240,13 @@ export type NodeInfo_Deserialize = {
 	 *  is REALLY listening, not what the policy wants.
 	 */
 	listeners: ListenerStatusDto[] | null,
+	/**
+	 *  The deployment this node's pack belongs to (`<root>/dist/packs/…`
+	 *  reverse-resolved); `None` for sealed imports and packs outside any
+	 *  deployment tree — the cross-link the new IA's fleet/machine views
+	 *  navigate by.
+	 */
+	deployment: DeploymentRefDto | null,
 };
 
 /**  One managed node (list rows, detail panes). */
@@ -1031,6 +1334,13 @@ export type NodeInfo_Serialize = {
 	 *  is REALLY listening, not what the policy wants.
 	 */
 	listeners: ListenerStatusDto[] | null,
+	/**
+	 *  The deployment this node's pack belongs to (`<root>/dist/packs/…`
+	 *  reverse-resolved); `None` for sealed imports and packs outside any
+	 *  deployment tree — the cross-link the new IA's fleet/machine views
+	 *  navigate by.
+	 */
+	deployment: DeploymentRefDto | null,
 };
 
 /**
@@ -1114,6 +1424,12 @@ export type NodeStateEvent_Deserialize = {
 export type NodeStateEvent_Serialize = {
 	id: string,
 	state: NodeStateDto_Serialize,
+};
+
+/**  One pack-swap failure, phrased for the fleet table's row. */
+export type NodeUpdateFailureDto = {
+	node: string,
+	error: string,
 };
 
 /**
@@ -1276,6 +1592,46 @@ export type PublicTlsEditDto = {
  */
 export type PublicTlsModeDto = "acme" | "frontend-proxy" | "manual";
 
+/**  What a publish did (the 发布 button's single backend entry). */
+export type PublishKindDto = 
+/**
+ *  Only the policy face moved — every node hot-applies within a
+ *  watcher period; no pack was touched.
+ */
+"policy_only" | 
+/**
+ *  The identity/dial face moved — packs re-rendered; local stale
+ *  packs were swapped in place (running nodes restarted).
+ */
+"full_render" | 
+/**  Nothing to do (the idempotent gate). */
+"no_op";
+
+/**
+ *  `deployment_publish`'s result: the apply report plus the orchestration
+ *  the old flow left to the operator (which local nodes were converged,
+ *  which were swapped, what needs manual attention).
+ */
+export type PublishResultDto = {
+	kind: PublishKindDto,
+	apply: ApplyReportDto,
+	/**
+	 *  Node names this publish converged WITHOUT touching (policy-only:
+	 *  every local node of the deployment is hot).
+	 */
+	hot_nodes: string[],
+	/**
+	 *  Node names whose local packs were swapped in place (full render;
+	 *  running ones restarted per their start intent).
+	 */
+	updated_nodes: string[],
+	/**
+	 *  `(node name, error)` — a failed pack swap never fails the publish
+	 *  itself; the row stays stale and the operator re-runs update.
+	 */
+	failed_updates: NodeUpdateFailureDto[],
+};
+
 /**
  *  The distribution plane's liveness face — distinct from whichever
  *  generation it delivered: `last_ok_unix == 0` on a connected agent is a
@@ -1308,6 +1664,14 @@ export type RealmEditDto = {
 	control_endpoint: string,
 };
 
+/**  The hub's face of a declared agent. */
+export type RemoteFaceDto = {
+	/**  `registered ≠ reachable` — presence as the hub answers it. */
+	online: boolean,
+	/**  The generation this agent last pulled; `None` = no completed pull. */
+	seen_generation: number | null,
+};
+
 /**  One `[[route]]`: public host → service identity. */
 export type RouteDto = {
 	host: string,
@@ -1319,6 +1683,22 @@ export type RouteEditDto = {
 	host: string,
 	service: string,
 };
+
+/**
+ *  `deploy_write_text` outcome. `Conflict` carries the CURRENT on-disk
+ *  document so the editor's reload-or-keep choice needs no second round
+ *  trip — the other writer's edit is already in the payload.
+ */
+export type SaveManifestOutcomeDto = { kind: "saved"; 
+/**
+ *  The freshness token of what was just written — the next save's
+ *  expected digest.
+ */
+digest: string } | { kind: "conflict"; 
+/**  What the disk holds now (the winning writer's version). */
+text: string; 
+/**  Its freshness token — adopting the disk version adopts this. */
+digest: string };
 
 /**
  *  `deploy_seal_to_downloads` result: where the sealed pack landed plus the
@@ -1358,6 +1738,63 @@ export type ServiceEditDto = {
 };
 
 /**
+ *  One expose service (the 服务 view's row): the declared id + default
+ *  address, joined with this machine's effective dial target.
+ */
+export type ServiceFaceDto = {
+	agent: string,
+	workspace: string,
+	id: string,
+	/**
+	 *  The manifest-declared default — the signed default since the hot
+	 *  channel (what a machine without a local preference dials).
+	 */
+	default_address: string,
+	/**
+	 *  This machine's effective address (`None` = the agent does not run
+	 *  here).
+	 */
+	effective_address: string | null,
+	/**  The effective address came from a machine-local preference. */
+	overridden: boolean,
+	/**  The local NodeManager id of the serving agent. */
+	local_node_id: string | null,
+};
+
+/**
+ *  One mesh stream (the 流 view's row): a cross-machine pairing object —
+ *  the source agent's listen rule AND the target's remote, joined with
+ *  everything live about it.
+ */
+export type StreamDto = {
+	/**  The source agent (where the loopback listener runs). */
+	agent: string,
+	/**  The stream's name (rule identity on the source agent). */
+	name: string,
+	listen: string,
+	protocol: MeshProtocolDto,
+	target_agent: string,
+	remote_addr: string,
+	idle_timeout_secs: number | null,
+	status: StreamStatusDto,
+	/**
+	 *  The actually-bound address, port materialized (`:0` picks show the
+	 *  real port) — `None` = not bound, or no local face to observe it.
+	 */
+	bound_addr: string | null,
+	/**
+	 *  The last bind failure verbatim (`None` = healthy or unobservable) —
+	 *  the 流 row's down reason (gui.md's "挂了看原因").
+	 */
+	last_error: string | null,
+	/**
+	 *  The local NodeManager id of the source agent (`None` = it does not
+	 *  run on this machine) — the 节点 view cross-link.
+	 */
+	source_node_id: string | null,
+};
+
+/**
  *  One stream-proposal request (the requester's form = the validator's
  *  fields, verbatim).
  */
@@ -1370,6 +1807,31 @@ export type StreamProposalRequestDto = {
 	remote_addr: string,
 	idle_timeout_secs: number | null,
 };
+
+/**
+ *  A stream row's live status. Local bind state is definitive when the
+ *  source node runs here; convergence answers "has the fleet taken the
+ *  current policy"; `Unknown` is honest (a remote source's bind state is
+ *  not observable from here — the row then leans on its remote face).
+ */
+export type StreamStatusDto = 
+/**  A local listener is bound and serving this rule. */
+"serving" | 
+/**
+ *  The local listener exists but its bind failed (down; the error
+ *  rides the listener face).
+ */
+"down" | 
+/**
+ *  The policy generation is still propagating (hub serving above the
+ *  source node's seen/applied generation).
+ */
+"catching_up" | 
+/**
+ *  No local face and no convergence answer — render from the remote
+ *  face instead of guessing.
+ */
+"unknown";
 
 /**
  *  Transport toward the hub/control endpoint (wire form mirrors mesh

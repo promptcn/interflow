@@ -8,7 +8,7 @@ import { Badge, Button, Field, Hint, Input, SegmentedControl } from "./ui";
 
 /// The manifest page — one document, two views.
 ///
-/// The editor's state IS the manifest text (`text`, owned by DeployFace);
+/// The editor's state IS the manifest text (`text`, owned by the deployment
 /// the Form view is a projection of it (parsed + issues via the backend),
 /// the TOML view is the text itself. Every form action is one pure
 /// `text → validated text` transform (`deployEditManifest`) whose result
@@ -24,6 +24,7 @@ export default function ManifestEditor({
   busy,
   dirty,
   recentContexts,
+  compact = false,
   onManifestChange,
   onIssuerChange,
   onOutChange,
@@ -59,6 +60,12 @@ export default function ManifestEditor({
   onSave: () => void;
   onValidate: () => void;
   onApply: () => void;
+  /// Deployment-context mode: the path triple is fixed by the deployment
+  /// folder, so the three path inputs, the recents picker, and the
+  /// template builder collapse into one slim header line (path + Load +
+  /// Save). Publish lives in the shell's status cluster — the bottom bar
+  /// keeps Validate only.
+  compact?: boolean;
 }) {
   const { t } = useT();
   const [view, setView] = useState<"form" | "toml">("form");
@@ -189,6 +196,23 @@ export default function ManifestEditor({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto">
+      {compact ? (
+        <div className="flex min-w-0 items-center gap-2">
+          <code
+            className="min-w-0 flex-1 truncate rounded-lg border border-line bg-bg-3 px-2 py-1 font-mono text-small text-fg-2"
+            title={`${manifest} · ${issuer} · ${out}`}
+          >
+            {manifest}
+          </code>
+          <Button disabled={busy} onClick={onLoad}>
+            {t("manifest.load")}
+          </Button>
+          <Button disabled={busy || text === null} onClick={onSave}>
+            {t("manifest.save")}
+            {dirty ? " •" : ""}
+          </Button>
+        </div>
+      ) : (
       <div className="flex flex-col gap-2">
         {recentContexts.length > 1 && (
           <div className="flex items-center gap-2">
@@ -223,6 +247,7 @@ export default function ManifestEditor({
           onPickFile(onOutChange, true, t("manifest.chooseDist")),
         )}
       </div>
+      )}
 
       <div className="flex flex-wrap items-center gap-2">
         <SegmentedControl
@@ -237,7 +262,7 @@ export default function ManifestEditor({
         {statusChip()}
         {dirty && <span className="text-small text-warn">{t("manifest.unsavedHint")}</span>}
         <span className="flex-1" />
-        <TemplateBuilder onTemplate={onTextChange} />
+        {!compact && <TemplateBuilder onTemplate={onTextChange} />}
       </div>
 
       {text === null ? (
@@ -275,9 +300,11 @@ export default function ManifestEditor({
         <Button disabled={busy} onClick={onValidate}>
           {t("manifest.validate")}
         </Button>
-        <Button variant="primary" disabled={busy || text === null} onClick={onApply}>
-          {t("manifest.applyButton")}
-        </Button>
+        {!compact && (
+          <Button variant="primary" disabled={busy || text === null} onClick={onApply}>
+            {t("manifest.applyButton")}
+          </Button>
+        )}
       </div>
     </div>
   );

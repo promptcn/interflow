@@ -11,12 +11,12 @@
 
 export const EN = {
   // ---- app shell ------------------------------------------------------
-  "app.nodes": "Nodes",
-  "app.deploy": "Deploy",
-  "app.versionTitle": "Click to copy the build identity",
+  "app.versionTitle": "View the build identity",
   "app.versionDirtyTitle":
-    "Built from uncommitted local changes — treat as the builder's, not the commit's. Click to copy the build identity",
-  "app.copied": "copied ✓",
+    "Built from uncommitted local changes — treat as the builder's, not the commit's",
+  "app.version": "Version",
+  "app.buildTag": "Build tag",
+  "app.copyBuildIdentity": "Copy build identity",
   "app.dismiss": "dismiss",
 
   // ---- shared words ---------------------------------------------------
@@ -27,6 +27,7 @@ export const EN = {
   "common.stop": "Stop",
   "common.remove": "Remove",
   "common.edit": "Edit",
+  "common.more": "More actions",
   "common.browse": "Browse",
   "common.generate": "Generate",
   "common.generatePassphraseTitle": "generate a 144-bit passphrase",
@@ -37,7 +38,6 @@ export const EN = {
   "common.passphrase": "Passphrase",
   "common.addService": "+ service",
   "common.addRule": "+ rule",
-  "common.or": "or",
   "common.packDefaultTitle": "Pack default: {addr}",
   "common.overriddenTitle": "local override",
 
@@ -66,6 +66,8 @@ export const EN = {
   "overview.pendingCount": "{n} pending",
   "overview.none": "no nodes yet",
   "overview.addNode": "+ Add node",
+  "overview.allStoppedNotice": "All nodes are stopped — start them?",
+  "overview.startAll": "Start all",
   "overview.actionFailed": "{action} {name} failed: {error}",
 
   // ---- node card ---------------------------------------------------------
@@ -86,9 +88,8 @@ export const EN = {
   "prefs.hubQuicAddr": "Hub QUIC address",
   "prefs.hubQuicPlaceholder": "(optional) host:port — derived if empty",
   "prefs.hubQuicDerived": "blank = derived from the pack ({addr})",
-  "prefs.packDefaultHint": "pack default: {value}",
   "prefs.transportPersistTitle":
-    "Only a choice different from the pack's signed default is persisted as this machine's preference; the default follows the pack on every future re-issue",
+    "pack default: {value} — only a different choice is persisted as this machine's preference",
 
   // ---- add-node dialog ---------------------------------------------------
   "addNode.title": "Add a node",
@@ -111,7 +112,7 @@ export const EN = {
   "addNode.addButton": "Add node",
 
   // ---- node detail page ---------------------------------------------------
-  "nodeDetail.allNodes": "← All nodes",
+  "nodeDetail.allNodes": "All nodes",
   "nodeDetail.status": "Status",
   "nodeDetail.viewConfig": "Config",
   "nodeDetail.health": "Health",
@@ -121,7 +122,8 @@ export const EN = {
   "nodeDetail.receiptRegistered": " · registered {time}",
   "nodeDetail.quicTimeout":
     "QUIC dial keeps timing out — check UDP egress / the hub security group; switching this node's transport to h2 restores connectivity",
-  "nodeDetail.willReconnect": "Will reconnect automatically once the network recovers",
+  "nodeDetail.willReconnect":
+    "Will reconnect automatically once the network recovers",
   "nodeDetail.identity": "Identity",
   "nodeDetail.credentialPack": "Credential Pack",
   "nodeDetail.generation": "Generation",
@@ -130,10 +132,10 @@ export const EN = {
   "nodeDetail.policySourceState": "state/policy",
   "nodeDetail.policyHubGen": " · hub gen {gen}",
   "nodeDetail.policyStaleTitle":
-    "The hub serves a policy generation below this node's watermark — new policies will be rejected as stale until the lineage catches up (re-apply to mint above it)",
+    "The hub serves a policy generation below this node's watermark — re-apply to mint above it",
   "nodeDetail.policyPull": "Control-plane pull",
   "nodeDetail.policyPullTitle":
-    "The hub control-plane pull channel's own liveness: never having completed a pull (while the node is online) means the hot-distribution channel is dead — new policies will never arrive",
+    "The control-plane pull channel's own liveness — never having pulled (while online) means new policies will never arrive",
   "nodeDetail.policyPullNever": "never completed a pull ⚠",
   "nodeDetail.policyPullOk": "{ago} ago · {fails} failure(s)",
   "nodeDetail.policyTitle":
@@ -146,20 +148,15 @@ export const EN = {
   "nodeDetail.listeners": "Listeners",
   "nodeDetail.listenersNone": "No ingress rules declared",
   "nodeDetail.listenerBoundTitle":
-    "Actually bound here — a `:0` port pick shows the materialized port (what is really listening, not what the policy wants)",
+    "Actually bound here — a `:0` pick shows the materialized port, not what the policy wants",
   "nodeDetail.listenerDownTitle":
-    "A declared ingress rule has no listener serving it — the bind failed or the listener vanished while the session stayed green. The bind error is in this node's logs.",
+    "A declared ingress rule has no listener serving it — the bind error is in this node's logs.",
   "nodeDetail.listenerNotServing": "not serving",
   "nodeDetail.listenerRetry": "retry pending",
-  "nodeDetail.peers": "Peers",
   "nodeDetail.peersNone": "No other agents in this workspace yet",
   "nodeDetail.peersUpdated": "updated {ago} ago",
   "nodeDetail.peerOnline": "online",
   "nodeDetail.peerOffline": "offline",
-  "nodeDetail.peerOnlineTitle":
-    "Registered and reachable right now (session in place)",
-  "nodeDetail.peerOfflineTitle":
-    "Registered but not reachable right now (no session in place) — the far end decides whether \"cannot connect\" is local or remote",
   "nodeDetail.peerLeafTitle":
     "This peer's leaf credential health — same tiering as the node's own credentials",
   "nodeDetail.runtimePrefs": "Runtime preferences",
@@ -178,6 +175,7 @@ export const EN = {
   "nodeDetail.logs": "Logs",
   "nodeDetail.thisNode": "This node",
   "nodeDetail.thisMachine": "This machine",
+  "nodeDetail.localImport": "local sealed import",
 
   // ---- log pane chrome ----------------------------------------------------
   "log.clear": "Clear logs",
@@ -185,52 +183,20 @@ export const EN = {
 
   // ---- deploy face ----------------------------------------------------------
   "deploy.packs": "Packs",
-  "deploy.manifest": "Manifest",
-  "deploy.overview": "Overview",
-  "deploy.output": "Output",
-
-  "overview.fleet": "Deployment",
-  "overview.fleetHub": "hub serving gen {gen}",
-  "overview.refresh": "Refresh",
-  "overview.agent": "Agent",
-  "overview.workspace": "Workspace",
-  "overview.streams": "Streams",
-  "overview.transport": "Transport",
-  "overview.online": "Online",
-  "overview.notLoaded": "Load a manifest to see the deployment here.",
-  "overview.noAgents": "No agents declared yet — {name}",
-  "overview.hubUnreachable": "Hub unreachable — online status and convergence unavailable (paths correct? hub running?).",
-  "overview.adjustStreamTitle": "Adjust stream {name}",
-  "overview.onlineShort": "online",
-  "overview.offlineShort": "offline",
-  "overview.pendingGen": "at gen {gen}, catching up",
-  "overview.tasks": "Tasks",
-  "overview.addStream": "Add stream",
-  "overview.addStreamHint": "Give one agent one more mesh stream — wizard, no TOML",
-  "overview.adjustStream": "Adjust stream",
-  "overview.adjustStreamHint": "Idle budget, address, protocol — pick a stream row",
-  "overview.apply": "Apply",
-  "overview.rotate": "Rotate / packs",
-  "overview.rotateHint": "Rotate credentials, seal, distribute, revoke",
-  "overview.nextSteps": "Next steps",
   "overview.go": "Go",
-  "overview.lastApply": "Last apply",
-  "overview.generation": "policy generation",
-  "overview.converged": "fleet converged ✓",
-  "overview.reportLines": "Report lines",
   "overview.stepLoad": "Load the manifest (paths above)",
   "overview.stepFileMissing": "Cannot read the manifest: {error}",
   "overview.chooseAction": "Open manifest…",
-  "overview.createAction": "New from template…",
-  "overview.emptyBody": "No deployment open yet — open an existing manifest, or start one from a template.",
   "overview.createTitle": "New deployment",
-  "overview.createHint": "Pick a starter skeleton — the file you save becomes the manifest this pane works from.",
-  "overview.createSaved": "created {path}",
+  "overview.createHint":
+    "Pick a starter skeleton — the file you save becomes the manifest this pane works from.",
   "overview.stepFixSyntax": "Fix the manifest's TOML syntax: {error}",
   "overview.stepIssues": "Resolve {n} issue(s): {first}",
   "overview.stepValid": "Document valid",
   "overview.stepFirstNode": "Declare the first agent node",
   "overview.stepFirstStream": "Add the first stream",
+  "overview.stepFirstService": "Declare the first service",
+  "overview.editManifestAction": "Edit manifest",
   "overview.stepSave": "Save unsaved edits",
   "overview.stepApplied": "Applied · gen {gen} live",
   "overview.changeUnknown": "Apply state unknown",
@@ -256,26 +222,18 @@ export const EN = {
   "stream.remoteError": "Must be <host>:<port>",
   "stream.previewOk": "validator accepts this stream ✓",
   "stream.previewReject": "The validator rejects this stream:",
-  "stream.previewIncomplete": "Fill in the fields — the validator previews live",
-  "stream.saveApply": "Save & Apply",
-
-  "deploy.pendingProposals": "{n} proposal(s) waiting",
-
-  "overview.proposals": "Stream proposals",
-  "overview.proposalsHint": "Nodes' self-service requests — approve mints via the manifest (the single source of truth)",
-  "overview.approve": "Approve",
-  "overview.approveTitle": "Edit the manifest, apply (mint + publish), and record the decision",
+  "stream.previewIncomplete":
+    "Fill in the fields — the validator previews live",
   "overview.reject": "Reject",
-  "overview.rejectConfirm": "Reject",
-  "overview.rejectReasonPlaceholder": "reason (the requester sees it)",
-  "overview.rejectedLine": "rejected {id}: {reason}",
 
   "proposal.title": "Request stream",
-  "proposal.semantics":
-    "Ask the operator for one more stream: this agent listens on <listen>; traffic relays through the hub to <target>, which dials <remote> from its own network. The operator approves or rejects; the decision lands here.",
+  "proposal.decisionLands":
+    "The operator approves or rejects; the decision lands in Requested streams.",
   "proposal.submit": "Submit request",
-  "proposal.queued": "Queued ✓ — the operator will see it; the decision lands in Requested streams",
-  "proposal.duplicate": "An identical request is already queued — waiting for the operator",
+  "proposal.queued":
+    "Queued ✓ — the operator will see it; the decision lands in Requested streams",
+  "proposal.duplicate":
+    "An identical request is already queued — waiting for the operator",
   "proposal.denied": "The hub rejected the request: ",
   "proposal.requestStream": "Request stream",
   "proposal.statusPending": "pending",
@@ -288,7 +246,6 @@ export const EN = {
   "form.deployTime": "Deploy-time configuration",
   "form.deployTimeTitle":
     "Realm, identity tier, public TLS, hub, workspaces — decided once per deployment; expand to edit",
-  "deploy.outputPlaceholder": "plan validate / apply output appears here",
   "deploy.savedLine": "saved {path}",
   "deploy.updatedGen": "updated — gen {from} → {to}",
   "deploy.updatedContent": "updated — content (gen {a} → {b})",
@@ -299,11 +256,10 @@ export const EN = {
   "deploy.onServerLine": "on the target server: {command}",
 
   // ---- pack grid ----------------------------------------------------------
-  "pack.output": "Output",
-  "pack.chooseDist": "Choose the dist directory",
   "pack.refresh": "Refresh",
   "pack.issuePack": "+ Issue pack…",
-  "pack.issuePackTitle": "append a node to the manifest, apply, seal into Downloads",
+  "pack.issuePackTitle":
+    "append a node to the manifest, apply, seal into Downloads",
   "pack.noPacks": "No packs yet — apply the manifest or Refresh.",
   "pack.genExpires": "gen {gen} · expires {expires}",
   "pack.notOnMachine": "not on this machine",
@@ -312,9 +268,17 @@ export const EN = {
   "pack.updateTitle": "stop, swap the pack in place (state kept), restart",
   "pack.updateTitleContent":
     "same generation, different content — stop, swap the pack in place (state kept), restart",
+  "pack.downgradeHint":
+    "the local node already runs gen {local}, newer than this pack (gen {pack}) — installing it would be a downgrade; deliberate rollbacks go through the CLI",
+  "pack.windowUpdateBadge": "gen {gen} to install",
+  "pack.windowUpdateTitle":
+    "rotate rendered generation {gen} and this machine's node has not installed it yet — update from it, or open the card for distribution",
+  "pack.windowDistributeBadge": "gen {gen} to distribute",
+  "pack.windowDistributeTitle":
+    "rotate rendered generation {gen} for this identity — distribute it to its machine over a trusted channel (seal it or copy the install command)",
 
   // ---- pack detail page -----------------------------------------------------
-  "packDetail.backPacks": "← Packs",
+  "packDetail.backPacks": "Packs",
   "packDetail.identity": "Identity",
   "packDetail.fromPath": "from {path}",
   "packDetail.principal": "Principal",
@@ -324,6 +288,7 @@ export const EN = {
   "packDetail.updateName": "Update {name}",
   "packDetail.reinstallInto": "Reinstall into {name}",
   "packDetail.distribute": "Distribute",
+  "packDetail.distributeFrom": "Shipping",
   "packDetail.sealButton": "Seal .iflowpack…",
   "packDetail.sealAs": "Seal {name} as .iflowpack",
   "packDetail.copyInstall": "Copy install command",
@@ -356,6 +321,13 @@ export const EN = {
   "manifest.issuesCount": "✕ {n} issues",
   "manifest.valid": "✓ valid",
   "manifest.unsavedHint": "unsaved — Save writes the file (with a .bak)",
+  "manifest.conflictTitle": "Manifest changed on disk",
+  "manifest.conflictBody":
+    "Another writer (a terminal CLI run, another window) saved this file while it was open here. The disk's current version is shown below — take it and re-apply your change on top.",
+  "manifest.conflictTakeDisk": "Use the disk version",
+  "manifest.conflictKeep": "Keep my edits (unsaved)",
+  "manifest.conflictShort":
+    "manifest changed on disk — the disk version was loaded; re-apply the change",
   "manifest.loadHint": "load a manifest, or generate a template",
   "manifest.parseFail":
     "The text does not parse — switch to the TOML view to fix it; the Form view returns as soon as it does.",
@@ -377,10 +349,12 @@ export const EN = {
   // ---- manifest form view --------------------------------------------------------
   "form.editsLandHint": "edits land in the document — Save writes the file",
   "form.realmTitle": "Realm",
-  "form.realmHint": "one independent trust domain — the identity inside principal URIs",
+  "form.realmHint":
+    "one independent trust domain — the identity inside principal URIs",
   "form.id": "Id",
   "form.controlEndpoint": "Control endpoint",
-  "form.controlEndpointPh": "blank = site-to-site only (agents dial the mesh hub)",
+  "form.controlEndpointPh":
+    "blank = site-to-site only (agents dial the mesh hub)",
   "form.identityTitle": "Identity tier",
   "form.identityHint": "one decision: credential lifetime + how it renews",
   "form.mode": "Mode",
@@ -399,7 +373,8 @@ export const EN = {
   "form.acmeDirectory": "ACME directory",
   "form.acmeDirectoryPh": "blank = Let's Encrypt production",
   "form.hubTitle": "Mesh hub",
-  "form.hubHint": "the public relay site-to-site agents dial (v1: one per realm)",
+  "form.hubHint":
+    "the public relay site-to-site agents dial (v1: one per realm)",
   "form.addHub": "+ hub",
   "form.noHub":
     "No hub — add one before (or while) declaring mesh agents; a hub without agents shows as an issue until the first one arrives.",
@@ -419,10 +394,21 @@ export const EN = {
   "form.agentsTitle": "Agents",
   "form.agentsHint": "one pack, one role: services or mesh rules — never both",
   "form.addNode": "+ node",
+  "form.agentsPickerTitle": "Pick the agent to edit",
+  "form.agentsStatAgent": "{n} agent",
+  "form.agentsStatAgents": "{n} agents",
+  "form.agentsStatMesh": "{n} mesh",
+  "form.agentsStatExpose": "{n} expose",
+  "form.agentsStatMixed": "{n} mixed",
+  "form.agentsStatEmpty": "{n} empty",
+  "form.agentsStatServices": "{n} services",
+  "form.agentsStatIn": "{n} ingress",
+  "form.agentsStatOut": "{n} egress",
+  "form.pickerInOut": "{i} in/{o} out",
   "form.singleWorkspaceTitle": "the manifest has a single workspace",
   "form.retargetWorkspaceTitle": "retarget the workspace",
   "form.transportTitle":
-    "dial transport the pack pins as this agent's signed default — expose agents dial the ingress (needs its quic_listen face), mesh agents dial the hub (needs its quic_listen face)",
+    "the dial transport pinned as this agent's signed default — expose agents dial the ingress, mesh agents dial the hub",
   "form.servicesExpose": "Services — expose to public routes",
   "form.meshIngressTitle": "Mesh ingress — forward a local listener to a peer",
   "form.meshEgressTitle": "Mesh egress — what this agent dials for peers",
@@ -435,32 +421,36 @@ export const EN = {
   "form.ingressTitle": "Ingress nodes",
   "form.ingressHint": "public entry points for expose routes",
   "form.addIngress": "+ ingress",
-  "form.noIngress": "No ingress — this realm is site-to-site only (a hub serves as the entry).",
+  "form.noIngress":
+    "No ingress — this realm is site-to-site only (a hub serves as the entry).",
   "form.perIpRate": "{n}/min per IP",
-  "form.declareWorkspaceFirst": "Declare a workspace first — an ingress serves workspaces.",
+  "form.declareWorkspaceFirst":
+    "Declare a workspace first — an ingress serves workspaces.",
   "form.ingressRemoveTitle": "Remove ingress {name}?",
   "form.ingressRemoveMessage":
     "The ingress leaves the manifest; its routes must go too (or the document shows issues).",
   "form.routesTitle": "Routes",
-  "form.routesHint": "public hostname → service identity (workspace/agent/service)",
+  "form.routesHint":
+    "public hostname → service identity (workspace/agent/service)",
   "form.addRoute": "+ route",
   "form.noRoutes": "no routes (required once an ingress exists)",
 
   // ---- manifest edit dialogs ---------------------------------------------------
   "dialogs.serviceTitle": "Service {id} — {agent}",
   "dialogs.newServiceTitle": "New service — {agent}",
-  "dialogs.serviceHint": "id + the manifest-issued default dial address (strict ip:port).",
+  "dialogs.serviceHint":
+    "id + the manifest-issued default dial address (strict ip:port).",
   "dialogs.ruleTitle": "Rule {name} — {agent}",
   "dialogs.newIngressRuleTitle": "New mesh ingress rule — {agent}",
   "dialogs.newEgressRuleTitle": "New mesh egress rule — {agent}",
   "dialogs.idleTimeoutLabel": "idle timeout (s)",
   "dialogs.idlePh": "blank = default (tcp 300 / udp 60)",
   "dialogs.ingressRuleHint":
-    "The peer must offer the remote address (exact or inside an authorized range); the validator refuses unmatched pairs. Idle budget bounds: 1–86400.",
+    "The peer's egress must cover the remote address; the validator refuses unmatched pairs. Idle bounds: 1–86400.",
   "dialogs.udpIdleLabel": "udp idle timeout (s)",
   "dialogs.udpIdlePh": "blank = default 60",
   "dialogs.egressRuleHint":
-    "A `/` makes it a range authorization (any port) — a wider range grows the blast radius of this pack's leak; declare the narrowest that covers what you serve.",
+    "A `/` authorizes a whole range — declare the narrowest that covers what you serve.",
   "dialogs.routeTitle": "Route {host}",
   "dialogs.newRouteTitle": "New route",
   "dialogs.routeHint":
@@ -471,7 +461,7 @@ export const EN = {
   "dialogs.listenLabel": "listen",
   "dialogs.quicListenLabel": "QUIC listen",
   "dialogs.hubHint":
-    "The endpoint is the address agents dial and the SAN source of the hub's server credential — a hostname that resolves directly to this machine. The QUIC listen is the hub's UDP face (conventionally the same port as listen); agents opt in per node with transport = quic. v1 allows one hub per realm.",
+    "The endpoint is what agents dial and the SAN source of the hub's server credential; the QUIC listen is the hub's UDP face (conventionally the same port as listen).",
   "dialogs.ingressTitle": "Ingress {node}",
   "dialogs.newIngressTitle": "New ingress node",
   "dialogs.publicListen": "public listen",
@@ -479,9 +469,8 @@ export const EN = {
   "dialogs.rateLabel": "per-IP new-conn/min",
   "dialogs.addNodeTitle": "Add node to the manifest",
   "dialogs.addConfirm": "Add",
-  "dialogs.onePackOneRoleA": "An agent declares services ",
-  "dialogs.onePackOneRoleB":
-    " mesh rules — one pack, one role. The edit lands in the document (nothing is issued until Apply).",
+  "dialogs.onePackOneRole":
+    "One pack, one role — an agent declares services or mesh rules, never both.",
   "dialogs.peerAuthHint":
     "The peer's egress must already authorize the remote address (protocol included); the validator refuses unmatched pairs.",
   "dialogs.phListen": "listen 127.0.0.1:11434",
@@ -499,7 +488,8 @@ export const EN = {
   "dialogs.phBlankControl": "blank = 127.0.0.1:16666",
   "dialogs.phBlankQuicIngress": "blank = QUIC off (e.g. 0.0.0.0:16666)",
   "dialogs.phRate": "blank = engine default (fronted 600 / direct 30)",
-  "dialogs.phEgressTarget": "127.0.0.1:8080 (one service) or 127.0.0.0/8 (a range)",
+  "dialogs.phEgressTarget":
+    "127.0.0.1:8080 (one service) or 127.0.0.0/8 (a range)",
 
   // ---- issue wizard ------------------------------------------------------------
   "issue.title": "Issue a pack",
@@ -525,6 +515,150 @@ export const EN = {
   "issue.issueDownload": "Issue & download",
   "issue.appendedLine": "✔ {node} appended to {manifest} → packs/{pack}",
   "issue.sealedLine": "sealed → {path}",
+
+  // ---- deployment-centric shell (2026-10-11 IA) ------------------------
+  // Plain-word vocabulary per the mapping table: the main views say
+  // "publish / config version / node"; the engine terms (manifest,
+  // pack, generation, apply) stay in the advanced view and tooltips.
+  "dep.nav.overview": "Overview",
+  "dep.nav.fleet": "Fleet",
+  "dep.nav.streams": "Streams",
+  "dep.nav.services": "Services",
+  "dep.nav.advanced": "Advanced",
+  "dep.nav.local": "This machine",
+  "dep.nav.localEntry": "{host} · {count} nodes",
+  "dep.nav.localGroup": "This machine",
+  "fleet.hubReported": "hub-reported",
+  "fleet.observed": "observed locally",
+  "fleet.observedAt": "observed locally · updated {ago} ago",
+  "fleet.degraded":
+    "hub unreachable — showing this machine's agents' observation",
+  "fleet.none":
+    "The fleet appears here once a site link (mesh agent) node is running.",
+  "fleet.unavailable":
+    "Fleet overview unavailable — the deployment read failed (see the error banner).",
+  "fleet.openNode": "Open node",
+  "fleet.localNode": "this machine",
+  "fleet.unknown": "unknown",
+  "fleet.undeclared": "undeclared",
+  "fleet.undeclaredHint":
+    "registered at the hub but not declared by the manifest, or a local sealed import",
+  "fleet.lineageStale": "serving behind floor",
+  "fleet.lineageStaleHint":
+    "The policy generation the hub serves is behind its own floor watermark — the signature of a stalled lineage.",
+  "dep.switcher.realms": "Local realms (read-only)",
+  "dep.switcher.lockedHint":
+    "inferred from this machine's packs — fleet observation only, read-only",
+  "dep.switcher.lockedShort": "read-only",
+  "dep.advanced.file": "Deployment file",
+  "dep.switcher.open": "Open deployment…",
+  "dep.switcher.hint": "One folder = one deployment (~/interflow-deployments)",
+  "dep.switcher.title": "Deployments",
+  "dep.sidebar.collapse": "Collapse sidebar",
+  "dep.sidebar.expand": "Expand sidebar",
+  "dep.onboarding.title": "Open a deployment to begin",
+  "dep.onboarding.body":
+    "A deployment is one folder — the deployment file, the issuer store, and the rendered node credentials live together. Pick an existing one or create it from a template.",
+  "dep.onboarding.open": "Open deployment…",
+  "dep.onboarding.create": "New from template…",
+  "dep.onboarding.discovered": "Found on this machine",
+  "dep.status.saved": "All changes published",
+  "dep.status.dirty": "Unsaved edits",
+  "dep.status.unpublished": "Unpublished changes",
+  "dep.status.unpublishedHot": "publishes hot (<=10s to the fleet)",
+  "dep.status.unpublishedRestart":
+    "publishing re-renders packs and restarts local nodes",
+  "dep.status.pending": "{n} request(s) waiting",
+  "dep.publish": "Publish",
+  "dep.publishing": "Publishing…",
+  "dep.publish.policyOnly":
+    "Published · config version {gen} — hot, <=10s to the fleet",
+  "dep.publish.fullRender":
+    "Published · config version {gen} — packs re-rendered",
+  "dep.publish.noOp": "Already published",
+  "dep.publish.updated": "{n} node(s) updated and restarted",
+  "dep.publish.failed": "{n} node update(s) failed — retry from the node page",
+  "dep.overview.fleet": "Members",
+  "dep.overview.col.node": "Node",
+  "dep.overview.col.here": "Here",
+  "dep.overview.col.online": "Online",
+  "dep.overview.col.version": "Version",
+  "dep.overview.here.running": "running",
+  "dep.overview.here.stopped": "stopped",
+  "dep.overview.here.absent": "—",
+  "dep.overview.here.open": "Open node",
+  "dep.overview.nextSteps": "Next steps",
+  "dep.overview.lastPublish": "Last publish",
+  "dep.overview.proposals": "Stream requests",
+  "dep.overview.hubUnreachable":
+    "The hub is unreachable — online status and convergence unknown. Check the hub node or paths.",
+  "dep.overview.hubOpen": "Open the hub node",
+  "dep.overview.converged": "fleet converged ✓",
+  "dep.overview.catchingUp": "{n} node(s) catching up",
+  "dep.overview.emptyAgents":
+    "No nodes declared yet — issue the first node credential to begin.",
+  "dep.overview.localOtherRealm":
+    "{name} — runs here, belongs to another deployment (realm: {realm}); switch deployments to manage it",
+  "dep.overview.localOther":
+    "{name} — runs here, belongs to another deployment; switch deployments to manage it",
+  "dep.overview.issueNode": "+ Add node",
+  "dep.streams.title": "Streams",
+  "dep.streams.col.name": "Name",
+  "dep.streams.col.route": "Forward",
+  "dep.streams.col.status": "Status",
+  "dep.streams.add": "+ Add stream",
+  "dep.streams.save": "Save",
+  "dep.streams.adjust": "Adjust",
+  "dep.streams.rename": "Rename",
+  "dep.streams.delete": "Delete",
+  "dep.streams.renameTitle": "Rename stream",
+  "dep.streams.renameFrom": "Current name",
+  "dep.streams.renameTo": "New name",
+  "dep.streams.deleteTitle": "Delete stream {name}?",
+  "dep.streams.deleteBody":
+    "The stream stops serving after the next publish; the manifest entry is removed immediately.",
+  "dep.streams.status.serving": "serving",
+  "dep.streams.status.down": "down",
+  "dep.streams.status.catchingUp": "catching up",
+  "dep.streams.status.unknown": "unknown",
+  "dep.streams.openSourceNode": "Open the source node",
+  "dep.streams.openTargetNode": "Open the target node",
+  "dep.streams.drawer.semantics":
+    "This agent listens on loopback {listen}; traffic relays through the hub to {target}, which dials {remote} from its own network.",
+  "dep.streams.drawer.source": "Source",
+  "dep.streams.drawer.listen": "Listen",
+  "dep.streams.drawer.bound": "bound",
+  "dep.streams.drawer.target": "Target",
+  "dep.streams.drawer.idle": "Idle timeout",
+  "dep.streams.drawer.idleDefault": "default",
+  "dep.streams.drawer.error": "Last error",
+  "dep.streams.drawer.gen": "gen {floor} → {serving}",
+  "dep.streams.empty":
+    "No streams yet — add the first one to forward a port to another node.",
+  "dep.services.routes": "Public routes",
+  "dep.services.col.host": "Host",
+  "dep.services.col.service": "Service",
+  "dep.services.routeAdd": "+ Add route",
+  "dep.services.node": "Node services",
+  "dep.services.col.node": "Node",
+  "dep.services.col.address": "Effective address",
+  "dep.services.col.default": "Default",
+  "dep.services.editDefault": "Edit default",
+  "dep.services.delete": "Delete",
+  "dep.services.overridden": "overridden on this machine",
+  "dep.services.notHere": "not on this machine",
+  "dep.services.addressTitle": "Where this machine dials {service}",
+  "dep.services.addressLive":
+    "Applies live — the next connection dials the new target.",
+  "dep.services.deleteRouteTitle": "Delete route {name}?",
+  "dep.services.deleteRouteBody":
+    "The route leaves the manifest immediately and stops serving at the next publish.",
+  "dep.services.deleteServiceTitle": "Delete service {name}?",
+  "dep.services.deleteServiceBody":
+    "The service leaves the manifest immediately; the change reaches nodes at the next publish.",
+  "dep.services.empty": "No services declared yet.",
+  "dep.node.addHere": "Add on this machine now",
+  "dep.node.addedHere": "Added — opening Nodes…",
 } as const;
 
 export type TKey = keyof typeof EN;

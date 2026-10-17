@@ -107,13 +107,27 @@ fn first_apply_binds_then_stays_silent_across_reruns_and_edits() {
     let first = env.apply(&a, "dist", false);
     assert!(first.success, "{}\n{}", first.stdout, first.stderr);
     assert!(
-        first
-            .stdout
-            .contains("issuer store bound to realm promptcn"),
+        first.stdout.contains("bound to realm promptcn"),
         "{}",
         first.stdout
     );
-    assert!(env.dir.join("issuer/binding.json").exists());
+    // The store's minted id rides the bind line — the store is itself,
+    // not the path it happens to sit at.
+    assert!(first.stdout.contains("issuer store "), "{}", first.stdout);
+    // The binding and applied accounting live in the store's bookkeeping
+    // db; the legacy JSON pair never appears.
+    assert!(env.dir.join("issuer/store.db").exists());
+    assert!(!env.dir.join("issuer/binding.json").exists());
+    assert!(!env.dir.join("issuer/applied.json").exists());
+    let store = interflow_identity::issuance::IssuerStore::open(env.dir.join("issuer"));
+    assert_eq!(
+        store.binding().unwrap().map(|b| b.realm),
+        Some("promptcn".to_string())
+    );
+    assert!(
+        store.applied_manifest_text().unwrap().is_some(),
+        "apply snapshots the declaration text (the plan diff baseline)"
+    );
 
     // Re-run: same lineage, nothing to say.
     let second = env.apply(&a, "dist", false);
@@ -219,7 +233,7 @@ fn a_legacy_store_is_bound_on_first_apply() {
     let out = env.apply(&a, "dist", false);
     assert!(out.success, "{}\n{}", out.stdout, out.stderr);
     assert!(
-        out.stdout.contains("issuer store bound to realm promptcn"),
+        out.stdout.contains("bound to realm promptcn"),
         "{}",
         out.stdout
     );

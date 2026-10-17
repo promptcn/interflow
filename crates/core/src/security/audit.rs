@@ -157,6 +157,23 @@ pub enum AuditKind {
         /// The rejection category.
         reason: String,
     },
+    /// A CRL update was pushed through the control plane and applied (the
+    /// verification plane hot-swapped onto it; revoked online legs evicted
+    /// as named by `evicted`).
+    CrlPublished {
+        /// The applied issuers' CRL counters (`stem → crl_number`).
+        applied: std::collections::BTreeMap<String, u64>,
+        /// Qualified ids of live agent sessions evicted for holding a
+        /// credential the pushed CRLs revoke.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        evicted: Vec<String>,
+    },
+    /// A CRL push was rejected at publication (malformed PEM, rollback
+    /// below the counter floor, wrong principal class, unwritable stem).
+    CrlPublishDenied {
+        /// The rejection category.
+        reason: String,
+    },
     /// An agent pulled the current signed policy bytes.
     PolicyPulled {
         /// The policy generation served.

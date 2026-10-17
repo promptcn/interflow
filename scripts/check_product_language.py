@@ -37,7 +37,8 @@ TEXT_SUFFIXES = {".md", ".toml", ".sh", ".conf", ".yml", ".yaml", ".json"}
 # Exact filenames without a useful suffix.
 EXACT_NAMES = {"justfile", "dockerfile"}
 
-# User-facing roots (all optional — the public export has no docs/).
+# User-facing roots (all optional — the public export carries documentation/
+# but no docs/).
 ROOTS = [
     "README.md",
     "THREAT_MODEL.md",
@@ -45,6 +46,7 @@ ROOTS = [
     "justfile",
     "Dockerfile",
     "docs",
+    "documentation",
     "examples",
     "src",
     "src-tauri/src",

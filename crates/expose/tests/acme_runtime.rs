@@ -9,7 +9,7 @@
 //! the public listener → an HTTPS request routes through the tunnel to the
 //! echo backend.
 
-use interflow_expose::client::{ExposeArgs, LocalService};
+use interflow_expose::client::ExposeArgs;
 use interflow_expose::edge::{
     AcmeOptions, ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, PublicTls,
     Route, WorkspaceTrust,
@@ -83,11 +83,8 @@ async fn acme_issues_serves_and_routes() {
     let (client_cert, client_key) = certs.client_paths();
     let args = ExposeArgs {
         log_name: None,
-        services: vec![LocalService {
-            id: "web".into(),
-            target_addr: echo_addr,
-            overridden: false,
-        }],
+        service_addresses: interflow_mesh::config::ServiceAddresses::of(&[("web", echo_addr)], &[]),
+        pack_dir: None,
         hub_url: format!("https://127.0.0.1:{hub_port}"),
         client_cert: Some(client_cert.display().to_string()),
         client_key: Some(client_key.display().to_string()),

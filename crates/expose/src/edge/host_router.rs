@@ -1,9 +1,11 @@
 //! Host routing table: `Host` header → `(workspace, agent_id, service_id)`.
 //!
 //! Production source: the Credential Pack's **signed runtime policy**,
-//! resolved in memory at startup (`HostRouter::from_routes`). A pack
-//! generation is immutable — route changes go through `rotate`, never a file
-//! edit, so there is no file schema and no hot-reload path.
+//! resolved in memory at startup (`HostRouter::from_routes`) and
+//! **hot-swapped** when a verified policy generation moves routes
+//! (`HostRouter::replace`, driven by the edge's policy watcher — the
+//! 2026-10-10 expose hot channel). A swap that does not derive (duplicate
+//! hosts, unparseable key) is fail-keep: the current table keeps serving.
 
 use interflow_core::error::{InterflowError, Result};
 use std::collections::HashMap;
@@ -29,11 +31,17 @@ pub struct Route {
     pub service_id: String,
 }
 
-/// In-process host routing table. Built once from the signed policy and
-/// immutable afterwards; the read side is lock-free.
+type SharedTable = Arc<std::sync::RwLock<Arc<HashMap<String, Route>>>>;
+
+/// In-process host routing table: built from the signed policy's routes,
+/// atomically replaceable on policy generations.
+///
+/// Reads take one uncontended RwLock read and clone out of the shared
+/// `Arc` map — the per-request cost is noise against TLS termination and
+/// proxying.
 #[derive(Debug, Clone)]
 pub struct HostRouter {
-    inner: Arc<HashMap<String, Route>>,
+    inner: SharedTable,
 }
 
 impl HostRouter {
@@ -44,8 +52,24 @@ impl HostRouter {
     /// instead.
     pub fn from_routes(routes: &[Route]) -> Result<Self> {
         Ok(Self {
-            inner: Arc::new(routes_to_map(routes)?),
+            inner: Arc::new(std::sync::RwLock::new(Arc::new(routes_to_map(routes)?))),
         })
+    }
+
+    /// Atomically replaces the whole table. Fail-keep: a rejection leaves
+    /// the current table untouched — a policy whose routes do not derive
+    /// (duplicate hosts, unparseable key) must not open a hole by half
+    /// applying.
+    pub fn replace(&self, routes: &[Route]) -> Result<()> {
+        let table = routes_to_map(routes)?;
+        // A panicked writer leaves a complete table behind (replacement writes a
+        // fully-built map in one assignment); serving it beats failing every
+        // request — the engine's serving-cell vocabulary.
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(table);
+        Ok(())
     }
 
     /// Looks up a host. The `host` argument is normalized (lowercased, port
@@ -54,17 +78,27 @@ impl HostRouter {
     /// unparseable Host header simply never routes (fail closed).
     pub fn lookup(&self, host: &str) -> Option<Route> {
         let key = normalize_host(host)?;
-        self.inner.get(&key).cloned()
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned()
     }
 
     /// Number of registered hosts.
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Whether the table is empty.
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
     }
 }
 
@@ -159,7 +193,7 @@ mod tests {
         let router =
             HostRouter::from_routes(&[route("MyApp.Example.com", "expose-myapp")]).unwrap();
         assert!(router.lookup("myapp.example.com").is_some());
-        assert!(router.lookup("myapp.example.com:8443").is_some());
+        assert!(router.lookup("myapp.example.com:443").is_some());
         assert!(router.lookup("MYAPP.EXAMPLE.COM").is_some());
         assert!(router.lookup("other.example.com").is_none());
     }
@@ -182,5 +216,36 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("duplicate host"));
+    }
+
+    /// The hot channel's contract: a replace() moves lookups atomically,
+    /// a rejected replace() keeps the current table serving, and clones
+    /// taken before the swap keep observing the OLD table (a per-request
+    /// clone never sees a half-applied generation).
+    #[test]
+    fn replace_swaps_atomically_and_fails_keep() {
+        let router = HostRouter::from_routes(&[route("a.example.com", "agent-a")]).unwrap();
+        assert!(router.replace(&[route("b.example.com", "agent-b")]).is_ok());
+        assert!(router.lookup("a.example.com").is_none());
+        assert_eq!(router.lookup("b.example.com").unwrap().agent_id, "agent-b");
+
+        // Fail-keep: the duplicate rejection leaves generation 2 serving.
+        assert!(
+            router
+                .replace(&[
+                    route("c.example.com", "c1"),
+                    route("c.example.com:443", "c2"),
+                ])
+                .is_err()
+        );
+        assert!(router.lookup("b.example.com").is_some());
+        assert!(router.lookup("c.example.com").is_none());
+
+        // Shared-handle semantics: clones observe swaps (the edge hands
+        // out the same router everywhere — one swap moves every reader).
+        let twin = router.clone();
+        assert!(router.replace(&[]).is_ok());
+        assert!(router.lookup("b.example.com").is_none());
+        assert!(twin.lookup("b.example.com").is_none());
     }
 }

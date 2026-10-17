@@ -21,22 +21,35 @@
 //!
 //! This module remains the convergence point of the four death signals (data
 //! send timeout / poll disconnect grace timeout / heartbeat loss / QUIC
-//! disconnect); all of them complete cleanup through the single entry point
-//! [`evict_agent`]:
-//! 1. advance the generation + clear rx — residual poll streams end via the
+//! disconnect); all of them complete cleanup through the single mutation
+//! funnel [`remove_agent_if_current`], each carrying the credential of the
+//! registration it was armed against ([`SessionWitness`]: the session Arc +
+//! its circuit at arming time). There is no other path that removes a
+//! registry entry — a new death-signal source must enter through this
+//! funnel, and its entry event gets a lifecycle-matrix e2e row
+//!:
+//! 1. credential check (compare-before-mutate over the armed epoch, see
+//!    [`interflow_contract::generation`]): void the removal unless the
+//!    registry entry is still the same Arc AND still carries that circuit —
+//!    covering BOTH re-registration shapes: a new-Arc takeover (h2 implicit
+//!    re-register) fails the `Arc::ptr_eq` check, and a replace-in-place
+//!    re-register (h2 `/register` and QUIC registration alike) reuses the
+//!    very Arc but rotates the circuit (2026-10-11 stale-watcher incident:
+//!    the old check could not see the second shape and severed the live
+//!    successor);
+//! 2. advance the generation + clear rx — residual poll streams end via the
 //!    generation self-check; closing the channel unblocks every blocked
 //!    `send().await` immediately;
-//! 2. remove the entry from the registry (`Arc::ptr_eq` guards against
-//!    deleting a new entry created by a re-registration in the meantime);
 //! 3. sweep orphan streams + reset the per-agent count.
 //!
 //! An evicted agent's next `/poll` implicitly re-registers it (see
 //! [`crate::hub::poll`]); the agent side self-heals with zero cooperation.
 
 use crate::hub::service::HubService;
-use crate::hub::state::{AgentSession, HubState, TunnelData};
+use crate::hub::state::{AgentSession, HubState, SessionWitness, TunnelData};
 use bytes::Bytes;
-use interflow_core::protocol::{FLAG_HUB_ORIGIN, FrameOrigin, StreamId};
+use interflow_contract::generation::{GenerationalHandle, Verdict};
+use interflow_core::protocol::{CircuitToken, FLAG_HUB_ORIGIN, FrameOrigin, StreamId};
 use interflow_core::security::AuditKind;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -81,57 +94,121 @@ pub(crate) fn pong_expired(session: &AgentSession, cadence: &HeartbeatCadence) -
     session.last_pong.elapsed() > cadence.dead_line()
 }
 
-/// Evicts an agent: the unified cleanup entry point for all death signals
-/// (send timeout / poll grace timeout / heartbeat loss).
+/// Removes an agent registration **iff the armed credential still speaks
+/// for it** — the single mutation funnel for every death signal (send
+/// timeout / poll grace timeout / heartbeat loss / QUIC disconnect /
+/// connection-lost watcher).
 ///
-/// `expected` is the `AgentSession` Arc captured when the death signal was
-/// observed; if the agent re-registered in the meantime (the entry replaced
-/// by a new Arc), this eviction is voided and the new session is untouched.
-pub(crate) async fn evict_agent(
+/// The compare-before-mutate check runs through the generational-handle
+/// contract ([`interflow_contract::generation`]): pointer identity alone
+/// cannot guard this registry, because a replace-in-place re-registration
+/// reuses the very `Arc` while rotating the circuit. The removal is voided —
+/// leaving the live session untouched — when either re-registration shape
+/// has taken over in the meantime; the residual-channel cleanup of a
+/// superseded Arc still happens (its poll streams end via the generation
+/// self-check). Attribution (log lines, `evicted` / `eviction_voided`
+/// metrics, audit) is settled entirely inside this funnel, so no caller
+/// re-reads shared state to explain what happened.
+pub(crate) async fn remove_agent_if_current(
     h: &HubState,
     agent_id: &str,
-    expected: &Arc<tokio::sync::RwLock<AgentSession>>,
+    witness: SessionWitness,
     reason: &'static str,
 ) {
-    let circuit = expected.read().await.circuit;
-    // 1. Sever the session entry (see [`AgentSession::terminate`]).
-    expected.write().await.terminate();
-
-    // 2. Remove the registry entry (only if it is still the same Arc, to
-    //    avoid deleting a new entry from a re-registration).
-    let removed = {
+    // Credential check BEFORE any mutation (lock order matches
+    // `register_quic_agent`: registry write → session read). Terminating or
+    // removing before this check would hit the LIVE successor session in the
+    // replace-in-place shape — the exact mechanism of the 2026-10-11
+    // stale-watcher incident.
+    let armed = GenerationalHandle::armed_at(agent_id, witness.circuit);
+    enum Internal {
+        Evict,
+        /// Same Arc, circuit rotated: a re-registration took over in place.
+        VoidedByRotation(CircuitToken),
+        /// Entry replaced by a new Arc or already gone.
+        VoidedByTakeover,
+    }
+    let outcome = {
         let mut agents = h.agents.write().await;
         match agents.get(agent_id) {
-            Some(cur) if Arc::ptr_eq(cur, expected) => {
-                agents.remove(agent_id);
-                metrics::gauge!("interflow_hub_agents_registered")
-                    .set(crate::hub::state::count_as_f64(agents.len()));
-                true
+            Some(cur) if Arc::ptr_eq(cur, &witness.session) => {
+                let current = cur.read().await.circuit;
+                match armed.equal_epoch(&current) {
+                    Verdict::Current => {
+                        agents.remove(agent_id);
+                        metrics::gauge!("interflow_hub_agents_registered")
+                            .set(crate::hub::state::count_as_f64(agents.len()));
+                        Internal::Evict
+                    }
+                    Verdict::Superseded(current) => Internal::VoidedByRotation(current),
+                }
             }
-            _ => false,
+            _ => Internal::VoidedByTakeover,
         }
     };
-    if !removed {
-        debug!(
-            "agent eviction voided (entry already taken over by re-registration): reason={reason}"
-        );
-        return;
+    match outcome {
+        Internal::Evict => {
+            // 1. Sever the session entry (see [`AgentSession::terminate`]).
+            witness.session.write().await.terminate();
+
+            // 2. Sweep orphan streams + notify peers + reset the per-agent
+            //    count (reuses the register sweep).
+            HubService::sweep_agent_streams(
+                &h.agents,
+                &h.active_streams,
+                &h.stream_counts,
+                agent_id,
+            )
+            .await;
+
+            metrics::counter!("interflow_hub_agent_evicted", "reason" => reason).increment(1);
+            // The domain-counter twin of the metric above: the steady-state
+            // face (`GET /snapshot`) reports it without a Prometheus scrape,
+            // so "the acceptance window had zero evictions" is a product
+            // query, not a dashboard one.
+            h.evicted_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            h.audit.record(
+                AuditKind::AgentEvicted {
+                    circuit: witness.circuit.to_hex(),
+                    reason: reason.to_string(),
+                },
+                Some(witness.circuit.to_hex()),
+                None,
+            );
+            warn!(
+                "agent circuit={} evicted (reason={reason}), orphan streams cleaned",
+                witness.circuit
+            );
+        }
+        Internal::VoidedByRotation(current) => {
+            // The successor session lives on this very Arc: no terminate, no
+            // sweep. Both circuits are logged so the journal pairs the
+            // connection that actually died (the witness, also named by the
+            // connection-lost log line) with the registration that survived —
+            // the attribution split the 2026-10-11 case file asked for.
+            metrics::counter!("interflow_hub_agent_eviction_voided", "reason" => reason)
+                .increment(1);
+            info!(
+                "agent eviction voided (circuit={} superseded by re-registration \
+                 circuit={current}): reason={reason}",
+                witness.circuit
+            );
+        }
+        Internal::VoidedByTakeover => {
+            // The captured Arc is no longer the registry entry: severing it
+            // only cleans up the dead registration's residual channels (its
+            // poll streams end via the generation self-check).
+            witness.session.write().await.terminate();
+            metrics::counter!("interflow_hub_agent_eviction_voided", "reason" => reason)
+                .increment(1);
+            debug!(
+                "agent eviction voided (entry already taken over by re-registration \
+                 circuit={}): reason={reason}",
+                witness.circuit
+            );
+        }
     }
-
-    // 3. Sweep orphan streams + notify peers + reset the per-agent count
-    //    (reuses the register sweep).
-    HubService::sweep_agent_streams(&h.agents, &h.active_streams, &h.stream_counts, agent_id).await;
-
-    metrics::counter!("interflow_hub_agent_evicted", "reason" => reason).increment(1);
-    h.audit.record(
-        AuditKind::AgentEvicted {
-            circuit: circuit.to_hex(),
-            reason: reason.to_string(),
-        },
-        Some(circuit.to_hex()),
-        None,
-    );
-    warn!("agent circuit={circuit} evicted (reason={reason}), orphan streams cleaned");
 }
 
 /// Managed entry point of the heartbeat supervision loop: when the loop body
@@ -294,7 +371,16 @@ async fn run_heartbeat_supervisor(h: std::sync::Arc<HubState>, shutdown: Cancell
                     "agent circuit={circuit} heartbeat lost (no Pong for >{deadline:?}), evicting"
                 );
                 full_streaks.remove(agent_id);
-                evict_agent(&h, agent_id, state, "heartbeat_missed").await;
+                remove_agent_if_current(
+                    &h,
+                    agent_id,
+                    SessionWitness {
+                        session: state.clone(),
+                        circuit,
+                    },
+                    "heartbeat_missed",
+                )
+                .await;
                 evicted += 1;
                 continue;
             }

@@ -12,6 +12,8 @@
 //!   itself signals `READY=1`, or fails after `TimeoutStartSec`);
 //! - re-run     — swaps in the new pack (previous install moves to
 //!   `<kind>-<node>.previous`), restarts, same readiness contract;
+//!   installing moves FORWARD only — a lower generation is refused
+//!   unless `--allow-downgrade` names the rollback explicitly;
 //! - user/group creation never duplicates (same guard as `install.sh`).
 //!
 //! There is deliberately no readiness probing here: the engines state their
@@ -39,6 +41,13 @@ pub struct NodeInstall {
     pub user: String,
     /// Passphrase for sealed sources (env `INTERFLOW_PACK_PASSPHRASE`).
     pub passphrase: Option<String>,
+    /// Restart OTHER units found still running a replaced engine binary
+    /// (the cross-unit disk-swap detection's kill switch). Without it the
+    /// findings are reported with the exact restart commands instead.
+    pub restart_stale_units: bool,
+    /// Allow installing a pack whose generation is LOWER than the target's
+    /// current install — the deliberate, typed rollback path.
+    pub allow_downgrade: bool,
 }
 
 /// What one install run did — printed by the CLI, asserted by tests.
@@ -52,6 +61,13 @@ pub struct InstallReport {
     /// The unit was started/restarted through systemd this run (with
     /// `Type=notify`, a successful start already implies READY=1).
     pub service_started: bool,
+    /// Engine processes found still running a replaced binary AFTER this
+    /// install's own unit was restarted (the 换盘不换进程 cross-unit
+    /// detection; system layout on Linux, empty elsewhere). This own unit
+    /// is never on this list — it was just restarted onto the current disk.
+    pub stale_processes: Vec<crate::stale_exec::StaleFinding>,
+    /// Units this run restarted via [`NodeInstall::restart_stale_units`].
+    pub restarted_units: Vec<String>,
 }
 
 impl NodeInstall {
@@ -84,6 +100,7 @@ pub fn install(opts: &NodeInstall) -> interflow_core::error::Result<InstallRepor
     let pack = stage_pack(&opts.pack, &staged_path, opts.passphrase.as_deref())?;
     let kind = pack.metadata.kind;
     let node = pack.metadata.node.clone();
+    let source_generation = pack.metadata.generation;
     let mesh_role = kind == PackKind::Hub || pack.node_config.mesh.is_some();
     drop(pack);
 
@@ -105,6 +122,26 @@ pub fn install(opts: &NodeInstall) -> interflow_core::error::Result<InstallRepor
     // pack's embedded gen 1); a fresh install has nothing to carry.
     let target = packs_root.join(format!("{}-{node}", kind.as_str()));
     let upgraded = target.exists();
+    // Installing moves forward only: a strict downgrade would put older —
+    // possibly revoked — material back on this server, and the policy
+    // anti-rollback would only reject it at the NEXT start, after the swap
+    // had already rolled `.previous`. Refuse it before anything is
+    // swapped; `--allow-downgrade` is the deliberate, typed rollback path.
+    // An unreadable current install is a repair case, not a downgrade —
+    // the tolerant probe cannot read a generation and the install
+    // proceeds (same recovery-first stance as the GUI's update path).
+    if upgraded
+        && !opts.allow_downgrade
+        && let Ok(current) = interflow_identity::pack_generation_of(&target)
+        && source_generation < current
+    {
+        return Err(interflow_core::error::InterflowError::config(format!(
+            "downgrade refused: the pack is generation {source_generation} but {} runs \
+             generation {current}; deliberate rollbacks pass --allow-downgrade (the policy \
+             anti-rollback may still refuse the older material at start)",
+            target.display()
+        )));
+    }
     commit_staged(&staging, &staged_path, &target, upgraded)?;
     if system_target {
         chown_tree(&target, &opts.user)?;
@@ -144,6 +181,36 @@ pub fn install(opts: &NodeInstall) -> interflow_core::error::Result<InstallRepor
         }
     }
 
+    // Cross-unit disk-swap detection (the §10.8 shape): this command
+    // restarted only its OWN unit, but the machine's other product units
+    // may still run binaries replaced underneath them — the edge unit
+    // execs `interflow-cli` while mesh units exec `interflow-mesh`, so a
+    // `interflow-cli` swap never restarts the edge by itself. Scan AFTER
+    // the own-unit restart (structural no-false-positive: a process just
+    // restarted onto the current disk cannot be stale). Non-system
+    // layouts run no units — nothing to scan.
+    let (stale_processes, restarted_units) = if system_target {
+        let findings =
+            crate::stale_exec::detect_stale_engine_processes(Path::new(render::ENGINE_BIN_DIR));
+        let restarted_units = if opts.restart_stale_units && !findings.is_empty() {
+            let mut targets: Vec<String> = findings
+                .iter()
+                .filter_map(|f| f.restart_target().map(str::to_owned))
+                .collect();
+            targets.sort();
+            targets.dedup();
+            for unit in &targets {
+                systemctl(&["restart", unit])?;
+            }
+            targets
+        } else {
+            Vec::new()
+        };
+        (findings, restarted_units)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     Ok(InstallReport {
         kind,
         node,
@@ -151,6 +218,8 @@ pub fn install(opts: &NodeInstall) -> interflow_core::error::Result<InstallRepor
         upgraded,
         unit_path,
         service_started,
+        stale_processes,
+        restarted_units,
     })
 }
 

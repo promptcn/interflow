@@ -275,6 +275,13 @@ pub struct ServerConfig {
     /// protocol or validation meaning.
     #[serde(default)]
     pub node_name: Option<String>,
+    /// The manifest-declared hub node name, self-reported in the
+    /// `GET /policy/floor` answer so clients can attribute presence and
+    /// generations to the hub that actually answered. Deliberately separate
+    /// from `node_name`: embedders overwrite that one with a log
+    /// attribution (`name·id`), which is not a name any manifest declares.
+    #[serde(default)]
+    pub hub_name: Option<String>,
     /// PROXY protocol negotiation (restores the real client IP behind an
     /// nginx `stream`/`proxy_pass` front). See
     /// `interflow_core::security::proxy_protocol` for the trust matrix.

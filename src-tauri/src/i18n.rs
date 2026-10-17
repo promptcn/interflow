@@ -59,6 +59,9 @@ pub struct Strings {
     /// Manifest-creation refusal (the CLI setup semantic: never overwrite
     /// a live manifest). Placeholder: `{path}`.
     pub err_manifest_exists: &'static str,
+    /// `deployment_set_current` on a folder without `interflow.toml`.
+    /// Placeholders: `{path}`.
+    pub err_not_deployment: &'static str,
     /// Hostname lookup failure. Placeholder: `{err}`.
     pub err_hostname: &'static str,
     /// The Downloads directory could not be resolved (seal-to-downloads).
@@ -85,6 +88,7 @@ pub const EN: Strings = Strings {
     err_write: "write {path}: {err}",
     err_not_found: "File not found: {path}",
     err_manifest_exists: "manifest already exists — refusing to overwrite: {path}",
+    err_not_deployment: "not a deployment folder (no interflow.toml inside): {path}",
     err_hostname: "hostname unavailable: {err}",
     err_downloads_dir: "cannot resolve the Downloads directory",
     err_unknown_node: "unknown node",
@@ -107,6 +111,7 @@ pub const ZH: Strings = Strings {
     err_write: "写入 {path} 失败:{err}",
     err_not_found: "文件不存在:{path}",
     err_manifest_exists: "manifest 已存在——拒绝覆盖:{path}",
+    err_not_deployment: "不是部署文件夹（缺少 interflow.toml）：{path}",
     err_hostname: "无法获取主机名:{err}",
     err_downloads_dir: "无法定位「下载」目录",
     err_unknown_node: "未知节点",

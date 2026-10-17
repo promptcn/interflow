@@ -833,11 +833,14 @@ async fn t7_response_poison_closes_stalled_client_only() {
     // The stalled stream was actively reaped — by which mechanism depends on
     // load pacing: solo, the 8 MiB echo response fills the 256-frame dispatch
     // channel, the dispatch send stalls past its 5s timeout and poisons the
-    // stream; under a full-suite load the response trickles, the channel never
-    // fills, and the ingress pump's 10s client write-stall closes the client
-    // instead (the dispatch send then sees a closed channel, not a stall).
+    // stream; under load the response trickles, the channel never fills, and
+    // the ingress pump's 10s client write-stall closes the client instead.
     // Both are the designed anti-resource-hog outcome — neither firing would
-    // mean the stream leaked.
+    // mean the stream leaked. (2026-10-11 evaluation: a strict poison-only
+    // assertion was tried and flakes even on an 8-core dev machine under
+    // cross-binary parallelism — the serialized CI tier cannot cover local
+    // parallel runs, so the either-mechanism form IS the load-independent
+    // semantic, not a relaxation to retire.)
     eventually(
         || {
             counter_value("interflow_dispatch_stream_poisoned_total") >= 1

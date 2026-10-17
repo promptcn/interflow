@@ -8,6 +8,7 @@
 //!
 //! Modules:
 //! - [`certs`]: self-signed CA / server / client certificates (via interflow-certs)
+//! - [`clock`]: a controllable fake clock for the renewal scheduler's `Clock` seam
 //! - [`config`]: `HubConfig` / `AgentConfig` builders (test and bench presets)
 //! - [`stack`]: in-process hub / agent assembly + graceful shutdown + readiness probes
 //! - [`backend`]: echo / UDP echo / SSE timestamped-chunk backends (phased, with silence/burst support)
@@ -15,6 +16,7 @@
 //! - [`hub_http`]: consumer-side mirrors of the hub's operator HTTP contracts + the shared `GET /agents` e2e client
 //! - [`metrics`]: quantiles and scenario result types (bench artifact schema)
 //! - [`soak`]: long-running regression gate (real process topology + eight assertions; CLI in `bin/soak.rs`)
+//! - [`supervisor`]: bounded Restart=on-success loop (the renewal exit contract's e2e harness)
 
 // dev-only harness: panicking directly on assembly failure is test-code convention
 // (aligned with the tests/common header).
@@ -31,6 +33,7 @@
 pub mod backend;
 pub mod certs;
 pub use certs::{tls_client_connect, tls_client_connect_with};
+pub mod clock;
 pub mod config;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
@@ -40,6 +43,7 @@ pub mod metrics;
 pub mod metrics_harness;
 pub mod soak;
 pub mod stack;
+pub mod supervisor;
 
 // Flat re-exports: tests/benches import the common pieces in one line via
 // `use interflow_testkit::{...}` (certs/impair/metrics keep their namespaces to

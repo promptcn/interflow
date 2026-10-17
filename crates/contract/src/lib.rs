@@ -5,16 +5,27 @@
 //! without changing a wire or pack format, and a format break must not be
 //! inferred from an ordinary release bump.
 
-/// The compatibility epoch for every Interflow-defined machine format.
+/// The compatibility epoch for every Interflow-defined machine format
+/// (data-plane frames, the inner-stream hello, Credential Pack metadata).
 ///
-/// This is a marker, not a history: a breaking change to the data-plane
-/// frame, inner-stream hello, or Credential Pack layout **redefines the
-/// format in place** — peers and packs are rebuilt together (Interflow is
-/// deployed as one realm at a time), and the value stays where it is.
-/// Endpoints and packs carrying any other value are rejected fail-closed
-/// rather than migrated.
+/// A **monotonic epoch**, not an in-place marker: a breaking change to any
+/// of those formats bumps this value, and every peer and pack moves together
+/// following the coordinated-upgrade runbook — endpoints and packs carrying
+/// any other value are rejected fail-closed rather than migrated. While the
+/// protocol is in its `0.x` churn phase the check is strict equality on both
+/// sides (a mixed-version realm fails closed at the first frame); additive
+/// evolution — unknown frame types, unknown flag bits, unknown JSON keys,
+/// unknown caps bits — never bumps the epoch (documentation/versioning.md,
+/// "Format epoch"). A breaking change must pair the bump with a MINOR
+/// release and a CHANGELOG migration section.
 pub const FORMAT_VERSION: u8 = 1;
 
+/// The generational-handle contract.
+///
+/// The single compare-before-mutate pattern shared by every
+/// rotation-guarded surface (policy generation watermark, session channel
+/// generation, circuit witness).
+pub mod generation;
 /// A rotation generation.
 ///
 /// The value is monotonic within a deployment's signed objects. A Credential
@@ -27,6 +38,13 @@ pub type Generation = u64;
 
 /// Capability bits for the QUIC Hello/HelloAck handshake (u32 bitfield on the
 /// wire, big-endian).
+///
+/// Additive wire features are gated here, never by epoch bumps: a sender may
+/// use a new wire feature only once the peer advertised the bit (the
+/// handshake ANDs both sides; unknown bits are ignored, not rejected). A
+/// change that cannot be expressed as an addition is breaking and bumps
+/// `FORMAT_VERSION` instead — there is no third kind (documentation/versioning.md,
+/// "Additive changes never bump the epoch").
 pub mod caps {
     /// The peer supports the QUIC DATAGRAM fast path for small Data frames
     /// (RFC 9221; eligibility additionally requires an OpenAck on the stream

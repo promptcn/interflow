@@ -11,7 +11,7 @@
 //!   (eviction / preemption / disconnect); the agent detects this and
 //!   rebuilds immediately;
 //! - Single-consumer semantics: an agent that already has an active upload
-//!   gets 409; register preemption and [`crate::hub::heartbeat::evict_agent`]
+//!   gets 409; register preemption and [`crate::hub::heartbeat::remove_agent_if_current`]
 //!   eviction cancel the lease (`AgentSession::up_lease`);
 //! - An unregistered agent is implicitly re-registered (reusing the
 //!   self-healing path of `/poll`).
@@ -67,7 +67,10 @@ impl HubService {
         };
         let state_arc = match state_arc {
             Some(a) => a,
-            None => self.implicit_re_register(&agent_key).await,
+            None => match self.implicit_re_register(&agent_key).await {
+                Ok(arc) => arc,
+                Err(denied) => return Ok(*denied),
+            },
         };
         if state_arc.read().await.circuit != circuit {
             return Ok(text_response(StatusCode::UNAUTHORIZED, "Circuit mismatch"));
@@ -93,10 +96,13 @@ impl HubService {
         };
 
         // Reader task: holds the request body, incrementally decoding and
-        // dispatching frame by frame
+        // dispatching frame by frame. Tracked (it holds an Arc<HubState>
+        // through the service clone — see the invariant note at the tracker
+        // construction in server.rs) and shutdown-responsive so the drain
+        // never waits out the h2 teardown grace for it.
         let (end_tx, end_rx) = oneshot::channel::<()>();
         let reader_svc = self.clone();
-        tokio::spawn(upload_reader(
+        self.state.tasks.spawn(upload_reader(
             reader_svc,
             agent_key.clone(),
             circuit,
@@ -290,6 +296,8 @@ impl HubService {
 ///
 /// Exit paths (mutually exclusive):
 /// - lease cancelled (register preemption / eviction);
+/// - hub shutdown (the drain tears the connection down anyway — exit
+///   through the same cleanup so no reader outlives the run);
 /// - body EOF (agent half-close) or read error (connection dead);
 /// - wire decoding error (protocol violation — ends the entire upload
 ///   stream, so the agent's rebuild starts from a clean decoding state).
@@ -310,6 +318,7 @@ async fn upload_reader(
     let why: &'static str = 'outer: loop {
         tokio::select! {
             () = lease.cancelled() => break 'outer "lease_cancelled",
+            () = svc.state.shutdown.cancelled() => break 'outer "hub_shutdown",
             r = body.frame() => match r {
                 None => break 'outer "eof",
                 Some(Err(_)) => break 'outer "read_error",
