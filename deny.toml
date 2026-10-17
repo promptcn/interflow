@@ -38,6 +38,16 @@ ignore = [
     # PEM parsing, which is stable; the replacement (migrating to `pem` or writing
     # our own parser) is tracked as a separate task.
     "RUSTSEC-2025-0134",
+    # zbus-5 family (zvariant / zbus_names / zvariant_derive): folded into
+    # zbus 6 and unmaintained as standalone crates. Pulled in ONLY via
+    # interflow-gui -> tauri-plugin-notification / single-instance ->
+    # notify-rust 4.18.x, which still rides zbus 5 (verified: its 4.18.2
+    # update does not migrate); they never reach the mesh / expose /
+    # identity runtime graph. Unmaintained-class, not vulnerabilities.
+    # Re-evaluate when tauri's notification plugins move to zbus 6.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]

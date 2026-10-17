@@ -7,6 +7,9 @@ on:
     paths:
       - "Cargo.lock"
       - "Cargo.toml"
+      # The advisories ignore list is advisory-enforcement config: an
+      # exemption landing must re-run this check, not wait for the cron.
+      - "deny.toml"
       - ".github/workflows/audit.yml"
   pull_request:
     paths:
