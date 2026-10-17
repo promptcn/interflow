@@ -451,10 +451,16 @@ async fn source_re_register_sweep_notifies_egress_streams() {
         "T4 egress releases all backend connections after the sweep notice",
     )
     .await;
-    assert!(
-        counter_value("interflow_egress_stream_closed_total") >= closed_before + K as u64,
-        "all K streams must go through the unified close-out"
-    );
+    // The fd release and the unified close-out counter are two steps of one
+    // teardown; on a starved runner the gap between them outlives the
+    // active==0 poll above, so the counter claim gets its own deadline
+    // instead of a point-in-time assert.
+    eventually(
+        || counter_value("interflow_egress_stream_closed_total") >= closed_before + K as u64,
+        Duration::from_secs(10),
+        "all K streams must go through the unified close-out",
+    )
+    .await;
 
     hub.shutdown_graceful().await.expect("hub shutdown");
 }

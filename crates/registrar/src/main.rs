@@ -127,7 +127,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let codes = EnrollmentCodes::open(issuer.join("enrollments.json"))?;
             let code = codes.create(&realm, kind, workspace.as_deref(), &node)?;
             println!("{}", serde_json::to_string_pretty(&code)?);
-            Ok(())
         }
         Command::Enroll { issuer, code, csr } => {
             let source = FileKeySource::open(&issuer)?;
@@ -143,7 +142,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let csr_pem = std::fs::read_to_string(csr)?;
             let credential = service.enroll(&code, &csr_pem)?;
             println!("{}", serde_json::to_string_pretty(&credential)?);
-            Ok(())
         }
         Command::Certificate {
             issuer,
@@ -163,7 +161,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "registrar TLS certificate written to {}",
                 out_cert.display()
             );
-            Ok(())
         }
         Command::Serve {
             issuer,
@@ -188,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .await?;
-            Ok(())
         }
     }
+    Ok(())
 }
