@@ -380,7 +380,10 @@ mod tests {
     /// A missing/empty proc root is a clean scan, never an error.
     #[test]
     fn missing_proc_root_scans_clean() {
-        assert!(scan_stale_processes(Path::new("/nonexistent-proc"), None).is_empty());
+        assert_eq!(
+            scan_stale_processes(Path::new("/nonexistent-proc"), None).len(),
+            0
+        );
     }
 
     /// The real-machine shape on Linux: spawn a process from a staged
@@ -423,8 +426,17 @@ mod tests {
         std::fs::rename(tmp.path().join("replacement"), &fake_engine).unwrap();
         let stale = scan_stale_processes(Path::new("/proc"), Some(&bin));
         let hit = stale.iter().find(|f| f.pid == child.id());
+        // Which evidence surfaces depends on the filesystem: rename-over
+        // unlinks the running inode, and on some filesystems (overlayfs —
+        // the GitHub runner's /tmp) that reads back as the deleted marker,
+        // while others surface the inode mismatch. Both prove the disk
+        // under the process was replaced; the contract under test is
+        // "named as stale", not which kernel tell fired.
         assert!(
-            hit.is_some_and(|f| f.evidence == StaleEvidence::InodeMismatch),
+            hit.is_some_and(|f| matches!(
+                f.evidence,
+                StaleEvidence::DeletedMarker | StaleEvidence::InodeMismatch
+            )),
             "the replaced-disk process must be named: {stale:?}"
         );
         let _ = child.kill();

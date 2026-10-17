@@ -238,7 +238,7 @@ mod tests {
         .map(|item| into_data(item.unwrap()))
         .collect()
         .await;
-        assert!(out.is_empty());
+        assert_eq!(out.len(), 0);
     }
 
     /// Invariant 2: consecutive small chunks coalesce into one ≥256B chunk.

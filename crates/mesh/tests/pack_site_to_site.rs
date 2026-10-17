@@ -238,7 +238,7 @@ udp_idle_timeout_secs = 90
     let pack = CredentialPack::load_runtime(&pack_dir_a).unwrap();
     let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
     let config = build_agent_config(&pack, &active, &pack_dir_a).unwrap();
-    assert!(config.security.allowed_targets.is_empty());
+    assert_eq!(config.security.allowed_targets.len(), 0);
 }
 
 /// Range egress end to end: the serve side declares ONE loopback range and

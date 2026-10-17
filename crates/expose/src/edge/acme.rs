@@ -838,7 +838,7 @@ mod tests {
             "https://good.com/path?a=1&b=%2F"
         );
         assert_eq!(header_value(&get_redirect, "Content-Length"), "0");
-        assert!(response_body(&get_redirect).is_empty());
+        assert_eq!(response_body(&get_redirect).len(), 0);
 
         let head_redirect = exchange(
             b"HEAD / HTTP/1.1\r\nHost: good.com\r\n\r\n",
@@ -847,7 +847,7 @@ mod tests {
         )
         .await;
         assert!(response_head(&head_redirect).starts_with("HTTP/1.1 301 Moved Permanently"));
-        assert!(response_body(&head_redirect).is_empty());
+        assert_eq!(response_body(&head_redirect).len(), 0);
 
         let post_redirect = exchange(
             b"POST /submit?a=1 HTTP/1.1\r\nHost: [2001:db8::1]:80\r\n\r\n",
@@ -860,7 +860,7 @@ mod tests {
             header_value(&post_redirect, "Location"),
             "https://[2001:db8::1]:8443/submit?a=1"
         );
-        assert!(response_body(&post_redirect).is_empty());
+        assert_eq!(response_body(&post_redirect).len(), 0);
 
         let before = counter_value("interflow_edge_acme_http01_rejected_total");
         let oversized = vec![b'X'; HTTP_HEAD_MAX_BYTES + 1];

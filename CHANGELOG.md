@@ -151,6 +151,24 @@ the first public release carrying this changelog.
   hub's own row no longer reads 未知 while the header it anchors already
   reports the hub reachable.
 
+### Security
+
+- Dependencies: quinn-proto 0.11.17 → 0.11.19 and rustls 0.23.45 →
+  0.23.46, picking up seven October transport advisories — three
+  remote-panic vectors in quinn-proto (zero-length STREAM frames during
+  unordered reads, ACK_FREQUENCY minimum-delay handling, outgoing-datagram
+  buffer accounting) and four in rustls (TLS secrets exposed by client-
+  session `Debug` output, application data sent to the outer server after
+  ECH rejection, a 1 GiB certificate-decompression allocation before
+  authentication, and a classical-key-exchange downgrade persisting across
+  later connections). For a tunnel whose peers are exactly the remote
+  attackers, the panic vectors are release-blocking.
+- The doctor's UDP probe pads its version-negotiation trigger to the QUIC
+  minimum datagram size (1200 bytes): RFC 9000 §5.2.2 lets servers drop
+  smaller unsupported-version packets, and quinn-proto 0.11.18+ does —
+  the old 15-byte probe would read silence off a healthy QUIC listener
+  and diagnose a broken link.
+
 ## [0.10.0] - 2026-10-13
 
 ### Added

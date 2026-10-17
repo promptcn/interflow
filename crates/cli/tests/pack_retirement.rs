@@ -206,7 +206,7 @@ fn revoke_of_a_legacy_format_pack_denies_its_certificates() {
             .unwrap()
         })
         .collect();
-    assert!(!serials.is_empty());
+    assert_ne!(serials.len(), 0);
 
     deprecate_pack_format(&pack);
     let out = run_ok(&[

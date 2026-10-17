@@ -635,7 +635,7 @@ mod tests {
         let ProxyOutcome::Direct { read_back } = out else {
             panic!("expected direct");
         };
-        assert!(!read_back.is_empty());
+        assert_ne!(read_back.len(), 0);
         // Invariant: replayed prefix ⊕ bytes still in the stream == the
         // original payload (nothing lost, nothing duplicated).
         let mut rest = Vec::new();

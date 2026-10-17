@@ -332,7 +332,7 @@ mod tests {
         store.remove_ingress("api-rule").await.unwrap();
         store.remove_egress("eg").await.unwrap();
         assert_eq!(store.ingress_snapshot().await.len(), 1);
-        assert!(store.egress_snapshot().await.is_empty());
+        assert_eq!(store.egress_snapshot().await.len(), 0);
     }
 
     #[tokio::test]

@@ -2680,7 +2680,7 @@ service = "default/existing/svc"
         )
         .unwrap();
         let rewritten = std::fs::read_to_string(&path).unwrap();
-        assert!(!tcp.pack_dir_name.is_empty());
+        assert_ne!(tcp.pack_dir_name, "");
         let manifest = Manifest::parse(&rewritten).unwrap();
         let rules = &manifest.agent["leo"].mesh_ingress;
         assert_eq!(rules.len(), 2);

@@ -212,7 +212,7 @@ mod tests {
         let mut transition = ReconcileReport::new();
         transition.record_removed();
         for events in [capture(&ReconcileReport::new()), capture(&transition)] {
-            assert!(!events.is_empty());
+            assert_ne!(events.len(), 0);
             for (level, node, _) in &events {
                 assert_eq!(
                     node.as_deref(),

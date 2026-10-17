@@ -848,7 +848,7 @@ mod tests {
                 panic!("server handshake must fail on client CN mismatch")
             }
         };
-        assert!(!error.to_string().is_empty());
+        assert_ne!(error.to_string(), "");
         // The server-side failure surfaces to the client as a read error.
         let mut sink_buf = [0u8; 8];
         assert!(tls_client.read(&mut sink_buf).await.is_err());

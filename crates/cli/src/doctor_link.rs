@@ -387,15 +387,21 @@ impl LinkProbe for SystemProbe {
 // ---------------------------------------------------------------------------
 
 /// A long-header packet with an unknown version: the server MUST answer
-/// with a Version Negotiation packet. DCID carried for the response's
-/// correlation (any nonzero value works for the probe).
+/// with a Version Negotiation packet — but only if the datagram is at
+/// least the QUIC minimum datagram size (RFC 9000 §5.2.2 lets servers
+/// drop smaller unsupported-version packets, and quinn-proto 0.11.18+
+/// does, so an unpadded probe reads silence instead of a dead path).
+/// DCID carried for the response's correlation (any nonzero value works
+/// for the probe); everything past the header is padding the server never
+/// reads before answering VN.
 pub fn version_negotiation_trigger(dcid: &[u8]) -> Vec<u8> {
-    let mut packet = Vec::with_capacity(14);
+    let mut packet = Vec::with_capacity(1200);
     packet.extend_from_slice(&[0xc0]); // long header, type bits zeroed
     packet.extend_from_slice(&[0x0a, 0x0a, 0x0a, 0x0a]); // unknown version
     packet.push(u8::try_from(dcid.len()).unwrap_or(8)); // DCID length
     packet.extend_from_slice(dcid);
     packet.push(0); // empty SCID
+    packet.resize(1200, 0);
     packet
 }
 
@@ -1955,7 +1961,7 @@ mod tests {
         );
         assert_eq!(hits.len(), 1, "exactly the revoked serial: {hits:?}");
         assert!(hits[0].contains("00ff") && hits[0].contains(&label));
-        assert!(bad.is_empty());
+        assert_eq!(bad.len(), 0);
 
         // Nothing revoked at all: clean with no unparseable material.
         let (hits, bad) = scan_crls(&["00ee".to_owned()], &[(label.clone(), crl.clone())]);
@@ -1966,7 +1972,7 @@ mod tests {
             &["00ee".to_owned()],
             &[(label, crl), ("bogus".to_owned(), "not a crl".to_owned())],
         );
-        assert!(hits.is_empty());
+        assert_eq!(hits.len(), 0);
         assert_eq!(bad.len(), 1, "the bogus CRL is named: {bad:?}");
     }
 

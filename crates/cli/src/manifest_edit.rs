@@ -1790,7 +1790,7 @@ service = "default/desktop/asr"
         );
 
         let skeleton = crate::plan::setup_mesh_template("t", "central", "mesh.example.com:6666");
-        assert!(!summarize(&skeleton).unwrap().issues.is_empty());
+        assert_ne!(summarize(&skeleton).unwrap().issues.len(), 0);
         // The skeleton's hub is already declared; editing the realm on the
         // invalid skeleton proceeds — shape funnel only.
         let edited = apply_edit(

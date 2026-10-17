@@ -19,10 +19,12 @@ check fails it at commit time).
 
 Internal crate dependencies are part of the same contract: nothing is
 published to crates.io (the source export is the distribution), so each one
-is declared once in [workspace.dependencies] as a bare path spec and
-inherited by members with `interflow-x.workspace = true`. A version literal
-anywhere is a bump-time drift trap — the v0.11.0 bump left 39 stale
-member-manifest pins and broke every cargo invocation at HEAD.
+is declared once in [workspace.dependencies] as a path + version dual spec
+and inherited by members with `interflow-x.workspace = true`. The version
+literal exists for cargo-deny's wildcard ban and must equal the workspace
+version — this guard holds the equality in the one file, and
+scripts/bump_version.py moves it on every bump (the v0.11.0 bump once left
+39 stale member-manifest pins and broke every cargo invocation at HEAD).
 
 Local migration counters (documentation/versioning.md, "Local migration
 counters") are the one sanctioned second kind of version. A counter whose
@@ -301,13 +303,16 @@ def member_internal_dep_violations(member: str, text: str) -> list[str]:
     return findings
 
 
-def root_internal_dep_violations(text: str) -> list[str]:
+def root_internal_dep_violations(text: str, workspace_version: str | None) -> list[str]:
     """The one place an internal dependency may be declared is
-    [workspace.dependencies], and the spec must be path-only: nothing is
-    published to crates.io (the source export is the distribution), so no
-    version literal needs to exist. If publishing ever starts, add the
-    `version` key here — one file — and flip this check to value-match the
-    workspace version."""
+    [workspace.dependencies], and the spec must carry the workspace version
+    as its version requirement (path + version dual spec): a spec with no
+    version is a wildcard, which cargo-deny's wildcard ban rejects — the
+    v0.11.0 export reddened public CI on all twelve after the single-sourcing
+    removed the literals. Nothing is published to crates.io (the source
+    export is the distribution), so the requirement stays == the workspace
+    version in this one file; scripts/bump_version.py moves it with every
+    bump and this check holds the equality."""
     findings: list[str] = []
     in_deps = False
     for lineno, line in enumerate(text.splitlines(), start=1):
@@ -317,11 +322,21 @@ def root_internal_dep_violations(text: str) -> list[str]:
         if not in_deps:
             continue
         match = re.match(r"^\s*(interflow-[\w-]+)\s*=\s*\{(.*)\}\s*$", line)
-        if match and re.search(r"\bversion\s*=", match.group(2)):
+        if not match:
+            continue
+        name, spec = match.group(1), match.group(2)
+        version = re.search(r'\bversion\s*=\s*"([^"]+)"', spec)
+        if not version:
             findings.append(
-                f"Cargo.toml:{lineno}: {match.group(1)} declaration must stay "
-                "path-only — a version literal drifts on every bump (add one "
-                "only when publishing starts)"
+                f"Cargo.toml:{lineno}: {name} declaration carries no version — a "
+                "version-less spec is a wildcard (rejected by cargo-deny); add "
+                f'version = "{workspace_version}"'
+            )
+        elif workspace_version and version.group(1) != workspace_version:
+            findings.append(
+                f"Cargo.toml:{lineno}: {name} version {version.group(1)!r} must equal "
+                f"the workspace version {workspace_version!r} (moved by "
+                "scripts/bump_version.py, one file)"
             )
     return findings
 
@@ -372,7 +387,7 @@ def main() -> int:
         exempt = local_counter_exemptions(messages)
         messages.extend(born_public_violations())
 
-    messages.extend(root_internal_dep_violations(cargo_text))
+    messages.extend(root_internal_dep_violations(cargo_text, workspace_version))
 
     members = workspace_members(cargo_text)
     for member in members:

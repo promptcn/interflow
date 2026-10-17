@@ -38,25 +38,26 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # Line diff for `plan diff` (declaration vs applied snapshot) — pure Rust.
 similar = "3.2"
 
-# Internal crates — path-only specs, declared once here so members inherit
-# with `interflow-x.workspace = true`. Nothing is published to crates.io (the
-# source export is the distribution), so no version literal exists to drift
-# from the workspace version — the v0.11.0 bump left 39 stale member-manifest
-# pins and broke every cargo invocation at HEAD (fixed in c458728).
-# If publishing ever starts, add `version` HERE (one file) and flip the
-# version-contract guard's path-only rule to value-match.
-interflow-buildinfo = { path = "crates/buildinfo" }
-interflow-certs = { path = "crates/certs" }
-interflow-cli = { path = "crates/cli" }
-interflow-contract = { path = "crates/contract" }
-interflow-core = { path = "crates/core" }
-interflow-expose = { path = "crates/expose" }
-interflow-identity = { path = "crates/identity" }
-interflow-mesh = { path = "crates/mesh" }
-interflow-registrar = { path = "crates/registrar" }
-interflow-renewal = { path = "crates/renewal" }
-interflow-testkit = { path = "crates/testkit" }
-interflow-util = { path = "crates/util" }
+# Internal crates — path + version dual specs, declared once here so members
+# inherit with `interflow-x.workspace = true`. Nothing is published to
+# crates.io (the source export is the distribution); the version literal
+# exists for cargo-deny's wildcard ban (a spec with no version requirement
+# is a wildcard — the v0.11.0 export reddened public CI on all twelve) and
+# is pinned to the workspace version by check_version_contract.py, so it
+# cannot drift the way the v0.11.0 bump's 39 stale member-manifest pins did
+# (fixed in c458728). scripts/bump_version.py moves it with every bump.
+interflow-buildinfo = { path = "crates/buildinfo", version = "0.11.0" }
+interflow-certs = { path = "crates/certs", version = "0.11.0" }
+interflow-cli = { path = "crates/cli", version = "0.11.0" }
+interflow-contract = { path = "crates/contract", version = "0.11.0" }
+interflow-core = { path = "crates/core", version = "0.11.0" }
+interflow-expose = { path = "crates/expose", version = "0.11.0" }
+interflow-identity = { path = "crates/identity", version = "0.11.0" }
+interflow-mesh = { path = "crates/mesh", version = "0.11.0" }
+interflow-registrar = { path = "crates/registrar", version = "0.11.0" }
+interflow-renewal = { path = "crates/renewal", version = "0.11.0" }
+interflow-testkit = { path = "crates/testkit", version = "0.11.0" }
+interflow-util = { path = "crates/util", version = "0.11.0" }
 
 # ============================================================================
 # Lints — applied uniformly via [workspace.lints]; sub-crates inherit with `[lints] workspace = true`

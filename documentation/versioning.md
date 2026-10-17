@@ -193,10 +193,12 @@ steps:
 3. Cut: `./scripts/release_public.sh <target> vX.Y.Z` — after its contracts
    hold (tag == the target tree's workspace version; the CHANGELOG carries a
    `## [X.Y.Z]` section; every already-released section still matches its
-   tag annotation verbatim; tag unused locally and on the remote; target
-   HEAD == origin/main; clean tree), it creates an annotated tag whose body
-   is that CHANGELOG section and pushes it. Any failed contract leaves
-   nothing behind.
+   tag annotation verbatim; a completed GREEN `ci` run on GitHub for the
+   commit being tagged — the export's local parity proves the test job,
+   this proves the whole public matrix; tag unused locally and on the
+   remote; target HEAD == origin/main; clean tree), it creates an
+   annotated tag whose body is that CHANGELOG section and pushes it. Any
+   failed contract leaves nothing behind.
 4. Wait for `release.yml`; the Release page then shows the CLI archives,
    GUI bundles, checksums and the docker image (22 assets), with the
    CHANGELOG section as the body — identical to the tag annotation by

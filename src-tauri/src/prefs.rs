@@ -630,7 +630,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join(LEGACY_GUI), "language = \"zh\"\n").unwrap();
         let db = db_in(dir.path());
-        assert!(db.nodes().unwrap().is_empty());
+        assert_eq!(db.nodes().unwrap().len(), 0);
         assert_eq!(db.gui().language, Lang::Zh);
         assert!(
             dir.path().join(LEGACY_PROFILE).exists(),

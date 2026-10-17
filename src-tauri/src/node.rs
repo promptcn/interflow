@@ -4543,7 +4543,7 @@ target_addr = "127.0.0.1:{echo_port}"
                 service_addresses: Default::default(),
             })
             .expect("a different identity sharing the node name must pass");
-        assert!(!other.is_empty());
+        assert_ne!(other.len(), 0);
     }
 
     /// Renewal rotation: the scheduler's Ok completion (new credential
