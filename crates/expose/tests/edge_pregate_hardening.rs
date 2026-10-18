@@ -37,7 +37,8 @@ use interflow_expose::edge::{
     AcmeOptions, ControlEndpointTls, EdgeConfig, EdgeListenerPolicy, IngressPrincipal, PublicTls,
     Route, WorkspaceTrust,
 };
-use interflow_testkit::metrics_harness::{counter_value, eventually, init_tracing};
+use interflow_testkit::metrics_harness::{counter_value, init_tracing};
+use interflow_testkit::wait::eventually;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -224,14 +225,16 @@ async fn audit_count_reaches(audit_path: &PathBuf, needle: &str, expect: usize) 
     let count = |content: String| content.lines().filter(|l| l.contains(needle)).count();
     let path = audit_path.clone();
     eventually(
-        move || {
-            std::fs::read_to_string(&path)
-                .map(|c| count(c))
-                .unwrap_or(0)
-                >= expect
-        },
-        Duration::from_secs(3),
         "audit records to appear",
+        Duration::from_secs(3),
+        move || {
+            let hits = std::fs::read_to_string(&path)
+                .map(|c| count(c))
+                .unwrap_or(0);
+            (hits >= expect)
+                .then_some(())
+                .ok_or_else(|| format!("{hits} of {expect} matching audit lines"))
+        },
     )
     .await;
     let got = std::fs::read_to_string(audit_path)

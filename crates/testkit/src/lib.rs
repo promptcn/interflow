@@ -20,6 +20,8 @@
 //! - [`registrar`]: in-process registrar fixture (dead-then-alive port, asserted readiness)
 //! - [`soak`]: long-running regression gate (real process topology + eight assertions; CLI in `bin/soak.rs`)
 //! - [`supervisor`]: bounded Restart=on-success loop (the renewal exit contract's e2e harness)
+//! - [`wait`]: bounded wait-for-condition polling — the canonical `eventually` /
+//!   `eventually_sync` (budgets are the contract; the poll period is not)
 
 // dev-only harness: panicking directly on assembly failure is test-code convention
 // (aligned with the tests/common header).
@@ -50,6 +52,7 @@ pub mod registrar;
 pub mod soak;
 pub mod stack;
 pub mod supervisor;
+pub mod wait;
 
 // Flat re-exports: tests/benches import the common pieces in one line via
 // `use interflow_testkit::{...}` (certs/impair/metrics keep their namespaces to

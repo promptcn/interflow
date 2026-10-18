@@ -14,6 +14,17 @@ the first public release carrying this changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- The stale-exec scan test no longer flakes on starved CI runners: the
+  post-replacement assertion became a bounded wait-for-condition (the
+  kernel's `/proc` view of a rename-over races the scan instant; the wait
+  target is a condition, not a time) instead of a point-in-time assert. The
+  wait itself moved into a shared testkit primitive (`eventually` /
+  `eventually_sync`, whose timeout panics carry the last observation) that
+  replaces the three ad-hoc polling-loop variants the suites had grown.
+  No production code changed.
+
 ## [0.11.1] - 2026-10-17
 
 ### Fixed

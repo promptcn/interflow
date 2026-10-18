@@ -43,7 +43,7 @@ use interflow_core::tunnel::{InnerStreamHello, TargetSelector};
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, hub_config, metrics_harness::counter_value, metrics_harness::metrics_handle,
-    spawn_agent_registered, spawn_hub,
+    spawn_agent_registered, spawn_hub, wait::eventually,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -60,28 +60,6 @@ fn certs() -> &'static interflow_testkit::certs::TestCerts {
 /// Egress drain window (egress.rs BACKEND_EOF_DRAIN_GRACE) + assertion
 /// headroom.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(12);
-
-// ---------------------------------------------------------------------------
-// metrics: in-process recorder read directly; `eventually` is a local
-// variant of testkit's — its timeout panic embeds the metrics snapshot,
-// which the generic helper cannot offer.
-// ---------------------------------------------------------------------------
-
-async fn eventually<F: Fn() -> bool>(cond: F, timeout: Duration, what: &str) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if cond() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for {what} (snapshot:\n{})",
-                metrics_handle().render()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
 
 /// Bare-tunnel injection endpoint: connect to the hub + register + AgentTunnel
 /// (frame-level direct send, with full control over the frame count).
@@ -329,9 +307,14 @@ async fn backend_eof_without_peer_close_releases_fd() {
     // After the drain window (5s) expires the forwarder must close out:
     // backend connection closed + backend_closed attribution
     eventually(
-        || active.load(Ordering::SeqCst) == 0,
-        RELEASE_DEADLINE,
         "T1 backend connection released (EOF self-healing)",
+        RELEASE_DEADLINE,
+        || {
+            let n = active.load(Ordering::SeqCst);
+            (n == 0)
+                .then_some(())
+                .ok_or_else(|| format!("active at {n}"))
+        },
     )
     .await;
     assert!(
@@ -386,17 +369,27 @@ async fn backend_eof_drain_window_delivers_late_request_tail() {
 
     // The tail data reaches the backend through the drain window
     eventually(
-        || tail.lock().unwrap().as_slice() == b"late-tail",
-        Duration::from_secs(5),
         "T2 tail data delivered to the backend",
+        Duration::from_secs(5),
+        || {
+            let got = tail.lock().unwrap().clone();
+            (got.as_slice() == b"late-tail")
+                .then_some(())
+                .ok_or_else(|| format!("backend received {:?}", String::from_utf8_lossy(&got)))
+        },
     )
     .await;
     // Close out after the window expires: connection closed (read-side EOF
     // triggered by the forwarder drop)
     eventually(
-        || active.load(Ordering::SeqCst) == 0,
-        RELEASE_DEADLINE,
         "T2 drain finished, connection released",
+        RELEASE_DEADLINE,
+        || {
+            let n = active.load(Ordering::SeqCst);
+            (n == 0)
+                .then_some(())
+                .ok_or_else(|| format!("active at {n}"))
+        },
     )
     .await;
 
@@ -428,9 +421,14 @@ async fn source_re_register_sweep_notifies_egress_streams() {
         silent_streams.push(open_inner_tls(&inj, "src-t4", sid, &backend_addr.to_string()).await);
     }
     eventually(
-        || active.load(Ordering::SeqCst) == K,
-        Duration::from_secs(10),
         "T4 silent streams established",
+        Duration::from_secs(10),
+        || {
+            let n = active.load(Ordering::SeqCst);
+            (n == K)
+                .then_some(())
+                .ok_or_else(|| format!("active at {n} of {K}"))
+        },
     )
     .await;
 
@@ -446,9 +444,14 @@ async fn source_re_register_sweep_notifies_egress_streams() {
     drop(silent_streams);
 
     eventually(
-        || active.load(Ordering::SeqCst) == 0,
-        Duration::from_secs(10),
         "T4 egress releases all backend connections after the sweep notice",
+        Duration::from_secs(10),
+        || {
+            let n = active.load(Ordering::SeqCst);
+            (n == 0)
+                .then_some(())
+                .ok_or_else(|| format!("active at {n}"))
+        },
     )
     .await;
     // The fd release and the unified close-out counter are two steps of one
@@ -456,9 +459,21 @@ async fn source_re_register_sweep_notifies_egress_streams() {
     // active==0 poll above, so the counter claim gets its own deadline
     // instead of a point-in-time assert.
     eventually(
-        || counter_value("interflow_egress_stream_closed_total") >= closed_before + K as u64,
-        Duration::from_secs(10),
         "all K streams must go through the unified close-out",
+        Duration::from_secs(10),
+        || {
+            let closed = counter_value("interflow_egress_stream_closed_total");
+            (closed >= closed_before + K as u64)
+                .then_some(())
+                .ok_or_else(|| {
+                    format!(
+                        "closed_total at {} of {} (snapshot:\n{})",
+                        closed,
+                        closed_before + K as u64,
+                        metrics_handle().render()
+                    )
+                })
+        },
     )
     .await;
 
@@ -491,9 +506,14 @@ async fn normal_source_close_still_releases_backend() {
     )
     .await;
     eventually(
-        || active.load(Ordering::SeqCst) == 1,
-        Duration::from_secs(10),
         "regression: backend connection established",
+        Duration::from_secs(10),
+        || {
+            let n = active.load(Ordering::SeqCst);
+            (n == 1)
+                .then_some(())
+                .ok_or_else(|| format!("active at {n}"))
+        },
     )
     .await;
 
@@ -502,9 +522,14 @@ async fn normal_source_close_still_releases_backend() {
         .await
         .expect("source Close");
     eventually(
-        || active.load(Ordering::SeqCst) == 0,
-        Duration::from_secs(5),
         "regression: Close (control-channel path) releases the backend connection",
+        Duration::from_secs(5),
+        || {
+            let n = active.load(Ordering::SeqCst);
+            (n == 0)
+                .then_some(())
+                .ok_or_else(|| format!("active at {n}"))
+        },
     )
     .await;
 

@@ -394,6 +394,7 @@ mod tests {
     #[test]
     fn real_process_replacement_is_detected() {
         use std::process::{Command, Stdio};
+        use std::time::Duration;
 
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
@@ -424,20 +425,36 @@ mod tests {
         )
         .unwrap();
         std::fs::rename(tmp.path().join("replacement"), &fake_engine).unwrap();
-        let stale = scan_stale_processes(Path::new("/proc"), Some(&bin));
-        let hit = stale.iter().find(|f| f.pid == child.id());
+        // The kernel's presentation of a rename-over in /proc races the
+        // scan instant (public ci run 39080056983: the first rescan after
+        // the swap read back an empty table on a starved runner); the
+        // contract under test is "named eventually", never "named at this
+        // instant", so the claim gets its own deadline instead of a
+        // point-in-time assert.
+        //
         // Which evidence surfaces depends on the filesystem: rename-over
         // unlinks the running inode, and on some filesystems (overlayfs —
         // the GitHub runner's /tmp) that reads back as the deleted marker,
         // while others surface the inode mismatch. Both prove the disk
         // under the process was replaced; the contract under test is
         // "named as stale", not which kernel tell fired.
-        assert!(
-            hit.is_some_and(|f| matches!(
-                f.evidence,
-                StaleEvidence::DeletedMarker | StaleEvidence::InodeMismatch
-            )),
-            "the replaced-disk process must be named: {stale:?}"
+        let _finding = interflow_testkit::wait::eventually_sync(
+            "the replaced-disk process to be named",
+            Duration::from_secs(5),
+            || {
+                let stale = scan_stale_processes(Path::new("/proc"), Some(&bin));
+                stale
+                    .iter()
+                    .find(|f| {
+                        f.pid == child.id()
+                            && matches!(
+                                f.evidence,
+                                StaleEvidence::DeletedMarker | StaleEvidence::InodeMismatch
+                            )
+                    })
+                    .cloned()
+                    .ok_or_else(|| format!("scan: {stale:?}"))
+            },
         );
         let _ = child.kill();
         let _ = child.wait();

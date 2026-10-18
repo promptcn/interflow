@@ -44,8 +44,8 @@ use interflow_core::tunnel::{AgentTunnel, TargetSelector};
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, hub_config_tuned, metrics_harness::counter_value,
-    metrics_harness::eventually, metrics_harness::init_tracing, metrics_harness::metrics_handle,
-    metrics_harness::wait_counter_at_least, spawn_hub,
+    metrics_harness::init_tracing, metrics_harness::metrics_handle,
+    metrics_harness::wait_counter_at_least, spawn_hub, wait::eventually,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -378,9 +378,14 @@ async fn f2_local_stream_limit_rejects_and_releases() {
         kept.push(tls);
     }
     eventually(
-        || conns.load(Ordering::SeqCst) >= 4,
-        Duration::from_secs(5),
         "all 4 streams connected to the backend",
+        Duration::from_secs(5),
+        || {
+            let n = conns.load(Ordering::SeqCst);
+            (n >= 4)
+                .then_some(())
+                .ok_or_else(|| format!("conns at {n} of 4"))
+        },
     )
     .await;
 

@@ -87,37 +87,16 @@ pub fn counter_value(metric: &str) -> u64 {
 
 /// Polls until `counter_value(metric)` >= `min`; panics with the full
 /// snapshot on timeout (the snapshot is the only post-mortem a global
-/// recorder can offer).
+/// recorder can offer). The loop itself is [`crate::wait::eventually`];
+/// this is only the metrics-flavored probe.
 pub async fn wait_counter_at_least(metric: &str, min: u64, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
+    crate::wait::eventually(&format!("metric {metric} >= {min}"), timeout, || {
         let v = counter_value(metric);
-        if v >= min {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for metric {metric} >= {min}, current {v} (snapshot:\n{})",
-                metrics_handle().render()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-/// Polls an arbitrary condition until it holds or the timeout elapses
-/// (200ms period); panics with `what` on timeout.
-pub async fn eventually<F: Fn() -> bool>(cond: F, timeout: Duration, what: &str) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if cond() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("timed out waiting for {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+        (v >= min)
+            .then_some(())
+            .ok_or_else(|| format!("current {v} (snapshot:\n{})", metrics_handle().render()))
+    })
+    .await
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ use interflow_mesh::config::ControlConfig;
 use interflow_testkit::certs::TestCerts;
 use interflow_testkit::{
     agent_config, agent_quic_config, hub_quic_config, list_agents, spawn_agent_registered,
-    spawn_hub, tls_client_connect,
+    spawn_hub, tls_client_connect, wait::eventually,
 };
 use std::time::Duration;
 
@@ -46,20 +46,6 @@ fn sees_peer(handle: &interflow_mesh::agent::AgentHandle, peer_short: &str, onli
     snap.peers
         .iter()
         .any(|p| p.agent.rsplit('/').next() == Some(peer_short) && p.online == online)
-}
-
-/// Polls until `cond` or the deadline; panics with `what` on timeout.
-async fn eventually<F: Fn() -> bool>(what: &str, budget: Duration, cond: F) {
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        if cond() {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("timed out waiting for: {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
 }
 
 /// The full acceptance cycle on an all-QUIC fleet: both peers visible and
@@ -83,10 +69,14 @@ async fn quic_fleet_peer_presence_full_cycle() {
     let budget = Duration::from_secs(25);
     eventually("lan-a sees lan-b online", budget, || {
         sees_peer(&a, "lan-b", true)
+            .then_some(())
+            .ok_or("peer snapshot does not show lan-b online yet")
     })
     .await;
     eventually("lan-b sees lan-a online", budget, || {
         sees_peer(&b, "lan-a", true)
+            .then_some(())
+            .ok_or("peer snapshot does not show lan-a online yet")
     })
     .await;
 
@@ -98,7 +88,11 @@ async fn quic_fleet_peer_presence_full_cycle() {
     eventually(
         "lan-a no longer sees lan-b online",
         Duration::from_secs(20),
-        || !sees_peer(&a, "lan-b", true),
+        || {
+            (!sees_peer(&a, "lan-b", true))
+                .then_some(())
+                .ok_or("peer snapshot still shows lan-b online")
+        },
     )
     .await;
 
@@ -106,6 +100,8 @@ async fn quic_fleet_peer_presence_full_cycle() {
     let b2 = spawn_agent_registered(agent_quic_config("lan-b", port, certs())).await;
     eventually("lan-a sees the restarted lan-b online", budget, || {
         sees_peer(&a, "lan-b", true)
+            .then_some(())
+            .ok_or("peer snapshot does not show the restarted lan-b online yet")
     })
     .await;
     let _ = b2.shutdown_graceful().await;
@@ -128,13 +124,21 @@ async fn h2_fleet_peer_presence() {
     eventually(
         "h2 lan-a sees lan-b online",
         Duration::from_secs(25),
-        || sees_peer(&a, "lan-b", true),
+        || {
+            sees_peer(&a, "lan-b", true)
+                .then_some(())
+                .ok_or("peer snapshot does not show lan-b online yet")
+        },
     )
     .await;
     eventually(
         "h2 lan-b sees lan-a online",
         Duration::from_secs(25),
-        || sees_peer(&b, "lan-a", true),
+        || {
+            sees_peer(&b, "lan-a", true)
+                .then_some(())
+                .ok_or("peer snapshot does not show lan-a online yet")
+        },
     )
     .await;
 

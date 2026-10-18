@@ -45,9 +45,9 @@ use interflow_core::tunnel::TargetSelector;
 use interflow_core::tunnel::e2e::{E2eHandshakeOutcome, E2eTunnelIo, inner_tls_connect};
 use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_testkit::{
-    agent_config, hub_config, metrics_harness::counter_value, metrics_harness::eventually,
-    metrics_harness::init_tracing, metrics_harness::metrics_handle,
-    metrics_harness::wait_counter_at_least, spawn_agent_registered, spawn_hub,
+    agent_config, hub_config, metrics_harness::counter_value, metrics_harness::init_tracing,
+    metrics_harness::metrics_handle, metrics_harness::wait_counter_at_least,
+    spawn_agent_registered, spawn_hub, wait::eventually,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -219,9 +219,14 @@ async fn session_rebuild_releases_silent_streams_without_accumulation() {
         // All silent streams reach the backend (active = K: the previous
         // round's have all been released)
         eventually(
-            || active.load(Ordering::SeqCst) == STREAMS_PER_ROUND,
-            Duration::from_secs(10),
             &format!("round {round} silent streams established"),
+            Duration::from_secs(10),
+            || {
+                let n = active.load(Ordering::SeqCst);
+                (n == STREAMS_PER_ROUND)
+                    .then_some(())
+                    .ok_or_else(|| format!("active at {n} of {STREAMS_PER_ROUND}"))
+            },
         )
         .await;
 
@@ -237,9 +242,14 @@ async fn session_rebuild_releases_silent_streams_without_accumulation() {
         // If the forwarder hangs on frames.recv(), the connections never
         // close and active accumulates across rounds.
         eventually(
-            || active.load(Ordering::SeqCst) == 0,
-            TEARDOWN_DEADLINE,
             &format!("round {round} backend connections back to zero after teardown (fd release)"),
+            TEARDOWN_DEADLINE,
+            || {
+                let n = active.load(Ordering::SeqCst);
+                (n == 0)
+                    .then_some(())
+                    .ok_or_else(|| format!("active at {n}"))
+            },
         )
         .await;
 

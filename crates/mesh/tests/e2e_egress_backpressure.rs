@@ -53,8 +53,8 @@ use interflow_mesh::agent::{AgentClient, AgentHandle, AgentState};
 use interflow_mesh::config::{EgressRule, EgressTarget, IngressRule};
 use interflow_testkit::{
     agent_config, echo_server, hub_config, metrics_harness::counter_value,
-    metrics_harness::eventually, metrics_harness::init_tracing, metrics_harness::metrics_handle,
-    metrics_harness::wait_counter_at_least, spawn_hub,
+    metrics_harness::init_tracing, metrics_harness::metrics_handle,
+    metrics_harness::wait_counter_at_least, spawn_hub, wait::eventually,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -384,11 +384,12 @@ async fn t1_slow_backend_does_not_corrupt_unrelated_streams() {
     drop(slow_tls);
     let _ = inj.send_close(slow_sid).await;
     inj.unregister_stream(slow_sid).await;
-    eventually(
-        || slow_active.load(Ordering::SeqCst) == 0,
-        LONG_DEADLINE,
-        "all slow-backend connections closed",
-    )
+    eventually("all slow-backend connections closed", LONG_DEADLINE, || {
+        let n = slow_active.load(Ordering::SeqCst);
+        (n == 0)
+            .then_some(())
+            .ok_or_else(|| format!("slow_active at {n}"))
+    })
     .await;
     // The session was not torn down: new streams work as usual.
     let resp = tunnel_round_trip(
@@ -683,9 +684,14 @@ async fn t5_no_connection_leak_after_kill_and_shutdown() {
     // After the death verdict, the backend connection count must reach zero
     // (forwarder cancel + both halves dropped = actually closed).
     eventually(
-        || slow_active.load(Ordering::SeqCst) == 0,
-        LONG_DEADLINE,
         "slow-backend connections closed after the death verdict",
+        LONG_DEADLINE,
+        || {
+            let n = slow_active.load(Ordering::SeqCst);
+            (n == 0)
+                .then_some(())
+                .ok_or_else(|| format!("slow_active at {n}"))
+        },
     )
     .await;
     let _ = flood.await;
@@ -842,12 +848,15 @@ async fn t7_response_poison_closes_stalled_client_only() {
     // parallel runs, so the either-mechanism form IS the load-independent
     // semantic, not a relaxation to retire.)
     eventually(
-        || {
-            counter_value("interflow_dispatch_stream_poisoned_total") >= 1
-                || counter_value("interflow_ingress_client_write_stall") >= 1
-        },
-        Duration::from_secs(5),
         "stalled-client reap counter (dispatch poison or ingress write stall)",
+        Duration::from_secs(5),
+        || {
+            let poisoned = counter_value("interflow_dispatch_stream_poisoned_total");
+            let stall = counter_value("interflow_ingress_client_write_stall");
+            (poisoned >= 1 || stall >= 1).then_some(()).ok_or_else(|| {
+                format!("dispatch poisoned at {poisoned}, ingress write stall at {stall}")
+            })
+        },
     )
     .await;
 }
