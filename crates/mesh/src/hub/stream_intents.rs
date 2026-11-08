@@ -14,8 +14,7 @@
 //!   stream unpaused and the operator re-issues (the same
 //!   deliberately-in-memory discipline as the state-transfer ledgers).
 //!
-//!   The mailbox is itself floor-visible since 2026-10-20
-//!  : an op
+//!   The mailbox is itself floor-visible since 2026-10-20: an op
 //!   queued for an offline leg can sit for days, and "something is
 //!   waiting, for how long, was anything dropped" is exactly the level a
 //!   read face owes. Enqueue bumps (a rare operator verb); an exchange

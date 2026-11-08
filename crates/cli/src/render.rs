@@ -597,7 +597,17 @@ install_bins() {{
     if [[ -f "$BIN_DIR/$name" ]] && cmp -s "$f" "$BIN_DIR/$name"; then
       echo "install.sh: bin/$name unchanged (skipped)"
     else
-      install -m 0755 "$f" "$BIN_DIR/$name"
+      # Staged swap, never truncate in place: GNU install on Linux
+      # rewrites an existing destination under the SAME inode (BSD/macOS
+      # installs land a fresh one), and even rm-then-install can hand the
+      # just-freed inode number straight back. A real change must break
+      # the inode — that break is what the disk-swap detection reads — so
+      # the new bytes land beside the old as .new (its inode exists before
+      # the old one is freed) and mv swaps the directory entry atomically:
+      # a running process keeps its old inode until exit, same discipline
+      # as node install's staged swap.
+      install -m 0755 "$f" "$BIN_DIR/$name.new"
+      mv -f "$BIN_DIR/$name.new" "$BIN_DIR/$name"
     fi
   done
 }}

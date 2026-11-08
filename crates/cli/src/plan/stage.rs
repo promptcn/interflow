@@ -21,8 +21,7 @@
 //!   vintage line in each fragment's header is the receipt, and any dist
 //!   lag is named as an ℹ. This is the fragments' freshness face: pack
 //!   bytes have the fork gate, `bin/` the artifact gate, the fragments an
-//!   always-fresh render
-//!  ;
+//!   always-fresh render.
 //! - `bin/` comes from the artifact record: a `build-manifest.*.json` is
 //!   consumed when present (commit must match this build, each artifact's
 //!   sha256 re-hashed, the build tag scanned out of the bytes), exact

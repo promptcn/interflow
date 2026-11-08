@@ -763,6 +763,23 @@ the first public release carrying this changelog.
   fixtures now assemble their header line from `concat!` parts — the
   assembled value is byte-identical, and no literal key-shaped header
   ships in the public tree. No production code changed.
+- install.sh's changed-binary copy now lands as a staged swap (the new
+  bytes arrive beside the old as `.new`, then `mv` replaces the
+  directory entry atomically): GNU install on Linux rewrites an existing
+  destination under the same inode (BSD/macOS installs land a fresh one),
+  so the "a real change breaks the inode" contract the disk-swap
+  detection reads did not hold on Linux machines — and even
+  rm-then-install can hand the just-freed inode number straight back. A
+  running process now keeps its old binary until exit across the swap,
+  the same discipline `node install`'s staged swap uses.
+- Two doc-comment citations sat mid-line ahead of their sentence, and the
+  release export's strip pass (which removes the private parenthetical)
+  left an orphaned `: …` / `;` continuation behind that clippy's
+  doc-lazy-continuation lint rejected on the public tree; the citations
+  are whole-line now, dropped cleanly. The GUI's localStorage test stub
+  was likewise missing the `Storage` interface's `length`/`key` members
+  (no local gate typechecks the frontend — the public gui job caught
+  it). Neither changes behavior.
 
 ### Security
 

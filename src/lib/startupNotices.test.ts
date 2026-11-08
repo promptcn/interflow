@@ -12,6 +12,8 @@ beforeEach(() => {
       setItem: (key: string, value: string) => void store.set(key, value),
       removeItem: (key: string) => void store.delete(key),
       clear: () => store.clear(),
+      length: store.size,
+      key: (index: number) => Array.from(store.keys())[index] ?? null,
     } satisfies Storage,
   );
 });

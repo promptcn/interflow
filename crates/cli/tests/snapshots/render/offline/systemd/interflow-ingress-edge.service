@@ -1,4 +1,4 @@
-# rendered by interflow-cli 2026-11-04_594ce6e-dirty
+# rendered by interflow-cli 2026-11-08_b85e73d-dirty
 [Unit]
 Description=Interflow ingress node edge
 After=network-online.target
