@@ -801,6 +801,16 @@ the first public release carrying this changelog.
   path components now (`Path::starts_with`/`ends_with`,
   separator-agnostic), keeping the Windows coverage instead of gating
   it off. No production code changed.
+- The audit ledger opened its active file append-only, and std maps a
+  bare append open on Windows to `FILE_APPEND_DATA` without
+  `GENERIC_READ`/`GENERIC_WRITE` — access rights the whole-file lock
+  claim (`LockFileEx`) refuses with "Access is denied". Every Windows
+  machine therefore took the designed degradation path ("another
+  writer — refusing to interleave") and ran the audit sink disabled,
+  always. The active file (and the foreign-lock test's handle) opens
+  read+append now: `FILE_GENERIC_READ | FILE_APPEND_DATA` on Windows,
+  `O_RDWR | O_APPEND` unchanged on unix — the ledger works and locks
+  on both.
 
 ### Security
 

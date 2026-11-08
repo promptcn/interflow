@@ -712,8 +712,16 @@ async fn writer_task(path: &Path, rotation: &AuditRotation, rx: &mut mpsc::Recei
 /// than a missing one. `None` (with a warn) also when the filesystem
 /// refuses — audit then runs disabled, exactly as before.
 async fn open_active(path: &Path) -> Option<WriterFile> {
+    // read+append, never append alone: std maps a bare append open on
+    // Windows to FILE_APPEND_DATA without GENERIC_READ/WRITE, and
+    // LockFileEx — the whole-file claim below — refuses that handle with
+    // ERROR_ACCESS_DENIED. The sink would then see "another writer" and
+    // disable the ledger on every Windows machine; read+append opens with
+    // FILE_GENERIC_READ | FILE_APPEND_DATA, which LockFileEx accepts
+    // (writes stay append-only on both platforms; unix is O_RDWR|O_APPEND).
     let file = match OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .await
@@ -1656,9 +1664,12 @@ mod tests {
     async fn foreign_lock_disables_writer_rather_than_interleaving() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        // A foreign writer holds the ledger's advisory lock.
+        // A foreign writer holds the ledger's advisory lock (read+append:
+        // a bare append handle can't carry the whole-file claim on
+        // Windows — see open_active).
         let foreign = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .unwrap();
