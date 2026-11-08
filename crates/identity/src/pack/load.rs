@@ -734,7 +734,9 @@ pub fn pack_digest_of(dir: &Path) -> Option<String> {
 /// - the manifest itself;
 /// - the runtime `state/` tree (policy refresh, live CRLs, ACME, creds);
 /// - the audit ledger family the node writes while running (`audit.jsonl`
-///   plus its rotated `audit-<ts>-<seq>.jsonl[.gz]` segments);
+///   plus its rotated `audit-<ts>-<seq>.jsonl[.gz]` segments, and the
+///   single-writer sidecar lock `audit.jsonl.lock` the sink claims beside
+///   the active ledger — present from the first boot, content-free);
 /// - the embedded revocation snapshot `trust/crls/` — an OPTIONAL member:
 ///   apply writes it into the pack after sealing (unlisted until rotate or
 ///   the next render folds it back into the manifest), so present-but-
@@ -749,6 +751,7 @@ fn may_be_unlisted(rel: &str) -> bool {
         || rel == "state"
         || rel.starts_with("state/")
         || rel == "audit.jsonl"
+        || rel == "audit.jsonl.lock"
         || (rel.starts_with("audit-") && (rel.ends_with(".jsonl") || rel.ends_with(".jsonl.gz")))
         || rel == "trust/crls"
         || rel.starts_with("trust/crls/")
@@ -1055,6 +1058,8 @@ service = "main/desktop/asr"
         std::fs::create_dir_all(out.join("state/policy")).unwrap();
         std::fs::write(out.join("state/policy/live.policy"), b"hot").unwrap();
         std::fs::write(out.join("audit.jsonl"), b"{}\n").unwrap();
+        // The sink's single-writer sidecar claim (present from first boot).
+        std::fs::write(out.join("audit.jsonl.lock"), b"").unwrap();
         std::fs::write(
             out.join("audit-20261103T000000Z-0000000000000001.jsonl.gz"),
             b"gz",

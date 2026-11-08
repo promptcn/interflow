@@ -15,12 +15,13 @@
 //! chain). A violation panics at the spawn site because an in-process
 //! double writer is a wiring bug whose runtime failure mode is silent:
 //! two startup seals race, two chains interleave into one file, and the
-//! ledger stops replaying. Across processes the active file itself is
-//! held under an exclusive advisory lock ([`open_active`]): a second
-//! service unit pointed at the same `audit.jsonl` (an ops
-//! misconfiguration) fails to lock, logs at ERROR, and runs disabled —
-//! integrity over availability, a corrupted ledger is worse than a
-//! missing one.
+//! ledger stops replaying. Across processes the claim rides a sidecar
+//! lock file beside the active ledger ([`sidecar_lock_path`]) — never
+//! the ledger itself, whose whole-file lock is enforced against readers
+//! on Windows: a second service unit pointed at the same `audit.jsonl`
+//! (an ops misconfiguration) fails the sidecar claim, logs at ERROR,
+//! and runs disabled — integrity over availability, a corrupted ledger
+//! is worse than a missing one.
 //!
 //! # Ledger lifecycle (rotation)
 //!
@@ -357,6 +358,11 @@ pub struct AuditSink {
     /// `Arc` so it lives exactly as long as the last sink handle — the
     /// path is reusable the moment its final handle drops.
     _claim: Option<Arc<ClaimGuard>>,
+    /// The sidecar lock file's fd — the cross-process single-writer claim
+    /// (see `sidecar_lock_path`), under an `Arc` so sink clones share one
+    /// fd: it closes with the LAST handle, releasing the lock at exactly
+    /// the claim's end of life. Held, never read.
+    _sidecar_lock: Option<Arc<std::fs::File>>,
 }
 
 /// Live ledger-path claims: the process-wide "one path, one writer"
@@ -380,6 +386,21 @@ impl Drop for ClaimGuard {
                 .remove(&self.key);
         }
     }
+}
+
+/// The cross-process single-writer claim rides a sidecar lock file beside
+/// the active ledger — never the ledger itself: a whole-file exclusive
+/// lock is advisory on unix but ENFORCED against readers on Windows
+/// (`LockFileEx`), so locking the ledger would make the active file
+/// unreadable to every other handle (doctor, verify, the GUI) for the
+/// writer's whole lifetime. The sidecar is opened read+append — a bare
+/// append handle maps to `FILE_APPEND_DATA` without `GENERIC_READ` on
+/// Windows, which the lock call refuses with "Access is denied" — and
+/// matches no pattern `discover_audit_files` scans for.
+fn sidecar_lock_path(active: &Path) -> PathBuf {
+    let mut suffixed = active.as_os_str().to_os_string();
+    suffixed.push(".lock");
+    PathBuf::from(suffixed)
 }
 
 /// Anchors a ledger path so textually different spellings of one file
@@ -443,6 +464,7 @@ impl AuditSink {
             source_id: String::new(),
             chain: Arc::new(Mutex::new(AuditChainState::default())),
             _claim: None,
+            _sidecar_lock: None,
         }
     }
 
@@ -473,6 +495,34 @@ impl AuditSink {
 
         let claim = claim_ledger_path(Path::new(&path), std::panic::Location::caller());
 
+        // The cross-process half of the claim: the sidecar lock file
+        // (see `sidecar_lock_path`). A second PROCESS on the same ledger —
+        // two service units sharing a pack dir, an ops misconfiguration —
+        // fails here, logs at ERROR, and runs disabled: a corrupted
+        // ledger is worse than a missing one. The fd rides the sink (it
+        // closes with the last handle, releasing the lock); a failure
+        // here returns with `claim` dropping, so the registry entry the
+        // claim inserted is released again — no leak.
+        let active = Path::new(&path);
+        let sidecar = sidecar_lock_path(active);
+        let sidecar_lock = match std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&sidecar)
+            .and_then(|f| f.try_lock_exclusive().map(|()| f))
+        {
+            Ok(f) => Some(Arc::new(f)),
+            Err(e) => {
+                error!(
+                    "[audit] {} is held by another writer ({e}); refusing to \
+                     interleave chains — audit disabled for this process",
+                    sidecar.display()
+                );
+                return Self::disabled();
+            }
+        };
+
         let (tx, mut rx) = mpsc::channel::<AuditMsg>(256);
         let tx = Arc::new(tx);
         let source_id = source_id();
@@ -488,6 +538,7 @@ impl AuditSink {
             source_id,
             chain: Arc::new(Mutex::new(AuditChainState::default())),
             _claim: Some(claim),
+            _sidecar_lock: sidecar_lock,
         }
     }
 
@@ -700,28 +751,16 @@ async fn writer_task(path: &Path, rotation: &AuditRotation, rx: &mut mpsc::Recei
     let _ = out.file.sync_all().await;
 }
 
-/// Opens (creates) the active audit file under an exclusive advisory
-/// lock — the ledger's cross-process single-writer guard.
-///
-/// The lock rides the fd: it survives the async↔std conversions below,
-/// and is released only when the handle closes (startup and the
-/// rotation reopen both go through here, so each active file is locked
-/// for its own lifetime). A second process on the same path — two
-/// service units sharing a pack dir, an ops misconfiguration — fails to
-/// lock, logs at ERROR, and runs disabled: a corrupted ledger is worse
-/// than a missing one. `None` (with a warn) also when the filesystem
-/// refuses — audit then runs disabled, exactly as before.
+/// Opens (creates) the active audit file. The cross-process
+/// single-writer claim lives in the sidecar lock taken at spawn
+/// (see `sidecar_lock_path`), NOT on this file: a whole-file exclusive
+/// lock is enforced against readers on Windows, and the active ledger
+/// must stay readable (doctor, verify, the GUI) while the writer lives.
+/// `None` (with a warn) when the filesystem refuses the open — audit
+/// then runs disabled.
 async fn open_active(path: &Path) -> Option<WriterFile> {
-    // read+append, never append alone: std maps a bare append open on
-    // Windows to FILE_APPEND_DATA without GENERIC_READ/WRITE, and
-    // LockFileEx — the whole-file claim below — refuses that handle with
-    // ERROR_ACCESS_DENIED. The sink would then see "another writer" and
-    // disable the ledger on every Windows machine; read+append opens with
-    // FILE_GENERIC_READ | FILE_APPEND_DATA, which LockFileEx accepts
-    // (writes stay append-only on both platforms; unix is O_RDWR|O_APPEND).
     let file = match OpenOptions::new()
         .create(true)
-        .read(true)
         .append(true)
         .open(path)
         .await
@@ -735,24 +774,13 @@ async fn open_active(path: &Path) -> Option<WriterFile> {
             return None;
         }
     };
-    let std_file = file.into_std().await;
-    match std_file.try_lock_exclusive() {
-        Ok(()) => Some(WriterFile {
-            file: tokio::fs::File::from_std(std_file),
-            written: 0,
-            first_sequence: 0,
-            since_sync: 0,
-            last_sync: std::time::Instant::now(),
-        }),
-        Err(e) => {
-            error!(
-                "audit file {} is held by another writer ({e}); refusing to \
-                 interleave chains — audit disabled for this process",
-                path.display()
-            );
-            None
-        }
-    }
+    Some(WriterFile {
+        file,
+        written: 0,
+        first_sequence: 0,
+        since_sync: 0,
+        last_sync: std::time::Instant::now(),
+    })
 }
 
 /// Seals the active file found at startup: read its first line (to name
@@ -1664,14 +1692,14 @@ mod tests {
     async fn foreign_lock_disables_writer_rather_than_interleaving() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
-        // A foreign writer holds the ledger's advisory lock (read+append:
-        // a bare append handle can't carry the whole-file claim on
-        // Windows — see open_active).
+        // A foreign writer holds the ledger's cross-process claim: the
+        // sidecar lock file (read+append — a bare append handle can't
+        // carry the whole-file claim on Windows; see sidecar_lock_path).
         let foreign = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
-            .open(&path)
+            .open(sidecar_lock_path(&path))
             .unwrap();
         foreign.try_lock_exclusive().unwrap();
         let sink = AuditSink::spawn(&test_config(dir.path(), AuditRotation::default()));

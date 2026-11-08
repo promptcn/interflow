@@ -801,16 +801,21 @@ the first public release carrying this changelog.
   path components now (`Path::starts_with`/`ends_with`,
   separator-agnostic), keeping the Windows coverage instead of gating
   it off. No production code changed.
-- The audit ledger opened its active file append-only, and std maps a
-  bare append open on Windows to `FILE_APPEND_DATA` without
-  `GENERIC_READ`/`GENERIC_WRITE` — access rights the whole-file lock
-  claim (`LockFileEx`) refuses with "Access is denied". Every Windows
-  machine therefore took the designed degradation path ("another
-  writer — refusing to interleave") and ran the audit sink disabled,
-  always. The active file (and the foreign-lock test's handle) opens
-  read+append now: `FILE_GENERIC_READ | FILE_APPEND_DATA` on Windows,
-  `O_RDWR | O_APPEND` unchanged on unix — the ledger works and locks
-  on both.
+- The audit ledger's cross-process single-writer claim locked the active
+  file itself, and that shape fails twice on Windows: std maps a bare
+  append open to `FILE_APPEND_DATA` without `GENERIC_READ` (the
+  whole-file lock call refuses the handle with "Access is denied" —
+  every Windows machine took the designed degradation path and ran the
+  audit sink disabled, always), and even with the handle fixed,
+  `LockFileEx` is enforced against readers too, so a live active file
+  would be unreadable to doctor/verify/GUI for the writer's whole
+  lifetime. The claim now rides a sidecar lock file beside the ledger
+  (`audit.jsonl.lock`, opened read+append, matching no pattern the
+  discovery scan reads, and exempt from the pack digest reconciliation
+  alongside the ledger family — a running node's pack keeps loading):
+  the ledger itself is never locked, single-writer holds across
+  processes on both platforms, and the fd closes with the last sink
+  handle — the claim's exact lifetime.
 
 ### Security
 
