@@ -780,6 +780,12 @@ the first public release carrying this changelog.
   was likewise missing the `Storage` interface's `length`/`key` members
   (no local gate typechecks the frontend — the public gui job caught
   it). Neither changes behavior.
+- The tree-walk single-sourcing's non-unix `entry_mode` stub could be a
+  `const fn` (clippy's nursery `missing_const_for_fn`, a lint that only
+  fires on the compiled Windows face — no local gate or ubuntu job sees
+  it; the windows-smoke job caught it): `const` now, in step with the
+  stub conventions elsewhere (`same_device` is const, `chown_tree` allows
+  the lint). No behavior change.
 
 ### Security
 

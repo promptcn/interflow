@@ -85,7 +85,7 @@ fn entry_mode(meta: &std::fs::Metadata, _is_dir: bool) -> u32 {
 }
 
 #[cfg(not(unix))]
-fn entry_mode(_meta: &std::fs::Metadata, is_dir: bool) -> u32 {
+const fn entry_mode(_meta: &std::fs::Metadata, is_dir: bool) -> u32 {
     if is_dir { 0o755 } else { 0o644 }
 }
 
