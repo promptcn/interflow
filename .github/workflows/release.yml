@@ -26,10 +26,10 @@ jobs:
             os: ubuntu-24.04
             archive: tar.gz
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
             archive: tar.gz
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-2022
@@ -123,10 +123,10 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             bundles: dmg
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
             bundles: dmg
           # GUI linux builds use gnu, not musl: webkit2gtk has no musl story
           # and desktop targets don't need static linking.
