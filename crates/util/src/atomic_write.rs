@@ -74,9 +74,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: WriteMode) -> io::Result<()
             Ok(_) => break,
             Err(e) if attempt < 5 && is_transient_rename_refusal(&e.error) => {
                 attempt += 1;
-                std::thread::sleep(std::time::Duration::from_millis(
-                    u64::from(2 * attempt),
-                ));
+                std::thread::sleep(std::time::Duration::from_millis(u64::from(2 * attempt)));
                 outcome = e.file.persist(path);
             }
             Err(e) => {
@@ -109,7 +107,7 @@ fn is_transient_rename_refusal(error: &std::io::Error) -> bool {
 }
 
 #[cfg(not(windows))]
-fn is_transient_rename_refusal(_error: &std::io::Error) -> bool {
+const fn is_transient_rename_refusal(_error: &std::io::Error) -> bool {
     false
 }
 
