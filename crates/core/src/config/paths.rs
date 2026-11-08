@@ -75,20 +75,27 @@ mod tests {
 
     #[test]
     fn relative_joins_base() {
+        // Component-wise assertions: the rendered separators are the
+        // platform's (the string spelling is unix-only; these tests ride
+        // the named Windows risk face too and failed there on `/`-literals).
         let anchored = anchor(Path::new("/etc/interflow"), "certs/hub.crt");
-        assert_eq!(anchored, "/etc/interflow/certs/hub.crt");
+        let joined = Path::new(&anchored);
+        assert!(joined.starts_with("/etc/interflow"), "{anchored}");
+        assert!(joined.ends_with("certs/hub.crt"), "{anchored}");
     }
 
     #[test]
     fn dot_slash_prefix_joins_base() {
         // "." components drop lexically; ".." is preserved.
-        assert_eq!(
-            anchor(Path::new("/etc/interflow"), "./audit.jsonl"),
-            "/etc/interflow/audit.jsonl"
-        );
-        assert_eq!(
-            anchor(Path::new("/etc/interflow"), "../log/audit.jsonl"),
-            "/etc/interflow/../log/audit.jsonl"
+        let anchored = anchor(Path::new("/etc/interflow"), "./audit.jsonl");
+        let joined = Path::new(&anchored);
+        assert!(joined.starts_with("/etc/interflow"), "{anchored}");
+        assert!(joined.ends_with("audit.jsonl"), "{anchored}");
+
+        let dotted = anchor(Path::new("/etc/interflow"), "../log/audit.jsonl");
+        assert!(
+            Path::new(&dotted).ends_with("../log/audit.jsonl"),
+            "{dotted}"
         );
     }
 

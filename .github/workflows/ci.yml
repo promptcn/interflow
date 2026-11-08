@@ -284,7 +284,21 @@ jobs:
                    if (a[1] != "") printf "::error file=%s,line=%s::clippy: %s\n", a[1], a[2], msg }' msvc-clippy.log || true
             exit 1
           }
+      # Same annotation discipline as the clippy step above: this face is
+      # windows-only (no local gate compiles it), and its nextest panics
+      # print windows-backslash paths — the 0.12.0 cut burned another blind
+      # round here before the step learned to annotate.
       - name: unit tests on the Windows risk classes (NTFS atomic writes, SQLite store, config/paths)
-        run: cargo nextest run --all-features --lib -p interflow-util -p interflow-identity -p interflow-core -p interflow-buildinfo -p interflow-contract
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo nextest run --all-features --lib -p interflow-util -p interflow-identity -p interflow-core -p interflow-buildinfo -p interflow-contract \
+            2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee win-unit.log || {
+            awk '/^ *FAIL/ { printf "::error::nextest FAIL %s\n", substr($0, 1, 200) }
+                 /panicked at/ && match($0, /at [^ ]+:[0-9]+:[0-9]+/) {
+                   loc = substr($0, RSTART+3, RLENGTH-3); gsub(/\\/, "/", loc); split(loc, a, ":");
+                   if (a[1] != "") printf "::error file=%s,line=%s::%s\n", a[1], a[2], substr($0, 1, 200) }' win-unit.log || true
+            exit 1
+          }
       - name: mesh smoke (version face, pack assembly, agent lifecycle)
         run: cargo nextest run -p interflow-mesh --test platform_smoke --test version_face --test pack_quic_assembly

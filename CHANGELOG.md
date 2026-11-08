@@ -794,6 +794,13 @@ the first public release carrying this changelog.
   end to end. The windows clippy step also converts its diagnostics
   into public annotations, the channel the test stages already use.
   No production code changed.
+- The config path-anchoring tests asserted unix separator spellings
+  byte-for-byte and failed on the Windows risk face the moment the
+  clippy fix let windows-smoke reach its unit-test step (a face no
+  earlier round this release had exercised): the assertions compare
+  path components now (`Path::starts_with`/`ends_with`,
+  separator-agnostic), keeping the Windows coverage instead of gating
+  it off. No production code changed.
 
 ### Security
 
