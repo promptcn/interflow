@@ -7,10 +7,14 @@ import { describe, expect, it } from "vitest";
 import { idleTimeoutDefault, streamStatusKey, targetLocalNodeId } from "./streamFaces";
 
 describe("streamStatusKey", () => {
-  it("maps the four states onto the shared status vocabulary", () => {
+  it("maps the states onto the shared status vocabulary", () => {
     expect(streamStatusKey("serving")).toBe("success");
     expect(streamStatusKey("down")).toBe("critical");
     expect(streamStatusKey("catching_up")).toBe("warn");
+  });
+
+  it("paused is YELLOW, not red — planned unavailability is intent, not a fault", () => {
+    expect(streamStatusKey("paused")).toBe("warn");
   });
 
   it("unknown maps to null — the hollow dot, never a guessed color", () => {

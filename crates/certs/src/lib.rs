@@ -21,9 +21,11 @@ pub mod ops;
 pub use material::{CaMaterial, LeafMaterial, LoadedCa, build_ca};
 pub use ops::{
     AgentCertPaths, AgentPaths, GATEWAY_CLIENT_CN, GatewayPaths, GeneratedCerts, Outcome,
-    ensure_agent_cert, ensure_gateway, ensure_hub_cert, ensure_tenant_ca, generate,
+    PublicCertMaterial, ensure_agent_cert, ensure_gateway, ensure_hub_cert, ensure_tenant_ca,
+    generate, inspect_public_pair,
 };
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::net::IpAddr;
 
@@ -100,6 +102,38 @@ impl SanName {
             Ok(Self::Dns(name.to_ascii_lowercase()))
         }
     }
+
+    /// Whether a certificate carrying this SAN entry serves `host`: DNS
+    /// names match exactly (this type lowercases on parse) or through a
+    /// single-label wildcard — `*.example.com` covers `app.example.com`,
+    /// never `a.b.example.com` nor the bare `example.com`; IPs match
+    /// exactly. The coverage question every hostname verifier asks, owned
+    /// by the SAN type it belongs to.
+    pub fn covers(&self, host: &str) -> bool {
+        match self {
+            Self::Dns(name) => {
+                if host.eq_ignore_ascii_case(name) {
+                    return true;
+                }
+                let Some(suffix) = name.strip_prefix("*.") else {
+                    return false;
+                };
+                let host = host.to_ascii_lowercase();
+                let Some(prefix) = host.strip_suffix(&format!(".{suffix}")) else {
+                    return false;
+                };
+                !prefix.is_empty() && !prefix.contains('.')
+            }
+            Self::Ip(ip) => host.parse::<IpAddr>().is_ok_and(|parsed| parsed == *ip),
+        }
+    }
+}
+
+/// Whether any SAN in the set serves `host` — a certificate "covers" a
+/// hostname when one of its SAN entries does (the SAN set is the only
+/// name authority modern clients honor; the CN is not consulted).
+pub fn san_set_covers(sans: &BTreeSet<SanName>, host: &str) -> bool {
+    sans.iter().any(|san| san.covers(host))
 }
 
 impl fmt::Display for SanName {
@@ -191,7 +225,46 @@ mod tests {
     fn local_dev_san_covers_both_dial_forms() {
         let san = local_dev_san();
         assert!(san.contains(&SanName::Dns("localhost".to_owned())));
-        assert!(san.contains(&SanName::Ip("127.0.0.1".parse().unwrap())));
+        assert!(san.contains(&SanName::Ip("127.0.0.1".parse::<IpAddr>().unwrap())));
+    }
+
+    /// The coverage rule: exact DNS (case-folded), one-label wildcards, exact
+    /// IP — and nothing else matches.
+    #[test]
+    fn san_name_covers_matrix() {
+        let dns = SanName::Dns("app.example.com".to_owned());
+        assert!(dns.covers("app.example.com"));
+        assert!(dns.covers("APP.EXAMPLE.COM"));
+        assert!(!dns.covers("other.example.com"));
+        assert!(!dns.covers("sub.app.example.com"));
+
+        let wildcard = SanName::Dns("*.example.com".to_owned());
+        assert!(wildcard.covers("app.example.com"));
+        assert!(wildcard.covers("App.Example.Com"));
+        assert!(!wildcard.covers("a.b.example.com"), "one label only");
+        assert!(
+            !wildcard.covers("example.com"),
+            "the bare zone never matches"
+        );
+        assert!(!wildcard.covers("example.com.evil.net"));
+
+        let ip = SanName::Ip("10.0.0.5".parse::<IpAddr>().unwrap());
+        assert!(ip.covers("10.0.0.5"));
+        assert!(!ip.covers("10.0.0.6"));
+        assert!(!ip.covers("app.example.com"));
+    }
+
+    /// A set covers when any entry does — the certificate's whole name
+    /// authority, one question.
+    #[test]
+    fn san_set_covers_any_entry() {
+        let mut sans = std::collections::BTreeSet::new();
+        sans.insert(SanName::Dns("*.wild.example.com".to_owned()));
+        sans.insert(SanName::Dns("b.example.com".to_owned()));
+        assert!(san_set_covers(&sans, "a.wild.example.com"));
+        assert!(san_set_covers(&sans, "B.EXAMPLE.COM"));
+        assert!(!san_set_covers(&sans, "c.example.com"));
+        assert!(!san_set_covers(&sans, "wild.example.com"));
     }
 
     #[test]

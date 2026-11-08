@@ -302,6 +302,59 @@ impl PeersPlane {
     }
 }
 
+/// The renewal loop's CRL-poll liveness plane for one node — the LOCAL
+/// face (the GUI's node detail reads it in-process; fleet rows come from
+/// the hub's floor face instead). Value plus confirmation instant, the
+/// level-face shape: `last_success_unix` advances on every successful
+/// poll (no-change included), and a wedge that stops advancing is the
+/// "is the poll loop alive" answer
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrlPollPlane {
+    /// Unix seconds of the last successful CRL poll; `0` = never.
+    pub last_success_unix: u64,
+    /// Failed polls since the node's process started.
+    pub failures_total: u64,
+}
+
+impl CrlPollPlane {
+    /// Assembles the live face from the renewal loop's atomics — the one
+    /// construction the event forwarder uses (same contract as
+    /// [`PeersPlane::live`]).
+    const fn live(snap: interflow_renewal::CrlPollSnapshot) -> Self {
+        Self {
+            last_success_unix: snap.last_success_unix,
+            failures_total: snap.failures_total,
+        }
+    }
+}
+
+/// The egress breaker open-set plane for one running mesh agent — the
+/// local read face of the breaker table (2026-10-19): WHICH targets are
+/// OPEN, WHEN they tripped, WHEN the recovery machinery last probed.
+/// A dead target reads as an old `opened_unix`; a dead recovery prober
+/// as a `last_probe_unix` that stopped advancing on a still-open entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakerOpenFace {
+    /// The dial key (`tcp:host:port` / `udp:host:port`).
+    pub target: String,
+    /// Unix seconds of the trip; `0` = unknown.
+    pub opened_unix: u64,
+    /// Unix seconds of the last admitted probe; `0` = never.
+    pub last_probe_unix: u64,
+}
+
+impl BreakerOpenFace {
+    /// Maps the engine's row (the one construction shared by the query
+    /// path and the event forwarder).
+    fn from_row(row: interflow_mesh::agent::target_breaker::BreakerOpenRow) -> Self {
+        Self {
+            target: row.target,
+            opened_unix: row.opened_unix,
+            last_probe_unix: row.last_probe_unix,
+        }
+    }
+}
+
 /// One peer of the tenant's fleet as the node's peer watcher reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerStatus {
@@ -334,6 +387,10 @@ pub struct ListenerStatusFace {
     pub bound_addr: Option<String>,
     /// The last bind failure (`None` = healthy).
     pub last_error: Option<String>,
+    /// The stream is paused by intent (planned unavailability): no
+    /// listener SHOULD be up, the port is deliberately free — its own
+    /// face, not a bind failure.
+    pub paused: bool,
 }
 
 impl ListenerStatusFace {
@@ -349,6 +406,7 @@ impl ListenerStatusFace {
                 rule,
                 bound_addr: status.bound_addr.map(|a| a.to_string()),
                 last_error: status.last_error,
+                paused: status.paused,
             })
             .collect();
         faces.sort_by(|a, b| a.rule.cmp(&b.rule));
@@ -610,9 +668,11 @@ enum Prepared {
     Expose(interflow_expose::client::ExposeArgs),
     /// The mesh agent config. The signed-policy plane (and the pack dir it
     /// reads) rides the config itself — the engine spawns its own watcher
-    /// at start.
+    /// at start. `offline` = the pack's identity mode (the liveness face
+    /// attaches only to polling nodes).
     Mesh {
         config: AgentConfig,
+        offline: bool,
     },
     /// The hub config — the signed-policy ACL watcher rides the engine's
     /// run future via the config's policy plane (pack_dir embedded by
@@ -702,7 +762,11 @@ fn prepare(spec: &NodeSpec) -> Result<Prepared, String> {
                 });
             config.agent.hub_quic_addr = quic_addr;
             config.agent.log_name = Some(log_attribution(spec));
-            Ok(Prepared::Mesh { config })
+            Ok(Prepared::Mesh {
+                config,
+                offline: pack.metadata.identity_mode
+                    == interflow_identity::manifest::IdentityMode::Offline,
+            })
         }
         NodeKind::Hub => {
             if pack.metadata.kind != PackKind::Hub {
@@ -917,6 +981,11 @@ struct NodeEntry {
     state: NodeState,
     engine: Option<Engine>,
     renewal: Option<tokio::task::AbortHandle>,
+    /// The renewal loop's CRL-poll liveness face while the node runs —
+    /// the query-side source for the node detail's local "CRL polling"
+    /// panel (the event forwarder patches the live view; this serves the
+    /// list_nodes baseline). Cleared when the engine stops.
+    crl_face: Option<std::sync::Arc<interflow_renewal::CrlPollFace>>,
     restart: SupervisorRestartPolicy,
     /// Bumped on every start and stop; listener/restart tasks carry the
     /// generation they were spawned for and go quiet once it advances.
@@ -960,6 +1029,15 @@ pub type ProposalsSink =
 /// the honesty axis of the 2026-10-09 case: a green card plus a gone
 /// listener must surface as exactly that, not as nothing.
 pub type ListenersSink = Arc<dyn Fn(&str, &[ListenerStatusFace]) + Send + Sync>;
+/// Delivers a running node's CRL-poll liveness plane to the UI (wired to
+/// the frontend `mesh-crl` event). Fired by the forwarder task whenever
+/// the renewal loop's level moves — the local half of the 2026-10-19
+/// liveness face (fleet rows come from the hub's floor face).
+pub type CrlSink = Arc<dyn Fn(&str, &CrlPollPlane) + Send + Sync>;
+/// Delivers a running mesh agent's egress-breaker open set to the UI
+/// (wired to the frontend `mesh-breakers` event). Fired by the forwarder
+/// task on every open-set change — trip, recovery, cap eviction.
+pub type BreakersSink = Arc<dyn Fn(&str, &[BreakerOpenFace]) + Send + Sync>;
 
 /// What the manager tells its sinks, in order. Mutation code only ever
 /// *sends* these — inside the critical section, right where the state is
@@ -1003,6 +1081,19 @@ enum ManagerEvent {
         id: NodeId,
         faces: Vec<ListenerStatusFace>,
     },
+    /// A running node's CRL-poll liveness plane moved (forwarder task →
+    /// [`CrlSink`]). Mirrors the renewal loop's atomics, not manager
+    /// state — same outside-the-lock contract.
+    CrlPlane {
+        id: NodeId,
+        plane: CrlPollPlane,
+    },
+    /// A running mesh agent's egress-breaker open set moved (forwarder
+    /// task → [`BreakersSink`]). Mirrors the engine table's watch face.
+    BreakersPlane {
+        id: NodeId,
+        rows: Vec<BreakerOpenFace>,
+    },
     /// Round-trip marker behind [`NodeManager::settle`].
     Settled {
         ack: tokio::sync::oneshot::Sender<()>,
@@ -1015,6 +1106,7 @@ pub type RenewalFactory = Arc<
     dyn Fn(
             PathBuf,
             String,
+            std::sync::Arc<interflow_renewal::CrlPollFace>,
         ) -> Pin<Box<dyn Future<Output = interflow_core::error::Result<()>> + Send>>
         + Send
         + Sync,
@@ -1126,6 +1218,7 @@ pub struct NodeSnapshot {
 }
 
 impl NodeManager {
+    #[allow(clippy::too_many_arguments)] // one sink per engine face, passed explicitly (the family's shape)
     pub fn new(
         rt: tokio::runtime::Handle,
         on_state: impl Fn(&str, &NodeState) + Send + Sync + 'static,
@@ -1137,6 +1230,8 @@ impl NodeManager {
         + Sync
         + 'static,
         on_listeners: impl Fn(&str, &[ListenerStatusFace]) + Send + Sync + 'static,
+        on_crl: impl Fn(&str, &CrlPollPlane) + Send + Sync + 'static,
+        on_breakers: impl Fn(&str, &[BreakerOpenFace]) + Send + Sync + 'static,
     ) -> Self {
         Self::with_renewal(
             rt,
@@ -1146,17 +1241,24 @@ impl NodeManager {
             on_peers_plane,
             on_proposals,
             on_listeners,
-            Arc::new(|pack_dir, log_name| {
+            on_crl,
+            on_breakers,
+            Arc::new(|pack_dir, log_name, face| {
                 // The future owns the path (it outlives the closure call).
                 Box::pin(async move {
-                    interflow_renewal::renewal_scheduler_with_log_name(&pack_dir, Some(log_name))
-                        .await
+                    interflow_renewal::renewal_scheduler_with_log_name(
+                        &pack_dir,
+                        Some(log_name),
+                        face,
+                    )
+                    .await
                 }) as Pin<Box<dyn Future<Output = _> + Send>>
             }),
         )
     }
 
     /// Test seam: injectable renewal future.
+    #[allow(clippy::too_many_arguments)] // one sink per engine face, passed explicitly (the family's shape)
     pub fn with_renewal(
         rt: tokio::runtime::Handle,
         on_state: impl Fn(&str, &NodeState) + Send + Sync + 'static,
@@ -1168,6 +1270,8 @@ impl NodeManager {
         + Sync
         + 'static,
         on_listeners: impl Fn(&str, &[ListenerStatusFace]) + Send + Sync + 'static,
+        on_crl: impl Fn(&str, &CrlPollPlane) + Send + Sync + 'static,
+        on_breakers: impl Fn(&str, &[BreakerOpenFace]) + Send + Sync + 'static,
         renewal: RenewalFactory,
     ) -> Self {
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1179,6 +1283,8 @@ impl NodeManager {
         let on_peers_plane: PeersSink = Arc::new(on_peers_plane);
         let on_proposals: ProposalsSink = Arc::new(on_proposals);
         let on_listeners: ListenersSink = Arc::new(on_listeners);
+        let on_crl: CrlSink = Arc::new(on_crl);
+        let on_breakers: BreakersSink = Arc::new(on_breakers);
         rt.spawn(async move {
             while let Some(event) = rx.recv().await {
                 match event {
@@ -1188,6 +1294,8 @@ impl NodeManager {
                     ManagerEvent::PeersPlane { id, plane } => on_peers_plane(&id, &plane),
                     ManagerEvent::Proposals { id, receipts } => on_proposals(&id, &receipts),
                     ManagerEvent::Listeners { id, faces } => on_listeners(&id, &faces),
+                    ManagerEvent::CrlPlane { id, plane } => on_crl(&id, &plane),
+                    ManagerEvent::BreakersPlane { id, rows } => on_breakers(&id, &rows),
                     ManagerEvent::Settled { ack } => {
                         let _ = ack.send(());
                     }
@@ -1290,6 +1398,7 @@ impl NodeManager {
                     state: NodeState::Stopped,
                     engine: None,
                     renewal: None,
+                    crl_face: None,
                     restart: SupervisorRestartPolicy::new(),
                     generation: 0,
                     spec: spec.spec,
@@ -1360,6 +1469,7 @@ impl NodeManager {
                 state: NodeState::Stopped,
                 engine: None,
                 renewal: None,
+                crl_face: None,
                 restart: SupervisorRestartPolicy::new(),
                 generation: 0,
                 spec,
@@ -1712,6 +1822,41 @@ impl NodeManager {
     /// live presence reading to show — `None` (deliberately no stale
     /// last-known display: presence is meaningless without the session
     /// that observed it).
+    /// The mesh agent's egress-breaker open set (running, breaker
+    /// enabled) — the query-side read for the list_nodes baseline.
+    /// `None` for other kinds, stopped nodes, and breaker-disabled
+    /// configs.
+    pub fn breakers_plane(&self, id: &str) -> Option<Vec<BreakerOpenFace>> {
+        let inner = self.lock();
+        let entry = inner.nodes.get(id)?;
+        if entry.spec.kind != NodeKind::MeshAgent {
+            return None;
+        }
+        match entry.engine.as_ref() {
+            Some(Engine::Agent { handle }) => handle.breaker_state().map(|state| {
+                state
+                    .snapshot()
+                    .into_iter()
+                    .map(BreakerOpenFace::from_row)
+                    .collect()
+            }),
+            _ => None,
+        }
+    }
+
+    /// The node's CRL-poll liveness plane (any agent/edge kind, running) —
+    /// the local query-side read of the renewal loop's level. `None` for
+    /// stopped nodes and kinds without a renewal loop.
+    pub fn crl_plane(&self, id: &str) -> Option<CrlPollPlane> {
+        let inner = self.lock();
+        let entry = inner.nodes.get(id)?;
+        entry.engine.as_ref()?;
+        entry
+            .crl_face
+            .as_ref()
+            .map(|face| CrlPollPlane::live(face.snapshot()))
+    }
+
     pub fn peers_plane(&self, id: &str) -> Option<PeersPlane> {
         let inner = self.lock();
         let entry = inner.nodes.get(id)?;
@@ -1866,8 +2011,16 @@ impl NodeManager {
     ) -> Result<(), String> {
         let _rt = self.rt.enter();
         let generation = entry.generation;
+        // The renewal face: one `Arc` shared by the engine's liveness
+        // reporter (agent kinds, when the node actually polls), the
+        // renewal future below, and the local plane forwarder — one truth
+        // per node, the same shape every binary assembly uses.
+        let renewal_face = std::sync::Arc::new(interflow_renewal::CrlPollFace::new());
         match prepared {
-            Prepared::Expose(args) => {
+            Prepared::Expose(mut args) => {
+                if !args.identity_offline {
+                    args.renewal_face = Some(std::sync::Arc::clone(&renewal_face));
+                }
                 entry.service_table = Some(args.service_addresses.clone());
                 let handle = interflow_expose::client::start(&args)
                     .map_err(|e| format!("cannot start: {e}"))?;
@@ -1876,10 +2029,16 @@ impl NodeManager {
                 entry.state = handle.state().into();
                 entry.engine = Some(Engine::Agent { handle });
             }
-            Prepared::Mesh { config, .. } => {
-                let handle = AgentClient::new(config)
-                    .map_err(|e| format!("cannot start: {e}"))?
-                    .start();
+            Prepared::Mesh { config, offline } => {
+                let client = if offline {
+                    AgentClient::new(config)
+                } else {
+                    AgentClient::with_renewal_face(
+                        config,
+                        Some(std::sync::Arc::clone(&renewal_face)),
+                    )
+                };
+                let handle = client.map_err(|e| format!("cannot start: {e}"))?.start();
                 // The signed-policy watcher is the engine's own (the config
                 // carries the policy plane) — same path the CLI binary and
                 // every e2e take; there is no GUI-side wiring to drift. The
@@ -1901,6 +2060,13 @@ impl NodeManager {
                 // forwarder mirrors the peers one.
                 let proposals_rx = handle.proposal_state().subscribe();
                 self.clone().spawn_proposals_forwarder(id, proposals_rx);
+                // The egress-breaker open-set face (2026-10-19): a real
+                // watch channel — subscribe and forward, the peers
+                // forwarder's shape verbatim.
+                if let Some(breakers) = handle.breaker_state() {
+                    let breakers_rx = breakers.subscribe();
+                    self.clone().spawn_breakers_forwarder(id, breakers_rx);
+                }
                 // The ingress-listener actual-state face (what is really
                 // listening) — the 2026-10-09 honesty axis. Same
                 // hold-only-the-subscription contract.
@@ -1921,7 +2087,10 @@ impl NodeManager {
                 entry.state = handle.state().into();
                 entry.engine = Some(Engine::Hub { handle });
             }
-            Prepared::Ingress(config) => {
+            Prepared::Ingress(mut config) => {
+                if !config.identity_offline {
+                    config.renewal_face = Some(std::sync::Arc::clone(&renewal_face));
+                }
                 let engine = FutureEngine::spawn_ingress(config, &self.rt);
                 self.clone()
                     .spawn_lifecycle_listener(id, generation, engine.state.clone());
@@ -1934,9 +2103,36 @@ impl NodeManager {
             generation,
             entry.spec.pack_dir.clone(),
             log_attribution(&entry.spec),
+            std::sync::Arc::clone(&renewal_face),
         ));
+        entry.crl_face = Some(std::sync::Arc::clone(&renewal_face));
+        // The local liveness plane (node detail's "CRL polling" panel):
+        // ticks the face's atomics — the level moves once per poll cycle,
+        // so the change-guarded sends stay quiet in steady state.
+        self.clone()
+            .spawn_crl_face_forwarder(id, generation, renewal_face);
         self.record_state(id, &entry.state);
         Ok(())
+    }
+
+    /// Stream pause/resume on a LOCAL mesh node (the in-process command
+    /// path — no wire, no hub dependency; the node's intent watcher
+    /// reports the change upstream on its next exchange). Idempotent:
+    /// pausing a paused stream / resuming a serving one is a quiet no-op.
+    /// Returns whether the intent changed.
+    pub fn stream_pause_resume(&self, id: &str, name: &str, pause: bool) -> Result<bool, String> {
+        let inner = self.lock();
+        let Some(entry) = inner.nodes.get(id) else {
+            return Err("unknown node".into());
+        };
+        let Some(Engine::Agent { handle }) = &entry.engine else {
+            return Err("node is not a running mesh agent".into());
+        };
+        Ok(if pause {
+            handle.pause_stream(name)
+        } else {
+            handle.resume_stream(name)
+        })
     }
 
     /// User stop: clears the start intent, cancels renewal, shuts the
@@ -1955,6 +2151,7 @@ impl NodeManager {
             }
             let engine = entry.engine.take();
             entry.service_table = None;
+            entry.crl_face = None;
             let name = engine.as_ref().map(|_| log_attribution(&entry.spec));
             entry.generation += 1;
             self.record_persist(inner.profile_entries());
@@ -2176,6 +2373,81 @@ impl NodeManager {
                 let _ = manager.events.send(ManagerEvent::PeersPlane {
                     id: id.clone(),
                     plane,
+                });
+            }
+        });
+    }
+
+    /// Any running node: forwards the renewal loop's CRL-poll liveness
+    /// level into the event queue (→ [`CrlSink`] → the node detail's "CRL
+    /// polling" panel). The face is plain atomics (no watch channel — the
+    /// renewal crate deliberately stays runtime-free), so this forwarder
+    /// TICKS instead of subscribing: change-guarded sends keep it quiet in
+    /// steady state (the level moves once per poll cycle), and the
+    /// generation guard rides the task down on stop/restart.
+    fn spawn_crl_face_forwarder(
+        self,
+        id: &str,
+        generation: u64,
+        face: std::sync::Arc<interflow_renewal::CrlPollFace>,
+    ) {
+        let rt = self.rt.clone();
+        let manager = self;
+        let id = id.to_string();
+        rt.spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_sent: Option<CrlPollPlane> = None;
+            loop {
+                ticker.tick().await;
+                if manager.generation_of(&id) != Some(generation) {
+                    return; // the node moved on (stop or restart bumped it)
+                }
+                let plane = CrlPollPlane::live(face.snapshot());
+                if last_sent != Some(plane) {
+                    last_sent = Some(plane);
+                    let _ = manager.events.send(ManagerEvent::CrlPlane {
+                        id: id.clone(),
+                        plane,
+                    });
+                }
+            }
+        });
+    }
+
+    /// The node's current generation, `None` when the node is gone — the
+    /// tick-based forwarders' ride-down guard.
+    fn generation_of(&self, id: &str) -> Option<u64> {
+        let inner = self.lock();
+        inner.nodes.get(id).map(|entry| entry.generation)
+    }
+
+    /// Mesh agents: forwards the egress-breaker table's open set into
+    /// the event queue (→ [`BreakersSink`] → the node detail's "Egress
+    /// breakers" panel). Same hold-only-the-subscription contract as the
+    /// peers forwarder — when the engine drops, the table's sender goes
+    /// with it, `changed()` errors, the task rides down.
+    fn spawn_breakers_forwarder(
+        self,
+        id: &str,
+        mut rx: tokio::sync::watch::Receiver<
+            Vec<interflow_mesh::agent::target_breaker::BreakerOpenRow>,
+        >,
+    ) {
+        let rt = self.rt.clone();
+        let manager = self;
+        let id = id.to_string();
+        rt.spawn(async move {
+            while rx.changed().await.is_ok() {
+                let rows: Vec<BreakerOpenFace> = rx
+                    .borrow_and_update()
+                    .clone()
+                    .into_iter()
+                    .map(BreakerOpenFace::from_row)
+                    .collect();
+                let _ = manager.events.send(ManagerEvent::BreakersPlane {
+                    id: id.clone(),
+                    rows,
                 });
             }
         });
@@ -2479,13 +2751,14 @@ impl NodeManager {
         generation: u64,
         pack_dir: PathBuf,
         log_name: String,
+        face: std::sync::Arc<interflow_renewal::CrlPollFace>,
     ) -> tokio::task::AbortHandle {
         let renewal = self.renewal.clone();
         let manager = self.clone();
         let id = id.to_string();
         self.rt
             .spawn(async move {
-                match (renewal)(pack_dir, log_name).await {
+                match (renewal)(pack_dir, log_name, face).await {
                     Ok(()) => manager.renewal_completed(&id, generation).await,
                     Err(e) => manager.renewal_failed(&id, generation, e),
                 }
@@ -2835,7 +3108,7 @@ target_addr = "127.0.0.1:1"
     /// Never-completes renewal (the scheduler's steady state between 50%-TTL
     /// rotations).
     fn pending_renewal() -> RenewalFactory {
-        Arc::new(|_pack_dir, _log_name| {
+        Arc::new(|_pack_dir, _log_name, _face| {
             Box::pin(std::future::pending::<interflow_core::error::Result<()>>())
         })
     }
@@ -2985,6 +3258,8 @@ target_addr = "127.0.0.1:{echo_port}"
                     .push((id.to_string(), receipts.to_vec()));
             },
             |_, _| {}, // no listeners assertion in this stack
+            |_, _| {}, // no crl-plane assertion in this stack
+            |_, _| {}, // no breakers assertion in this stack
             renewal,
         );
         *manager_slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(manager.clone());
@@ -3658,19 +3933,21 @@ target_addr = "127.0.0.1:{echo_port}"
         );
 
         // The class-level lock: every line from every mesh-agent module
-        // carries one of the stack's node attributions — a bare (or
-        // foreign-valued) `node` field anywhere fails here. This is the
-        // machine-enforced half of the fix: per-line annotation discipline
-        // is no longer a convention but an invariant under test.
+        // carries A node attribution — a bare `node` field anywhere fails
+        // here. This is the machine-enforced half of the fix: per-line
+        // annotation discipline is no longer a convention but an invariant
+        // under test. (The capture buffer is process-global and libtest
+        // runs this suite's stacks in parallel — and sibling stacks reuse
+        // the same lan-a/lan-b node names with their own suffix hashes —
+        // so foreign-attributed lines cannot be told apart from ours:
+        // only BARE lines are offenders, which is the invariant that
+        // matters.)
         let offenders = attributed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .filter(|(target, ..)| target.starts_with("interflow_mesh::agent"))
-            .filter(|(_, node, _)| {
-                node.as_deref() != Some(lan_a_attr.as_str())
-                    && node.as_deref() != Some(lan_b_attr.as_str())
-            })
+            .filter(|(_, node, _)| node.is_none())
             .map(|(target, node, message)| (*target, node.clone(), message.clone()))
             .collect::<Vec<_>>();
         // Non-vacuity: the assertion below only means something if the
@@ -3689,8 +3966,8 @@ target_addr = "127.0.0.1:{echo_port}"
         );
         assert!(
             offenders.is_empty(),
-            "every interflow_mesh::agent::* line must carry one of the node attributions \
-             ({lan_a_attr} / {lan_b_attr}); bare or misattributed lines: {offenders:?}"
+            "every interflow_mesh::agent::* line must carry a node attribution; bare lines: \
+             {offenders:?}"
         );
     }
 
@@ -4138,6 +4415,8 @@ target_addr = "127.0.0.1:{dead_port}"
             },
             |_, _| {},
             |_, _| {},
+            |_, _| {},
+            |_, _| {},
             pending_renewal(),
         );
 
@@ -4558,7 +4837,7 @@ target_addr = "127.0.0.1:{echo_port}"
         let (fire_tx, fire_rx) = tokio::sync::oneshot::channel::<()>();
         *gate.lock().unwrap() = Some(fire_rx);
         let gate_for_factory = gate.clone();
-        let renewal: RenewalFactory = Arc::new(move |_dir, _log_name| {
+        let renewal: RenewalFactory = Arc::new(move |_dir, _log_name, _face| {
             let rx = gate_for_factory.lock().unwrap().take();
             Box::pin(async move {
                 match rx {
@@ -4718,6 +4997,8 @@ service = "default/desktop/web"
             |_, _| {}, // ...and neither does the peers face
             |_, _| {}, // ...nor the proposal receipts face
             |_, _| {}, // ...nor the listeners face
+            |_, _| {}, // ...nor the CRL-poll face
+            |_, _| {}, // ...nor the breakers face
             pending_renewal(),
         );
 

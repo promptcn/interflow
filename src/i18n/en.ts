@@ -18,6 +18,10 @@ export const EN = {
   "app.buildTag": "Build tag",
   "app.copyBuildIdentity": "Copy build identity",
   "app.dismiss": "dismiss",
+  "notice.prefsRetired":
+    "Stored preferences were written by an older build and were retired by this upgrade — remove prefs.db to start fresh, then import your node pack or open a current deployment.",
+  "notice.deploymentGone":
+    "The remembered deployment no longer opens as one — retired by an upgrade or moved. Open a current deployment or import a node pack.",
 
   // ---- shared words ---------------------------------------------------
   "common.cancel": "Cancel",
@@ -138,6 +142,10 @@ export const EN = {
     "The control-plane pull channel's own liveness — never having pulled (while online) means new policies will never arrive",
   "nodeDetail.policyPullNever": "never completed a pull ⚠",
   "nodeDetail.policyPullOk": "{ago} ago · {fails} failure(s)",
+  "nodeDetail.crlPoll": "CRL polling",
+  "nodeDetail.crlPollTitle":
+    "The renewal loop\u2019s CRL-poll liveness — the confirmation instant of the last successful poll (a no-change poll counts: polled, nothing moved). A level that stops advancing while the node runs is a wedged poll loop; the 1h fail-closed bound only fires if the loop itself still runs.",
+  "nodeDetail.crlPollOk": "{ago} ago · {fails} failed poll(s)",
   "nodeDetail.policyTitle":
     "The signed policy this node actually runs, and which channel it came from",
   "nodeDetail.credentialsExpire": "Credentials expire",
@@ -189,7 +197,9 @@ export const EN = {
   "overview.chooseAction": "Open manifest…",
   "overview.createTitle": "New deployment",
   "overview.createHint":
-    "Pick a starter skeleton — the file you save becomes the manifest this pane works from.",
+    "Pick a starter skeleton — the file you save becomes the manifest this pane works \
+     from. This starts a brand-NEW deployment; to join an existing one, open its folder \
+     or import its node pack.",
   "overview.stepFixSyntax": "Fix the manifest's TOML syntax: {error}",
   "overview.stepIssues": "Resolve {n} issue(s): {first}",
   "overview.stepValid": "Document valid",
@@ -204,6 +214,8 @@ export const EN = {
   "overview.changeApplied": "All applied · gen {gen}",
   "overview.changePolicy": "Rule edits pending apply",
   "overview.changeIdentity": "Identity changes pending apply",
+  "overview.changePackTreeStale": "Pack tree stale · re-render pending apply",
+  "overview.changeWatermarksDiverged": "Watermarks diverged · re-publish pending apply",
 
   "stream.addTitle": "Add stream",
   "stream.adjustTitle": "Adjust stream {name}",
@@ -541,11 +553,66 @@ export const EN = {
   "fleet.localNode": "this machine",
   "fleet.unknown": "unknown",
   "fleet.undeclared": "undeclared",
+  "fleet.maintenance": "maintenance",
+  "fleet.maintenanceHint": "planned absence — the leg being down is expected, not an accident; the declaration lifts itself when the node rejoins",
+  "fleet.maintenanceHintPaused": "planned absence; {count} stream(s) paused",
+  "fleet.maintenanceDeclare": "declare maintenance",
+  "fleet.maintenanceLift": "lift maintenance",
   "fleet.undeclaredHint":
     "registered at the hub but not declared by the manifest, or a local sealed import",
   "fleet.lineageStale": "serving behind floor",
   "fleet.lineageStaleHint":
     "The policy generation the hub serves is behind its own floor watermark — the signature of a stalled lineage.",
+  "fleet.policyPulled": "pulled {ago} ago",
+  "fleet.policySilent": "policy face silent {ago}",
+  "fleet.policySilentHint":
+    "The watermark holds but its confirmation instant stopped advancing — the policy watcher may be dead while the node stays online; the hub-side sweeper pushes this transition the moment it crosses the threshold.",
+  "fleet.policyNever": "no completed pull",
+  "fleet.crlPolled": "crl polled {ago} ago",
+  "fleet.crlSilent": "crl poll silent {ago}",
+  "fleet.crlSilentHint":
+    "The renewal loop\u2019s confirmation instant stopped advancing \u2014 the CRL poll loop may be wedged while the node stays online (the 1h fail-closed bound only fires if the loop itself still runs).",
+  "fleet.crlFailures": "{count} failed polls",
+  "fleet.routeBreaker": "route breaker OPEN: {host} ({ago})",
+  "fleet.routeBreakerHint":
+    "The edge gateway is rejecting traffic to this host pre-dial; the last recovery probe was {probe} ago — a probe age that keeps growing on a stuck entry is the dead-recovery-machinery signature.",
+  "fleet.watchersArmed": "watchers {count}/{count} armed",
+  "fleet.watcherSilent": "watcher {name} silent {ago}",
+  "fleet.connReconnects": "{count} reconnects/h",
+  "fleet.connReconnectingHint":
+    "This leg re-established its session inside the reconnect window — chronic instability. Reconnects climbing together with the renewal backoff ladder is the long-term-loss edge.",
+  "fleet.connProbes": "{count} probes unanswered",
+  "fleet.connProbesHint":
+    "Demanding liveness roundtrips went unanswered while the heartbeat stays in-register — the one-way-blackhole signature. Check `circuit evicted` on the hub before assuming the network.",
+  "fleet.leafRemaining": "leaf {left} left",
+  "fleet.leafYellowOfflineHint":
+    "Fewer than one rotate-ceremony lead remains on this offline-tier leaf — rotate with interflow-cli rotate before the red line (the node stops serving at expiry).",
+  "fleet.leafYellowRegistrarHint":
+    "The registrar-tier leaf is aging past its warn line — renewal is not landing as fast as the leaf burns; check the registrar.",
+  "fleet.leafRedHint":
+    "Inside the backup window: rotate NOW with interflow-cli rotate — the node stops serving at expiry, and a failed ceremony here has no margin left.",
+  "fleet.fossilStream": "stream {name} idle {ago}",
+  "fleet.fossilHint":
+    "This stream rule is mounted and its listener armed, but no byte has crossed for longer than a multiple of its own idle budget — the service may be gone or the rule ready to remove (removal is a plan-apply operation).",
+  "fleet.headroomTight": "sessions {pct}% headroom",
+  "fleet.headroomHint":
+    "Remaining stream-admission capacity fell under the warn line — chronic growth will hit the admission wall; check the session count growth before it rejects Opens.",
+  "fleet.queuedOps": "{count} queued op(s) waiting ({ago})",
+  "fleet.queuedHint":
+    "Operator stream ops queued at the hub for this leg — the node is offline or has not exchanged; they apply on its next check-in.",
+  "fleet.queuedStuckHint":
+    "The leg is ONLINE but queued ops outlived the delivery budget — the node's intent watcher is not consuming (a working loop delivers within one watch interval).",
+  "fleet.queuedDropped": "mailbox dropped {count} op(s)",
+  "fleet.queuedDroppedHint":
+    "The hub's stream-op mailbox overflowed at least once — an op was dropped (the oldest undelivered one); re-issue if it mattered.",
+  "fleet.watcherSilentHint":
+    "This resident hub task stopped ticking more than 3\u00d7 its own {interval}s cadence \u2014 the task is wedged while the hub keeps serving; check the journal for its last output before the silence started.",
+  "nodeDetail.egressBreakers": "Egress breakers",
+  "nodeDetail.egressBreakersNone": "all targets healthy",
+  "nodeDetail.breakerOpen": "OPEN {ago}",
+  "nodeDetail.breakerProbe": "probed {ago} ago",
+  "nodeDetail.egressBreakersHint":
+    "The per-target circuit breakers currently OPEN (connect failures tripped them; Opens are rejected pre-dial). The probe age shows when the recovery prober last checked — one that stops advancing while entries stay open is a dead prober.",
   "dep.switcher.realms": "Local realms (read-only)",
   "dep.switcher.lockedHint":
     "inferred from this machine's packs — fleet observation only, read-only",
@@ -561,6 +628,12 @@ export const EN = {
     "A deployment is one folder — the deployment file, the issuer store, and the rendered node credentials live together. Pick an existing one or create it from a template.",
   "dep.onboarding.open": "Open deployment…",
   "dep.onboarding.create": "New from template…",
+  "dep.onboarding.importPack": "Import a node pack…",
+  "dep.onboarding.importPackHint":
+    "A .iflowpack carries the node's identity and hub endpoint — agent machines start here, no deployment tree needed.",
+  "dep.onboarding.advanced": "Advanced",
+  "dep.onboarding.createHint":
+    "Starts a brand-new deployment (not joining an existing one).",
   "dep.onboarding.discovered": "Found on this machine",
   "dep.status.saved": "All changes published",
   "dep.status.dirty": "Unsaved edits",
@@ -609,6 +682,8 @@ export const EN = {
   "dep.streams.add": "+ Add stream",
   "dep.streams.save": "Save",
   "dep.streams.adjust": "Adjust",
+  "dep.streams.pause": "pause",
+  "dep.streams.resume": "resume",
   "dep.streams.rename": "Rename",
   "dep.streams.delete": "Delete",
   "dep.streams.renameTitle": "Rename stream",
@@ -618,6 +693,7 @@ export const EN = {
   "dep.streams.deleteBody":
     "The stream stops serving after the next publish; the manifest entry is removed immediately.",
   "dep.streams.status.serving": "serving",
+  "dep.streams.status.paused": "paused",
   "dep.streams.status.down": "down",
   "dep.streams.status.catchingUp": "catching up",
   "dep.streams.status.unknown": "unknown",

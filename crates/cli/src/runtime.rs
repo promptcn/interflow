@@ -141,6 +141,7 @@ pub fn init_node_logging() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_ansi(interflow_core::telemetry::ansi_enabled())
         .try_init();
 }
 
@@ -148,10 +149,17 @@ pub async fn run_ingress(pack_dir: &Path) -> Result<()> {
     init_node_logging();
     let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
     let active = ActiveCredentialSet::load_or_bootstrap(&pack).map_err(pack_error)?;
-    let config = build_edge_config(&pack, &active, pack_dir)?;
+    let mut config = build_edge_config(&pack, &active, pack_dir)?;
+    // The edge's own renewal face: one `Arc` shared by the scheduler spawn
+    // below and the embedded hub's liveness self slot. Offline-identity
+    // edges attach none (nothing polls, so nothing reports).
+    let renewal_face = std::sync::Arc::new(interflow_renewal::CrlPollFace::new());
+    if pack.metadata.identity_mode != interflow_identity::manifest::IdentityMode::Offline {
+        config.renewal_face = Some(std::sync::Arc::clone(&renewal_face));
+    }
     tokio::select! {
         result = interflow_expose::edge::run(config) => result,
-        result = interflow_renewal::renewal_scheduler(pack_dir) => result,
+        result = interflow_renewal::renewal_scheduler(pack_dir, renewal_face) => result,
     }
 }
 
@@ -165,7 +173,7 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
         )));
     }
     pack.primary_identity().map_err(pack_error)?;
-    let args = build_agent_args(
+    let mut args = build_agent_args(
         &pack,
         &ActiveCredentialSet::load_or_bootstrap(&pack).map_err(pack_error)?,
         pack_dir,
@@ -177,6 +185,13 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
         None,
         &std::collections::BTreeMap::new(),
     )?;
+    // The renewal face: one `Arc` shared by the scheduler spawn below and
+    // the client's liveness reporter. Offline-identity agents attach none
+    // (nothing polls, so nothing reports).
+    let renewal_face = std::sync::Arc::new(interflow_renewal::CrlPollFace::new());
+    if pack.metadata.identity_mode != IdentityMode::Offline {
+        args.renewal_face = Some(std::sync::Arc::clone(&renewal_face));
+    }
     let mut handle = interflow_expose::client::start(&args)?;
     outln!(
         "agent {} started: {} service(s) → {}",
@@ -208,7 +223,7 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
     });
     tokio::select! {
         () = wait_for_shutdown() => {},
-        result = interflow_renewal::renewal_scheduler(pack_dir) => result?,
+        result = interflow_renewal::renewal_scheduler(pack_dir, renewal_face) => result?,
     }
     pump.abort();
     handle.shutdown_graceful().await?;
@@ -460,6 +475,9 @@ pub fn build_agent_args(
         transport,
         hub_quic_addr,
         identity_offline: pack.metadata.identity_mode == IdentityMode::Offline,
+        // The headless agent's renewal face — set by the caller (run_agent)
+        // so the SAME `Arc` reaches the scheduler spawn.
+        renewal_face: None,
     })
 }
 

@@ -7,15 +7,11 @@
 //! from (internal design notes) — the
 //! loss branch is walked for real, in a test, on every run.
 
+mod common;
+use common::bin;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop(); // deps/
-    p.pop(); // tests/
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
 
 fn run_output(args: &[&str]) -> String {
     let output = Command::new(bin())

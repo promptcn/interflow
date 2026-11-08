@@ -15,6 +15,10 @@ export const ZH: Record<TKey, string> = {
   "app.buildTag": "构建标签",
   "app.copyBuildIdentity": "复制构建标识",
   "app.dismiss": "关闭",
+  "notice.prefsRetired":
+    "本机存储的偏好来自旧版本构建，已随本次升级退役——删除 prefs.db 重新开始，然后导入节点 pack 或打开现有部署。",
+  "notice.deploymentGone":
+    "记住的部署已无法作为部署打开——已随升级退役或被移动。请打开现有部署或导入节点 pack。",
 
   // ---- shared words ---------------------------------------------------
   "common.cancel": "取消",
@@ -135,6 +139,10 @@ export const ZH: Record<TKey, string> = {
     "控制面拉取通道自身的存活——节点在线却从未拉取成功,意味着新策略永远到不了本节点",
   "nodeDetail.policyPullNever": "从未成功拉取 ⚠",
   "nodeDetail.policyPullOk": "{ago} 前 · 累计失败 {fails} 次",
+  "nodeDetail.crlPoll": "CRL 轮询",
+  "nodeDetail.crlPollTitle":
+    "renewal 循环的 CRL 轮询存活——最近一次成功轮询的确认时刻（无变化也算成功：轮询过、没动）。节点运行中该时刻停更即轮询楔死；1 小时 fail-closed 界只有在循环还活着时才会触发。",
+  "nodeDetail.crlPollOk": "{ago} 前 · 累计失败 {fails} 次",
   "nodeDetail.credentialsExpire": "凭据过期",
   "nodeDetail.credentialsExpireTitle":
     "该节点的 leaf 凭据何时失效——请在那之前轮换",
@@ -184,7 +192,7 @@ export const ZH: Record<TKey, string> = {
   "overview.chooseAction": "打开 manifest…",
   "overview.createTitle": "新建部署",
   "overview.createHint":
-    "选一个起步骨架——保存的文件就是这个面板工作的 manifest。",
+    "选一个起步骨架——保存的文件就是这个面板工作的 manifest。这会新建一个全新部署；要接入现有部署，请打开其目录或导入其节点 pack。",
   "overview.stepFixSyntax": "修复 manifest 的 TOML 语法：{error}",
   "overview.stepIssues": "解决 {n} 个问题：{first}",
   "overview.stepValid": "文档合法",
@@ -199,6 +207,8 @@ export const ZH: Record<TKey, string> = {
   "overview.changeApplied": "全部已应用 · gen {gen}",
   "overview.changePolicy": "流规则编辑待 apply",
   "overview.changeIdentity": "身份面变更待 apply",
+  "overview.changePackTreeStale": "包树过期 · 重渲染待 apply",
+  "overview.changeWatermarksDiverged": "水位分叉 · 重发布待 apply",
 
   "stream.addTitle": "加流",
   "stream.adjustTitle": "调整流 {name}",
@@ -521,10 +531,65 @@ export const ZH: Record<TKey, string> = {
   "fleet.localNode": "本机",
   "fleet.unknown": "未知",
   "fleet.undeclared": "未声明",
+  "fleet.maintenance": "维护中",
+  "fleet.maintenanceHint": "计划内缺席——这条腿下线是预期而非意外；节点回归时声明自动解除",
+  "fleet.maintenanceHintPaused": "计划内缺席；{count} 条流已暂停",
+  "fleet.maintenanceDeclare": "声明维护",
+  "fleet.maintenanceLift": "解除维护",
   "fleet.undeclaredHint": "hub 已注册但 manifest 未声明，或本机的密封导入",
   "fleet.lineageStale": "serving 落后 floor",
   "fleet.lineageStaleHint":
     "hub 正在服务的策略代落后于自身 floor 水位——血脉推进停滞的征兆。",
+  "fleet.policyPulled": "{ago} 前拉取",
+  "fleet.policySilent": "策略面静默 {ago}",
+  "fleet.policySilentHint":
+    "水位还在但确认时刻已停更——策略 watcher 可能已死而节点仍在线；hub 侧扫描器会在越过阈值时推送这条转变。",
+  "fleet.policyNever": "尚无完成拉取",
+  "fleet.crlPolled": "{ago} 前轮询 CRL",
+  "fleet.crlSilent": "CRL 轮询静默 {ago}",
+  "fleet.crlSilentHint":
+    "renewal 循环的确认时刻已停更——CRL 轮询可能已楔死而节点仍在线（1 小时 fail-closed 界只有在循环还活着时才会触发）。",
+  "fleet.crlFailures": "{count} 次失败轮询",
+  "fleet.routeBreaker": "路由断路器 OPEN：{host}（{ago}）",
+  "fleet.routeBreakerHint":
+    "edge 网关正在预拨号拒绝去往该主机的流量；最近一次恢复拨测在 {probe} 前——卡死条目上不断增长的拨测时龄就是恢复机制死掉的签名。",
+  "fleet.watchersArmed": "常驻任务 {count}/{count} 在册存活",
+  "fleet.watcherSilent": "常驻任务 {name} 静默 {ago}",
+  "fleet.connReconnects": "{count} 次/时重连",
+  "fleet.connReconnectingHint":
+    "这条腿在重连窗口内重建了会话——慢性不稳。重连数与续期退避阶梯一起爬升,就是长期失联边缘。",
+  "fleet.connProbes": "{count} 次探针未答",
+  "fleet.connProbesHint":
+    "要求必答的活性往返未获应答而心跳仍在册——单向黑洞签名。先查 hub 上的 `circuit evicted`,再怀疑网络。",
+  "fleet.leafRemaining": "leaf 余 {left}",
+  "fleet.leafYellowOfflineHint":
+    "这条 offline 档 leaf 的剩余时间已少于一个 rotate 仪式的提前量——在红线前用 interflow-cli rotate 轮换(到期即停止服务)。",
+  "fleet.leafYellowRegistrarHint":
+    "registrar 档 leaf 已越过警戒线——续期落地速度赶不上 leaf 消耗;查 registrar。",
+  "fleet.leafRedHint":
+    "已进入 backup 窗口:立即用 interflow-cli rotate 轮换——到期即停止服务,此时一次失败的仪式没有任何余量。",
+  "fleet.fossilStream": "流 {name} 已静默 {ago}",
+  "fleet.fossilHint":
+    "这条流规则仍挂载、listener 仍在监听,但已超过其自身空闲预算的整数倍没有任何字节——服务可能已下线或规则该删了(删除是 plan apply 操作)。",
+  "fleet.headroomTight": "会话余量 {pct}%",
+  "fleet.headroomHint":
+    "流的准入余量已低于警戒线——慢性增长即将撞上准入墙;在开始拒绝 Open 之前查会话数的增长轨迹。",
+  "fleet.queuedOps": "{count} 个已排队 op 等待中（{ago}）",
+  "fleet.queuedHint":
+    "操作者排给这条腿的流 op 还在 hub 邮箱里——节点离线或尚未交换，下次签到时生效。",
+  "fleet.queuedStuckHint":
+    "腿在线但排队的 op 超出了送达预算——节点的 intent watcher 没在消费（正常循环一个 watch interval 内必达）。",
+  "fleet.queuedDropped": "邮箱丢弃过 {count} 个 op",
+  "fleet.queuedDroppedHint":
+    "hub 的流 op 邮箱至少溢出过一次——有个 op 被丢掉（最旧的未送达者）；若重要请重发。",
+  "fleet.watcherSilentHint":
+    "这个 hub 常驻任务已超过自身节奏（{interval}s）的 3 倍没有心跳——任务楔死而 hub 仍在服务；去 journal 查它静默前的最后输出。",
+  "nodeDetail.egressBreakers": "出口断路器",
+  "nodeDetail.egressBreakersNone": "所有目标健康",
+  "nodeDetail.breakerOpen": "OPEN {ago}",
+  "nodeDetail.breakerProbe": "{ago} 前拨测",
+  "nodeDetail.egressBreakersHint":
+    "当前 OPEN 的按目标断路器（连接失败触发；Open 在预拨号即被拒绝）。拨测时龄显示恢复探测器最近一次检查的时间——条目持续 OPEN 而时龄停更即探测器已死。",
   "dep.switcher.realms": "本机 realm（只读）",
   "dep.switcher.lockedHint": "由本机 pack 反推——仅编队观察,只读",
   "dep.switcher.lockedShort": "只读",
@@ -539,6 +604,11 @@ export const ZH: Record<TKey, string> = {
     "部署就是一个文件夹——部署文件、签发存储、渲染好的节点凭据都在一起。选一个已有的，或从模板新建。",
   "dep.onboarding.open": "打开部署…",
   "dep.onboarding.create": "从模板新建…",
+  "dep.onboarding.importPack": "导入节点 pack…",
+  "dep.onboarding.importPackHint":
+    ".iflowpack 自带节点身份与 hub 端点——纯节点机从这里开始，不需要部署树。",
+  "dep.onboarding.advanced": "高级",
+  "dep.onboarding.createHint": "新建一个全新部署（不是接入现有部署）。",
   "dep.onboarding.discovered": "本机发现",
   "dep.status.saved": "所有变更已发布",
   "dep.status.dirty": "有未保存的编辑",
@@ -582,6 +652,8 @@ export const ZH: Record<TKey, string> = {
   "dep.streams.add": "+ 加流",
   "dep.streams.save": "保存",
   "dep.streams.adjust": "调整",
+  "dep.streams.pause": "暂停",
+  "dep.streams.resume": "恢复",
   "dep.streams.rename": "改名",
   "dep.streams.delete": "删除",
   "dep.streams.renameTitle": "流改名",
@@ -591,6 +663,7 @@ export const ZH: Record<TKey, string> = {
   "dep.streams.deleteBody":
     "下次发布后该流停止服务；部署文件中的条目立即移除。",
   "dep.streams.status.serving": "服务中",
+  "dep.streams.status.paused": "已暂停",
   "dep.streams.status.down": "挂了",
   "dep.streams.status.catchingUp": "追赶中",
   "dep.streams.status.unknown": "未知",

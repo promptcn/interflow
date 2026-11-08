@@ -44,6 +44,15 @@ pub fn load() -> GuiPrefs {
     }
 }
 
+/// Loads the preferences with the failure VISIBLE — the startup-notice face
+/// of the same read [`load`] absorbs silently. `Err` means preferences
+/// EXIST but this build cannot read them (a different GUI generation wrote
+/// them; a missing db is created, not an error). The shell narrates that
+/// retirement once instead of letting remembered entries vanish unexplained.
+pub fn load_status() -> interflow_core::error::Result<GuiPrefs> {
+    crate::prefs::PrefsDb::open().map(|db| db.gui())
+}
+
 /// Persists the preferences (one transaction, per-key upsert).
 pub fn save(prefs: &GuiPrefs) -> Result<(), String> {
     let mut db = crate::prefs::PrefsDb::open().map_err(|e| e.to_string())?;

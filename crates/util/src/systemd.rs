@@ -25,9 +25,10 @@ pub fn notify_ready() -> bool {
     }
 }
 
-/// Non-unix targets: there is no systemd to notify, so readiness is vacuous.
+/// Non-unix targets: there is no systemd to notify, so readiness is vacuous
+/// (a constant answer, hence `const` — the unix variant does I/O).
 #[cfg(not(unix))]
-pub fn notify_ready() -> bool {
+pub const fn notify_ready() -> bool {
     false
 }
 

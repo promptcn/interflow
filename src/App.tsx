@@ -13,6 +13,8 @@ import {
 import {
   api,
   onLogLine,
+  onMeshCrl,
+  onMeshBreakers,
   onMeshListeners,
   onMeshPeers,
   onMeshProposals,
@@ -21,6 +23,7 @@ import {
   type LogLine,
   type NodeInfo,
   type NodeStateDto,
+  type StartupNoticeDto,
   type VersionInfo,
 } from "./api";
 import { type DetailView } from "./components/NodeDetail";
@@ -36,6 +39,7 @@ import {
 } from "./components/ui";
 import { useT } from "./i18n";
 import { meshRealms, shellFace } from "./lib/shellFace";
+import { dismissedNotices, dismissNotice, visibleNotices } from "./lib/startupNotices";
 import { hasFleetFace, hasServicesFace, hasStreamsFace } from "./lib/fleetRows";
 import {
   DeploymentProvider,
@@ -144,6 +148,9 @@ function Shell() {
     });
   const [selectedPackPrincipal, setSelectedPackPrincipal] = useState<string | null>(null);
   const [guiError, setGuiError] = useState<string | null>(null);
+  /// Known retirements this build narrates once (dismissal persists per
+  /// notice id — see lib/startupNotices.ts).
+  const [startupNotices, setStartupNotices] = useState<StartupNoticeDto[]>([]);
   const toast = useToast();
   const { lang, setLang, t } = useT();
   const dep = useDeployment();
@@ -162,6 +169,21 @@ function Shell() {
     } catch (e) {
       console.error("Failed to list nodes:", e);
     }
+  };
+
+  /// Retirements this build knows about, shown once each — the upgrade's
+  /// own words for entries it dropped, instead of entries vanishing
+  /// silently (prefs the new build cannot read, a remembered deployment
+  /// that no longer opens as one).
+  useEffect(() => {
+    void api
+      .guiStartupNotices()
+      .then((all) => setStartupNotices(visibleNotices(all, dismissedNotices())))
+      .catch(() => {});
+  }, []);
+  const dismissStartupNotice = (id: string) => {
+    dismissNotice(id);
+    setStartupNotices((prev) => prev.filter((notice) => notice.id !== id));
   };
 
   useEffect(() => {
@@ -195,6 +217,12 @@ function Shell() {
       }),
       onMeshPeers((id, peers) => {
         setNodes((prev) => prev.map((n) => (n.id === id ? { ...n, peers } : n)));
+      }),
+      onMeshCrl((id, crl) => {
+        setNodes((prev) => prev.map((n) => (n.id === id ? { ...n, crl } : n)));
+      }),
+      onMeshBreakers((id, breakers) => {
+        setNodes((prev) => prev.map((n) => (n.id === id ? { ...n, breakers } : n)));
       }),
       onMeshProposals((id, proposals) => {
         setNodes((prev) => prev.map((n) => (n.id === id ? { ...n, proposals } : n)));
@@ -564,13 +592,30 @@ function Shell() {
           </div>
         )}
 
+        {startupNotices.map((notice) => (
+          <div
+            key={notice.id}
+            role="status"
+            className="mx-4 mt-1 flex items-baseline gap-3 rounded-lg border border-warn/55 bg-warn/10 px-3 py-2 text-base text-warn"
+          >
+            <span className="min-w-0 flex-1 break-words">
+              {notice.kind === "prefs_retired"
+                ? t("notice.prefsRetired")
+                : t("notice.deploymentGone")}
+            </span>
+            <Button variant="link" size="sm" onClick={() => dismissStartupNotice(notice.id)}>
+              {t("app.dismiss")}
+            </Button>
+          </div>
+        ))}
+
         <ConflictDialog />
 
         <main className="flex min-h-0 flex-1 flex-col px-4 pt-2 pb-4">
           {face === "loading" ? (
             <div className="flex flex-1 items-center justify-center text-small text-fg-3">…</div>
           ) : face === "onboarding" ? (
-            <Onboarding />
+            <Onboarding onNodesChanged={refreshNodes} />
           ) : (
             <>
               {view === "overview" && depOpen && (

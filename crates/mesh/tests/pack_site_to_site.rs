@@ -1542,6 +1542,113 @@ target_addr = "127.0.0.1:{remote_port}"
     let _ = hub_task.await;
 }
 
+/// A control-plane principal cannot register as a data-plane agent over
+/// QUIC either. The h2 arm's 403 is pinned in the policy-endpoint test
+/// above; the QUIC arm historically lacked the gate (the 2026-10-21 case
+/// file: registration semantics were a hand-mirrored copy per transport)
+/// — the transport-neutral registration core's control-tenant refusal
+/// closes it. The probe is the production QUIC client (`QuicTunnel`), so
+/// the refusal is exercised at the real Hello/register boundary, and the
+/// fleet snapshot proves no row ever landed.
+#[tokio::test]
+async fn control_principal_cannot_register_over_quic() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let hub_port = free_port();
+    let remote_port = free_port();
+
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = IssuerStore::open(dir.path().join("issuer"));
+    issuer.ensure_realm().unwrap();
+    issuer.ensure_workspace("main").unwrap();
+    issuer.ensure_policy_key().unwrap();
+    let manifest = Manifest::parse(&format!(
+        r#"
+[realm]
+id = "test"
+[registrar]
+endpoint = "https://registrar.example.com"
+[mesh.hub.central]
+listen = "127.0.0.1:{hub_port}"
+endpoint = "127.0.0.1:{hub_port}"
+quic_listen = "0.0.0.0:{hub_port}"
+[workspace.main]
+[agent.home]
+workspace = "main"
+[[agent.home.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:{remote_port}"
+"#
+    ))
+    .unwrap();
+    let hub_dir = dir.path().join("packs/hub-central");
+    HubCredentialPack::render(&issuer, &manifest, "central", 1, &hub_dir).unwrap();
+    let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
+    let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
+    let hub_config = build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap();
+    let audit = AuditSink::spawn(&hub_config.audit);
+    let hub = HubServer::new(hub_config, audit).unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
+    ready_rx.await.unwrap();
+
+    // Control credentials (the principal class the policy/CRL planes
+    // accept) — over the QUIC data plane they must meet the same refusal
+    // the h2 register answers with.
+    let creds_dir = dir.path().join("quic-control-creds");
+    std::fs::create_dir_all(&creds_dir).unwrap();
+    let (ca, cert, key) = materialize_creds(&creds_dir, &issuer, "test");
+    let tls = std::sync::Arc::new(
+        interflow_core::tls::client::build_client_config(
+            None,
+            Some(&ca.display().to_string()),
+            Some(&cert.display().to_string()),
+            Some(&key.display().to_string()),
+            &[interflow_core::tunnel::quic::QUIC_ALPN],
+        )
+        .unwrap(),
+    );
+    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
+    let err = match interflow_core::tunnel::quic::QuicTunnel::connect(
+        "plan-apply".to_string(),
+        server_addr,
+        "127.0.0.1",
+        tls,
+        interflow_core::tunnel::session_tasks::SessionTasks::new(shutdown.clone()),
+        interflow_core::tunnel::quic::QuicSessionParams::DEFAULT,
+    )
+    .await
+    {
+        Ok(_tunnel) => panic!("a control principal must not register as an agent over QUIC"),
+        Err(e) => e,
+    };
+    assert!(
+        !err.to_string().is_empty(),
+        "the refusal should carry its reason: {err}"
+    );
+
+    // Hub side: the registry never gained the control principal's row.
+    let doc = interflow_mesh::hub::snapshot::query_fleet_snapshot(
+        &format!("127.0.0.1:{hub_port}"),
+        &ca,
+        &cert,
+        &key,
+    )
+    .await
+    .unwrap();
+    assert!(
+        doc.agents.iter().all(|r| r.agent != "control/plan-apply"),
+        "no registration row for the control principal: {:?}",
+        doc.agents
+            .iter()
+            .map(|r| r.agent.clone())
+            .collect::<Vec<_>>()
+    );
+
+    shutdown.cancel();
+    let _ = hub_task.await;
+}
+
 /// The zero-touch acceptance: an update PUBLISHED at the hub reaches both
 /// agents over the control plane — no file drops, no restarts, no pack
 /// swaps — and an agent that was offline during the publish catches up to
@@ -2077,16 +2184,7 @@ async fn wait_port_rebindable(port: u16, budget: Duration) -> bool {
 /// before any node ran from it: no `state/`, no credential bootstrap — the
 /// "re-provisioned node" shape).
 fn copy_dir(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
+    interflow_util::copy_dir_recursive(src, dst).unwrap();
 }
 
 /// Publishes `manifest` at `generation` to the hub's policy endpoint using
@@ -2580,4 +2678,284 @@ target_addr = "127.0.0.1:{remote_port}"
     for task in backends {
         task.abort();
     }
+}
+
+/// Stream pause persistence — the 2026-10-18 backlog's lifecycle ruling,
+/// at pack level: the intent is kept across an agent RESTART (a restart
+/// must not quietly re-grab the paused port — that was the real-world
+/// surprise) and is NOT kept across a REINSTALL (a re-provisioned node is
+/// a new intent; the pristine pack carries no `state/`).
+#[tokio::test]
+async fn stream_pause_persists_across_restart_and_not_across_reinstall() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let hub_port = free_port();
+    let backend_port = free_port();
+    let listen_port = free_port();
+
+    // The echo backend behind lan-b's egress.
+    let echo = tokio::net::TcpListener::bind(("127.0.0.1", backend_port))
+        .await
+        .unwrap();
+    let backend = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = echo.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let issuer = IssuerStore::open(dir.path().join("issuer"));
+    issuer.ensure_realm().unwrap();
+    issuer.ensure_workspace("main").unwrap();
+    issuer.ensure_policy_key().unwrap();
+
+    let manifest_text = format!(
+        r#"
+[realm]
+id = "test"
+[registrar]
+endpoint = "https://registrar.example.com"
+[mesh.hub.central]
+listen = "127.0.0.1:{hub_port}"
+endpoint = "127.0.0.1:{hub_port}"
+[workspace.main]
+[agent.lan-a]
+workspace = "main"
+[[agent.lan-a.mesh_ingress]]
+name = "svc"
+listen = "127.0.0.1:{listen_port}"
+target_agent = "lan-b"
+remote_addr = "127.0.0.1:{backend_port}"
+[agent.lan-b]
+workspace = "main"
+[[agent.lan-b.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:{backend_port}"
+"#
+    );
+    let manifest = Manifest::parse(&manifest_text).unwrap();
+
+    let hub_dir = dir.path().join("packs/hub-central");
+    HubCredentialPack::render(&issuer, &manifest, "central", 1, &hub_dir).unwrap();
+    let pack_dir_a = dir.path().join("packs/agent-lan-a");
+    AgentCredentialPack::render(&issuer, &manifest, "lan-a", 1, &pack_dir_a).unwrap();
+    let pack_dir_b = dir.path().join("packs/agent-lan-b");
+    AgentCredentialPack::render(&issuer, &manifest, "lan-b", 1, &pack_dir_b).unwrap();
+    // The pristine copy taken before any node ran from it: no `state/` —
+    // the re-provisioned node shape.
+    let pack_dir_a_pristine = dir.path().join("packs/agent-lan-a-pristine");
+    copy_dir(&pack_dir_a, &pack_dir_a_pristine);
+
+    // The operator's control credential (the same materialization the
+    // publish client uses — a realm-anchored control principal).
+    let creds_dir = dir.path().join("stream-op-creds");
+    std::fs::create_dir_all(&creds_dir).unwrap();
+    let (op_ca, op_cert, op_key) = materialize_creds(&creds_dir, &issuer, "test");
+
+    let build_hub_cfg = || {
+        let hub_pack = CredentialPack::load_runtime(&hub_dir).unwrap();
+        let hub_active = ActiveCredentialSet::load_or_bootstrap(&hub_pack).unwrap();
+        build_hub_config(&hub_pack, &hub_active, &hub_dir).unwrap()
+    };
+    let audit = AuditSink::spawn(&build_hub_cfg().audit);
+    let hub_config = build_hub_cfg();
+    let hub = HubServer::new(hub_config, audit.clone()).unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let hub_shutdown = tokio_util::sync::CancellationToken::new();
+    let hub_task = tokio::spawn(hub.run_until_signalled(hub_shutdown.clone(), ready_tx));
+    ready_rx.await.unwrap();
+
+    let start_agent = |pack_dir: &Path| {
+        let pack = CredentialPack::load_runtime(pack_dir).unwrap();
+        let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
+        let config = build_agent_config(&pack, &active, pack_dir).unwrap();
+        AgentClient::new(config).unwrap().start()
+    };
+    async fn round_trip(port: u16, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+        client.write_all(payload).await?;
+        let mut echoed = vec![0u8; payload.len()];
+        client.read_exact(&mut echoed).await?;
+        Ok(echoed)
+    }
+    async fn round_trip_eventually(port: u16, payload: &[u8], budget: Duration, what: &str) {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if let Ok(echoed) = round_trip(port, payload).await
+                && echoed == payload
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: round trip did not recover within {budget:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+    /// Waits until the snapshot face reports lan-a's `svc` pause state.
+    async fn wait_face(
+        hub_port: u16,
+        op_ca: &Path,
+        op_cert: &Path,
+        op_key: &Path,
+        paused: bool,
+        what: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        loop {
+            let shows = interflow_mesh::hub::snapshot::query_fleet_snapshot(
+                &format!("127.0.0.1:{hub_port}"),
+                op_ca,
+                op_cert,
+                op_key,
+            )
+            .await
+            .ok()
+            .and_then(|doc| {
+                doc.agents
+                    .into_iter()
+                    .find(|row| row.agent == "main/lan-a")
+                    .and_then(|row| row.paused_streams)
+            })
+            .is_some_and(|names| names.iter().any(|n| n == "svc"));
+            if shows == paused {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{what}: face did not converge to paused={paused}"
+            );
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    let mut agent_a = start_agent(&pack_dir_a);
+    let agent_b = start_agent(&pack_dir_b);
+    let payload = b"pause-persistence";
+    round_trip_eventually(
+        listen_port,
+        payload,
+        Duration::from_secs(45),
+        "baseline round trip",
+    )
+    .await;
+
+    // ---- pause: the port releases, the hub face shows it planned ----
+    interflow_mesh::hub::stream_intents::queue_op(
+        &format!("127.0.0.1:{hub_port}"),
+        &op_ca,
+        &op_cert,
+        &op_key,
+        "main/lan-a",
+        &interflow_core::tunnel::transport::StreamIntentOp::Pause {
+            name: "svc".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    wait_face(hub_port, &op_ca, &op_cert, &op_key, true, "pause lands").await;
+    assert!(
+        wait_port_rebindable(listen_port, Duration::from_secs(5)).await,
+        "the pause released the port"
+    );
+
+    // ---- restart from the SAME pack: the intent survives (the money
+    // assertion — a restart must not quietly re-grab the port) ----
+    let _ = agent_a.shutdown_graceful().await;
+    agent_a = start_agent(&pack_dir_a);
+    // Give the restarted agent's listeners a beat: the port must STAY
+    // free (the persisted pause filters it before any bind) and the face
+    // must re-report after the first intent exchange (~10s cadence).
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", listen_port)).is_ok(),
+        "a restarted agent must NOT re-grab the paused port"
+    );
+    wait_face(
+        hub_port,
+        &op_ca,
+        &op_cert,
+        &op_key,
+        true,
+        "restarted agent re-reports the pause",
+    )
+    .await;
+
+    // ---- resume: serving again, lineage continuing ----
+    interflow_mesh::hub::stream_intents::queue_op(
+        &format!("127.0.0.1:{hub_port}"),
+        &op_ca,
+        &op_cert,
+        &op_key,
+        "main/lan-a",
+        &interflow_core::tunnel::transport::StreamIntentOp::Resume {
+            name: "svc".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    wait_face(hub_port, &op_ca, &op_cert, &op_key, false, "resume lands").await;
+    round_trip_eventually(
+        listen_port,
+        payload,
+        Duration::from_secs(45),
+        "round trip after resume",
+    )
+    .await;
+
+    // ---- pause again, then REINSTALL from the pristine pack: the
+    // intent does NOT survive re-provisioning ----
+    interflow_mesh::hub::stream_intents::queue_op(
+        &format!("127.0.0.1:{hub_port}"),
+        &op_ca,
+        &op_cert,
+        &op_key,
+        "main/lan-a",
+        &interflow_core::tunnel::transport::StreamIntentOp::Pause {
+            name: "svc".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    wait_face(
+        hub_port,
+        &op_ca,
+        &op_cert,
+        &op_key,
+        true,
+        "second pause lands",
+    )
+    .await;
+    let _ = agent_a.shutdown_graceful().await;
+    std::fs::remove_dir_all(&pack_dir_a).unwrap();
+    copy_dir(&pack_dir_a_pristine, &pack_dir_a);
+    agent_a = start_agent(&pack_dir_a);
+    round_trip_eventually(
+        listen_port,
+        payload,
+        Duration::from_secs(45),
+        "reinstalled node serves (pause not resurrected)",
+    )
+    .await;
+
+    let _ = agent_a.shutdown_graceful().await;
+    let _ = agent_b.shutdown_graceful().await;
+    hub_shutdown.cancel();
+    let _ = hub_task.await;
+    backend.abort();
 }

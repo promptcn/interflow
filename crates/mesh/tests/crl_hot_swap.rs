@@ -4,6 +4,15 @@
 //! and a live session holding one is evicted by the serial sweep.
 //! Plus the endpoint's floor discipline: idempotent equal numbers,
 //! rejected rollbacks.
+//!
+//! Dual-state by the 433bc12 doctrine
+//!:
+//! the revoked leg under test dials on the scenario's transport. The
+//! QUIC state additionally pins that the eviction SEVERS the relay
+//! connection — an evicted QUIC registration must not keep a
+//! transport-alive connection (and with it, its route leases) for the
+//! connection's remaining lifetime; the h2 state pins the same
+//! cannot-resurrect contract through the poll/implicit-re-register gate.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use interflow_core::security::AuditSink;
@@ -14,6 +23,7 @@ use interflow_identity::pack::CredentialPack;
 use interflow_identity::pack::render::{AgentCredentialPack, HubCredentialPack};
 use interflow_identity::revocation::{RevocationEntry, RevocationList, build_crl, cert_serial_hex};
 use interflow_mesh::agent::AgentClient;
+use interflow_mesh::config::TransportKind;
 use interflow_mesh::hub::HubServer;
 use interflow_mesh::hub::crl::{PublishCrlsOutcome, publish_crls};
 use interflow_mesh::pack::{build_agent_config, build_hub_config};
@@ -175,8 +185,18 @@ async fn mtls_handshake_dial(hub_port: u16, pack_dir: &Path) -> Result<(), Strin
         .map_err(|e| e.to_string())?
 }
 
-#[tokio::test]
-async fn crl_push_hot_swaps_rejects_and_evicts_without_restart() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crl_push_hot_swaps_rejects_and_evicts_without_restart_h2() {
+    crl_hot_swap_scenario(TransportKind::H2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crl_push_hot_swaps_rejects_and_evicts_without_restart_quic() {
+    crl_hot_swap_scenario(TransportKind::Quic).await;
+}
+
+async fn crl_hot_swap_scenario(transport: TransportKind) {
+    interflow_testkit::logging::init_test_logging();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let hub_port = free_port();
     let echo_port = free_port();
@@ -222,6 +242,7 @@ endpoint = "https://registrar.example.com"
 [mesh.hub.central]
 listen = "127.0.0.1:{hub_port}"
 endpoint = "127.0.0.1:{hub_port}"
+quic_listen = "0.0.0.0:{hub_port}"
 [workspace.main]
 [agent.lan-a]
 workspace = "main"
@@ -256,27 +277,41 @@ target_addr = "127.0.0.1:{echo_port}"
     let hub_task = tokio::spawn(hub.run_until_signalled(shutdown.clone(), ready_tx));
     ready_rx.await.unwrap();
 
-    let start = |pack_dir: PathBuf| {
+    // lan-a — the leg whose leaf gets revoked — is the transport under
+    // test; lan-b stays on h2 in both states (the fleet-narrowing
+    // witness below).
+    let start = |pack_dir: PathBuf, transport: TransportKind| {
         let pack = CredentialPack::load_runtime(&pack_dir).unwrap();
         let active = ActiveCredentialSet::load_or_bootstrap(&pack).unwrap();
-        let config = build_agent_config(&pack, &active, &pack_dir).unwrap();
+        let mut config = build_agent_config(&pack, &active, &pack_dir).unwrap();
+        config.agent.transport = transport;
+        if matches!(transport, TransportKind::Quic) {
+            config.agent.hub_quic_addr = Some(format!("127.0.0.1:{hub_port}"));
+        }
         AgentClient::new(config).unwrap().start()
     };
-    let agent_b = start(pack_dir_b.clone());
+    let agent_b = start(pack_dir_b.clone(), TransportKind::H2);
     wait_connected(&agent_b).await;
-    let agent_a = start(pack_dir_a.clone());
+    let agent_a = start(pack_dir_a.clone(), transport);
     wait_connected(&agent_a).await;
 
     // A live roundtrip establishes lan-a's session (the eviction target).
+    // The ingress listener binds on the agent side — on QUIC it can land
+    // just after the Connected state, so the probe retries until it is
+    // up (a refused dial here is startup racing, not the contract).
     let echoed = tokio::time::timeout(Duration::from_secs(30), async {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", listen_port))
-            .await
-            .unwrap();
-        client.write_all(b"before-revoke").await.unwrap();
-        let mut echoed = vec![0u8; b"before-revoke".len()];
-        client.read_exact(&mut echoed).await.unwrap();
-        echoed
+        loop {
+            let Ok(mut client) = tokio::net::TcpStream::connect(("127.0.0.1", listen_port)).await
+            else {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            };
+            client.write_all(b"before-revoke").await.unwrap();
+            let mut echoed = vec![0u8; b"before-revoke".len()];
+            client.read_exact(&mut echoed).await.unwrap();
+            break echoed;
+        }
     })
     .await
     .unwrap();
@@ -339,6 +374,98 @@ target_addr = "127.0.0.1:{echo_port}"
             );
         }
         other => panic!("first push must apply: {other:?}"),
+    }
+
+    // The eviction must hold on BOTH faces:
+    //
+    // - hub side (both transports): the revoked leg's registry row is gone
+    //   and STAYS gone — every resurrection path (the re-poll's implicit
+    //   re-registration, a fresh dial) meets a revocation gate, while the
+    //   untouched leg's row stands.
+    // - agent side (QUIC): the eviction SEVERS the relay connection — an
+    //   evicted QUIC registration keeping its transport connection alive
+    //   would keep its route leases usable for the connection's remaining
+    //   lifetime (the 2026-10-21 case file). The h2 leg is exempt from
+    //   this half: its h2 connection surviving eviction is harmless (its
+    //   data plane requires the registry row), and its agent-side state
+    //   face is a separate observation, not this contract.
+    {
+        let snapshot = || async {
+            interflow_mesh::hub::snapshot::query_fleet_snapshot(
+                &format!("127.0.0.1:{hub_port}"),
+                &ca,
+                &cert,
+                &key,
+            )
+            .await
+            .unwrap()
+        };
+        let online = |doc: &interflow_mesh::hub::snapshot::FleetSnapshotDoc, agent: &str| {
+            doc.agents
+                .iter()
+                .find(|r| r.agent == agent)
+                .is_some_and(|r| r.online)
+        };
+        let doc = snapshot().await;
+        assert!(
+            !online(&doc, "main/lan-a"),
+            "the revoked leg must read offline (its remembrance row may stand, \
+             its registration must not): {:?}",
+            doc.agents
+                .iter()
+                .map(|r| r.agent.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            online(&doc, "main/lan-b"),
+            "the untouched leg stands online"
+        );
+        // And it stays offline — the resurrection paths keep meeting gates.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let doc = snapshot().await;
+        assert!(
+            !online(&doc, "main/lan-a"),
+            "the revoked leg resurrected its registration"
+        );
+
+        if matches!(transport, TransportKind::Quic) {
+            let mut state = agent_a.subscribe_state();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if !matches!(
+                    *state.borrow(),
+                    interflow_mesh::agent::AgentState::Connected { .. }
+                ) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the revoked QUIC leg must leave Connected after the sweep \
+                     (last state {:?}) — the eviction severed the registry row \
+                     but not the leg",
+                    state.borrow()
+                );
+                let _ = tokio::time::timeout(Duration::from_millis(200), state.changed()).await;
+            }
+            // And it STAYS off: its re-dials keep meeting the gates.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(
+                !matches!(
+                    *state.borrow(),
+                    interflow_mesh::agent::AgentState::Connected { .. }
+                ),
+                "the revoked QUIC leg resurrected itself (state {:?})",
+                state.borrow()
+            );
+        }
+        // Fleet narrowing: the untouched h2 leg keeps working throughout.
+        assert!(
+            matches!(
+                *agent_b.subscribe_state().borrow(),
+                interflow_mesh::agent::AgentState::Connected { .. }
+            ),
+            "the untouched leg must stay connected"
+        );
     }
 
     // The revoked leaf is rejected at the handshake itself — no restart,

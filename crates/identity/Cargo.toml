@@ -28,15 +28,15 @@ interflow-util.workspace = true
 interflow-buildinfo.workspace = true
 
 # X.509 issuance with URI SAN support (SPIFFE-like principal paths).
-rcgen = { version = "0.14", features = ["x509-parser"] }
-x509-parser = "0.18"
-rustls-pemfile = "2.2.0"
-time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+rcgen = { workspace = true, features = ["x509-parser"] }
+x509-parser = { workspace = true }
+rustls-pemfile = { workspace = true }
+time = { workspace = true, features = ["formatting", "parsing", "macros"] }
 
 # Serialization.
 serde = { workspace = true }
 toml = { workspace = true }
-serde_json = "1"
+serde_json = { workspace = true }
 humantime = "2.3"
 
 # Errors, hashing.
@@ -44,7 +44,7 @@ thiserror = { workspace = true }
 hex = { workspace = true }
 
 # Rejection logging on the fail-keep policy-update path (state/policy).
-tracing = "0.1"
+tracing = { workspace = true }
 
 # Policy signing (realm issuer policy key, independent of X.509 CAs).
 ed25519-dalek = { version = "2", features = ["rand_core"] }
@@ -53,11 +53,11 @@ getrandom = "0.3"
 # Range egress authorization (`mesh_egress.target_cidr`) — the same crate
 # the engine matches with (`is_target_allowed`), so manifest validation and
 # runtime matching can never drift apart.
-ipnetwork = "0.21.1"
+ipnetwork = { workspace = true }
 
 # Sealed Credential Packs (.iflowpack = age-encrypted tar).
-age = "0.11"
-tar = "0.4"
+age = "0.12"
+tar = { workspace = true }
 
 # The issuer store's bookkeeping db (binding + applied state + applied
 # history; the manifest-sqlite-pivot form B). Rows map by hand — rusqlite's
@@ -65,5 +65,8 @@ tar = "0.4"
 rusqlite = { workspace = true }
 
 [dev-dependencies]
-tokio-rustls = "0.26.4"
-tempfile = "3"
+# Property test: the pre-parsed revoked-serial set must answer exactly
+# like the per-query BigUint comparison (leading-zero / sign encodings).
+proptest = "1.7"
+tokio-rustls = { workspace = true }
+tempfile = { workspace = true }

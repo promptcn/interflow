@@ -161,7 +161,7 @@ pub struct EdgeListener {
     /// Fixed `EdgeListenerPolicy` default (300s); must be ≤ the fronting
     /// nginx `proxy_read_timeout` in the fronted topology.
     pub stream_idle_timeout: Duration,
-    /// Connection tracker (per-IP + global caps).
+    /// Connection tracker (per-client + global caps).
     pub conn_tracker: Arc<ConnTracker>,
     /// Per-IP new-connection rate limit (None = disabled). Checked before
     /// conn_tracker to stop connect→peek→disconnect loop attacks from
@@ -344,7 +344,7 @@ async fn handle_public_connection(
     };
     // Pre-handshake gate: ACME mode is 80/443 direct by product definition
     // (no PROXY/XFF front), so the TCP peer IP is the client IP. Running the
-    // gate here — before any handshake byte is read — extends the per-IP
+    // gate here — before any handshake byte is read — extends the per-client
     // rate limit and concurrency caps over the handshake itself; the guard
     // is handed down to `handle_connection` and reused, never re-acquired.
     // A denial stays a silent close on this path: no handshake has started,
@@ -532,7 +532,7 @@ where
     // 2. Real-IP source selection. X-Forwarded-For restoration applies only
     //    when the mechanism is enabled AND the TCP peer is a trusted proxy
     //    (the header from anyone else is attacker-controlled). For everyone
-    //    else the peer IP is authoritative and the per-IP gate runs before
+    //    else the peer IP is authoritative and the per-client gate runs before
     //    the peek, preserving the connect→peek→disconnect flood defense.
     //    For a trusted proxy the gate is deferred until the request head is
     //    buffered: the effective IP lives in the XFF header, and nginx's own
@@ -614,6 +614,18 @@ where
         metrics::counter!("interflow_edge_host_peek_failed").increment(1);
     })?;
 
+    // Canonical host form, resolved once: lowercase, port and IPv6
+    // brackets stripped (the same parser the router's keys derive from).
+    // The route breaker keys its entries by exactly this form — clients
+    // spelling the same host differently (`Host: x` vs `x:443`) must
+    // aggregate into one breaker entry, and the target-recovery sink must
+    // be able to name the entry it closes. An unparseable authority never
+    // routes (fail closed, same miss as before normalization existed).
+    let host = HostRouter::normalize(&host).ok_or_else(|| {
+        metrics::counter!("interflow_edge_host_invalid").increment(1);
+        InterflowError::protocol(format!("unparseable host header: {host}"))
+    })?;
+
     // 3. Deferred XFF resolution + gate: the head is buffered, the
     //    right-most chain entry is the IP our trusted proxy observed.
     if xff_deferred {
@@ -668,7 +680,7 @@ where
         }
     }
 
-    let Some(route) = router.lookup(&host) else {
+    let Some(route) = router.lookup_normalized(&host) else {
         // No route matched: close silently, send no 404, do not leak that the edge is alive
         warn!(
             node = %node,
@@ -753,7 +765,7 @@ where
     // Every ingress stream uses inner TLS. A missing per-route workspace
     // anchor or stale principal material is a configuration error: close this stream
     // rather than downgrading the hub leg to plaintext.
-    let material = match identity.material_for(&route.workspace) {
+    let material = match identity.material_for(&route.workspace).await {
         Ok(material) => material,
         Err(e) => {
             warn!(
@@ -784,7 +796,7 @@ where
     let _ = guard;
 
     let connector = match interflow_core::tls::inner_client_config(&material, &route.agent_id) {
-        Ok(config) => tokio_rustls::TlsConnector::from(std::sync::Arc::new(config)),
+        Ok(config) => tokio_rustls::TlsConnector::from(config),
         Err(e) => {
             warn!(
                 node = %node,
@@ -887,9 +899,15 @@ where
     // everything else (client-side aborts, ordinary closes) is neutral.
     if let Some(breaker) = route_breaker {
         match route_evidence(&outcome, route_probe) {
-            RouteEvidence::Failure => breaker.note_failure(&host),
-            RouteEvidence::DerivativeFailure => breaker.note_soft_failure(&host),
-            RouteEvidence::Recovery => breaker.note_success(&host),
+            RouteEvidence::Failure => {
+                breaker.note_failure(&host);
+            }
+            RouteEvidence::DerivativeFailure => {
+                breaker.note_soft_failure(&host);
+            }
+            RouteEvidence::Recovery => {
+                breaker.note_success(&host);
+            }
             RouteEvidence::Neutral => {}
         }
     }
@@ -905,7 +923,7 @@ where
 pub(super) enum DenialKind {
     /// Per-IP new-connection quota exceeded → HTTP 429 + `Retry-After`.
     RateLimited {
-        /// The configured per-IP-per-minute quota (drives `Retry-After`).
+        /// The configured per-client-per-minute quota (drives `Retry-After`).
         quota_per_minute: u32,
     },
     /// Per-IP concurrent connection cap exceeded → HTTP 503.
@@ -918,7 +936,7 @@ pub(super) enum ConnAdmission {
     Denied(DenialKind),
 }
 
-/// Applies the per-IP new-connection rate limit and concurrency caps to one
+/// Applies the per-client new-connection rate limit and concurrency caps to one
 /// connection, keyed on the effective client IP (TCP peer, PROXY-asserted,
 /// or XFF-restored). A denial records metrics + audit and logs at WARN — a
 /// security rejection that was invisible at the production INFO level
@@ -948,7 +966,7 @@ pub(super) fn gate_connection(
         warn!(
             node = %node,
             "edge connection denied (rate limited): effective={effective_ip} peer={peer} — \
-             per-IP new-connection quota ({} per minute) exceeded; legitimate traffic behind a \
+             per-client new-connection quota ({} per minute) exceeded; legitimate traffic behind a \
              front proxy should raise [edge] new_conn_rate_per_ip_per_minute",
             limiter.quota()
         );
@@ -973,7 +991,7 @@ pub(super) fn gate_connection(
     warn!(
         node = %node,
         "edge connection denied (connection limit): effective={effective_ip} peer={peer} — \
-         per-IP concurrent connection cap exceeded"
+         per-client concurrent connection cap exceeded"
     );
     ConnAdmission::Denied(DenialKind::ConnLimitExceeded)
 }
@@ -995,13 +1013,13 @@ where
         DenialKind::RateLimited { quota_per_minute } => (
             "429 Too Many Requests",
             60_u32.div_ceil(quota_per_minute.max(1)).clamp(1, 60),
-            "edge: per-IP new-connection rate limit exceeded\n",
+            "edge: per-client new-connection rate limit exceeded\n",
         ),
         // A concurrency slot frees as soon as any one connection closes.
         DenialKind::ConnLimitExceeded => (
             "503 Service Unavailable",
             1,
-            "edge: per-IP concurrent connection limit exceeded\n",
+            "edge: per-client concurrent connection limit exceeded\n",
         ),
     };
     let answer = format!(
@@ -1033,6 +1051,7 @@ const fn pump_cfg(stream_idle_timeout: std::time::Duration) -> PumpConfig {
         idle_timeout_counter: "interflow_edge_stream_idle_timeout",
         write_stall_counter: "interflow_edge_client_write_stall",
         log_label: "edge",
+        activity: None,
     }
 }
 

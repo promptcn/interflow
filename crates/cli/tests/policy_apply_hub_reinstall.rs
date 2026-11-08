@@ -5,7 +5,8 @@
 //! (bootstrapped from the rendered pack, exactly like a fresh install from
 //! stale artifacts); `plan apply` runs as the real CLI binary against it.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod common;
+use common::{RunOutcome, bin};
 
 use interflow_core::security::AuditSink;
 use interflow_identity::credentials::ActiveCredentialSet;
@@ -14,13 +15,6 @@ use interflow_mesh::hub::HubServer;
 use interflow_mesh::pack::build_hub_config;
 use std::path::PathBuf;
 use std::process::Command;
-
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop(); // deps/
-    p.pop(); // tests/
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -104,12 +98,6 @@ impl Env {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }
     }
-}
-
-struct RunOutcome {
-    success: bool,
-    stdout: String,
-    stderr: String,
 }
 
 /// Bookkeeping gen 2 + a hub reinstalled from the gen-1 pack (floor 1) +

@@ -2,8 +2,8 @@
 //! a PROXY-capable front (LB / nginx stream).
 //!
 //! In the nginx-fronted topology both the edge public listener and the hub
-//! agent plane see every connection arriving from 127.0.0.1 — per-IP rate
-//! limits, per-IP connection caps and audit records all key on the proxy
+//! agent plane see every connection arriving from 127.0.0.1 — per-client
+//! rate limits, per-client connection caps and audit records key on the proxy
 //! instead of the client. This module negotiates the PROXY protocol
 //! preamble under a strict fail-closed trust matrix. Note: the standard
 //! nginx **HTTP** `proxy_pass` leg cannot emit the PROXY protocol (that

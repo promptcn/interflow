@@ -43,9 +43,6 @@ pub struct RevocationList {
     /// addition or removal — must advance this** ([`Self::record`] does);
     /// issuance reads it without bumping, so an unchanged deny list keeps
     /// its number and consumers can read a repeated number as "no change".
-    /// `0` never appears on disk: [`Self::load`] backfills absent (legacy)
-    /// fields, and [`Self::default`] starts at 1.
-    #[serde(default)]
     pub next_crl_number: u64,
 }
 
@@ -62,7 +59,7 @@ impl RevocationList {
     /// Loads the deny list from an issuer store (missing file = empty).
     pub fn load(issuer_root: &Path) -> Result<Self> {
         let path = issuer_root.join("revocations.json");
-        let mut list = match std::fs::read_to_string(&path) {
+        match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str::<Self>(&text)
                 .map_err(|e| Error::issuance("revocations.json parse".to_string()).with_source(e)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -70,15 +67,7 @@ impl RevocationList {
                 path: path.display().to_string(),
                 source: e,
             }),
-        }?;
-        if list.next_crl_number == 0 {
-            // A legacy file predates the counter; the last CRL it issued
-            // carried `entries.len() + 1` (the old formula), so backfill
-            // exactly that — no number repeats or regresses across the
-            // upgrade.
-            list.next_crl_number = list.entries.len() as u64 + 1;
         }
-        Ok(list)
     }
 
     /// Appends entries and persists atomically.
@@ -217,6 +206,61 @@ pub fn crl_number(crl_pem: &str) -> Result<u64> {
         .ok_or_else(|| Error::issuance("CRL carries no readable crl_number".to_string()))
 }
 
+/// The canonical minimal-hex form of a certificate serial: numeric
+/// equality (what DER serial integers mean) — leading zero nybbles (and
+/// the DER sign byte, already absent from [`cert_serial_hex`] output but
+/// stripped defensively) do not change the number. The pre-parsed set from
+/// [`crl_revoked_serials`] and every membership lookup pass through this,
+/// making the O(1) query exactly equivalent to [`crl_revokes_serial`]'s
+/// BigUint comparison.
+pub fn normalize_serial_hex(serial_hex: &str) -> String {
+    // A defensive sign-byte strip: an even-length hex string starting
+    // "00" may be a sign-prefixed encoding of the shorter number.
+    let bytes: Vec<char> = serial_hex.trim().chars().collect();
+    let without_sign = if bytes.len() >= 2 && bytes[0] == '0' && bytes[1] == '0' {
+        &bytes[2..]
+    } else {
+        &bytes[..]
+    };
+    let stripped: String = without_sign
+        .iter()
+        .collect::<String>()
+        .trim_start_matches('0')
+        .to_owned();
+    let minimal = if stripped.is_empty() {
+        "0".to_owned()
+    } else {
+        stripped
+    };
+    // Byte-aligned even length (hex::decode-compatible).
+    if minimal.len() % 2 == 0 {
+        minimal
+    } else {
+        format!("0{minimal}")
+    }
+}
+
+/// The full revoked-serial set of a CRL in PEM form, pre-parsed into
+/// normalized hex ([`normalize_serial_hex`]) — the reload-time material
+/// for O(1) membership queries (2026-11-04 audit §3.2: the old query path
+/// re-parsed the whole PEM per registration/poll).
+pub fn crl_revoked_serials(crl_pem: &str) -> Result<std::collections::HashSet<String>> {
+    use x509_parser::pem::parse_x509_pem;
+    use x509_parser::prelude::FromDer;
+    use x509_parser::revocation_list::CertificateRevocationList;
+    let (_, pem) = parse_x509_pem(crl_pem.as_bytes())
+        .map_err(|e| Error::issuance("CRL PEM parse".to_string()).with_source(Box::new(e)))?;
+    let (_, crl) = CertificateRevocationList::from_der(&pem.contents)
+        .map_err(|e| Error::issuance("CRL parse".to_string()).with_source(Box::new(e)))?;
+    Ok(crl
+        .iter_revoked_certificates()
+        // Canonical even-length form — the same spelling normalize/cert
+        // serials produce. A bare to_str_radix would leave odd-length
+        // minimal forms ("d" for 0x0d) that never match a normalized query.
+        .map(|entry| normalize_serial_hex(&entry.user_certificate.to_str_radix(16)))
+        .collect())
+}
+
 /// Whether a CRL in PEM form revokes the given certificate serial (hex,
 /// same canonical form [`cert_serial_hex`] produces) — the pack-side
 /// consumption half of the deny-list pipeline (a node checks its own leaf
@@ -310,30 +354,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_deny_list_backfills_to_the_old_formula() {
-        // A pre-counter revocations.json: 3 entries, no next_crl_number
-        // field. The old formula last issued `len() + 1` = 4, so the
-        // backfill must land exactly there — no repeat, no regression.
-        let dir = tempfile::tempdir().unwrap();
-        let mut legacy = r#"{
-  "entries": [
-    {"serial": "0001", "issuer": "control", "reason": "operator-requested", "revoked_at": "2026-09-01T00:00:00Z", "pack_digest": null},
-    {"serial": "0002", "issuer": "control", "reason": "superseded", "revoked_at": "2026-09-02T00:00:00Z", "pack_digest": null},
-    {"serial": "0003", "issuer": "workspace/main", "reason": "operator-requested", "revoked_at": "2026-09-03T00:00:00Z", "pack_digest": null}
-  ]
-}"#
-        .to_owned();
-        legacy.push('\n');
-        std::fs::write(dir.path().join("revocations.json"), legacy).unwrap();
-        let mut list = RevocationList::load(dir.path()).unwrap();
-        assert_eq!(list.entries.len(), 3);
-        assert_eq!(list.next_crl_number, 4);
-        // The next mutation lands strictly above the backfill.
-        list.record(entry("0004", "key-compromise"));
-        assert_eq!(list.next_crl_number, 5);
-    }
-
-    #[test]
     fn issued_crl_carries_the_rfc_reason_and_number() {
         let dir = tempfile::tempdir().unwrap();
         let store = IssuerStore::open(dir.path());
@@ -406,6 +426,103 @@ mod tests {
         // Anything else — legacy strings, typos, empty — is unspecified.
         for other in ["operator-requested", "test", "", "keyCompromise"] {
             assert!(matches!(crl_reason_code(other), Unspecified), "{other:?}");
+        }
+    }
+
+    /// §3.2 equivalence: the pre-parsed set ([`crl_revoked_serials`] +
+    /// [`normalize_serial_hex`]) answers membership exactly like
+    /// [`crl_revokes_serial`]'s per-query BigUint comparison — across
+    /// leading-zero paddings and sign-byte encodings of both the revoked
+    /// entry and the query.
+    #[test]
+    fn revoked_serial_set_matches_biguint_query() {
+        fn hex_of(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        // Deterministic matrix over the tricky encodings; the property
+        // form below generalizes it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = IssuerStore::open(dir.path());
+        store.ensure_realm().unwrap();
+        let mut list = RevocationList::load(dir.path()).unwrap();
+        list.record(entry("00ff", "key-compromise"));
+        list.record(entry("0ee", "key-compromise"));
+        list.record(entry("7b", "key-compromise"));
+        list.save(dir.path()).unwrap();
+        let reloaded = RevocationList::load(dir.path()).unwrap();
+        let crl = build_crl(
+            &store.realm_issuer().unwrap(),
+            &reloaded.entries,
+            reloaded.next_crl_number,
+        )
+        .unwrap();
+        let set = crl_revoked_serials(&crl).unwrap();
+
+        for query in [
+            "00ff", "ff", "000ff", "0ff", // 255 in every padding
+            "0ee", "ee", "00ee", "0e", // 238
+            "7b", "007b", "07b", // 123
+            "00", "0", "0000", // zero
+            "ab", "00ab", // not revoked
+        ] {
+            // skip odd-length queries: hex::decode (the old query's first
+            // step) rejects them — outside the equivalence domain.
+            if query.len() % 2 != 0 {
+                continue;
+            }
+            let biguint_answer = crl_revokes_serial(&crl, query).unwrap().unwrap();
+            let set_answer = set.contains(&normalize_serial_hex(query));
+            assert_eq!(
+                set_answer, biguint_answer,
+                "query {query:?}: set={set_answer}, biguint={biguint_answer}"
+            );
+        }
+        // The normalization itself: sign-byte and zero-nybble forms of one
+        // number share one key.
+        assert_eq!(normalize_serial_hex("00ff"), normalize_serial_hex("ff"));
+        assert_eq!(normalize_serial_hex("00"), "00");
+        assert_eq!(hex_of(&[0xff]), "ff");
+    }
+
+    use proptest::{prop_assert_eq, proptest};
+
+    proptest! {
+        /// The generalized equivalence: any even-length hex query (with any
+        /// even leading-zero padding) is answered identically by both
+        /// paths, against a CRL revoking an arbitrary serial.
+        #[test]
+        fn revoked_set_equivalence_arbitrary(
+            revoked_serial in "[0-9a-f]{1,8}",
+            query_value in "[0-9a-f]{1,8}",
+            query_pad in 0usize..3,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let store = IssuerStore::open(dir.path());
+            store.ensure_realm().unwrap();
+            let mut list = RevocationList::load(dir.path()).unwrap();
+            list.record(entry(&revoked_serial, "key-compromise"));
+            list.save(dir.path()).unwrap();
+            let reloaded = RevocationList::load(dir.path()).unwrap();
+            let crl = build_crl(
+                &store.realm_issuer().unwrap(),
+                &reloaded.entries,
+                reloaded.next_crl_number,
+            )
+            .unwrap();
+
+            // Byte-align the query value, then pad with "00" pairs (the
+            // DER sign-byte / leading-zero encodings).
+            let mut query = query_value.clone();
+            if query.len() % 2 != 0 {
+                query.insert(0, '0');
+            }
+            for _ in 0..query_pad {
+                query.insert_str(0, "00");
+            }
+
+            let biguint_answer = crl_revokes_serial(&crl, &query).unwrap().unwrap();
+            let set = crl_revoked_serials(&crl).unwrap();
+            prop_assert_eq!(set.contains(&normalize_serial_hex(&query)), biguint_answer);
         }
     }
 }

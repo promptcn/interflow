@@ -256,3 +256,112 @@ async fn enroll_renew_and_confirm_over_https_mtls() -> Result<(), Box<dyn std::e
     );
     Ok(())
 }
+
+/// Identity-plane event matrix row 5 (`crates/mesh/tests/identity_
+/// lifecycle_matrix.rs`): one enrollment code presented by many clients
+/// at once admits exactly one of them — the code's single-use arbitration
+/// (`EnrollmentCodes::consume`: load → check `used` → mark → save under
+/// one process-wide lock) holds under concurrency, so no two leaves are
+/// ever issued for one code. The losers are refused in the 400 class with
+/// the "already been used" reason, and a second code is unaffected.
+#[tokio::test]
+async fn concurrent_enrolls_with_one_code_admit_exactly_one() {
+    let _serial = SERIAL.lock().await;
+    interflow_registrar::fault::clear_hook();
+    let registrar = spawn_registrar().await;
+    let codes = EnrollmentCodes::open(registrar.issuer_dir().join("enrollments.json")).unwrap();
+    let code = codes
+        .create("test", PrincipalKind::Agent, Some("main"), "desktop")
+        .unwrap();
+    let principal =
+        PrincipalPath::workspace_member("test", "main", PrincipalKind::Agent, "desktop").unwrap();
+
+    const RACERS: usize = 8;
+    let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+    let endpoint = registrar.endpoint().to_owned();
+    let ca_pem = registrar.ca_pem().to_owned();
+    let mut racers = Vec::with_capacity(RACERS);
+    for _ in 0..RACERS {
+        // Distinct key pairs: every racer is a real, separately-generated
+        // client; only the code is shared.
+        let csr = generate_csr(&principal, &[], false).unwrap();
+        let code = code.code.clone();
+        let endpoint = endpoint.clone();
+        let ca_pem = ca_pem.clone();
+        let barrier = Arc::clone(&barrier);
+        racers.push(tokio::spawn(async move {
+            let client = direct_client()
+                .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+                .build()
+                .unwrap();
+            barrier.wait().await;
+            let response = client
+                .post(format!("{endpoint}/v1/enroll"))
+                .json(&serde_json::json!({ "code": code, "csr_pem": csr.csr_pem }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            (status, body)
+        }));
+    }
+    let mut admitted = Vec::new();
+    let mut refused = Vec::new();
+    for racer in racers {
+        let (status, body) = racer.await.unwrap();
+        if status == reqwest::StatusCode::OK {
+            let issued: Value = serde_json::from_str(&body).unwrap();
+            admitted.push(issued["serial"].as_str().unwrap().to_owned());
+        } else {
+            refused.push((status, body));
+        }
+    }
+    assert_eq!(
+        admitted.len(),
+        1,
+        "exactly one racer is issued a leaf: {admitted:?} / refused {refused:?}"
+    );
+    assert_eq!(refused.len(), RACERS - 1);
+    for (status, body) in &refused {
+        assert_eq!(
+            *status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "a spent code is a semantic rejection, not server trouble: {body}"
+        );
+        assert!(
+            body.contains("already been used"),
+            "the loser learns why: {body}"
+        );
+    }
+    // The ledger agrees: the code is spent once, and a fresh code is
+    // unaffected by the race.
+    let fresh = codes
+        .create("test", PrincipalKind::Agent, Some("main"), "laptop")
+        .unwrap();
+    assert!(
+        EnrollmentCodes::open(registrar.issuer_dir().join("enrollments.json"))
+            .unwrap()
+            .consume(&code.code)
+            .is_err(),
+        "the raced code stays spent on disk"
+    );
+    let laptop =
+        PrincipalPath::workspace_member("test", "main", PrincipalKind::Agent, "laptop").unwrap();
+    let csr = generate_csr(&laptop, &[], false).unwrap();
+    let status = direct_client()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+        .build()
+        .unwrap()
+        .post(format!("{endpoint}/v1/enroll"))
+        .json(&serde_json::json!({ "code": fresh.code, "csr_pem": csr.csr_pem }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "a fresh code still enrolls"
+    );
+}

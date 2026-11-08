@@ -23,7 +23,7 @@ http = "1.4"
 # Atomic replace-on-write (unique same-dir temp file + rename). Already in
 # the lockfile as a dev-dependency of most crates; promoting it here adds no
 # new versions to the graph.
-tempfile = "3"
+tempfile = { workspace = true }
 
 # Content digests (sha256_hex) for pack manifests / trust bundles / cert
 # fingerprints. Pure computation crates, already in the lockfile via most

@@ -69,6 +69,8 @@ pub enum AuditKind {
     AgentRegistered {
         /// The opaque connection circuit.
         circuit: String,
+        /// The registering agent's qualified id (the biography face).
+        agent: String,
         /// The registering binary's build tag (the agent's self-declared
         /// `<commit-date>_<git-short-hash>[-dirty]`). `None`/absent = an
         /// older agent or an implicit re-registration — the fleet view
@@ -85,6 +87,8 @@ pub enum AuditKind {
     AgentEvicted {
         /// The opaque connection circuit.
         circuit: String,
+        /// The evicted agent's qualified id (the biography face).
+        agent: String,
         /// The eviction reason (`send_timeout` / `poll_grace_expired` / `heartbeat_missed`).
         reason: String,
     },
@@ -117,7 +121,7 @@ pub enum AuditKind {
         /// The source circuit.
         source_circuit: String,
     },
-    /// Connection denied (per-IP or global limit exceeded).
+    /// Connection denied (per-client or global limit exceeded).
     ConnLimitExceeded {
         /// The peer IP.
         peer_ip: String,
@@ -258,6 +262,53 @@ pub enum AuditKind {
         quarantined_as: Option<String>,
         /// Why the load failed.
         error: String,
+    },
+    /// An operator paused one stream (planned unavailability: the node
+    /// stops the listener and releases the port; the hub exempts the
+    /// stream from unexpected-death signals). Recorded when the op is
+    /// queued for the agent, not when the agent applies it (the agent's
+    /// own audit line covers application).
+    StreamPauseQueued {
+        /// The agent whose stream is paused (qualified id).
+        agent: String,
+        /// The stream (ingress rule) name.
+        stream: String,
+    },
+    /// An operator resumed one paused stream (the only unpause).
+    StreamResumeQueued {
+        /// The agent whose stream is resumed (qualified id).
+        agent: String,
+        /// The stream (ingress rule) name.
+        stream: String,
+    },
+    /// An operator declared node-level maintenance (expected-type planned
+    /// unavailability: the whole leg's absence is not an accident — no
+    /// eviction accounting, probe windows exempt; auto-clears when the
+    /// node rejoins).
+    MaintenanceDeclared {
+        /// The agent (qualified id) declared under maintenance.
+        agent: String,
+    },
+    /// A maintenance declaration was lifted — by the operator
+    /// (`maintenance off`) or automatically by the node rejoining (the
+    /// expected condition came true; zero-operation recovery).
+    MaintenanceLifted {
+        /// The agent (qualified id) leaving maintenance.
+        agent: String,
+        /// How it was lifted: `operator` or `node_rejoined`.
+        via: String,
+    },
+    /// An agent's registry removal landed under a maintenance declaration:
+    /// the session teardown still happened (the offline fact stands), but
+    /// the eviction accounting was exempted (no `evicted_total`, no
+    /// eviction metric — the voided-eviction discipline applied to planned
+    /// unavailability).
+    MaintenanceDeparture {
+        /// The agent (qualified id) whose session ended under maintenance.
+        agent: String,
+        /// The removal reason the funnel saw (poll grace, connection
+        /// closed, heartbeat, send timeout).
+        reason: String,
     },
 }
 
@@ -930,6 +981,121 @@ const ZERO_HASH_HEX: &str = "000000000000000000000000000000000000000000000000000
 /// within a chain, `previous_hash` links each record to its predecessor,
 /// and a source change is only accepted as a fresh chain (sequence 1,
 /// zero previous hash).
+/// One parsed audit record for read paths (the biography face): the
+/// envelope minus chain material — verification stays `verify`'s job.
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    /// ISO 8601 UTC timestamp (the ordering key).
+    pub ts: String,
+    /// Per-source monotonic sequence.
+    pub sequence: u64,
+    /// The initiating identity, when recorded.
+    pub actor: Option<String>,
+    /// The event kind and details.
+    pub kind: AuditKind,
+}
+
+/// Reads and parses every record from `paths`, in file/line order.
+///
+/// `paths` are the current + rotated audit files, plain or gz. Malformed
+/// lines are skipped — a READ face degrades per record, never fails
+/// wholesale; chain integrity is [`verify_audit_files`]'s contract, not
+/// this one's.
+pub fn read_audit_records(paths: &[PathBuf]) -> Vec<AuditRecord> {
+    use std::io::BufRead as _;
+    let mut records = Vec::new();
+    for path in paths {
+        let is_gz = path.extension().is_some_and(|e| e == "gz");
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let reader: Box<dyn std::io::BufRead> = if is_gz {
+            Box::new(std::io::BufReader::new(flate2::read::GzDecoder::new(file)))
+        } else {
+            Box::new(std::io::BufReader::new(file))
+        };
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(event) = serde_json::from_str::<AuditEvent>(&line) {
+                records.push(AuditRecord {
+                    ts: event.ts,
+                    sequence: event.sequence,
+                    actor: event.actor,
+                    kind: event.kind,
+                });
+            }
+        }
+    }
+    records
+}
+
+/// The audit files under `dir` (`audit.jsonl` plus rotations), ordered
+/// oldest-first with the live file last (rotation names embed UTC
+/// timestamps; the live file sorts last by construction).
+// Rotation names are minted by `segment_name` in this module, lowercase by
+// construction — matching them case-sensitively is the contract.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+pub fn audit_file_paths(dir: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(String, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let live = name == "audit.jsonl";
+            let rotated = name.starts_with("audit-")
+                && (name.ends_with(".jsonl") || name.ends_with(".jsonl.gz"));
+            (live || rotated).then(|| {
+                let key = if live {
+                    format!("~{name}")
+                } else {
+                    name.clone()
+                };
+                (key, entry.path())
+            })
+        })
+        .collect();
+    files.sort();
+    files.into_iter().map(|(_, path)| path).collect()
+}
+
+/// Whether one record belongs to the named agent.
+///
+/// The kinds that carry a qualified-id field match it directly; the
+/// circuit-keyed kinds (registered/evicted/streams) match the agent's
+/// CURRENT circuit when the caller resolved one — a re-registered agent's
+/// own events stay linked to it through the present circuit.
+pub fn record_mentions_agent(kind: &AuditKind, agent: &str, current_circuit: Option<&str>) -> bool {
+    let circuit_match =
+        |circuit: &String| current_circuit.is_some_and(|current| circuit == current);
+    match kind {
+        AuditKind::AgentRegistered {
+            circuit,
+            agent: named,
+            ..
+        }
+        | AuditKind::AgentEvicted {
+            circuit,
+            agent: named,
+            ..
+        } => named == agent || circuit_match(circuit),
+        AuditKind::StreamOpened { source_circuit, .. }
+        | AuditKind::StreamClosed { source_circuit, .. }
+        | AuditKind::StreamDenied { source_circuit, .. } => circuit_match(source_circuit),
+        AuditKind::PolicyPulled { agent: a, .. }
+        | AuditKind::CredentialExpiry { agent: a, .. }
+        | AuditKind::StreamPauseQueued { agent: a, .. }
+        | AuditKind::StreamResumeQueued { agent: a, .. }
+        | AuditKind::MaintenanceDeclared { agent: a }
+        | AuditKind::MaintenanceLifted { agent: a, .. }
+        | AuditKind::MaintenanceDeparture { agent: a, .. } => a == agent,
+        AuditKind::ProposalSubmitted { requester, .. }
+        | AuditKind::ProposalSubmitDenied { requester, .. }
+        | AuditKind::ProposalExpired { requester, .. } => requester == agent,
+        _ => false,
+    }
+}
+
 pub fn verify_audit_files(paths: &[PathBuf]) -> Result<AuditVerifyReport, AuditVerifyError> {
     use std::io::BufRead as _;
     let mut report = AuditVerifyReport {
@@ -1111,6 +1277,69 @@ fn format_iso8601(t: time::OffsetDateTime) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod biography_tests {
+    use super::*;
+
+    #[test]
+    fn mentions_resolves_by_name_field_and_circuit_fallback() {
+        // The named field is authoritative.
+        let named = AuditKind::AgentRegistered {
+            circuit: "aa".repeat(16),
+            agent: "ws/node".to_owned(),
+            build: None,
+        };
+        assert!(record_mentions_agent(&named, "ws/node", None));
+        assert!(!record_mentions_agent(&named, "ws/other", None));
+        // A re-registered agent's own events also link through the CURRENT
+        // circuit (the name matches even when the circuit is stale).
+        let re_registered = AuditKind::AgentEvicted {
+            circuit: "bb".repeat(16),
+            agent: "ws/node".to_owned(),
+            reason: "poll_grace_expired".to_owned(),
+        };
+        assert!(record_mentions_agent(
+            &re_registered,
+            "ws/node",
+            Some(&"cc".repeat(16))
+        ));
+        assert!(!record_mentions_agent(
+            &re_registered,
+            "ws/other",
+            Some(&"cc".repeat(16))
+        ));
+        // The qualified-id kinds match directly.
+        let pause = AuditKind::StreamPauseQueued {
+            agent: "ws/node".to_owned(),
+            stream: "svc".to_owned(),
+        };
+        assert!(record_mentions_agent(&pause, "ws/node", None));
+        // Unrelated kinds never leak in.
+        let published = AuditKind::PolicyPublished { generation: 5 };
+        assert!(!record_mentions_agent(&published, "ws/node", None));
+    }
+
+    #[test]
+    fn read_skips_junk_lines_per_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        // One real record (hand-shaped envelope — the kind's serde form
+        // is the contract), then junk: the reader degrades per record.
+        let record = r#"{"source_id":"hub","sequence":1,"ts":"2026-10-20T00:00:00Z","kind":"maintenance_declared","agent":"ws/node","previous_hash":"0","record_hash":"1"}"#;
+        std::fs::write(&path, format!("not json\n{record}\n")).unwrap();
+        let records = read_audit_records(std::slice::from_ref(&path));
+        assert_eq!(records.len(), 1, "junk skipped, the record parsed");
+        assert!(matches!(
+            records[0].kind,
+            AuditKind::MaintenanceDeclared { .. }
+        ));
+        // Discovery: the live file (and only it) under the dir.
+        let files = audit_file_paths(dir.path());
+        assert_eq!(files, vec![path]);
+    }
+}
+
+#[cfg(test)]
 #[allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -1141,6 +1370,7 @@ mod tests {
         sink.record(
             AuditKind::AgentRegistered {
                 circuit: "12078a05e14f4e2c99b1679be1df7c30".into(),
+                agent: "ws/node".to_owned(),
                 build: Some("2026-10-07_2f3633f".into()),
             },
             None,

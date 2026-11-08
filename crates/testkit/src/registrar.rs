@@ -43,6 +43,15 @@ pub struct RegistrarFixtureOptions {
     pub ttl: LeafTtl,
     pub control_endpoint: String,
     pub hub_endpoints: std::collections::BTreeMap<String, String>,
+    /// Bind here instead of a fresh ephemeral port. For the revival shape
+    /// only: a registrar that was [`RegistrarFixture::kill`]ed comes back
+    /// at the address the packs under test already dial. Fresh fixtures
+    /// keep `None` — the ephemeral bind is the TOCTOU-free default.
+    pub listen_addr: Option<SocketAddr>,
+    /// Serve an existing issuer store instead of provisioning a fresh one
+    /// — the revived registrar must sign with the same realm the packs
+    /// trust. `None` provisions a store in the fixture's tempdir.
+    pub issuer_dir: Option<PathBuf>,
 }
 
 impl Default for RegistrarFixtureOptions {
@@ -51,25 +60,42 @@ impl Default for RegistrarFixtureOptions {
             ttl: LeafTtl::default_ttl(),
             control_endpoint: "127.0.0.1:16666".to_owned(),
             hub_endpoints: Default::default(),
+            listen_addr: None,
+            issuer_dir: None,
         }
     }
 }
 
-/// Provisions an issuer store and serves the registrar on a fresh
-/// loopback port. Installs the test logging sink and the process-default
-/// TLS provider (idempotent).
+impl RegistrarFixtureOptions {
+    /// Options that bring a killed registrar back where it was: same
+    /// listen address, same issuer store, same leaf TTL.
+    #[must_use]
+    pub fn revive(dead: &RegistrarFixture, ttl: LeafTtl) -> Self {
+        Self {
+            ttl,
+            listen_addr: Some(dead.addr),
+            issuer_dir: Some(dead.issuer_dir.clone()),
+            ..Self::default()
+        }
+    }
+}
+
+/// Provisions an issuer store (or opens the given one) and serves the
+/// registrar on a fresh loopback port (or the given address). Installs the
+/// test logging sink and the process-default TLS provider (idempotent).
 pub async fn spawn_registrar(options: RegistrarFixtureOptions) -> RegistrarFixture {
     crate::logging::init_test_logging();
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
     let dir = tempfile::tempdir().expect("registrar tempdir");
-    let issuer_dir = dir.path().join("issuer");
+    let issuer_dir = options
+        .issuer_dir
+        .clone()
+        .unwrap_or_else(|| dir.path().join("issuer"));
     let issuer = IssuerStore::open(&issuer_dir);
     issuer.ensure_realm().expect("ensure realm");
     issuer.ensure_workspace("main").expect("ensure workspace");
     issuer.ensure_policy_key().expect("ensure policy key");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind registrar listener");
+    let listener = bind_listener(options.listen_addr).await;
     let addr = listener.local_addr().expect("registrar local addr");
     let endpoint = format!("https://{addr}");
     let tls = issuer
@@ -112,6 +138,13 @@ impl RegistrarFixture {
     /// The serving address (`https://127.0.0.1:{port}`).
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// The bound socket address (what [`RegistrarFixtureOptions::revive`]
+    /// rebinds; what an unreachability probe dials).
+    #[must_use]
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
     }
 
     /// The realm CA PEM, for client trust stores.
@@ -170,6 +203,30 @@ impl RegistrarFixture {
         match self.serve.await {
             Ok(result) => result,
             Err(join) => panic!("registrar serve task failed: {join}"),
+        }
+    }
+}
+
+/// Binds the registrar listener: a fresh ephemeral port by default; the
+/// given address for a revival. A killed fixture's listener is released
+/// when its serve task is aborted, which the runtime completes a tick or
+/// two after `kill()` returns — the fixed-address bind retries briefly
+/// across that window rather than racing it.
+async fn bind_listener(listen_addr: Option<SocketAddr>) -> tokio::net::TcpListener {
+    let Some(addr) = listen_addr else {
+        return tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind registrar listener");
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => return listener,
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                tracing::debug!("registrar revival bind at {addr} not yet possible: {e}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("rebind registrar listener at {addr}: {e}"),
         }
     }
 }

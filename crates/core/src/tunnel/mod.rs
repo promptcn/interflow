@@ -43,5 +43,6 @@ pub use pump::{PumpConfig, StreamPumpTarget, pump_duplex, pump_tcp_stream};
 pub use selector::{InnerStreamHello, TargetSelector};
 pub use session_tasks::{Beat, SessionExitGuard, SessionTasks, TaskExit, TaskExitReason};
 pub use transport::{
-    IncomingStream, PolicyFetch, PolicyPull, SteadyStateLiveness, TunnelData, TunnelTransport,
+    IncomingStream, PolicyFetch, PolicyPull, SteadyStateLiveness, TunnelData, TunnelDispatch,
+    TunnelTransport,
 };

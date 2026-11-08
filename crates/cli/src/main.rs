@@ -4,7 +4,9 @@
 //! Operator surface: pack / trust / rotate / revoke / identity.
 
 mod doctor;
+mod doctor_biography;
 mod doctor_link;
+mod probe;
 mod status;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -97,6 +99,19 @@ enum Command {
     Proposals {
         #[command(subcommand)]
         command: ProposalsCommand,
+    },
+    /// Stream-level planned unavailability: pause one stream (stop its
+    /// listener, release its port) or resume it. Idempotent.
+    Stream {
+        #[command(subcommand)]
+        command: StreamCommand,
+    },
+    /// Node-level planned unavailability: declare a leg's coming absence
+    /// expected (no accidental-death signals), or lift the declaration.
+    /// The declaration also lifts itself when the node rejoins.
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
     },
     /// Run an ingress from a Credential Pack.
     Ingress {
@@ -375,6 +390,19 @@ enum NodeOp {
         #[arg(long)]
         allow_downgrade: bool,
     },
+    /// Retire one installed node: disable + remove its unit and archive the
+    /// pack directory (never deleted). The explicit inverse of install —
+    /// orphans it names (and `doctor host`) race for ports at the next
+    /// boot until retired.
+    Retire {
+        /// The INSTALLED pack directory to retire (e.g.
+        /// /srv/interflow/packs/hub-promptcn, or a path relative to --root).
+        #[arg(long)]
+        pack: PathBuf,
+        /// Install root (system paths require root).
+        #[arg(long, default_value = interflow_cli::render::DEFAULT_INSTALL_ROOT)]
+        root: PathBuf,
+    },
     /// Append a node to the manifest — structured and non-destructive
     /// (comments and layout stay; the edited manifest must pass the full
     /// validation funnel before anything is written).
@@ -447,6 +475,68 @@ enum ProposalsCommand {
     },
 }
 
+/// The stream-level planned-unavailability verbs (symmetric, idempotent).
+#[derive(Subcommand)]
+enum StreamCommand {
+    /// Pause one stream: the node stops its listener and releases the
+    /// port (e.g. to lend 127.0.0.1:11434 to a local process). Survives
+    /// node restarts; only `stream resume` lifts it.
+    Pause {
+        /// The node whose stream to pause (bare name or qualified
+        /// `tenant/agent`).
+        #[arg(long)]
+        agent: String,
+        /// The stream (ingress rule) name.
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "interflow.toml")]
+        manifest: PathBuf,
+        #[arg(long, default_value = "issuer")]
+        issuer: PathBuf,
+    },
+    /// Resume one paused stream (the only unpause).
+    Resume {
+        /// The node whose stream to resume.
+        #[arg(long)]
+        agent: String,
+        /// The stream (ingress rule) name.
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "interflow.toml")]
+        manifest: PathBuf,
+        #[arg(long, default_value = "issuer")]
+        issuer: PathBuf,
+    },
+}
+
+/// The node-level planned-unavailability verbs (symmetric, idempotent).
+#[derive(Subcommand)]
+enum MaintenanceCommand {
+    /// Declare a node under maintenance: its absence is expected, not an
+    /// accident — no eviction accounting, probe windows exempt. Lifts
+    /// itself when the node rejoins.
+    On {
+        /// The node (bare name or qualified `tenant/agent`).
+        #[arg(long)]
+        agent: String,
+        #[arg(long, default_value = "interflow.toml")]
+        manifest: PathBuf,
+        #[arg(long, default_value = "issuer")]
+        issuer: PathBuf,
+    },
+    /// Lift a maintenance declaration explicitly (the rejoined-node path
+    /// lifts it automatically).
+    Off {
+        /// The node (bare name or qualified `tenant/agent`).
+        #[arg(long)]
+        agent: String,
+        #[arg(long, default_value = "interflow.toml")]
+        manifest: PathBuf,
+        #[arg(long, default_value = "issuer")]
+        issuer: PathBuf,
+    },
+}
+
 #[derive(Subcommand)]
 enum PlanCommand {
     /// Check the manifest without changing anything.
@@ -456,12 +546,18 @@ enum PlanCommand {
     },
     /// Show what the next `plan apply` would change: the declaration vs
     /// the exact text of the last applied state, with the change
-    /// classification on top. Nothing is minted or dialed.
+    /// classification on top — the same fork decision apply takes, read
+    /// against the same output tree (pack-tree freshness, local watermarks).
+    /// Nothing is minted or dialed.
     Diff {
         #[arg(long, default_value = "interflow.toml")]
         manifest: PathBuf,
         #[arg(long, default_value = "issuer")]
         issuer: PathBuf,
+        /// The output root `plan apply` renders into — probed for pack-tree
+        /// freshness and watermark divergence (the same default as apply).
+        #[arg(long, default_value = "dist")]
+        out: PathBuf,
     },
     /// Issue identities + packs + node configs from the manifest.
     Apply {
@@ -500,6 +596,41 @@ enum PlanCommand {
         /// generation still mints above every watermark (no reset).
         #[arg(long)]
         force_rerender: bool,
+    },
+    /// Produce one host's minimal staging tree — verified bin/, the host's
+    /// validated pack, its nginx fragments (ingress), install.sh, a
+    /// per-file sha256 manifest and a deterministic tar — everything a
+    /// server needs, nothing it does not. `install.sh --verify-staging`
+    /// on the target checks the transfer before anything installs.
+    Stage {
+        /// The host to stage for: agent/<name>, ingress/<name> or
+        /// hub/<name>, as declared in the manifest.
+        #[arg(long)]
+        host: String,
+        /// Additional nodes staged into the SAME tree (repeatable) — one
+        /// physical machine hosting several nodes (e.g. an ingress edge and
+        /// a hub) stages one tree: bin/ and install.sh once, every node's
+        /// pack, the nginx fragment union.
+        #[arg(long = "with")]
+        with: Vec<String>,
+        #[arg(long, default_value = "interflow.toml")]
+        manifest: PathBuf,
+        /// Issuer store directory (read-only — the freshness gate's
+        /// baseline; staging is refused while the next apply would
+        /// re-render packs).
+        #[arg(long, default_value = "issuer")]
+        issuer: PathBuf,
+        /// The dist root `plan apply` rendered (pack + nginx source).
+        #[arg(long, default_value = "dist")]
+        out: PathBuf,
+        /// Directory holding the built engine binaries; a
+        /// build-manifest.*.json record is consumed and verified when
+        /// present (exact canonical names otherwise).
+        #[arg(long, default_value = "artifacts")]
+        artifacts: PathBuf,
+        /// Staging output directory (default: stage/<kind>-<node>).
+        #[arg(long)]
+        to: Option<PathBuf>,
     },
 }
 
@@ -624,8 +755,12 @@ async fn main() -> interflow_core::error::Result<()> {
                 }
                 Ok(())
             }
-            PlanCommand::Diff { manifest, issuer } => {
-                for line in plan::diff(&manifest, &issuer)? {
+            PlanCommand::Diff {
+                manifest,
+                issuer,
+                out,
+            } => {
+                for line in plan::diff(&manifest, &issuer, &out)? {
                     outln!("{line}");
                 }
                 Ok(())
@@ -655,6 +790,30 @@ async fn main() -> interflow_core::error::Result<()> {
                     &backup,
                     force_rerender,
                 )?
+                .lines
+                {
+                    outln!("{line}");
+                }
+                Ok(())
+            }
+            PlanCommand::Stage {
+                host,
+                with,
+                manifest,
+                issuer,
+                out,
+                artifacts,
+                to,
+            } => {
+                for line in plan::stage::stage(&plan::stage::StageOptions {
+                    host,
+                    with,
+                    manifest,
+                    issuer,
+                    out,
+                    artifacts,
+                    to,
+                })?
                 .lines
                 {
                     outln!("{line}");
@@ -803,6 +962,58 @@ async fn main() -> interflow_core::error::Result<()> {
                         );
                     }
                 }
+                if !report.host_findings.is_empty() {
+                    outln!(
+                        "⚠ host reconciliation: {} leftover(s) no installed set or signed \
+                         roster accounts for:",
+                        report.host_findings.len()
+                    );
+                    for finding in &report.host_findings {
+                        outln!("  {}", finding.describe());
+                    }
+                }
+                Ok(())
+            }
+            NodeOp::Retire { pack, root } => {
+                // A relative --pack resolves against the install root's
+                // packs/ directory — the shape the reconciliation output
+                // hands the operator (`node retire --pack packs/hub-x`).
+                let pack = if pack.is_absolute() {
+                    pack
+                } else {
+                    root.join(&pack)
+                };
+                let report = interflow_cli::node_install::retire(
+                    &interflow_cli::node_install::NodeRetire {
+                        pack,
+                        root: root.clone(),
+                    },
+                )?;
+                outln!("✔ retired {} node {}", report.kind.as_str(), report.node,);
+                if report.unit_disabled {
+                    outln!("  unit: stopped and disabled (systemd)");
+                }
+                if report.unit_removed {
+                    outln!("  unit file: removed (daemon-reloaded)");
+                } else {
+                    outln!("  unit file: none was present");
+                }
+                outln!("  pack: archived to {}", report.archived_to.display());
+                // The sweep after the sweep: anything the retirement left
+                // behind is named while the operator is looking.
+                let unit_dir =
+                    if root == std::path::Path::new(interflow_cli::render::DEFAULT_INSTALL_ROOT) {
+                        std::path::PathBuf::from("/etc/systemd/system")
+                    } else {
+                        root.join("systemd")
+                    };
+                let findings = interflow_cli::host_reconcile::scan(&unit_dir, &root.join("packs"));
+                if !findings.is_empty() {
+                    outln!("⚠ host reconciliation: leftovers remain:");
+                    for finding in &findings {
+                        outln!("  {}", finding.describe());
+                    }
+                }
                 Ok(())
             }
             NodeOp::Add {
@@ -849,6 +1060,36 @@ async fn main() -> interflow_core::error::Result<()> {
                 );
                 Ok(())
             }
+        },
+        Command::Stream { command } => match command {
+            StreamCommand::Pause {
+                agent,
+                name,
+                manifest,
+                issuer,
+            } => {
+                interflow_cli::streams::stream_pause_resume(&manifest, &issuer, &agent, &name, true)
+            }
+            StreamCommand::Resume {
+                agent,
+                name,
+                manifest,
+                issuer,
+            } => interflow_cli::streams::stream_pause_resume(
+                &manifest, &issuer, &agent, &name, false,
+            ),
+        },
+        Command::Maintenance { command } => match command {
+            MaintenanceCommand::On {
+                agent,
+                manifest,
+                issuer,
+            } => interflow_cli::streams::maintenance_on_off(&manifest, &issuer, &agent, true),
+            MaintenanceCommand::Off {
+                agent,
+                manifest,
+                issuer,
+            } => interflow_cli::streams::maintenance_on_off(&manifest, &issuer, &agent, false),
         },
         Command::Status { command } => command.run(),
         Command::Pack { command } => match command {

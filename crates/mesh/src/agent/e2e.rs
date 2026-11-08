@@ -17,9 +17,7 @@ use interflow_core::tls::{
     InnerTlsMaterial, classify_handshake_error, inner_client_config, inner_quic_client_config,
     inner_server_config_unbound,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
@@ -71,7 +69,6 @@ pub struct E2eRuntime {
     pub handshake_timeout: Duration,
     material: Arc<InnerTlsMaterial>,
     source_principal: String,
-    quic_client_configs: Arc<Mutex<HashMap<String, Arc<ClientConfig>>>>,
 }
 
 impl E2eRuntime {
@@ -114,26 +111,25 @@ impl E2eRuntime {
             handshake_timeout: Duration::from_secs(cfg.inner_tls.handshake_timeout_secs),
             material: Arc::new(material),
             source_principal: bare_agent_id(&cfg.agent.id).to_owned(),
-            quic_client_configs: Arc::default(),
         }))
     }
 
     /// Inner TLS client connector for one stream (ingress role): the
     /// expected peer CN is the Open target's bare agent id.
     pub(crate) fn client_connector(&self, expected_peer_cn: &str) -> Result<TlsConnector> {
-        Ok(TlsConnector::from(Arc::new(inner_client_config(
+        Ok(TlsConnector::from(inner_client_config(
             &self.material,
             expected_peer_cn,
-        )?)))
+        )?))
     }
 
     /// Source-opaque inner TLS acceptor. Chain verification still happens in
     /// the handshake; the encrypted [`InnerStreamHello`] binds CN and
     /// fingerprint immediately after establishment.
     pub fn server_acceptor_unbound(&self) -> Result<TlsAcceptor> {
-        Ok(TlsAcceptor::from(Arc::new(inner_server_config_unbound(
+        Ok(TlsAcceptor::from(inner_server_config_unbound(
             &self.material,
-        )?)))
+        )?))
     }
 
     /// Startup-assembled inner TLS material used by the UDP inner QUIC layer.
@@ -145,24 +141,13 @@ impl E2eRuntime {
         &self.source_principal
     }
 
-    /// Returns a reusable inner QUIC client config for one expected peer.
+    /// A reusable inner QUIC client config for one expected peer.
     ///
-    /// Cloning rustls config preserves its session-store `Arc`, so association
-    /// rebuilds can resume while the CN-specific cache remains isolated.
-    pub(crate) fn quic_client_config(&self, expected_peer_cn: &str) -> Result<ClientConfig> {
-        let mut cache = self
-            .quic_client_configs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(config) = cache.get(expected_peer_cn) {
-            return Ok((**config).clone());
-        }
-        let config = Arc::new(inner_quic_client_config(&self.material, expected_peer_cn)?);
-        if cache.len() >= 128 {
-            cache.clear();
-        }
-        cache.insert(expected_peer_cn.to_owned(), Arc::clone(&config));
-        Ok((*config).clone())
+    /// Cached on the material (per CN, 128-entry bound): association rebuilds
+    /// share the config `Arc`, preserving its per-CN session store across
+    /// reconnects while CN isolation holds.
+    pub(crate) fn quic_client_config(&self, expected_peer_cn: &str) -> Result<Arc<ClientConfig>> {
+        inner_quic_client_config(&self.material, expected_peer_cn)
     }
 
     /// Fingerprint of the leaf certificate this principal presents.

@@ -5,7 +5,8 @@
 //! the CRL staleness bound.
 //!
 //! Every case drives the REAL scheduler loop against a REAL in-process
-//! registrar over HTTPS — only time is faked. The fixture mirrors
+//! registrar over HTTPS — only time is faked. The fixture (`common/`,
+//! shared with the clock-skew and registrar-absence binaries) mirrors
 //! `crates/cli/tests/renewal.rs` (issuer store → `serve` → `plan::apply`),
 //! so the packs under test are production-shaped. Most cases ask for 1h
 //! leaves (the registrar-tier floor) so the 50% line sits 30 fake minutes
@@ -15,370 +16,16 @@
 //! buffer are process-global (the same discipline as core's fault tests),
 //! so every case takes [`SERIAL`] first.
 
-use interflow_cli::plan::{self, BackupInitOptions};
-use interflow_identity::credentials::ActiveCredentialSet;
+mod common;
+
+use common::*;
 use interflow_identity::issuance::IssuerStore;
-use interflow_identity::pack::CredentialPack;
 use interflow_registrar::fault::{self, FaultAction, FaultPoint};
-use interflow_renewal::{renewal_scheduler_with_clock, renewal_scheduler_with_crl_reload};
+use interflow_renewal::CrlPollFace;
 use interflow_testkit::clock::FakeClock;
-use interflow_testkit::registrar::{RegistrarFixture, RegistrarFixtureOptions};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use time::OffsetDateTime;
-use tokio::task::JoinHandle;
-
-use interflow_core::error::Result;
-
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Real-time cap for one chunk's quiescence wait: a wake's processing is a
-/// handful of loopback HTTPS round trips — anything approaching this is a
-/// hang, not slowness, and must fail loudly instead of stalling the drive.
-const SETTLE_CAP: Duration = Duration::from_secs(5);
-
-/// Waits until the scheduler has finished whatever a wake started: either
-/// the whole task completed, or every fake-clock sleep is re-parked beyond
-/// the current fake time. Runner speed no longer influences which fake
-/// chunk a consult lands in — the fixed real-time settles of the 2026-10
-/// era let a slow container's round trips straddle a chunk boundary and
-/// shifted attempt timestamps a whole chunk late (the backoff-ladder
-/// assertions pay for exactly that).
-async fn settle(clock: &FakeClock, scheduler: &Scheduler) {
-    let cap = tokio::time::Instant::now() + SETTLE_CAP;
-    loop {
-        if scheduler.is_finished() || clock.all_parked_beyond_now() {
-            return;
-        }
-        assert!(
-            tokio::time::Instant::now() < cap,
-            "scheduler did not go quiescent within {SETTLE_CAP:?} of a chunk advance"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tracing capture: the scheduler's banners (rotation_failed, the warning
-// bands) are tracing events; a global fmt subscriber mirrors every line
-// into a shared buffer the tests grep.
-// ---------------------------------------------------------------------------
-mod capture {
-    use std::io::Write;
-    use std::sync::{Mutex, OnceLock};
-
-    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    struct Maker;
-
-    impl tracing_subscriber::fmt::MakeWriter<'_> for Maker {
-        type Writer = Writer;
-
-        fn make_writer(&self) -> Self::Writer {
-            Writer
-        }
-    }
-
-    struct Writer;
-
-    impl Write for Writer {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            LINES
-                .lock()
-                .expect("capture lock poisoned")
-                .push(String::from_utf8_lossy(buf).trim().to_owned());
-            // Mirror to stderr: the buffer is only readable through the
-            // assertions, so a fixture that never becomes ready needs the
-            // stderr copy to be diagnosable under --nocapture (nextest
-            // prints captured output on failure only).
-            let _ = std::io::stderr().write_all(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Installs the capturing subscriber once per test binary.
-    pub fn install_once() {
-        static ONCE: OnceLock<()> = OnceLock::new();
-        ONCE.get_or_init(|| {
-            let _ = tracing::subscriber::set_global_default(
-                tracing_subscriber::fmt()
-                    .with_max_level(tracing::Level::INFO)
-                    .with_ansi(false)
-                    .with_writer(Maker)
-                    .finish(),
-            );
-        });
-    }
-
-    pub fn clear() {
-        LINES.lock().expect("capture lock poisoned").clear();
-    }
-
-    /// How many captured lines contain `needle`.
-    pub fn count(needle: &str) -> usize {
-        LINES
-            .lock()
-            .expect("capture lock poisoned")
-            .iter()
-            .filter(|line| line.contains(needle))
-            .count()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Fixture: issuer store → in-process registrar → plan::apply → agent pack
-// ---------------------------------------------------------------------------
-
-/// A registrar-tier agent pack plus the live registrar behind it.
-struct AgentFixture {
-    /// The live registrar (issuer provisioning, ready, killable).
-    registrar: RegistrarFixture,
-    #[expect(
-        dead_code,
-        reason = "holds the manifest/dist tree alive for the test body"
-    )]
-    dir: tempfile::TempDir,
-    pack_dir: PathBuf,
-}
-
-/// Renders an agent pack against a live in-process registrar serving
-/// `ttl`-long leaves (`ttl` is a humantime string; manifest and registrar
-/// agree on it).
-async fn agent_fixture(ttl: &str) -> AgentFixture {
-    let ttl_secs = i64::try_from(
-        humantime::parse_duration(ttl)
-            .expect("ttl humantime")
-            .as_secs(),
-    )
-    .expect("ttl fits");
-    let registrar = interflow_testkit::registrar::spawn_registrar(RegistrarFixtureOptions {
-        ttl: interflow_identity::issuance::LeafTtl::from_seconds(ttl_secs).expect("serve ttl"),
-        ..RegistrarFixtureOptions::default()
-    })
-    .await;
-    registrar.wait_ready().await;
-    let dir = tempfile::tempdir().expect("tempdir");
-    let endpoint = registrar.endpoint().to_owned();
-    let issuer_dir = registrar.issuer_dir().to_owned();
-    let manifest_path = dir.path().join("interflow.toml");
-    std::fs::write(
-        &manifest_path,
-        format!(
-            r#"
-[realm]
-id = "test"
-control_endpoint = "127.0.0.1:16666"
-[identity]
-leaf_ttl = "{ttl}"
-[registrar]
-endpoint = "{endpoint}"
-[ingress.edge]
-workspaces = ["main"]
-[workspace.main]
-[agent.desktop]
-workspace = "main"
-[[agent.desktop.services]]
-id = "web"
-address = "127.0.0.1:18080"
-[[route]]
-host = "web.test"
-service = "main/desktop/web"
-"#
-        ),
-    )
-    .expect("write manifest");
-    plan::apply(
-        &manifest_path,
-        &issuer_dir,
-        &dir.path().join("dist"),
-        false,
-        &BackupInitOptions {
-            skip: true,
-            ..BackupInitOptions::default()
-        },
-        false,
-    )
-    .expect("plan apply");
-    let pack_dir = dir.path().join("dist/packs/agent-desktop");
-    AgentFixture {
-        registrar,
-        dir,
-        pack_dir,
-    }
-}
-
-/// An offline-tier agent pack (180d leaves): nothing dials anything.
-fn offline_pack_dir() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let manifest_path = dir.path().join("interflow.toml");
-    std::fs::write(
-        &manifest_path,
-        r#"
-[realm]
-id = "test"
-control_endpoint = "127.0.0.1:26666"
-
-[public_tls]
-mode = "frontend-proxy"
-
-[identity]
-mode = "offline"
-leaf_ttl = "180d"
-
-[ingress.edge]
-workspaces = ["main"]
-listen = "127.0.0.1:18443"
-control_listen = "127.0.0.1:26666"
-
-[workspace.main]
-
-[agent.desktop]
-workspace = "main"
-
-[[agent.desktop.services]]
-id = "web"
-address = "127.0.0.1:18080"
-
-[[route]]
-host = "web.test"
-service = "main/desktop/web"
-"#,
-    )
-    .expect("write manifest");
-    plan::apply(
-        &manifest_path,
-        &dir.path().join("issuer"),
-        &dir.path().join("dist"),
-        false,
-        &BackupInitOptions {
-            skip: true,
-            ..BackupInitOptions::default()
-        },
-        false,
-    )
-    .expect("offline plan apply");
-    let pack_dir = dir.path().join("dist/packs/agent-desktop");
-    (dir, pack_dir)
-}
-
-fn active_set(pack_dir: &Path) -> ActiveCredentialSet {
-    ActiveCredentialSet::load_or_bootstrap(&CredentialPack::load_runtime(pack_dir).expect("pack"))
-        .expect("active set")
-}
-
-/// Runs the scheduler once on the real clock. On a fresh pack the first
-/// CRL pull writes the files and the scheduler exits onto the supervisor
-/// restart — which is exactly the priming the timed cases need: afterwards
-/// every pull is `Ok(false)` and the loop gets to the threshold math.
-async fn prime_crls(pack_dir: &Path) {
-    renewal_scheduler_with_crl_reload(pack_dir, None, None)
-        .await
-        .expect("CRL first-write exit is Ok");
-    assert!(
-        pack_dir
-            .join("state/crls")
-            .read_dir()
-            .expect("crl dir")
-            .count()
-            > 0,
-        "priming wrote the CRL files"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Fake-time driver
-// ---------------------------------------------------------------------------
-
-type Scheduler = JoinHandle<Result<()>>;
-
-fn spawn_scheduler(pack_dir: &Path, clock: &FakeClock) -> Scheduler {
-    let pack_dir = pack_dir.to_path_buf();
-    let clock: Arc<dyn interflow_renewal::Clock> = Arc::new(clock.clone());
-    tokio::spawn(async move { renewal_scheduler_with_clock(&pack_dir, None, None, clock).await })
-}
-
-/// Advances fake time in `step` chunks (with real settle time for the
-/// in-loop HTTPS traffic) until the scheduler settles; returns its result.
-async fn drive_to_completion(
-    clock: &FakeClock,
-    scheduler: Scheduler,
-    step: Duration,
-    max_chunks: usize,
-) -> Result<()> {
-    for _ in 0..max_chunks {
-        if scheduler.is_finished() {
-            return scheduler.await.expect("scheduler join");
-        }
-        clock.advance(step);
-        settle(clock, &scheduler).await;
-    }
-    assert!(
-        scheduler.is_finished(),
-        "scheduler did not settle within {max_chunks} chunks of {step:?}"
-    );
-    scheduler.await.expect("scheduler join")
-}
-
-/// Drives a fixed number of chunks and reports whether the scheduler
-/// settled (for cases that deliberately keep running).
-async fn drive_chunks(
-    clock: &FakeClock,
-    scheduler: &Scheduler,
-    step: Duration,
-    chunks: usize,
-) -> bool {
-    for _ in 0..chunks {
-        if scheduler.is_finished() {
-            return true;
-        }
-        clock.advance(step);
-        settle(clock, scheduler).await;
-    }
-    scheduler.is_finished()
-}
-
-/// A fault hook that fails `/v1/renew` for the first `failures` requests,
-/// recording the fake-clock reading of every consult (the renewal-attempt
-/// timestamps the backoff assertions need).
-struct RenewFault {
-    failures: usize,
-    consults: std::sync::Mutex<Vec<OffsetDateTime>>,
-}
-
-impl RenewFault {
-    fn install(failures: usize, clock: &FakeClock) -> Arc<Self> {
-        let plan = Arc::new(Self {
-            failures,
-            consults: std::sync::Mutex::new(Vec::new()),
-        });
-        let hook_clock = clock.clone();
-        let hook_plan = Arc::clone(&plan);
-        fault::install_hook(Arc::new(move |point: FaultPoint| {
-            if point != FaultPoint::Renew {
-                return FaultAction::Continue;
-            }
-            let mut consults = hook_plan.consults.lock().expect("consult lock poisoned");
-            consults.push(hook_clock.now());
-            if consults.len() <= hook_plan.failures {
-                FaultAction::ServiceUnavailable
-            } else {
-                FaultAction::Continue
-            }
-        }));
-        plan
-    }
-
-    /// Fake-clock readings at each `/v1/renew` consult, in order.
-    fn consult_times(&self) -> Vec<OffsetDateTime> {
-        self.consults.lock().expect("consult lock poisoned").clone()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // G1: 50%-TTL threshold natural triggering
@@ -396,7 +43,7 @@ async fn scheduler_renews_at_half_ttl_and_not_before() {
 
     let before = active_set(&fixture.pack_dir);
     let clock = FakeClock::at_real_now();
-    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock);
+    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock, &Arc::new(CrlPollFace::new()));
 
     // 28 of the 30 minutes: still short of the threshold — the scheduler
     // must stay parked on its poll sleeps, credentials untouched.
@@ -449,7 +96,7 @@ async fn failed_renewals_back_off_then_recover() {
     // First two /v1/renew requests 503; the third succeeds (renew +
     // confirm complete the rotation).
     let plan_hook = RenewFault::install(2, &clock);
-    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock);
+    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock, &Arc::new(CrlPollFace::new()));
 
     // 30s chunks so attempt gaps resolve the ladder steps.
     let result = drive_to_completion(&clock, scheduler, Duration::from_secs(30), 260).await;
@@ -509,7 +156,7 @@ async fn expired_credentials_fail_closed() {
     // outlive.
     let clock = FakeClock::at_real_now();
     let _plan_hook = RenewFault::install(usize::MAX, &clock);
-    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock);
+    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock, &Arc::new(CrlPollFace::new()));
     // 70 minutes into a 1h leaf (5-minute chunks).
     let result = drive_to_completion(&clock, scheduler, Duration::from_mins(5), 16).await;
     fault::clear_hook();
@@ -540,7 +187,7 @@ async fn less_than_ten_percent_ttl_logs_the_expiry_warning() {
 
     let clock = FakeClock::at_real_now();
     let plan_hook = RenewFault::install(usize::MAX, &clock);
-    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock);
+    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock, &Arc::new(CrlPollFace::new()));
 
     // 23h in: inside the warning band, short of expiry.
     let finished = drive_chunks(&clock, &scheduler, Duration::from_mins(30), 46).await;
@@ -572,7 +219,7 @@ async fn offline_watch_warns_once_at_twenty_percent_then_fails_closed() {
     let (_dir, pack_dir) = offline_pack_dir();
 
     let clock = FakeClock::at_real_now();
-    let scheduler = spawn_scheduler(&pack_dir, &clock);
+    let scheduler = spawn_scheduler(&pack_dir, &clock, &Arc::new(CrlPollFace::new()));
 
     // 180d leaves: the warning band opens below 20% remaining (< 36d left
     // ⇒ first possible at day 145). 143 days in, nothing may have fired —
@@ -685,7 +332,7 @@ async fn crl_pull_failures_beyond_one_hour_fail_closed() {
     }));
 
     let clock = FakeClock::at_real_now();
-    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock);
+    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock, &Arc::new(CrlPollFace::new()));
     // 10-minute chunks: the bound is 1h, so the fail-closed lands on chunk
     // ~7; short of the bound the loop must keep polling.
     let result = drive_to_completion(&clock, scheduler, Duration::from_mins(10), 10).await;
@@ -700,5 +347,187 @@ async fn crl_pull_failures_beyond_one_hour_fail_closed() {
         pulls.load(Ordering::SeqCst) >= 6,
         "pulls kept their cadence while stale: {}",
         pulls.load(Ordering::SeqCst)
+    );
+}
+
+/// The recovery half of the staleness bound (identity-plane matrix row 3,
+/// `crates/mesh/tests/identity_lifecycle_matrix.rs`): pulls that fail for
+/// a while and then succeed again BEFORE the bound never fail closed. The
+/// face counts exactly the injected failures, its confirmation instant
+/// freezes through the outage and advances again on the first good poll,
+/// and the loop simply carries on — self-healing, no restart needed.
+#[tokio::test]
+async fn crl_pull_recovers_before_the_bound_without_failing_closed() {
+    let _serial = SERIAL.lock().await;
+    capture::install_once();
+    capture::clear();
+    fault::clear_hook();
+    // 24h leaves: the threshold (12h out) never interferes.
+    let fixture = agent_fixture("24h").await;
+    prime_crls(&fixture.pack_dir).await;
+
+    // Exactly the first three pulls fail; the registrar then answers again.
+    const INJECTED_FAILURES: u64 = 3;
+    let pulls = Arc::new(AtomicUsize::new(0));
+    let hook_pulls = Arc::clone(&pulls);
+    fault::install_hook(Arc::new(move |point: FaultPoint| {
+        if point != FaultPoint::Crls {
+            return FaultAction::Continue;
+        }
+        let pull = u64::try_from(hook_pulls.fetch_add(1, Ordering::SeqCst)).unwrap_or(u64::MAX);
+        if pull < INJECTED_FAILURES {
+            FaultAction::ServiceUnavailable
+        } else {
+            FaultAction::Continue
+        }
+    }));
+
+    let face = Arc::new(CrlPollFace::new());
+    let started_at = face.snapshot().last_success_unix;
+    let clock = FakeClock::at_real_now();
+    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock, &face);
+
+    // Into the outage (the spawned task's first pass lands on the first
+    // chunk): failed polls are counted, the confirmation instant has not
+    // moved.
+    assert!(!drive_chunks(&clock, &scheduler, Duration::from_secs(60), 1).await);
+    let outage = face.snapshot();
+    assert!(
+        outage.failures_total >= 1,
+        "the failed polls count: {}",
+        outage.failures_total
+    );
+    assert_eq!(
+        outage.last_success_unix, started_at,
+        "no success yet → the confirmation instant is frozen"
+    );
+
+    // Five more polls: the remaining injected failures, then healthy
+    // answers.
+    assert!(
+        !drive_chunks(&clock, &scheduler, Duration::from_secs(60), 5).await,
+        "a recovered CRL lane keeps the loop running"
+    );
+    fault::clear_hook();
+    let healed = face.snapshot();
+    assert_eq!(
+        healed.failures_total, INJECTED_FAILURES,
+        "exactly the injected failures counted — none after recovery"
+    );
+    assert!(
+        healed.last_success_unix > started_at,
+        "the confirmation instant advanced again on the first good poll: {} → {}",
+        started_at,
+        healed.last_success_unix
+    );
+    assert_eq!(
+        capture::count("CRL freshness bound exceeded"),
+        0,
+        "a recovery inside the bound never fails closed"
+    );
+    assert!(
+        u64::try_from(pulls.load(Ordering::SeqCst)).unwrap_or(u64::MAX) > INJECTED_FAILURES,
+        "polls continued past the outage: {}",
+        pulls.load(Ordering::SeqCst)
+    );
+    scheduler.abort();
+}
+
+// ---------------------------------------------------------------------------
+// CRL-poll liveness face
+// ---------------------------------------------------------------------------
+
+/// Steady-state no-change polls ARE successes: the face's confirmation
+/// instant must advance every poll while `failures_total` stays zero —
+/// this is exactly the "polled, nothing moved" leg the old loop-local
+/// variable kept invisible.
+#[tokio::test]
+async fn crl_poll_face_advances_on_no_change_polls() {
+    let _serial = SERIAL.lock().await;
+    capture::install_once();
+    capture::clear();
+    fault::clear_hook();
+    // 24h leaves: the renewal threshold never fires during the drive.
+    let fixture = agent_fixture("24h").await;
+    prime_crls(&fixture.pack_dir).await;
+
+    let face = Arc::new(CrlPollFace::new());
+    let started_at = face.snapshot().last_success_unix;
+    let clock = FakeClock::at_real_now();
+    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock, &face);
+    // Three 60s chunks → three polls, each a no-change `Ok(false)`.
+    let finished = drive_chunks(&clock, &scheduler, Duration::from_secs(60), 3).await;
+    assert!(!finished, "the scheduler keeps polling (no exit expected)");
+    let snap = face.snapshot();
+    assert_eq!(snap.failures_total, 0, "healthy polls are not failures");
+    assert!(
+        snap.last_success_unix >= started_at + 2 * 60,
+        "the confirmation instant advanced with the polls: started {started_at}, now {}",
+        snap.last_success_unix
+    );
+}
+
+/// Failed polls count and the confirmation instant freezes: the level the
+/// hub-side sweeper will classify as silent once it crosses
+/// [`interflow_renewal::CRL_SILENT_AFTER_SECS`].
+#[tokio::test]
+async fn crl_poll_face_counts_failures_and_freezes_recency() {
+    let _serial = SERIAL.lock().await;
+    capture::install_once();
+    capture::clear();
+    fault::clear_hook();
+    let fixture = agent_fixture("24h").await;
+    prime_crls(&fixture.pack_dir).await;
+    // The fault hook covers ONLY the driven polls: installing it before
+    // the prime would fail the prime's own first-write pull, and
+    // prime_crls would never return (it awaits the first-write exit).
+
+    fault::install_hook(Arc::new(|point: FaultPoint| {
+        if point == FaultPoint::Crls {
+            FaultAction::ServiceUnavailable
+        } else {
+            FaultAction::Continue
+        }
+    }));
+    let face = Arc::new(CrlPollFace::new());
+    let started_at = face.snapshot().last_success_unix;
+    let clock = FakeClock::at_real_now();
+    let scheduler = spawn_scheduler(&fixture.pack_dir, &clock, &face);
+    let finished = drive_chunks(&clock, &scheduler, Duration::from_secs(60), 3).await;
+    fault::clear_hook();
+    assert!(!finished, "short of the 1h bound the loop keeps polling");
+    let snap = face.snapshot();
+    assert!(
+        snap.failures_total >= 3,
+        "every failed poll counts: {}",
+        snap.failures_total
+    );
+    assert_eq!(
+        snap.last_success_unix, started_at,
+        "no successful poll → the confirmation instant never moves"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The backoff stage rides the face (2026-10-20 connection-quality face).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backoff_stage_rides_the_face_through_the_ladder() {
+    let face = std::sync::Arc::new(CrlPollFace::new());
+    assert_eq!(face.snapshot().backoff_failures, 0, "fresh face: no stage");
+    face.note_backoff(1);
+    assert_eq!(face.snapshot().backoff_failures, 1);
+    face.note_backoff(5);
+    assert_eq!(
+        face.snapshot().backoff_failures,
+        5,
+        "the ladder caps at 5 stages"
+    );
+    face.note_backoff(0);
+    assert_eq!(
+        face.snapshot().backoff_failures,
+        0,
+        "a landed rotation resets (the process ends, the face mirrors it)"
     );
 }

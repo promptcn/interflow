@@ -248,6 +248,7 @@ async fn pp_proxied_registration_records_real_ip_in_audit() {
         hub_quic_addr: None,
 
         identity_offline: false,
+        renewal_face: None,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(

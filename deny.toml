@@ -15,13 +15,6 @@ ignore = [
     # scenarios never touch them; remove once tauri upstream switches to the GTK4
     # bindings.
     "RUSTSEC-2024-0370",
-    # proc-macro-error2: unmaintained upstream with no safe upgrade (the
-    # advisory itself lists none). Transitively via interflow-identity →
-    # age → i18n-embed-fl. A proc-macro executes only at build time (macro
-    # expansion for age's localized error strings) — it is not compiled into
-    # any shipped runtime binary. Re-evaluate when age drops i18n-embed-fl or
-    # the chain migrates to manyhow / proc-macro2-diagnostics.
-    "RUSTSEC-2026-0173",
     # paste: unmaintained upstream with no safe replacement; it is a transitive
     # macro dependency of the Tauri/Specta GUI build and is not present in the
     # mesh/expose runtime graph. Re-evaluate when specta/tauri migrate off it.
@@ -48,6 +41,31 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+    # basic-toml: upstream archived 2025-03, no fix will ever exist
+    # (unmaintained-class; the advisory lists only alternatives). Sole path:
+    # interflow-identity → age → i18n-embed-fl → i18n-embed-impl
+    # (fluent-system) → i18n-config 0.4.8 — whose latest release still
+    # requires basic-toml. It only parses i18n.toml at compile time during
+    # age's macro expansion and is never linked into a runtime binary.
+    # (The age 0.12 refresh of this chain already retired the
+    # proc-macro-error2 exemption below the same age dependency.) Remove
+    # when i18n-config migrates to the `toml` crate or age drops its fluent
+    # localization.
+    "RUSTSEC-2026-0374",
+    # crypto-bigint 0.5.5 (timing side channels in "constant-time" ops):
+    # the fix (0.7.6) sits on the semver-incompatible 0.7 line — reachable
+    # only through elliptic-curve 0.13 / p256 0.14+, and age 0.12.1 pins
+    # p256 ^0.13 unconditionally (no feature drops it; verified against its
+    # manifest). Sole path: interflow-identity → age → p256 (tag/tagpq
+    # recipients) → elliptic-curve → crypto-bigint. The affected code is
+    # UNREACHABLE in every shipped binary: this product's sealing only ever
+    # constructs x25519 and scrypt recipients — the p256-backed
+    # `age1tag1…`/`age1tagpq1…` recipient types are never parsed, and age's
+    # SSH layer rejects ecdsa keys outright. Ecosystem-wide bridged for the
+    # same reason (the 0.13 elliptic-curve family strands every consumer
+    # until upstreams republish). Remove when age requires p256 ≥ 0.14 —
+    # the lock then resolves crypto-bigint ≥ 0.7.6 on its own.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]

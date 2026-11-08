@@ -96,10 +96,12 @@ Registration requires a credential before any tunnel capability exists:
   the expose client's self-dial to its own edge pins by default — both
   endpoints are the same process, so the trust model needs no CA chain
   (`crates/expose/src/edge/mod.rs`).
-- **Pre-auth per-IP rate limiting** (default 30 auth attempts per minute,
-  `AuthRateLimiter`) rejects brute-force enumeration with 429 before
+- **Pre-auth per-client rate limiting** (default 30 auth attempts per
+  minute, `AuthRateLimiter`) rejects brute-force enumeration with 429 before
   registration is processed; failures are counted and audited
-  (`interflow_hub_auth_failures` metric with reason).
+  (`interflow_hub_auth_failures` metric with reason). One client is one
+  IPv4 address (IPv4-mapped spellings folded) or one IPv6 /64 — a host
+  rotating source addresses inside its /64 cannot mint fresh budgets.
 
 ### 4.2 Reaching the expose edge
 
@@ -111,7 +113,7 @@ defenses are resource-shape defenses:
   closed (`HTTP_HEAD_MAX_BYTES` / `HOST_PEEK_TIMEOUT`,
   `crates/expose/src/edge/mod.rs` and `listener.rs`). Unknown hosts are
   closed (no route).
-- **Pre-handshake budget (ACME mode)**: the per-IP gate below runs *before*
+- **Pre-handshake budget (ACME mode)**: the per-client gate below runs *before*
   the TLS accept — keyed on the TCP peer IP (80/443 direct, no front proxy)
   — so a dribbled or flooding ClientHello cannot outwait the gate; the
   ClientHello read and the handshake completion each carry a 10 s deadline
@@ -152,7 +154,7 @@ defenses are resource-shape defenses:
 ### 4.3 Reaching a mesh ingress listener directly
 
 Ingress listeners are intended for LAN-internal interfaces. They carry no
-local per-IP connection rate limit (TCP rules have an optional
+local per-client connection rate limit (TCP rules have an optional
 `idle_timeout_secs`; UDP rules have the rate limits of §4.4) — **directly
 exposing a TCP ingress listener to the public internet is unsupported** and
 is listed as a deployment requirement, not a defense ([§8](#8-known-blind-spots-and-residual-risks)).
@@ -325,14 +327,15 @@ may carry multiple tenants, each with its own client CA:
   fronted topology, `off` with ACME direct): only the right-most chain
   entry appended by a trusted proxy is used, left-side (client-forged)
   entries are ignored, and `required` rejects a trusted proxy that sends no
-  parseable header. With XFF active, per-IP gating for a trusted proxy is
-  deferred until the request head is buffered; the fronting nginx's own
+  parseable header. With XFF active, per-client gating for a trusted proxy
+  is deferred until the request head is buffered; the fronting nginx's own
   `limit_req`/`limit_conn` cover that leg in the meantime.
 - **Three PROXY protocol consumers** in the fronted topology, one trust
   rule: an untrusted source emitting a PROXY signature (either version) is
   hard-rejected everywhere. The **hub control endpoint** consumes the
-  preamble pre-mTLS and keys its per-IP admission, connection caps and
-  audit records on the restored IP — never an identity decision; UNKNOWN
+  preamble pre-mTLS and keys its per-client admission, connection caps and
+  audit records on the restored IP (admission keyed per client — IPv4 by
+  address, IPv6 by /64; records keep the exact address) — never an identity decision; UNKNOWN
   headers (either version) fall back to the TCP peer rather than fail. The
   **registrar** consumes the framing only (loopback-only listener, peek-
   based, address discarded, zero per-IP decisions). The **nginx internal
@@ -436,11 +439,13 @@ Named deliberately; this section is part of the document, not a footnote:
    process topology with stall / memory-drift / liveness assertions. The
    class is mitigated by construction, not eliminated — unit tests are
    structurally blind to long-run timing conditions.
-2. **Per-IP limits are per-IP.** The hub auth limiter, the edge
+2. **Per-client limits are per-client.** The hub auth limiter, the edge
    new-connection limiter, and the UDP inbound buckets are all keyed per
-   source address; a distributed flood bypasses the per-IP dimension. Global
-   caps (connection concurrency, stream totals) bound process-level cost,
-   not per-source fairness. Reports of *asymmetric* resource exhaustion
+   client (IPv4 by address, IPv6 by /64); a distributed flood bypasses the
+   per-client dimension. Global caps (connection concurrency, stream
+   totals) bound process-level cost, not per-source fairness. The limiter
+   state is bounded (idle clients expire losslessly; beyond the tracking
+   cap, keys idle for a generation are forgotten — never a new client). Reports of *asymmetric* resource exhaustion
    (cheap for the attacker, expensive for interflow) are explicitly in
    reporting scope per [SECURITY.md](SECURITY.md#out-of-scope).
 3. **No local rate limiting on TCP ingress listeners** ([§4.3](#43-reaching-a-mesh-ingress-listener-directly)):
@@ -454,13 +459,13 @@ Named deliberately; this section is part of the document, not a footnote:
    TLS-ALPN-01, automatic renewal, `crates/expose/src/edge/acme.rs`; ports
    80/443 direct, no front proxy). The former pre-handshake residuals are
    closed (pre-TLS connection gating, landed 2026-09-21): the
-   per-IP rate limit and concurrency caps (`gate_connection`) now run
+   per-client rate limit and concurrency caps (`gate_connection`) now run
    **before** the TLS accept on the TCP peer IP, the ClientHello read and
    the handshake completion each carry a 10 s deadline
    (`interflow_edge_tls_handshake_timeout`), an SNI outside the
    certificate/route host set is closed right after the acceptor
    (`interflow_edge_sni_rejected`), and the dedicated :80 HTTP-01/redirect
-   listener runs the same per-IP gate from the same tracker/limiter
+   listener runs the same per-client gate from the same tracker/limiter
    instances before spawning a task (its request head stays bounded by a
    10 s timeout, 8 KiB buffer and 100-header limit, with parsing and Host
    reflection hardening, and

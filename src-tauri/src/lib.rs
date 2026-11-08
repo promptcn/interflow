@@ -21,6 +21,7 @@ mod deploy_prefs;
 mod deployment;
 mod fleet;
 mod gui_prefs;
+mod hub_watch;
 mod i18n;
 mod node;
 mod prefs;
@@ -36,6 +37,9 @@ use tauri::{AppHandle, Manager};
 pub struct AppState {
     pub nodes: NodeManager,
     pub logs: tracing_capture::LogBuffer,
+    /// The deployment's hub floor watcher task, when one is running (see
+    /// `hub_watch`): aborted + respawned by the watch start/stop commands.
+    pub hub_watch: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
 pub type SharedState = Mutex<AppState>;
@@ -69,6 +73,9 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::deploy_apply,
             commands::deploy_change_state,
             commands::deploy_hub_overview,
+            commands::stream_pause_hub,
+            commands::maintenance_hub,
+            commands::stream_pause_local,
             commands::deploy_list_proposals,
             commands::deploy_approve_proposal,
             commands::deploy_reject_proposal,
@@ -86,18 +93,24 @@ fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
             commands::deploy_prefs_save,
             commands::gui_prefs_load,
             commands::gui_prefs_save,
+            commands::gui_startup_notices,
             commands::deployment_list,
             commands::deployment_current,
             commands::deployment_set_current,
             commands::fleet_overview,
             commands::deployment_publish,
+            commands::hub_floor_watch_start,
+            commands::hub_floor_watch_stop,
         ])
         .events(tauri_specta::collect_events![
             contract::NodeStateEvent,
             contract::PolicyPlaneEvent,
             contract::MeshPeersEvent,
+            contract::MeshCrlEvent,
+            contract::MeshBreakersEvent,
             contract::MeshProposalsEvent,
             contract::MeshListenersEvent,
+            contract::HubFloorEvent,
             contract::LogEvent
         ])
 }
@@ -207,6 +220,8 @@ pub fn run() {
             let peers_app = app.handle().clone();
             let proposals_app = app.handle().clone();
             let listeners_app = app.handle().clone();
+            let crl_app = app.handle().clone();
+            let breakers_app = app.handle().clone();
             let manager = NodeManager::new(
                 tauri::async_runtime::handle().inner().clone(),
                 move |id, state| emit_node_state(&nodes_app, id, state),
@@ -219,6 +234,8 @@ pub fn run() {
                 move |id, plane| emit_mesh_peers(&peers_app, id, plane),
                 move |id, receipts| emit_mesh_proposals(&proposals_app, id, receipts),
                 move |id, faces| emit_mesh_listeners(&listeners_app, id, faces),
+                move |id, plane| emit_mesh_crl(&crl_app, id, plane),
+                move |id, rows| emit_mesh_breakers(&breakers_app, id, rows),
             );
 
             // Restore the persisted node set, then bring the desired set up
@@ -233,6 +250,7 @@ pub fn run() {
             app.manage(Mutex::new(AppState {
                 nodes: manager.clone(),
                 logs: tracing_capture::LogBuffer::new(),
+                hub_watch: None,
             }));
 
             tauri::async_runtime::spawn(async move {
@@ -325,6 +343,32 @@ fn emit_mesh_peers(app: &AppHandle, id: &str, plane: &node::PeersPlane) {
     let _ = contract::MeshPeersEvent {
         id: id.to_string(),
         peers: plane.clone().into(),
+    }
+    .emit(app);
+}
+
+/// CRL-poll liveness → frontend `mesh-crl` event. Same consumer-task
+/// context and push-not-poll contract as [`emit_mesh_peers`]; the node
+/// detail's "CRL polling" panel patches the node's `crl` field from
+/// these (the renewal loop's level, shipped by the ticking forwarder).
+fn emit_mesh_crl(app: &AppHandle, id: &str, plane: &node::CrlPollPlane) {
+    use tauri_specta::Event;
+    let _ = contract::MeshCrlEvent {
+        id: id.to_string(),
+        crl: (*plane).into(),
+    }
+    .emit(app);
+}
+
+/// Egress-breaker open set → frontend `mesh-breakers` event. Same
+/// consumer-task context and push-not-poll contract as
+/// [`emit_mesh_peers`]; the node detail's "Egress breakers" panel
+/// patches the node's `breakers` from these.
+fn emit_mesh_breakers(app: &AppHandle, id: &str, rows: &[node::BreakerOpenFace]) {
+    use tauri_specta::Event;
+    let _ = contract::MeshBreakersEvent {
+        id: id.to_string(),
+        breakers: rows.iter().cloned().map(Into::into).collect(),
     }
     .emit(app);
 }

@@ -507,6 +507,32 @@ pub(crate) fn validate_agent(cfg: &AgentConfig) -> Result<(), ConfigErrorList> {
         }
     }
 
+    // recovery prober validation: cadence/timeout fields are limit-class —
+    // 0 would mean a spin loop (interval) or an unbounded dial (timeout),
+    // neither of which is a meaningful "unlimited" here.
+    if cfg.egress_recovery_probe_enabled {
+        for (field, value) in [
+            (
+                "egress_recovery_probe_loopback_interval_secs",
+                cfg.egress_recovery_probe_loopback_interval_secs,
+            ),
+            (
+                "egress_recovery_probe_remote_interval_secs",
+                cfg.egress_recovery_probe_remote_interval_secs,
+            ),
+            (
+                "egress_recovery_probe_connect_timeout_secs",
+                cfg.egress_recovery_probe_connect_timeout_secs,
+            ),
+        ] {
+            if value == 0 {
+                errs.push(ConfigError::Invalid(format!(
+                    "{field} must be greater than 0 when the recovery prober is enabled"
+                )));
+            }
+        }
+    }
+
     // transport = "quic" requires hub_quic_addr
     if matches!(cfg.agent.transport, crate::config::TransportKind::Quic) {
         let addr_ok = cfg
@@ -651,6 +677,7 @@ mod tests {
             },
             auth: AuthConfig {
                 rate_limit_per_minute: 30,
+                max_tracked_clients: interflow_core::security::MAX_TRACKED_CLIENTS,
                 tenants: vec![TenantConfig {
                     name: "acme".to_string(),
                     ca_path: dir.join("tenant-ca.crt").display().to_string(),

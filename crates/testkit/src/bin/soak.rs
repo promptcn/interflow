@@ -10,6 +10,9 @@ use interflow_testkit::soak::runner::{self, SoakArgs};
 
 #[tokio::main]
 async fn main() {
+    // A standalone runner, not a libtest queue: said before the first
+    // cert/stack construction trips the nextest guard.
+    interflow_testkit::declare_standalone_runner();
     let args = SoakArgs::parse();
     let outcome = runner::run(args).await;
     if !outcome.pass {

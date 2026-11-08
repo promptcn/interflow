@@ -25,8 +25,9 @@
 //!
 //! Type-byte allocation (renumbered 2026-10-10, epoch redefined in place):
 //! `0x01–0x0F` data plane, `0x10–0x1F` session/handshake/heartbeat,
-//! `0x20–0x2F` control-plane request/response pairs (request even, response
-//! odd), `0xFF` the terminal Error sentinel.
+//! `0x20–0x3F` control-plane request/response pairs (request even, response
+//! odd; the block grew past its original `0x2F` ceiling on 2026-10-20 with
+//! the node-status pair), `0xFF` the terminal Error sentinel.
 //!
 //! | type (byte)              | stream_id | circuit                          | flags                    |
 //! |--------------------------|-----------|----------------------------------|--------------------------|
@@ -50,6 +51,14 @@
 //! | ProposalMineResponse (0x27)  | corr id | zero                          | HUB_ORIGIN required      |
 //! | LivenessPing (0x28)     | corr id   | zero                             | —                        |
 //! | LivenessPong (0x29)     | corr id   | zero                             | HUB_ORIGIN required      |
+//! | StreamIntentRequest (0x2A)  | corr id | zero                            | —                        |
+//! | StreamIntentResponse (0x2B) | corr id | zero                            | HUB_ORIGIN required      |
+//! | TargetRecoveredRequest (0x2C)  | corr id | zero                         | —                        |
+//! | TargetRecoveredResponse (0x2D) | corr id | zero                         | HUB_ORIGIN required      |
+//! | CrlLivenessRequest (0x2E)  | corr id | zero                            | —                        |
+//! | CrlLivenessResponse (0x2F) | corr id | zero                            | HUB_ORIGIN required      |
+//! | NodeStatusRequest (0x30)  | corr id | zero                            | —                        |
+//! | NodeStatusResponse (0x31) | corr id | zero                            | HUB_ORIGIN required      |
 //! | Error (0xFF)            | zero      | zero                             | HUB_ORIGIN required      |
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -205,6 +214,61 @@ pub enum FrameType {
     /// echo of [`FrameType::LivenessPing`] on the same stream. Empty
     /// payload; correlation id echoed.
     LivenessPong,
+    /// Control-plane stream-intent exchange request: the agent's periodic
+    /// report of its actually-paused stream names, answered with the
+    /// hub's pending pause/resume ops (the operator-issued stream-intent
+    /// mailbox). Payload is the JSON
+    /// [`StreamIntentReport`](crate::tunnel::transport::StreamIntentReport);
+    /// the requester is the connection's registered agent, so the circuit
+    /// field stays zero.
+    StreamIntentRequest,
+    /// Control-plane stream-intent exchange answer: the hub's pending
+    /// ops for the reporting agent, as JSON
+    /// [`StreamIntentOps`](crate::tunnel::transport::StreamIntentOps).
+    /// The agent acks each op implicitly: its NEXT report's paused set
+    /// reflects the applied op, and the hub clears the op then.
+    StreamIntentResponse,
+    /// Control-plane target-recovery notice: the agent's out-of-band report
+    /// that a backend its egress breaker had tripped is answering bare-TCP
+    /// dials again (the 2026-10-18 active-recovery prober). Payload is the
+    /// JSON [`TargetRecoveredNotice`](crate::tunnel::transport::TargetRecoveredNotice);
+    /// the requester is the connection's registered agent, so the circuit
+    /// field stays zero. Purely informational — a lost or unhandled notice
+    /// only means the receiver keeps its own cooldown-based recovery.
+    TargetRecoveredRequest,
+    /// Control-plane target-recovery acknowledgement: the hub's (possibly
+    /// no-op) confirmation, as JSON
+    /// [`TargetRecoveredAck`](crate::tunnel::transport::TargetRecoveredAck).
+    TargetRecoveredResponse,
+    /// Control-plane CRL-poll liveness report: this node's renewal loop
+    /// publishing its current level (the confirmation instant of the last
+    /// successful CRL poll plus the cumulative failure count) so the hub's
+    /// fleet faces can distinguish "polling, nothing changed" from a
+    /// silently-hung poll loop
+    ///. Payload is the
+    /// JSON [`CrlLivenessReport`](crate::tunnel::transport::CrlLivenessReport);
+    /// the requester is the connection's registered agent, so the circuit
+    /// field stays zero. The report is the level itself, not a heartbeat:
+    /// a hung loop's reporter keeps sending a frozen confirmation instant,
+    /// which is exactly the silence the hub-side sweeper classifies.
+    CrlLivenessRequest,
+    /// Control-plane CRL-liveness acknowledgement: the hub's confirmation
+    /// that the report landed. Empty payload; correlation id echoed.
+    CrlLivenessResponse,
+    /// Control-plane node-status report: this node's engine-level levels
+    /// (per-stream byte activity for the fossil face; later the connection
+    /// quality window stats) published so the hub's fleet faces can see
+    /// what only the node itself can observe
+    /// Payload is the JSON [`NodeStatusReport`](crate::tunnel::transport::NodeStatusReport);
+    /// the requester is the connection's registered agent, so the circuit
+    /// field stays zero. Like the CRL-liveness report this is a LEVEL,
+    /// not a heartbeat: the reporter reads the engine's shared state at
+    /// send time, so a wedged engine keeps producing reports whose
+    /// levels stay frozen — the consumers' recency judgments read that.
+    NodeStatusRequest,
+    /// Control-plane node-status acknowledgement: the hub's confirmation
+    /// that the report landed. Empty payload; correlation id echoed.
+    NodeStatusResponse,
 }
 
 impl FrameType {
@@ -233,6 +297,14 @@ impl FrameType {
             Self::ProposalMineResponse => 0x27,
             Self::LivenessPing => 0x28,
             Self::LivenessPong => 0x29,
+            Self::StreamIntentRequest => 0x2A,
+            Self::StreamIntentResponse => 0x2B,
+            Self::TargetRecoveredRequest => 0x2C,
+            Self::TargetRecoveredResponse => 0x2D,
+            Self::CrlLivenessRequest => 0x2E,
+            Self::CrlLivenessResponse => 0x2F,
+            Self::NodeStatusRequest => 0x30,
+            Self::NodeStatusResponse => 0x31,
             Self::Error => 0xFF,
         }
     }
@@ -260,6 +332,14 @@ impl FrameType {
             0x27 => Some(Self::ProposalMineResponse),
             0x28 => Some(Self::LivenessPing),
             0x29 => Some(Self::LivenessPong),
+            0x2A => Some(Self::StreamIntentRequest),
+            0x2B => Some(Self::StreamIntentResponse),
+            0x2C => Some(Self::TargetRecoveredRequest),
+            0x2D => Some(Self::TargetRecoveredResponse),
+            0x2E => Some(Self::CrlLivenessRequest),
+            0x2F => Some(Self::CrlLivenessResponse),
+            0x30 => Some(Self::NodeStatusRequest),
+            0x31 => Some(Self::NodeStatusResponse),
             0xFF => Some(Self::Error),
             _ => None,
         }
@@ -282,6 +362,10 @@ impl FrameType {
                 | Self::ProposalSubmitResponse
                 | Self::ProposalMineResponse
                 | Self::LivenessPong
+                | Self::StreamIntentResponse
+                | Self::TargetRecoveredResponse
+                | Self::CrlLivenessResponse
+                | Self::NodeStatusResponse
                 | Self::Error
         )
     }
@@ -359,7 +443,15 @@ const fn contract_ok(ft: FrameType, flags: u8, sid: StreamId, circuit: CircuitTo
         | FrameType::ProposalMineRequest
         | FrameType::ProposalMineResponse
         | FrameType::LivenessPing
-        | FrameType::LivenessPong => !sid_zero && circuit_zero,
+        | FrameType::LivenessPong
+        | FrameType::StreamIntentRequest
+        | FrameType::StreamIntentResponse
+        | FrameType::TargetRecoveredRequest
+        | FrameType::TargetRecoveredResponse
+        | FrameType::CrlLivenessRequest
+        | FrameType::CrlLivenessResponse
+        | FrameType::NodeStatusRequest
+        | FrameType::NodeStatusResponse => !sid_zero && circuit_zero,
     }
 }
 
@@ -606,6 +698,14 @@ mod tests {
             (FrameType::ProposalSubmitResponse, FLAG_HUB_ORIGIN),
             (FrameType::ProposalMineRequest, 0),
             (FrameType::ProposalMineResponse, FLAG_HUB_ORIGIN),
+            (FrameType::StreamIntentRequest, 0),
+            (FrameType::StreamIntentResponse, FLAG_HUB_ORIGIN),
+            (FrameType::TargetRecoveredRequest, 0),
+            (FrameType::TargetRecoveredResponse, FLAG_HUB_ORIGIN),
+            (FrameType::CrlLivenessRequest, 0),
+            (FrameType::CrlLivenessResponse, FLAG_HUB_ORIGIN),
+            (FrameType::NodeStatusRequest, 0),
+            (FrameType::NodeStatusResponse, FLAG_HUB_ORIGIN),
             (FrameType::Error, FLAG_HUB_ORIGIN),
         ]
     }
@@ -791,6 +891,62 @@ mod tests {
                 sid_v,
                 c_v,
                 "PolicyPullRequest is connection-identified (zero circuit)",
+            ),
+            (
+                FrameType::StreamIntentResponse,
+                0,
+                sid_v,
+                CircuitToken::ZERO,
+                "StreamIntentResponse must be hub-origin",
+            ),
+            (
+                FrameType::StreamIntentRequest,
+                0,
+                StreamId::ZERO,
+                CircuitToken::ZERO,
+                "StreamIntentRequest needs a correlation id",
+            ),
+            (
+                FrameType::TargetRecoveredResponse,
+                0,
+                sid_v,
+                CircuitToken::ZERO,
+                "TargetRecoveredResponse must be hub-origin",
+            ),
+            (
+                FrameType::TargetRecoveredRequest,
+                0,
+                StreamId::ZERO,
+                CircuitToken::ZERO,
+                "TargetRecoveredRequest needs a correlation id",
+            ),
+            (
+                FrameType::TargetRecoveredRequest,
+                0,
+                sid_v,
+                c_v,
+                "TargetRecoveredRequest is connection-identified (zero circuit)",
+            ),
+            (
+                FrameType::CrlLivenessResponse,
+                0,
+                sid_v,
+                CircuitToken::ZERO,
+                "CrlLivenessResponse must be hub-origin",
+            ),
+            (
+                FrameType::CrlLivenessRequest,
+                0,
+                StreamId::ZERO,
+                CircuitToken::ZERO,
+                "CrlLivenessRequest needs a correlation id",
+            ),
+            (
+                FrameType::CrlLivenessRequest,
+                0,
+                sid_v,
+                c_v,
+                "CrlLivenessRequest is connection-identified (zero circuit)",
             ),
         ];
         for (ft, flags, stream_id, circuit, why) in violations {

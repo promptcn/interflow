@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2c28ff1e5cc61f4b92b2364b5c929e27c8b5dfca6afbbd854ff95762bb51ba91 # shrinks to revoked_serial = "0d", query_value = "d", query_pad = 0

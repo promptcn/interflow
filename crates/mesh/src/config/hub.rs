@@ -166,7 +166,8 @@ impl Default for HubQuicConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HubSecurityConfig {
-    /// Maximum concurrent TCP connections per IP; 0 = unlimited. Defaults to
+    /// Maximum concurrent TCP connections per client (IPv4 address or
+    /// IPv6 /64); 0 = unlimited. Defaults to
     /// 64.
     pub max_connections_per_ip: usize,
     /// Global maximum concurrent TCP connections; 0 = unlimited. Defaults to
@@ -298,11 +299,20 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    /// Maximum authentication attempts per IP per minute. 0 means unlimited.
+    /// Maximum authentication attempts per client per minute (client =
+    /// IPv4 address or IPv6 /64). 0 means unlimited.
     /// Defaults to 30. mTLS has no brute-forceable secret; the limiter's
     /// remaining job is churn/DoS suppression on the registration endpoints.
     #[serde(default = "default_rate_limit_per_minute")]
     pub rate_limit_per_minute: u32,
+    /// The most distinct clients the rate limiter tracks at once — its
+    /// memory bound (≈3 MB at the default). Beyond it the limiter forgets
+    /// the debt of clients idle for a whole generation first (counted in
+    /// `interflow_rate_limit_capacity_evictions` and warned about), never
+    /// refusing a new client. Size it to the deployment's distinct-client
+    /// population; rounds down to multiples of 32. Defaults to 65536.
+    #[serde(default = "default_max_tracked_clients")]
+    pub max_tracked_clients: usize,
     /// Tenant trust table (`[[auth.tenants]]`): one named client CA per
     /// tenant. Validation requires it non-empty (an empty trust table can
     /// authenticate nobody) and `[tls]` present (mTLS implies TLS).
@@ -314,6 +324,7 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             rate_limit_per_minute: default_rate_limit_per_minute(),
+            max_tracked_clients: default_max_tracked_clients(),
             tenants: Vec::new(),
         }
     }
@@ -383,6 +394,25 @@ impl AclConfig {
     pub fn contains(&self, rule: &AclRule) -> bool {
         self.rules.contains(rule)
     }
+
+    /// Borrowed-form membership (the per-Open hot path, §3.7):
+    /// operator-authored cross-tenant exception lists are single-digit
+    /// sets, so a linear borrowed comparison beats hashing four freshly
+    /// allocated `String`s.
+    pub fn allows(
+        &self,
+        source_tenant: &str,
+        source: &str,
+        target_tenant: &str,
+        target: &str,
+    ) -> bool {
+        self.rules.iter().any(|r| {
+            r.source_tenant == source_tenant
+                && r.source == source
+                && r.target_tenant == target_tenant
+                && r.target == target
+        })
+    }
 }
 
 /// One ACL rule: a **cross-tenant exception** letting `source` open streams
@@ -431,6 +461,10 @@ impl Default for MetricsConfig {
 
 const fn default_rate_limit_per_minute() -> u32 {
     30
+}
+
+const fn default_max_tracked_clients() -> usize {
+    interflow_core::security::MAX_TRACKED_CLIENTS
 }
 
 fn default_metrics_addr() -> SocketAddr {

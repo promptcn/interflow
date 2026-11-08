@@ -26,8 +26,11 @@ const BUSINESS_HOST: &str = "app.test";
 async fn public_port_dispatches_control_sni_to_the_hub_plane() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,interflow=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(
+                    "info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug",
+                )
+            }),
         )
         .try_init();
     let certs = interflow_testkit::certs::TestCerts::generate("dispatch", "agent-dispatch");

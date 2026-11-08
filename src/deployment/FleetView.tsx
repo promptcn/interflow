@@ -1,5 +1,5 @@
-import { useEffect } from "react";
 import {
+  formatAgeSecs,
   formatAgoSecs,
   formatRemainingSecs,
   leafPhase,
@@ -8,12 +8,15 @@ import {
 import { useT } from "../i18n";
 import { cn } from "../lib/utils";
 import { Button, EmptyState, Hint, PeerDot, SectionPanel } from "../components/ui";
+import { api } from "../api";
 import { useDeployment } from "./DeploymentContext";
 import {
   buildDeploymentRows,
   buildRealmRows,
   realmObservers,
   type FleetRow,
+  type RouteBreakerRow,
+  type WatchersFaceReading,
 } from "../lib/fleetRows";
 
 /// 编队 (ex-Peers, 2026-10-15 re-axis): the realm's whole fleet — who is
@@ -40,13 +43,31 @@ export default function FleetView({
   const { t } = useT();
   const dep = useDeployment();
 
-  // The hub's overview is pull-only (no push event) — keep it fresh
-  // while the page is open under a deployment.
-  useEffect(() => {
-    if (realm !== null || dep.deployment === null) return;
-    const timer = setInterval(() => void dep.refresh(true), 30_000);
-    return () => clearInterval(timer);
-  }, [realm, dep.deployment, dep.refresh]);
+  /// Node maintenance declare/lift (planned unavailability): the hub's
+  /// control plane under a minted credential; one refresh re-reads the
+  /// face. Idempotent — declaring an already-declared leg is a no-op.
+  const onMaintenance =
+    realm !== null || dep.deployment === null
+      ? undefined
+      : async (qualifiedId: string, on: boolean) => {
+          try {
+            await api.maintenanceHub(
+              dep.deployment!.manifest_path,
+              dep.deployment!.issuer_path,
+              qualifiedId,
+              on,
+            );
+            void dep.refresh(true);
+          } catch (e) {
+            dep.say([`✘ ${String(e)}`]);
+          }
+        };
+
+  // The hub's overview freshness is push-driven now: the deployment
+  // scope's hub floor watcher emits `hub-floor` on every face change and
+  // DeploymentContext re-pulls the composed fleet on receipt (the same
+  // push-not-poll contract as the node telemetry faces). This page keeps
+  // no poll of its own.
 
   if (realm !== null) {
     return <RealmFleet realm={realm} nodes={nodes} onOpenNode={onOpenNode} />;
@@ -82,14 +103,22 @@ export default function FleetView({
     );
   }
 
-  const { rows, floorServing } = buildDeploymentRows(dep.fleet, nodes, Date.now() / 1000);
+  const { rows, floorServing, routeBreakers, watchers } = buildDeploymentRows(dep.fleet, nodes, Date.now() / 1000);
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto">
       {floorServing !== null && <LineageStrip floor={floorServing.floor} serving={floorServing.serving} t={t} />}
+      {routeBreakers.length > 0 && <RouteBreakerStrip rows={routeBreakers} t={t} />}
+      {watchers.state !== "unknown" && <WatchersStrip reading={watchers} t={t} />}
       <SectionPanel title={dep.fleet.summary.realm.id} hint={t("fleet.hubReported")} grow>
         <div className="flex flex-col gap-1.5">
           {byPresence(rows).map((row) => (
-            <FleetRowLine key={row.key} row={row} onOpenNode={onOpenNode} t={t} />
+            <FleetRowLine
+              key={row.key}
+              row={row}
+              onOpenNode={onOpenNode}
+              t={t}
+              onMaintenance={onMaintenance}
+            />
           ))}
         </div>
       </SectionPanel>
@@ -177,6 +206,65 @@ function LineageStrip({
   );
 }
 
+/// The hub-level route-breaker strip (edge gateways): one ⚠ chip per
+/// OPEN route host, with the open age and the recovery probe's recency —
+/// the dead-recovery-machinery signature reads straight off the probe
+/// age (2026-10-19 open-set face).
+function RouteBreakerStrip({
+  rows,
+  t,
+}: {
+  rows: RouteBreakerRow[];
+  t: ReturnType<typeof useT>["t"];
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 px-1 text-small">
+      {rows.map((row) => (
+        <Hint key={row.host} text={t("fleet.routeBreakerHint", { probe: formatAgeSecs(row.probeAgoSecs) })}>
+          <span className="text-warn">
+            ⚠ {t("fleet.routeBreaker", { host: row.host, ago: formatAgeSecs(row.openSecs) })}
+          </span>
+        </Hint>
+      ))}
+    </div>
+  );
+}
+
+/// The hub-level resident-task assertion strip (the 2026-10-20 watchdog
+/// face): quiet "N/N armed" while every task ticks, one ⚠ chip per
+/// silent task — "the process is alive but a task inside it wedged" is
+/// readable here before secondary symptoms accumulate.
+function WatchersStrip({
+  reading,
+  t,
+}: {
+  reading: WatchersFaceReading;
+  t: ReturnType<typeof useT>["t"];
+}) {
+  if (reading.state === "unknown") return null;
+  if (reading.state === "allArmed") {
+    return (
+      <div className="px-1 text-small text-fg-3">
+        {t("fleet.watchersArmed", { count: reading.count })}
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-2 px-1 text-small">
+      {reading.silent.map((row) => (
+        <Hint
+          key={row.name}
+          text={t("fleet.watcherSilentHint", { interval: row.intervalSecs })}
+        >
+          <span className="text-warn">
+            ⚠ {t("fleet.watcherSilent", { name: row.name, ago: formatAgeSecs(row.quietSecs) })}
+          </span>
+        </Hint>
+      ))}
+    </div>
+  );
+}
+
 /// The degraded form's per-observer panel — the pre-re-axis Peers page's
 /// rendering, unchanged in shape (one panel per running mesh agent, its
 /// own tenant view), now scoped to the realm and stated as a fallback.
@@ -258,10 +346,15 @@ function FleetRowLine({
   row,
   onOpenNode,
   t,
+  onMaintenance,
 }: {
   row: FleetRow;
   onOpenNode: (id: string) => void;
   t: ReturnType<typeof useT>["t"];
+  /// The planned-unavailability toggle (mesh agents): declare/lift node
+  /// maintenance through the hub's control plane. Absent in contexts
+  /// without a deployment (the realm view).
+  onMaintenance?: (qualifiedId: string, on: boolean) => Promise<void>;
 }) {
   const leaf = row.leaf?.phase ? leafPhase({ phase: row.leaf.phase }) : null;
   return (
@@ -284,6 +377,105 @@ function FleetRowLine({
       {row.gen !== null && (
         <span className="font-mono text-small text-fg-3">gen {row.gen}</span>
       )}
+      {row.policy?.state === "current" && (
+        <span className="text-small text-fg-3">
+          · {t("fleet.policyPulled", { ago: formatAgeSecs(row.policy.ageSecs) })}
+        </span>
+      )}
+      {row.policy?.state === "silent" && (
+        <Hint text={t("fleet.policySilentHint")}>
+          <span className="text-small text-warn">
+            ⚠ {t("fleet.policySilent", { ago: formatAgeSecs(row.policy.ageSecs) })}
+          </span>
+        </Hint>
+      )}
+      {row.policy?.state === "never" && (
+        <span className="text-small text-fg-3">{t("fleet.policyNever")}</span>
+      )}
+      {row.crl?.state === "current" && (
+        <span className="text-small text-fg-3">
+          · {t("fleet.crlPolled", { ago: formatAgeSecs(row.crl.ageSecs) })}
+        </span>
+      )}
+      {row.crl?.state === "silent" && (
+        <Hint text={t("fleet.crlSilentHint")}>
+          <span className="text-small text-warn">
+            ⚠ {t("fleet.crlSilent", { ago: formatAgeSecs(row.crl.ageSecs) })}
+            {row.crl.failures > 0 ? ` · ${t("fleet.crlFailures", { count: row.crl.failures })}` : ""}
+          </span>
+        </Hint>
+      )}
+      {row.queuedOps?.state === "waiting" && (
+        <Hint
+          text={t(
+            row.queuedOps.stuck ? "fleet.queuedStuckHint" : "fleet.queuedHint",
+            row.queuedOps.oldestOp !== null ? { op: row.queuedOps.oldestOp } : {},
+          )}
+        >
+          <span className="text-small text-warn">
+            ⚠{" "}
+            {t("fleet.queuedOps", {
+              count: row.queuedOps.count,
+              ago: formatAgeSecs(row.queuedOps.ageSecs),
+            })}
+          </span>
+        </Hint>
+      )}
+      {row.queuedDropped > 0 && (
+        <Hint text={t("fleet.queuedDroppedHint")}>
+          <span className="text-small text-warn">
+            ⚠ {t("fleet.queuedDropped", { count: row.queuedDropped })}
+          </span>
+        </Hint>
+      )}
+      {row.fossils.map((fossil) => (
+        <Hint key={fossil.name} text={t("fleet.fossilHint")}>
+          <span className="text-small text-warn">
+            ⚠ {t("fleet.fossilStream", { name: fossil.name, ago: formatAgeSecs(fossil.idleSecs) })}
+          </span>
+        </Hint>
+      ))}
+      {row.connection?.state === "reconnecting" && (
+        <Hint text={t("fleet.connReconnectingHint")}>
+          <span className="text-small text-warn">
+            ⚠ {t("fleet.connReconnects", { count: row.connection.reconnects })}
+          </span>
+        </Hint>
+      )}
+      {row.connection?.state === "probesUnanswered" && (
+        <Hint text={t("fleet.connProbesHint")}>
+          <span className="text-small text-warn">
+            ⚠ {t("fleet.connProbes", { count: row.connection.timeouts })}
+          </span>
+        </Hint>
+      )}
+      {row.credential?.state === "yellow" && (
+        <Hint
+          text={t(
+            row.credential.mode === "offline"
+              ? "fleet.leafYellowOfflineHint"
+              : "fleet.leafYellowRegistrarHint",
+          )}
+        >
+          <span className="text-small text-warn">
+            ⚠ {t("fleet.leafRemaining", { left: formatRemainingSecs(row.credential.remainingSecs) })}
+          </span>
+        </Hint>
+      )}
+      {row.credential?.state === "red" && (
+        <Hint text={t("fleet.leafRedHint")}>
+          <span className="text-small text-critical">
+            ✘ {t("fleet.leafRemaining", { left: formatRemainingSecs(row.credential.remainingSecs) })}
+          </span>
+        </Hint>
+      )}
+      {row.headroom?.tight && (
+        <Hint text={t("fleet.headroomHint")}>
+          <span className="text-small text-warn">
+            ⚠ {t("fleet.headroomTight", { pct: row.headroom.remainingPct })}
+          </span>
+        </Hint>
+      )}
       {row.leaf?.phase && (
         <Hint text={t("nodeDetail.peerLeafTitle")}>
           <span
@@ -305,14 +497,45 @@ function FleetRowLine({
           </span>
         </Hint>
       )}
+      {row.maintenance && (
+        <Hint
+          text={
+            row.pausedStreams > 0
+              ? t("fleet.maintenanceHintPaused", { count: row.pausedStreams })
+              : t("fleet.maintenanceHint")
+          }
+        >
+          <span className="text-small text-warn">{t("fleet.maintenance")}</span>
+        </Hint>
+      )}
       {row.localNodeId !== null && (
         <Button
           variant="link"
           size="sm"
-          className="ml-auto"
+          className={cn(row.localNodeId !== null && row.maintenance ? "" : "ml-auto")}
           onClick={() => onOpenNode(row.localNodeId as string)}
         >
           {t("fleet.localNode")}
+        </Button>
+      )}
+      {row.maintenance && onMaintenance !== undefined && (
+        <Button
+          variant="link"
+          size="sm"
+          className="ml-auto"
+          onClick={() => void onMaintenance(row.key, false)}
+        >
+          {t("fleet.maintenanceLift")}
+        </Button>
+      )}
+      {!row.maintenance && row.kind === "mesh_agent" && onMaintenance !== undefined && (
+        <Button
+          variant="link"
+          size="sm"
+          className="ml-auto"
+          onClick={() => void onMaintenance(row.key, true)}
+        >
+          {t("fleet.maintenanceDeclare")}
         </Button>
       )}
     </div>

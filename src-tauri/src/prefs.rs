@@ -2,37 +2,29 @@
 //! three domains the GUI persists — the node list, the deploy pane's recent
 //! contexts, and the GUI-wide settings (language, current deployment).
 //!
-//! This db replaces the three per-domain TOML files (`profile.toml` /
-//! `deploy.toml` / `gui.toml`) that existed *only* because a snapshot-style
-//! load-modify-save over one file clobbers every other domain bolted onto
-//! it — each new domain had to grow a new file (the workaround's file
-//! headers said so outright). One db, one table per domain: domains share
-//! storage but never a write, so the clobber class is gone by construction.
-//! The old files are imported once on first open, then renamed `.migrated`.
+//! One db, one table per domain: domains share storage but never a write,
+//! so a snapshot-style load-modify-save over one file can never clobber
+//! another domain bolted onto it (the defect class that once forced a
+//! separate file per domain).
 //!
 //! The db is machine-owned GUI state, not an operator document: its shape
-//! lives in code and migrates via SQLite's `user_version` (the versioning
+//! lives in code and is declared by SQLite's `user_version` (the versioning
 //! doctrine's "no counters in human-authored files" rule governs documents,
 //! not machine state). The GUI process is the sole writer; WAL +
 //! busy_timeout keep concurrent domain writes correct anyway.
 
 use crate::deploy_prefs::DeployPrefs;
 use crate::gui_prefs::{GuiPrefs, Lang};
-use crate::profile::{NodeEntry, Profile, ServiceAddressPref};
+use crate::profile::{NodeEntry, ServiceAddressPref};
 use interflow_core::config::paths::anchor;
 use interflow_core::error::{InterflowError, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-/// The shape of the prefs db. Bump and extend [`PrefsDb::migrate_and_import`]
-/// whenever a table changes; never reset (a higher number on disk than in
-/// code means a newer GUI ran last — refuse loudly).
+/// The shape of the prefs db. Bump whenever a table changes; never reset
+/// (a number on disk this build does not recognize means a different GUI
+/// generation ran last — refuse loudly).
 const SHAPE: i32 = 1;
-
-const LEGACY_PROFILE: &str = "profile.toml";
-const LEGACY_DEPLOY: &str = "deploy.toml";
-const LEGACY_GUI: &str = "gui.toml";
-const MIGRATED_SUFFIX: &str = "migrated";
 
 /// An open prefs db. Cheap to open per call (the GUI process is the only
 /// writer); each domain's save is one short transaction.
@@ -40,14 +32,13 @@ const MIGRATED_SUFFIX: &str = "migrated";
 pub struct PrefsDb {
     conn: Connection,
     /// The db file's directory — the anchor base for relative `pack_dir`
-    /// values (the legacy files anchored to their own directory, which is
-    /// this directory).
+    /// values.
     base: PathBuf,
 }
 
 impl PrefsDb {
-    /// Opens the prefs db in the user config directory, creating (and
-    /// importing legacy files) on first use.
+    /// Opens the prefs db in the user config directory, creating it on
+    /// first use.
     pub fn open() -> Result<Self> {
         let base = dirs::config_dir()
             .ok_or_else(|| InterflowError::config("cannot resolve user config directory"))?;
@@ -73,7 +64,7 @@ impl PrefsDb {
                 .parent()
                 .map_or_else(|| PathBuf::from("."), ToOwned::to_owned),
         };
-        db.migrate_and_import()?;
+        db.ensure_shape()?;
         if !existed {
             // Same hygiene the TOML files had: user-scoped config that may
             // carry internal endpoint addresses.
@@ -82,23 +73,24 @@ impl PrefsDb {
         Ok(db)
     }
 
-    /// Brings a fresh db up to [`SHAPE`]; a first open also imports the
-    /// three legacy TOML files when they sit next to the db. One immediate
-    /// transaction, so two racing first-opens settle with one import.
-    fn migrate_and_import(&mut self) -> Result<()> {
+    /// Creates the db at [`SHAPE`] when absent; one immediate transaction,
+    /// so two racing first-opens settle with one creation. A shape this
+    /// build does not recognize is refused — the GUI's preferences are
+    /// cheap, bookkeeping drift is not.
+    fn ensure_shape(&mut self) -> Result<()> {
         let tx = self.conn.transaction().map_err(|e| prefs_db_err(&e))?;
         let current: i32 = tx
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| prefs_db_err(&e))?;
-        if current > SHAPE {
-            return Err(InterflowError::config(format!(
-                "prefs db shape {current} is newer than this build understands ({SHAPE}) — \
-                 upgrade the GUI before touching these preferences"
-            )));
-        }
         if current == SHAPE {
             // Read-only open; dropping the transaction rolls nothing back.
             return Ok(());
+        }
+        if current != 0 {
+            return Err(InterflowError::config(format!(
+                "prefs db shape {current} is not this build's ({SHAPE}) — the preferences were \
+                 written by a different GUI generation; remove prefs.db to start fresh"
+            )));
         }
         tx.execute_batch(
             "CREATE TABLE nodes (
@@ -119,51 +111,9 @@ impl PrefsDb {
             CREATE TABLE gui (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )
         .map_err(|e| prefs_db_err(&e))?;
-        Self::import_legacy(&self.base, &tx)?;
         tx.pragma_update(None, "user_version", SHAPE)
             .map_err(|e| prefs_db_err(&e))?;
         tx.commit().map_err(|e| prefs_db_err(&e))?;
-        Ok(())
-    }
-
-    /// Imports the legacy per-domain TOML files, then renames each imported
-    /// file to `<name>.migrated`. A malformed legacy profile is left in
-    /// place for inspection and its nodes skipped — the GUI still comes up,
-    /// exactly how a corrupt profile degraded before. The two pref files
-    /// degrade to their defaults, like their load functions always did.
-    fn import_legacy(base: &Path, tx: &rusqlite::Transaction<'_>) -> Result<()> {
-        let profile_path = base.join(LEGACY_PROFILE);
-        if profile_path.is_file() {
-            let imported = std::fs::read_to_string(&profile_path)
-                .map_err(InterflowError::from)
-                .and_then(|raw| parse_legacy_profile(&raw, base));
-            match imported {
-                Ok(nodes) => {
-                    insert_nodes(tx, &nodes)?;
-                    rename_migrated(&profile_path)?;
-                    tracing::info!(
-                        node = "gui",
-                        "imported {} legacy profile node(s) into the prefs db",
-                        nodes.len()
-                    );
-                }
-                Err(e) => tracing::error!(node = "gui", "legacy profile import skipped: {e}"),
-            }
-        }
-        let deploy_path = base.join(LEGACY_DEPLOY);
-        if deploy_path.is_file() {
-            if let Some(prefs) = read_legacy_toml::<DeployPrefs>(&deploy_path) {
-                insert_deploy(tx, &prefs)?;
-            }
-            rename_migrated(&deploy_path)?;
-        }
-        let gui_path = base.join(LEGACY_GUI);
-        if gui_path.is_file() {
-            if let Some(prefs) = read_legacy_toml::<GuiPrefs>(&gui_path) {
-                insert_gui(tx, &prefs)?;
-            }
-            rename_migrated(&gui_path)?;
-        }
         Ok(())
     }
 
@@ -387,31 +337,6 @@ fn insert_gui(tx: &rusqlite::Transaction<'_>, prefs: &GuiPrefs) -> Result<()> {
     Ok(())
 }
 
-/// Parses a legacy `profile.toml` (the `[[nodes]]` shape; unknown fields
-/// rejected loudly — the file convention) with `pack_dir` anchored to the
-/// file's directory.
-fn parse_legacy_profile(raw: &str, base: &Path) -> Result<Vec<NodeEntry>> {
-    let mut profile: Profile = toml::from_str(raw)?;
-    for node in &mut profile.nodes {
-        node.pack_dir = anchor(base, &node.pack_dir);
-    }
-    Ok(profile.nodes)
-}
-
-/// Reads one legacy TOML pref file leniently (a malformed file is the
-/// default, same as its old load function).
-fn read_legacy_toml<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Option<T> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    toml::from_str(&raw).ok()
-}
-
-fn rename_migrated(path: &Path) -> Result<()> {
-    let mut to = path.as_os_str().to_owned();
-    to.push(".");
-    to.push(MIGRATED_SUFFIX);
-    std::fs::rename(path, &to).map_err(InterflowError::from)
-}
-
 fn restrict_to_owner(path: &Path) {
     #[cfg(unix)]
     {
@@ -568,78 +493,6 @@ mod tests {
         assert_eq!(db_in(dir.path()).gui().current_deployment, None);
     }
 
-    /// First open imports the three legacy files and renames them;
-    /// `pack_dir` anchoring applies to the imported nodes too.
-    #[test]
-    fn legacy_files_are_imported_once() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(LEGACY_PROFILE),
-            "[[nodes]]\nid = \"x\"\npack_dir = \"packs/agent-x\"\ndesired_running = true\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join(LEGACY_DEPLOY),
-            "[[recent]]\nmanifest = \"/m\"\nissuer = \"/i\"\nout = \"/o\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join(LEGACY_GUI),
-            "language = \"zh\"\ncurrent_deployment = \"/deployments/prod\"\n",
-        )
-        .unwrap();
-        let db = db_in(dir.path());
-        let nodes = db.nodes().unwrap();
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].id, "x");
-        assert_eq!(nodes[0].pack_dir, anchor(dir.path(), "packs/agent-x"));
-        assert!(nodes[0].desired_running);
-        assert_eq!(db.deploy().recent.len(), 1);
-        assert_eq!(db.gui().language, Lang::Zh);
-        assert_eq!(
-            db.gui().current_deployment.as_deref(),
-            Some("/deployments/prod")
-        );
-        for name in [LEGACY_PROFILE, LEGACY_DEPLOY, LEGACY_GUI] {
-            assert!(
-                !dir.path().join(name).exists(),
-                "{name} should have been renamed"
-            );
-            assert!(
-                dir.path()
-                    .join(format!("{name}.{MIGRATED_SUFFIX}"))
-                    .exists()
-            );
-        }
-        // Second open: no legacy files left, nothing re-imports.
-        assert_eq!(db_in(dir.path()).nodes().unwrap().len(), 1);
-    }
-
-    /// A malformed legacy profile is skipped loudly (file left in place for
-    /// inspection) while the two lenient pref files still import; the GUI's
-    /// node list starts empty — the same degrade a corrupt profile had.
-    #[test]
-    fn malformed_legacy_profile_degrades_to_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        // The pre-2026-09-22 single-tunnel shape: top-level keys the
-        // [[nodes]] profile never had — rejected loudly by import.
-        std::fs::write(
-            dir.path().join(LEGACY_PROFILE),
-            "pack_dir = \"packs/old\"\ntransport = \"quic\"\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join(LEGACY_GUI), "language = \"zh\"\n").unwrap();
-        let db = db_in(dir.path());
-        assert_eq!(db.nodes().unwrap().len(), 0);
-        assert_eq!(db.gui().language, Lang::Zh);
-        assert!(
-            dir.path().join(LEGACY_PROFILE).exists(),
-            "malformed profile left for inspection"
-        );
-        assert!(!dir.path().join(LEGACY_GUI).exists());
-    }
-
-    /// A db written by a newer GUI (higher shape) is refused, not mangled.
     #[test]
     fn newer_shape_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -652,6 +505,9 @@ mod tests {
             .unwrap();
         }
         let err = PrefsDb::open_at(&dir.path().join("prefs.db")).unwrap_err();
-        assert!(err.to_string().contains("newer"), "wrong error: {err}");
+        assert!(
+            err.to_string().contains("different GUI generation"),
+            "wrong error: {err}"
+        );
     }
 }

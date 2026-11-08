@@ -139,6 +139,49 @@ impl StreamPumpTarget for AgentTunnel {
     }
 }
 
+/// Write outcome for [`write_all_stall`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallOutcome {
+    /// All bytes written.
+    Written,
+    /// The write pended for the whole stall budget (the peer is not
+    /// draining).
+    Stalled,
+}
+
+/// `write_all` with a stall budget armed only when the write first pends:
+/// the common path (the kernel/peer buffer accepts immediately) allocates
+/// no timer at all; a `Sleep` materializes on the first `Pending` poll and
+/// races the write from then on. Dropping the future at `Stalled` abandons
+/// the partial write — every caller treats a stall as stream death.
+async fn write_all_stall<W>(
+    wr: &mut W,
+    buf: &[u8],
+    stall_timeout: Duration,
+) -> std::io::Result<StallOutcome>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    use std::pin::pin;
+    use std::task::Poll;
+
+    let mut write = pin!(wr.write_all(buf));
+    let mut stall: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(res) = write.as_mut().poll(cx) {
+            return Poll::Ready(res.map(|()| StallOutcome::Written));
+        }
+        // First Pending arms the stall timer; from here both make progress
+        // (each wakeup re-enters this closure, re-poling both).
+        let stall = stall.get_or_insert_with(|| Box::pin(tokio::time::sleep(stall_timeout)));
+        if stall.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Ok(StallOutcome::Stalled));
+        }
+        Poll::Pending
+    })
+    .await
+}
+
 /// Pump parameters: liveness deadlines + metric counter names (the caller
 /// passes existing names so monitoring dashboards see no change).
 pub struct PumpConfig {
@@ -157,6 +200,26 @@ pub struct PumpConfig {
     pub write_stall_counter: &'static str,
     /// Log prefix ("edge" / "ingress").
     pub log_label: &'static str,
+    /// Per-rule byte-activity cell (the fossil face's level): fetched
+    /// `max(now)` beside each `progress.touch()` — the existing
+    /// idle-deadline reset points, so the touch costs one atomic store
+    /// on a path that already ran. `None` on pumps with no rule-level
+    /// activity question (the edge's own sockets, the e2e egress side).
+    pub activity: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl PumpConfig {
+    /// Records one byte-carrying pass on the activity cell (unix
+    /// millis). Inlined away entirely when no cell is attached.
+    #[inline]
+    pub fn note_activity(&self) {
+        if let Some(cell) = &self.activity {
+            cell.fetch_max(
+                crate::tunnel::transport::unix_millis_now(),
+                Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 /// Duplex half-close drain window.
@@ -260,6 +323,7 @@ where
                 Ok(Ok(0)) => break,
                 Ok(Ok(_)) => {
                     progress.touch();
+                    cfg.note_activity();
                     let chunk = buf.split().freeze();
                     if let Err(e) = target.send_data(stream_id, chunk).await {
                         warn!("{label} failed to send data: {e}");
@@ -300,24 +364,23 @@ where
             match tokio::time::timeout(remaining, data_rx.recv()).await {
                 Ok(Some(msg)) => {
                     progress.touch();
+                    cfg.note_activity();
                     if matches!(msg.stream_type, FrameType::Close) {
                         outcome.close_reason = Some(parse_close_reason(&msg.data));
                         break;
                     }
                     if !msg.data.is_empty() {
-                        match tokio::time::timeout(cfg.write_stall_timeout, wr.write_all(&msg.data))
-                            .await
-                        {
-                            Ok(Ok(())) => outcome.response_relayed = true,
-                            Ok(Err(e)) => {
-                                warn!("{label} failed to write socket: {e}");
-                                break;
-                            }
-                            Err(_) => {
+                        match write_all_stall(&mut wr, &msg.data, cfg.write_stall_timeout).await {
+                            Ok(StallOutcome::Written) => outcome.response_relayed = true,
+                            Ok(StallOutcome::Stalled) => {
                                 metrics::counter!(cfg.write_stall_counter).increment(1);
                                 debug!(
                                     "{label} client response write stalled, closing: {stream_id}"
                                 );
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("{label} failed to write socket: {e}");
                                 break;
                             }
                         }
@@ -451,6 +514,7 @@ where
                 Ok(Ok(0)) => break,
                 Ok(Ok(_)) => {
                     progress.touch();
+                    cfg.note_activity();
                     let chunk = buf.split().freeze();
                     if let Err(e) = tunnel_wr.write_all(&chunk).await {
                         debug!("{label} e2e tunnel write failed: {e}");
@@ -502,21 +566,20 @@ where
                 Ok(Ok(0)) => break, // peer Close / channel EOF via the TLS layer
                 Ok(Ok(_)) => {
                     progress.touch();
+                    cfg.note_activity();
                     let chunk = buf.split().freeze();
-                    match tokio::time::timeout(cfg.write_stall_timeout, local_wr.write_all(&chunk))
-                        .await
-                    {
-                        Ok(Ok(())) => {
+                    match write_all_stall(&mut local_wr, &chunk, cfg.write_stall_timeout).await {
+                        Ok(StallOutcome::Written) => {
                             outcome.response_relayed = true;
                             relay_observer.store(true, Ordering::Release);
                         }
-                        Ok(Err(e)) => {
-                            debug!("{label} failed to write local endpoint: {e}");
-                            break;
-                        }
-                        Err(_) => {
+                        Ok(StallOutcome::Stalled) => {
                             metrics::counter!(cfg.write_stall_counter).increment(1);
                             debug!("{label} local write stalled, closing: {stream_id}");
+                            break;
+                        }
+                        Err(e) => {
+                            debug!("{label} failed to write local endpoint: {e}");
                             break;
                         }
                     }
@@ -659,6 +722,7 @@ mod tests {
             idle_timeout_counter: "interflow_pump_test_idle",
             write_stall_counter: "interflow_pump_test_stall",
             log_label: "pump-test",
+            activity: None,
         }
     }
 

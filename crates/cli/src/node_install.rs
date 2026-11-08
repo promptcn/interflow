@@ -68,6 +68,11 @@ pub struct InstallReport {
     pub stale_processes: Vec<crate::stale_exec::StaleFinding>,
     /// Units this run restarted via [`NodeInstall::restart_stale_units`].
     pub restarted_units: Vec<String>,
+    /// Host-level leftovers this install's closing sweep named (units or
+    /// packs no installed set and no signed roster accounts for). Read-only
+    /// findings — retirement is [`retire`]'s explicit job, never a side
+    /// effect of installing.
+    pub host_findings: Vec<crate::host_reconcile::ReconcileFinding>,
 }
 
 impl NodeInstall {
@@ -211,6 +216,18 @@ pub fn install(opts: &NodeInstall) -> interflow_core::error::Result<InstallRepor
         (Vec::new(), Vec::new())
     };
 
+    // The closing host sweep: name this machine's other interflow units and
+    // packs that no installed set — and no signed roster (format epoch 3) —
+    // accounts for. A rename or retirement whose cleanup lived only in the
+    // runbook leaves a unit that races for ports at the NEXT boot; the
+    // findings name it now, while the operator is looking.
+    let unit_scan_dir = if system_target {
+        PathBuf::from("/etc/systemd/system")
+    } else {
+        opts.root.join("systemd")
+    };
+    let host_findings = crate::host_reconcile::scan(&unit_scan_dir, &packs_root);
+
     Ok(InstallReport {
         kind,
         node,
@@ -220,6 +237,106 @@ pub fn install(opts: &NodeInstall) -> interflow_core::error::Result<InstallRepor
         service_started,
         stale_processes,
         restarted_units,
+        host_findings,
+    })
+}
+
+/// Options for [`retire`].
+pub struct NodeRetire {
+    /// The INSTALLED pack directory to retire (e.g. `packs/hub-promptcn`
+    /// under the install root).
+    pub pack: PathBuf,
+    /// Install root the pack lives under (default `/srv/interflow`).
+    pub root: PathBuf,
+}
+
+/// What one retire run did — printed by the CLI, asserted by tests.
+pub struct RetireReport {
+    pub kind: PackKind,
+    pub node: String,
+    /// The unit was stopped and its enablement removed through systemd.
+    pub unit_disabled: bool,
+    /// The unit file was removed (and systemd reloaded on system layouts).
+    pub unit_removed: bool,
+    /// The pack directory's archive location — retired packs are archived,
+    /// never deleted (rollback and audit material).
+    pub archived_to: PathBuf,
+}
+
+/// Retires one installed node: disable --now its unit, remove the unit
+/// file, archive the pack as `<name>.retired-<date>`.
+///
+/// The explicit inverse of [`install`] — retirement used to be three manual
+/// steps the runbook had to remind the operator about, and a missed one
+/// armed a port race for the next boot. The archive keeps one step short of
+/// deletion: destructive irreversibility stays with `rm`, where it has
+/// always been.
+pub fn retire(opts: &NodeRetire) -> interflow_core::error::Result<RetireReport> {
+    let system_target = opts.root == Path::new(render::DEFAULT_INSTALL_ROOT);
+    if system_target && !running_as_root() {
+        return Err(interflow_core::error::InterflowError::config(
+            "retiring from system paths requires root — re-run with sudo, or pass \
+             --root <dir> for the self-contained layout",
+        ));
+    }
+    let (kind, node, _realm) =
+        interflow_identity::pack_kind_node_realm_of(&opts.pack).map_err(|e| {
+            interflow_core::error::InterflowError::config(format!(
+                "{} does not read as an installed pack — retire names an installed \
+                 <kind>-<node> directory under the packs root",
+                opts.pack.display()
+            ))
+            .with_source(e)
+        })?;
+    let unit_name = format!("interflow-{}-{node}.service", kind.as_str());
+    let unit_path = if system_target {
+        PathBuf::from("/etc/systemd/system").join(&unit_name)
+    } else {
+        opts.root.join("systemd").join(&unit_name)
+    };
+
+    // Stop the service and drop its enablement BEFORE anything else moves:
+    // the boot race is the failure this command exists to close.
+    let unit_disabled = system_target && systemctl_available() && unit_path.exists();
+    if unit_disabled {
+        systemctl(&["disable", "--now", &unit_name])?;
+    }
+    let unit_removed = unit_path.exists();
+    if unit_removed {
+        std::fs::remove_file(&unit_path)?;
+    }
+    if system_target && unit_removed && systemctl_available() {
+        systemctl(&["daemon-reload"])?;
+    }
+
+    // Archive, never delete: `<name>.retired-<YYYY-MM-DD>` beside the pack.
+    // A same-day archive already present means a re-run with the same pack
+    // — refuse rather than overwrite history.
+    let now = interflow_identity::timestamp::rfc3339_now().unwrap_or_else(|_| "unknown".to_owned());
+    let date = now[..now.len().min(10)].to_owned();
+    let dir_name = opts
+        .pack
+        .file_name()
+        .map_or_else(|| "pack".to_owned(), |n| n.to_string_lossy().into_owned());
+    let archived_to = opts
+        .pack
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{dir_name}.retired-{date}"));
+    if archived_to.exists() {
+        return Err(interflow_core::error::InterflowError::config(format!(
+            "{} already exists — remove it before retiring the same node again today",
+            archived_to.display()
+        )));
+    }
+    std::fs::rename(&opts.pack, &archived_to)?;
+
+    Ok(RetireReport {
+        kind,
+        node,
+        unit_disabled,
+        unit_removed,
+        archived_to,
     })
 }
 
@@ -499,24 +616,20 @@ fn chown_tree(dir: &Path, user: &str) -> interflow_core::error::Result<()> {
     walk(dir, uid, gid)
 }
 
+/// Off unix there is no ownership to transfer (the service-install face is
+/// Linux-shaped; see the Windows platform inventory). The fallible shape is
+/// the unix contract callers compile against.
 #[cfg(not(unix))]
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 fn chown_tree(_dir: &Path, _user: &str) -> interflow_core::error::Result<()> {
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> interflow_core::error::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let target = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_recursive(&path, &target)?;
-        } else {
-            std::fs::copy(&path, &target)?;
-        }
-    }
-    Ok(())
+/// The one recursive copy in the product — `plan stage` copies packs with
+/// it too, so every pack copy in the tree takes the same path (the 2026-11
+/// staging incident was a hand-rolled `cp` missing `-R`).
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> interflow_core::error::Result<()> {
+    interflow_util::copy_dir_recursive(src, dst).map_err(interflow_core::error::InterflowError::Io)
 }
 
 #[cfg(test)]

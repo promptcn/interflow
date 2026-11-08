@@ -21,6 +21,8 @@ import type {
   NodeKindDto,
   NodePrefs,
   NodeStateDto,
+  BreakerOpenRowDto,
+  CrlPollPlaneDto,
   PeersPlaneDto,
   PolicyPlaneDto,
   ProposalReceiptDto,
@@ -92,6 +94,7 @@ export type {
   RealmDto,
   RouteDto,
   SealedPackDto,
+  StartupNoticeDto,
   Transport,
   VersionInfo,
 } from "./bindings";
@@ -144,9 +147,11 @@ export const api = {
   deployApply: (manifest: string, issuer: string, out: string) =>
     unwrap(commands.deployApply(manifest, issuer, out)),
   // The bookkeeping-level "would apply do anything" pre-check — the
-  // overview's unapplied-changes badge and next-steps face.
-  deployChangeState: (manifest: string, issuer: string) =>
-    unwrap(commands.deployChangeState(manifest, issuer)),
+  // overview's unapplied-changes badge and next-steps face (the out tree
+  // and the deny list are local reads: stale trees and local watermark
+  // divergences count as "would do something").
+  deployChangeState: (manifest: string, issuer: string, out: string) =>
+    unwrap(commands.deployChangeState(manifest, issuer, out)),
   // The running hub's operator overview — Apply-result/convergence card
   // and the fleet table's online column.
   deployHubOverview: (manifest: string, issuer: string) =>
@@ -154,6 +159,18 @@ export const api = {
   // The stream-proposal queue (the operator's approve/reject face).
   deployListProposals: (manifest: string, issuer: string) =>
     unwrap(commands.deployListProposals(manifest, issuer)),
+  // Planned unavailability — stream level: pause (stop the listener,
+  // release the port) / resume. The hub path relays the op to a node
+  // running elsewhere; the local path drives this machine's node
+  // in-process. Both idempotent.
+  streamPauseHub: (manifest: string, issuer: string, agent: string, name: string, pause: boolean) =>
+    unwrap(commands.streamPauseHub(manifest, issuer, agent, name, pause)),
+  streamPauseLocal: (nodeId: string, name: string, pause: boolean) =>
+    unwrap(commands.streamPauseLocal(nodeId, name, pause)),
+  // Planned unavailability — node level: maintenance on/off (the hub's
+  // declaration; lifts itself when the node rejoins).
+  maintenanceHub: (manifest: string, issuer: string, agent: string, on: boolean) =>
+    unwrap(commands.maintenanceHub(manifest, issuer, agent, on)),
   deployApproveProposal: (manifest: string, issuer: string, out: string, id: string) =>
     unwrap(commands.deployApproveProposal(manifest, issuer, out, id)),
   deployRejectProposal: (manifest: string, issuer: string, id: string, reason: string) =>
@@ -184,19 +201,27 @@ export const api = {
   // language switch never drops the remembered deployment.
   guiPrefsLoad: () => unwrap(commands.guiPrefsLoad()),
   guiPrefsSave: (prefs: GuiPrefsDto) => unwrap(commands.guiPrefsSave(prefs)),
+  // Startup notices — known retirements this build narrates instead of
+  // silently absorbing (each shows once; dismissal keys on the notice id).
+  guiStartupNotices: () => unwrap(commands.guiStartupNotices()),
   // Deployment-as-root-object (2026-10-11 IA): discovery, the composed
   // fleet read model, and the one-click publish orchestration.
   deploymentList: () => unwrap(commands.deploymentList()),
   deploymentCurrent: () => unwrap(commands.deploymentCurrent()),
   deploymentSetCurrent: (root: string) => unwrap(commands.deploymentSetCurrent(root)),
-  fleetOverview: (manifest: string, issuer: string, includeHub: boolean) =>
-    unwrap(commands.fleetOverview(manifest, issuer, includeHub)),
+  fleetOverview: (manifest: string, issuer: string, out: string, includeHub: boolean) =>
+    unwrap(commands.fleetOverview(manifest, issuer, out, includeHub)),
   deploymentPublish: (
     manifest: string,
     issuer: string,
     out: string,
     manifestText: string | null,
   ) => unwrap(commands.deploymentPublish(manifestText, manifest, issuer, out)),
+  // The hub floor watcher's lifecycle (the fleet read model's
+  // invalidation signal — see `onHubFloor`).
+  hubFloorWatchStart: (manifest: string, issuer: string) =>
+    unwrap(commands.hubFloorWatchStart(manifest, issuer)),
+  hubFloorWatchStop: () => unwrap(commands.hubFloorWatchStop()),
 };
 
 /// Listeners resolve to an unlisten fn (App keeps them for cleanup).
@@ -228,6 +253,29 @@ export function onMeshPeers(
   );
 }
 
+/// CRL-poll liveness moved on a running node (renewal loop atomics →
+/// ticking forwarder). The node detail's "CRL polling" panel patches its
+/// node's `crl` field from these — the local half of the 2026-10-19
+/// liveness face.
+export function onMeshCrl(
+  handler: (id: string, crl: CrlPollPlaneDto) => void
+): Promise<() => void> {
+  return events.meshCrl.listen((e: Event<{ id: string; crl: CrlPollPlaneDto }>) =>
+    handler(e.payload.id, e.payload.crl)
+  );
+}
+
+/// The egress-breaker open set moved on a running mesh agent (table
+/// publish → manager forwarder). The node detail's "Egress breakers"
+/// panel patches its node's `breakers` from these.
+export function onMeshBreakers(
+  handler: (id: string, breakers: BreakerOpenRowDto[]) => void
+): Promise<() => void> {
+  return events.meshBreakers.listen((e: Event<{ id: string; breakers: BreakerOpenRowDto[] }>) =>
+    handler(e.payload.id, e.payload.breakers)
+  );
+}
+
 /// Proposal receipts moved on a running mesh agent (engine watcher →
 /// manager forwarder). The node detail's "Requested streams" section
 /// patches its node's `proposals` from these.
@@ -255,6 +303,19 @@ export function onMeshListeners(
 
 export function onLogLine(handler: (line: LogLine) => void): Promise<() => void> {
   return events.log.listen((e: Event<LogLine>) => handler(e.payload));
+}
+
+/// The deployment's hub floor version advanced (hub floor watcher →
+/// here). The composed fleet read model is a pull over the hub's floor
+/// endpoint; this event is its invalidation signal — the deployment
+/// scope re-pulls on receipt, so external writers (a CLI pause/resume, a
+/// maintenance declaration, another operator's publish, an agent's
+/// re-report) reach every fleet-reading view the moment the hub's face
+/// moves. Same push-not-poll contract as the node telemetry events
+export function onHubFloor(handler: (version: number) => void): Promise<() => void> {
+  return events.hubFloor.listen((e: Event<{ version: number }>) =>
+    handler(e.payload.version),
+  );
 }
 
 /// State wording is UI chrome — localized. The `Failed`/`Reconnecting`
@@ -308,6 +369,16 @@ export function formatAgoSecs(unix: number): string {
   if (ago < 3600) return `${Math.floor(ago / 60)}m`;
   if (ago < 86400) return `${Math.floor(ago / 3600)}h`;
   return `${Math.floor(ago / 86400)}d`;
+}
+
+/// An age already expressed in seconds, in [`formatAgoSecs`]'s buckets —
+/// for faces that carry a precomputed age (the policy recency readings,
+/// judged against a capture instant rather than the render clock).
+export function formatAgeSecs(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+  return `${Math.floor(secs / 86400)}d`;
 }
 
 /// 语义状态键——颜色的唯一词汇:success=运行/已连接,warn=过渡态与凭据

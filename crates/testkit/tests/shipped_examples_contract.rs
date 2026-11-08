@@ -18,7 +18,6 @@
     missing_docs
 )]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
@@ -55,30 +54,45 @@ fn check_scenario_shape(base: &Path, required: &[&str]) {
     for entry in std::fs::read_dir(base).expect("scenario should be listable") {
         let path = entry.expect("directory entry").path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("sh") {
-            assert!(
-                path.metadata()
-                    .expect("script metadata")
-                    .permissions()
-                    .mode()
-                    & 0o111
-                    != 0,
-                "script is not executable: {}",
-                path.display()
-            );
-            let output = std::process::Command::new("bash")
-                .arg("-n")
-                .arg(&path)
-                .output()
-                .expect("run bash -n");
-            assert!(
-                output.status.success(),
-                "{} failed bash -n: {}",
-                path.display(),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            check_shell_script(&path);
         }
     }
 }
+
+/// The shipped shell scripts are unix deployment material: executable
+/// bit set, `bash -n` clean. Both are unix semantics (no mode bits on
+/// NTFS, no bash contract on a Windows host), so the check is too; the
+/// structural contract above — the files exist and carry no private
+/// material — holds on every platform.
+#[cfg(unix)]
+fn check_shell_script(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert!(
+        path.metadata()
+            .expect("script metadata")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0,
+        "script is not executable: {}",
+        path.display()
+    );
+    let output = std::process::Command::new("bash")
+        .arg("-n")
+        .arg(path)
+        .output()
+        .expect("run bash -n");
+    assert!(
+        output.status.success(),
+        "{} failed bash -n: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(not(unix))]
+fn check_shell_script(_path: &Path) {}
 
 fn visit_files(root: &Path, callback: &mut dyn FnMut(&Path)) {
     if root.is_file() {

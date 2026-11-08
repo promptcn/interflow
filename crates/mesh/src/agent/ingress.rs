@@ -1,6 +1,7 @@
 use crate::agent::control::{ControlOpError, IngressCommand};
 use crate::agent::ingress_addrs::IngressAddrs;
 use crate::agent::ingress_listeners::IngressListeners;
+use crate::agent::paused_streams::PausedStreams;
 use crate::agent::reconcile_report::ReconcileReport;
 use crate::agent::rules::RuleStore;
 use crate::config::IngressRule;
@@ -143,6 +144,13 @@ pub struct IngressHandler {
     /// Agent-scoped listener health face: bound addresses and bind errors,
     /// observable from the [`AgentHandle`](crate::agent::AgentHandle).
     listeners: Arc<IngressListeners>,
+    /// Agent-scoped pause-intent truth: the desired face is filtered
+    /// through it (a paused stream wants no listener — planned
+    /// unavailability, deliberately distinct from a rule removal).
+    paused: Arc<PausedStreams>,
+    /// Agent-scoped byte-activity ledger: per-rule last-byte levels for
+    /// the fossil face (the node-status reporter ships its snapshot).
+    activity: Arc<crate::agent::stream_activity::StreamActivity>,
     /// Mandatory inner-TLS runtime.
     e2e: Arc<crate::agent::e2e::E2eRuntime>,
     /// Readiness signal: set once a session has bound every rule in its
@@ -164,6 +172,8 @@ impl IngressHandler {
         command_rx: Option<mpsc::Receiver<IngressCommand>>,
         addrs: Arc<IngressAddrs>,
         listeners: Arc<IngressListeners>,
+        paused: Arc<PausedStreams>,
+        activity: Arc<crate::agent::stream_activity::StreamActivity>,
         e2e: Arc<crate::agent::e2e::E2eRuntime>,
         ingress_ready: tokio::sync::watch::Sender<bool>,
     ) -> Self {
@@ -182,6 +192,8 @@ impl IngressHandler {
             bound: HashMap::new(),
             addrs,
             listeners,
+            paused,
+            activity,
             e2e,
             ingress_ready,
         }
@@ -200,10 +212,13 @@ impl IngressHandler {
         }
 
         // Reconcile triggers, level-triggered: rule-store changes (policy
-        // reload, control API), a periodic catch-all tick (retries failed
-        // binds, heals anything a missed wake-up could leave behind), and
-        // the command channel (Add/Remove/List + session teardown).
+        // reload, control API), pause-intent changes (the pause set is a
+        // desired-face input with the same contract as the store), a
+        // periodic catch-all tick (retries failed binds, heals anything a
+        // missed wake-up could leave behind), and the command channel
+        // (Add/Remove/List + session teardown).
         let mut version = self.store.version_rx();
+        let mut paused_version = self.paused.version_rx();
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut commands = self.command_rx.take();
@@ -234,6 +249,11 @@ impl IngressHandler {
                         self.reconcile().await;
                     }
                 }
+                changed = paused_version.changed() => {
+                    if changed.is_ok() {
+                        self.reconcile().await;
+                    }
+                }
                 _ = tick.tick() => {
                     self.reconcile().await;
                 }
@@ -260,25 +280,64 @@ impl IngressHandler {
     /// Returns the number of rules that want a listener but do not have
     /// one (bind failures pending retry).
     async fn reconcile(&mut self) -> usize {
-        let desired = self.store.ingress_snapshot().await;
+        let desired_all = self.store.ingress_snapshot().await;
+        // Planned unavailability: a paused stream wants no listener. The
+        // pause set is a desired-face input with the same level-triggered
+        // contract as the store — filtering here (not removing from the
+        // store) keeps the rule's identity, its `:0` pin, and its
+        // policy-reload semantics intact.
+        let desired: Vec<IngressRule> = desired_all
+            .iter()
+            .filter(|r| !self.paused.is_paused(&r.name))
+            .cloned()
+            .collect();
         let mut report = ReconcileReport::new();
 
-        // Stop listeners whose rule is gone from the desired face.
+        // Stop listeners whose rule is gone from the desired face — a
+        // three-way read: present-and-serving (skip), paused (stop but
+        // keep the pin and record the paused face), gone (full removal).
         let names: Vec<String> = self.bound.keys().cloned().collect();
         for name in names {
             if desired.iter().any(|r| r.name == name) {
                 continue;
             }
+            let paused_now = self.paused.is_paused(&name);
             if let Some(handle) = self.guard.handles.remove(&name) {
-                info!(node = %self.node, "Rule gone, stopping ingress listener: {name}");
+                if paused_now {
+                    info!(node = %self.node, "Stream paused, stopping ingress listener (port released): {name}");
+                } else {
+                    info!(node = %self.node, "Rule gone, stopping ingress listener: {name}");
+                }
                 stop_and_reap(handle).await;
             }
-            self.addrs.remove(&name);
             self.bound.remove(&name);
-            self.listeners.remove(&name);
+            if paused_now {
+                // The intent outlives this listener: keep the `:0` pin so
+                // resume rebinds the same address, and show the paused
+                // face (its own state — not a bind failure, not a gone
+                // rule).
+                self.listeners.set_paused(&name);
+            } else {
+                self.addrs.remove(&name);
+                self.listeners.remove(&name);
+            }
             metrics::gauge!("interflow_agent_ingress_listener_bound", "rule" => name.clone())
                 .set(0.0);
             report.record_removed();
+        }
+
+        // Face hygiene: a paused row whose rule has since left the store
+        // keeps its intent (the set is name-keyed) but not its face —
+        // there is no stream to show. A returning rule re-populates it.
+        let stale_faces: Vec<String> = self
+            .listeners
+            .snapshot()
+            .keys()
+            .filter(|name| !desired_all.iter().any(|r| &r.name == *name))
+            .cloned()
+            .collect();
+        for name in stale_faces {
+            self.listeners.remove(&name);
         }
 
         // Drive every desired rule to its listener.
@@ -362,6 +421,12 @@ impl IngressHandler {
             .await
             .map_err(ControlOpError::from)?;
         self.reconcile().await;
+        if self.paused.is_paused(&name) {
+            // In effect as paused: the rule is in the store and the
+            // intent is deliberately not serving — an applied state, not
+            // a failure to come up.
+            return Ok(());
+        }
         let serving = self
             .bound
             .get(&name)
@@ -461,7 +526,13 @@ impl IngressHandler {
         let session = self.session.clone();
         let e2e = Arc::clone(&self.e2e);
         let node = self.node.clone();
-        let name = rule.name;
+        let name = rule.name.clone();
+        // Same byte-activity ledger as the TCP path (the fossil face
+        // covers UDP rules alike); the cell rides the datagram loop.
+        let activity_cell = self.activity.arm_rule(
+            &rule.name,
+            rule.idle_timeout_secs.and_then(|s| u32::try_from(s).ok()),
+        );
         let handle = self.tracker.spawn(async move {
             // Stop on session end (the socket closes as the task drops)
             tokio::select! {
@@ -472,6 +543,7 @@ impl IngressHandler {
                     tunnel,
                     e2e,
                     node,
+                    activity_cell,
                 ) => {}
             }
         });
@@ -523,6 +595,13 @@ impl IngressHandler {
         let per_conn_tracker = self.tracker.clone();
         let e2e = self.e2e.clone();
         let node = self.node.clone();
+        // The byte-activity cell (the fossil face's per-rule level): armed
+        // at listener bind — the "mounted, listening" baseline instant —
+        // and touched by every pump beside its idle-deadline resets.
+        let activity_cell = self.activity.arm_rule(
+            &rule.name,
+            rule.idle_timeout_secs.and_then(|s| u32::try_from(s).ok()),
+        );
 
         // Global concurrency cap: guards against a connection flood
         // exhausting the scheduler and file descriptors (combined with
@@ -562,6 +641,7 @@ impl IngressHandler {
                                 let session = session.clone();
                                 let e2e = e2e.clone();
                                 let node = node.clone();
+                                let activity_cell = activity_cell.clone();
 
                                 per_conn_tracker.spawn(async move {
                                     // _permit releases automatically when
@@ -569,7 +649,7 @@ impl IngressHandler {
                                     let _permit = permit;
                                     tokio::select! {
                                         () = session.cancelled() => {}
-                                        r = Self::handle_connection(socket, tunnel, rule, agent_id, e2e, &node) => {
+                                        r = Self::handle_connection(socket, tunnel, rule, agent_id, e2e, &node, activity_cell) => {
                                             if let Err(e) = r {
                                                 error!(node = %node, "Connection handling error: {}", e);
                                             }
@@ -598,6 +678,7 @@ impl IngressHandler {
         agent_id: String,
         e2e: Arc<crate::agent::e2e::E2eRuntime>,
         node: &str,
+        activity_cell: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<()> {
         // Stream idle timeout: close the stream when neither direction has
         // data for this long (default tcp 300s, configurable per rule)
@@ -610,6 +691,7 @@ impl IngressHandler {
             idle_timeout_counter: "interflow_ingress_stream_idle_timeout",
             write_stall_counter: "interflow_ingress_client_write_stall",
             log_label: "ingress",
+            activity: Some(activity_cell),
         };
 
         // Mandatory inner TLS: the inner client handshake runs between the
@@ -702,10 +784,11 @@ impl IngressHandler {
                     info!(
                         node = %node,
                         "mesh ingress stream idle timeout: rule {} closed after {budget}s of \
-                         total silence (stream {stream_id}) — for requests that legitimately \
+                         total silence ({}) — for requests that legitimately \
                          stay silent (non-streaming LLM calls with long thinking), raise \
                          `idle_timeout_secs` on this rule in the manifest",
-                        rule.name
+                        rule.name,
+                        crate::agent::correlation::stream_note(&stream_id)
                     );
                 }
                 Ok(())

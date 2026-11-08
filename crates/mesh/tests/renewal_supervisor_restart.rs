@@ -184,9 +184,12 @@ target_addr = "127.0.0.1:{echo_port}"
     // and exits onto a restart (the CRL first-write path — the same one
     // crates/cli/tests/renewal.rs rides). Prime it out here so the
     // supervised loop below observes pure renewal-threshold cycles.
-    interflow_renewal::renewal_scheduler(&pack_dir_a)
-        .await
-        .unwrap();
+    interflow_renewal::renewal_scheduler(
+        &pack_dir_a,
+        std::sync::Arc::new(interflow_renewal::CrlPollFace::new()),
+    )
+    .await
+    .unwrap();
 
     // THE loop: real run_agent wiring under the bounded supervisor.
     //

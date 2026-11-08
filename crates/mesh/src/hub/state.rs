@@ -9,7 +9,7 @@
 use bytes::{Bytes, BytesMut};
 use interflow_contract::generation::GenerationalHandle;
 use interflow_core::error::InterflowError;
-use interflow_core::protocol::{CircuitToken, RouteToken, StreamProto};
+use interflow_core::protocol::{CircuitToken, RouteToken, StreamId, StreamProto};
 use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker};
 pub use interflow_core::tunnel::TunnelData;
 use std::collections::HashMap;
@@ -109,9 +109,98 @@ impl PeerIdentity {
 /// an await — avoiding a tokio Mutex serializing the hot path.
 pub type SharedStreamCounts = Arc<std::sync::Mutex<HashMap<String, usize>>>;
 
-/// Active stream table type.
-pub type SharedActiveStreams =
-    Arc<RwLock<HashMap<interflow_core::protocol::StreamId, ActiveStream>>>;
+/// Active stream table: sharded by `StreamId` hash.
+///
+/// 2026-11-04 audit §2.2: the old single global `tokio::RwLock` serialized
+/// every concurrent Data-frame forward behind every Open/Close write;
+/// shards confine a write to its own lane. The shard locks are `std` —
+/// every critical section is clone-out-only, never held across an await
+/// (the discipline the audit verified across the data plane).
+pub type SharedActiveStreams = Arc<ShardedStreams>;
+
+/// Shard count: fixed (power of two keeps the mask cheap); sized against
+/// hub-scale stream counts, not core counts — contention falls off with
+/// more shards, and 16 keeps per-shard maps dense enough for cheap
+/// iteration in the sweep paths.
+const STREAM_SHARDS: usize = 16;
+
+/// The sharded active-stream table itself.
+pub struct ShardedStreams {
+    shards: [std::sync::RwLock<HashMap<StreamId, ActiveStream>>; STREAM_SHARDS],
+}
+
+impl ShardedStreams {
+    /// An empty table.
+    pub fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn shard(&self, id: &StreamId) -> &std::sync::RwLock<HashMap<StreamId, ActiveStream>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut hasher);
+        let idx = hasher.finish() % STREAM_SHARDS as u64;
+        &self.shards[usize::try_from(idx).unwrap_or(0)]
+    }
+
+    /// Inserts (replaces) one entry under its shard's write lock.
+    pub fn insert(&self, id: StreamId, stream: ActiveStream) {
+        self.shard(&id)
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, stream);
+    }
+
+    /// Removes one entry under its shard's write lock.
+    pub fn remove(&self, id: &StreamId) -> Option<ActiveStream> {
+        self.shard(id)
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)
+    }
+
+    /// Read-side access: runs `f` under the shard's read lock (sync only —
+    /// clone out what the caller needs, never hold the guard across an
+    /// await). `None` = no such stream.
+    pub fn with<R>(&self, id: &StreamId, f: impl FnOnce(Option<&ActiveStream>) -> R) -> R {
+        let guard = self
+            .shard(id)
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(guard.get(id))
+    }
+
+    /// Total entry count across shards (the global stream cap's input).
+    pub fn total(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| {
+                s.read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
+            .sum()
+    }
+
+    /// Per-shard `retain` (the sweep paths): `f` returns false to remove.
+    /// Applies under each shard's write lock, one shard at a time.
+    pub fn retain(&self, mut f: impl FnMut(&StreamId, &ActiveStream) -> bool) {
+        for shard in &self.shards {
+            shard
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|id, s| f(id, s));
+        }
+    }
+}
+
+impl Default for ShardedStreams {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Route token → `(source semantic agent, qualified semantic target)`.
 /// Tokens are removed when their source semantic agent registers a new
@@ -136,6 +225,11 @@ pub struct HubLimits {
     pub channel_send_timeout_secs: Arc<AtomicU64>,
     /// Grace period in seconds that an entry survives after a poll disconnect.
     pub poll_grace_secs: Arc<AtomicU64>,
+    /// QUIC DATAGRAM fast-path toggle (startup-set, like the rest of the
+    /// collection: the transport face assembles once — a change is a
+    /// restart, same as the QUIC listener itself). Read on every Open;
+    /// the config RwLock stays OFF the per-Open path (§3.7).
+    pub datagram_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HubLimits {
@@ -149,6 +243,9 @@ impl HubLimits {
                 cfg.security.channel_send_timeout_secs,
             )),
             poll_grace_secs: Arc::new(AtomicU64::new(cfg.security.poll_grace_secs)),
+            datagram_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+                cfg.transport.quic.datagram_enabled,
+            )),
         }
     }
 }
@@ -221,6 +318,11 @@ pub const CONTROL_TENANT: &str = "control";
 /// restart every online agent answers 304 against its current generation,
 /// so no catch-up bookkeeping is owed. Entries are bounded by the set of
 /// agents that ever registered in this process (a few dozen bytes each).
+///
+/// This table is the AUDIT material only. The fleet faces read their level
+/// material (watermark + last-pull instant, recorded on every completed
+/// pull) from `hub::policy_watermarks` — an edge ledger feeding a level
+/// face is the family defect this batch retired
 pub type SharedPolicyPullLedger = Arc<std::sync::Mutex<HashMap<String, u64>>>;
 
 /// Check-and-set for one `policy_pulled` ledger entry: returns `true`
@@ -417,6 +519,13 @@ pub struct HubState {
     pub config: SharedHubConfig,
     /// Active stream table.
     pub active_streams: SharedActiveStreams,
+    /// The data-plane sender projection of the registry (agent → its
+    /// session's CURRENT data channel): maintained exactly at the two
+    /// registry mutation points (register install / removal-funnel
+    /// eviction), both under the agents write lock — the flat table lets
+    /// the data plane resolve a poll delivery with ONE lock instead of the
+    /// registry's two-level hop (2026-11-04 audit §2.2).
+    pub data_tx: Arc<std::sync::RwLock<HashMap<String, mpsc::Sender<TunnelData>>>>,
     /// TLS plane (mTLS acceptor + tenant derivation).
     pub tls_plane: SharedTlsPlane,
     /// Hot-reloadable runtime limits.
@@ -435,8 +544,42 @@ pub struct HubState {
     /// 404s, the plane has no live CRL lane).
     pub crl_channel: Option<Arc<crate::hub::crl::CrlChannel>>,
     /// Audit dedup table for policy servings (see
-    /// [`SharedPolicyPullLedger`]).
+    /// [`SharedPolicyPullLedger`]) — the EDGE ledger; the fleet faces read
+    /// their level material from [`Self::policy_watermarks`].
     pub policy_pull_ledger: SharedPolicyPullLedger,
+    /// The level-triggered policy-pull watermark face: every completed
+    /// pull (UpToDate or not) records `fetch_max(seen) +
+    /// last_pull_unix`, and the recency sweeper turns a crossing into a
+    /// floor-visible transition. This is the material behind the
+    /// floor/snapshot agents rows — see `hub::policy_watermarks`.
+    pub policy_watermarks: std::sync::Arc<crate::hub::policy_watermarks::PolicyWatermarks>,
+    /// The level-triggered CRL-poll liveness face: every agent's renewal
+    /// reporter lands its level here (`POST /crls/liveness` on h2, the
+    /// `CrlLivenessRequest` frame on QUIC), the self slot carries THIS
+    /// process's own renewal loop, and the recency sweeper turns a frozen
+    /// level into a floor-visible silent transition — the only structural
+    /// path a silently-hung poll loop reaches the push contract. See
+    /// `hub::crl_liveness`.
+    pub crl_liveness: std::sync::Arc<crate::hub::crl_liveness::CrlLiveness>,
+    /// The resident-task armed-assertion face: every long-lived hub task
+    /// registers its row at spawn and touches it each loop pass; the
+    /// silence sweeper turns a quiet row (quieter than its own interval's
+    /// [`crate::hub::watchdog::WATCHER_SILENT_FACTOR`] multiple) into a
+    /// floor-visible transition. A task that wedges without erroring is
+    /// readable here first, before secondary symptoms accumulate. See
+    /// `hub::watchdog`.
+    pub watchdog: std::sync::Arc<crate::hub::watchdog::WatchdogRegistry>,
+    /// The node-status face: every agent's latest engine-level report
+    /// (per-stream byte activity — the fossil face's material), landing
+    /// over `POST /node/status` / the NodeStatus frame pair. See
+    /// `hub::node_status`.
+    pub node_status: std::sync::Arc<crate::hub::node_status::NodeStatus>,
+    /// The credential watermarks: each agent's last-seen leaf validity
+    /// window (parsed from the mTLS chain at registration, retained
+    /// across eviction) — the credential-expiry fleet face's material.
+    /// See `hub::credential_watermarks`.
+    pub credential_watermarks:
+        std::sync::Arc<crate::hub::credential_watermarks::CredentialWatermarks>,
     /// Cumulative count of agent evictions that actually landed (the
     /// `Internal::Evict` branch of the removal funnel — voided removals do
     /// not count). A domain counter, not a metrics-registry readback: the
@@ -456,7 +599,38 @@ pub struct HubState {
     /// [`SharedExpiryLedger`]) — the symmetric-transfer accounting state
     /// for `credential_expiry` events.
     pub expiry_ledger: SharedExpiryLedger,
-    /// Connection tracker (per-IP + global caps).
+    /// The stream-intent face: the operator's pause/resume mailbox and
+    /// every agent's reported paused set (planned unavailability,
+    /// stream-level). In-memory by design — see `hub::stream_intents`.
+    pub stream_intents: Arc<crate::hub::stream_intents::StreamIntents>,
+    /// The node-level maintenance declarations (planned unavailability,
+    /// node-level): persisted in the hub's state channel, lifted by the
+    /// operator or automatically when the node rejoins. See
+    /// `hub::maintenance`.
+    pub maintenance: Arc<crate::hub::maintenance::MaintenanceLedger>,
+    /// The floor version clock (`GET /policy/floor/version`'s change
+    /// signal): bumped by every mutation funnel that feeds the floor read
+    /// model — the ledgers above hold clones. See `hub::floor_clock`.
+    pub floor_clock: crate::hub::floor_clock::FloorClock,
+    /// The edge's target-recovery sink (2026-10-18 active recovery):
+    /// present exactly on hubs fused with a public edge listener, which
+    /// reverse-maps an agent's out-of-band recovery notice onto its
+    /// route-breaker entries; `None` on plain mesh hubs (the notice is
+    /// acknowledged and dropped). See `hub::target_recovery`.
+    pub target_recovery: crate::hub::target_recovery::SharedTargetRecoverySink,
+    /// The edge's route-breaker open-set face (2026-10-19): present
+    /// exactly on hubs fused with a public edge listener — the snapshot
+    /// hub row and the floor payload read the currently-OPEN route
+    /// hosts; `None` on plain mesh hubs. See
+    /// `hub::target_recovery` for the registration pattern this
+    /// mirrors.
+    pub route_breaker_face: std::sync::Arc<crate::hub::state::SharedRouteBreakerFace>,
+    /// The PROXY-protocol trust policy, derived once at assembly (§3.8):
+    /// `server.proxy_protocol` is startup-fixed config (the live reload
+    /// channel only swaps `config.acl`), so the per-connection accept path
+    /// reuses this Arc instead of rebuilding the policy per TCP connection.
+    pub proxy_policy: Arc<interflow_core::security::ProxyProtocolPolicy>,
+    /// Connection tracker (per-client + global caps).
     pub conn_tracker: Arc<ConnTracker>,
     /// Background task group: connection-level tasks attach here so the
     /// shutdown drain waits for all of them to close out.
@@ -471,6 +645,96 @@ pub struct HubState {
 // direction/origin semantics live in the frame flags (`FLAG_RESPONSE`,
 // `FLAG_HUB_ORIGIN`) and are derived into `FrameOrigin` on the core
 // `TunnelData`.
+
+/// The shared route-breaker face slot: `None` on every hub without an
+/// edge listener (the read faces then report no open set — unknown,
+/// never guessed).
+pub type SharedRouteBreakerFace =
+    std::sync::RwLock<Option<std::sync::Arc<crate::agent::target_breaker::BreakerWatchState>>>;
+
+impl HubState {
+    /// Resolves the agent's CURRENT data-plane sender from the flat
+    /// projection (one std read lock; `None` = not registered).
+    pub fn data_tx(&self, agent_id: &str) -> Option<mpsc::Sender<TunnelData>> {
+        self.data_tx
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(agent_id)
+            .cloned()
+    }
+
+    /// Installs/replaces the agent's data-plane sender. Call sites: the
+    /// registry's session install (new row or replace-in-place) — always
+    /// under the agents write lock, so the projection and the registry
+    /// move together.
+    pub(crate) fn install_data_tx(&self, agent_id: &str, tx: mpsc::Sender<TunnelData>) {
+        self.data_tx
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(agent_id.to_owned(), tx);
+    }
+
+    /// Drops the agent's data-plane sender (registry-row removal — the
+    /// removal funnel's eviction arm).
+    pub(crate) fn remove_data_tx(&self, agent_id: &str) {
+        self.data_tx
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(agent_id);
+    }
+
+    /// Registers the edge's route-breaker open-set face (composition-time,
+    /// once — the expose edge's `run_until` is the only caller) and spawns
+    /// the floor-clock bridge: an open-set change bumps the version clock,
+    /// so floor watchers re-read the moment a route trips or recovers.
+    /// The bump stays hub-side (the `floor_clock` discipline: ledgers
+    /// bump, handlers never do).
+    pub fn register_route_breaker_face(
+        &self,
+        face: std::sync::Arc<crate::agent::target_breaker::BreakerWatchState>,
+    ) {
+        *self
+            .route_breaker_face
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::clone(&face));
+        let clock = self.floor_clock.clone();
+        let shutdown = self.shutdown.clone();
+        self.tasks.spawn(async move {
+            let mut rx = face.subscribe();
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    // `changed()` fires on every publish (the face is
+                    // itself change-guarded — a quiet table never wakes
+                    // this loop). The registered slot keeps the face's
+                    // sender alive for the hub's whole life, so shutdown
+                    // — not channel closure — is this task's other exit.
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        clock.bump();
+                    }
+                }
+            }
+        });
+    }
+
+    /// Registers the edge's target-recovery sink (composition-time, once —
+    /// the expose edge's `run_until` is the only caller; a plain mesh hub
+    /// never registers, and its recovery notices take the acknowledged
+    /// no-op arm). See `hub::target_recovery`.
+    pub fn register_target_recovery_sink(
+        &self,
+        sink: Arc<dyn crate::hub::target_recovery::TargetRecoverySink>,
+    ) {
+        *self
+            .target_recovery
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sink);
+    }
+}
 
 /// Shared state of a single agent.
 ///
@@ -675,21 +939,35 @@ impl AgentSession {
         }
     }
 
-    /// Severs the session — eviction step one: an RxStream still hanging on
-    /// some poll connection ends its response via the generation
-    /// self-check; dropping rx closes the data channel so every sender
-    /// blocked in `send().await` unblocks immediately; dropping ctrl_rx
-    /// closes the control channel (subsequent lifecycle notifications fail
-    /// immediately instead of queueing for a consumer that no longer
-    /// exists); the upload lease cancellation ends the upload reader's
-    /// response so the agent rebuilds.
-    pub fn terminate(&mut self) {
+    /// Severs the session — eviction step one, on both transports.
+    ///
+    /// The h2 half: an RxStream still hanging on some poll connection ends
+    /// its response via the generation self-check; dropping rx closes the
+    /// data channel so every sender blocked in `send().await` unblocks
+    /// immediately; dropping ctrl_rx closes the control channel (subsequent
+    /// lifecycle notifications fail immediately instead of queueing for a
+    /// consumer that no longer exists); the upload lease cancellation ends
+    /// the upload reader's response so the agent rebuilds.
+    ///
+    /// The QUIC half: the relay connection is CLOSED (`reason` rides the
+    /// CONNECTION_CLOSE so the agent's journal names why). An evicted
+    /// registration must not keep a transport-alive connection: its stream
+    /// handlers still carry this session's circuit, and its route leases
+    /// (no TTL) would stay usable for the connection's remaining lifetime
+    /// — the 2026-10-21 revocation residual-access case. The close also
+    /// fires the connection-lost watcher, which clears the circuit's
+    /// leases and ends the per-connection tasks.
+    pub fn terminate(&mut self, reason: &str) {
         self.rx = None;
         self.ctrl_rx = None;
         self.generation += 1;
         self.wake_poll();
         if let Some(lease) = self.up_lease.take() {
             lease.cancel();
+        }
+        if let Some(quic) = self.quic.take() {
+            quic.conn
+                .close(0_u32.into(), format!("hub evicted: {reason}").as_bytes());
         }
     }
 
@@ -724,23 +1002,30 @@ pub(crate) struct SessionWitness {
     pub(crate) circuit: CircuitToken,
 }
 
-/// Dispatch plane of one end of a stream (the transport shape is encoded in
-/// the type rather than implicitly expressed via `Option`).
+/// Dispatch plane of one end of a stream.
+///
+/// The transport shape is encoded in the type rather than implicitly
+/// expressed via `Option`. Both planes carry their delivery sender —
+/// captured once at Open (2026-11-04 audit §2.2), so a Data frame's route
+/// resolution is ONE shard read with no agent-table hop.
 #[derive(Debug, Clone)]
 pub enum StreamFace {
-    /// h2 agent: frames are dispatched via `lookup_tx` → `/poll`.
-    Poll,
+    /// h2 agent: frames go to the agent's session data channel (consumed by
+    /// its `/poll` body). The sender is the session's channel at Open time;
+    /// an in-place re-registration drops the old receiver, so a stale
+    /// sender presents as `Closed` and the relay core re-resolves once
+    /// from [`HubState::data_tx`] (the flat projection of the registry).
+    Poll(mpsc::Sender<TunnelData>),
     /// QUIC agent: frames are written to this agent's relay stream writer
     /// task.
     Relay(mpsc::Sender<TunnelData>),
 }
 
 impl StreamFace {
-    /// Relay sender (`None` for an h2 end).
-    pub const fn relay_sender(&self) -> Option<&mpsc::Sender<TunnelData>> {
+    /// This end's delivery sender (both planes carry one).
+    pub const fn sender(&self) -> &mpsc::Sender<TunnelData> {
         match self {
-            Self::Poll => None,
-            Self::Relay(tx) => Some(tx),
+            Self::Poll(tx) | Self::Relay(tx) => tx,
         }
     }
 
@@ -753,10 +1038,11 @@ impl StreamFace {
 /// Metadata of one active end-to-end stream.
 #[derive(Debug, Clone)]
 pub struct ActiveStream {
-    /// Initiating agent.
-    pub source_agent: String,
-    /// Target agent.
-    pub target_agent: String,
+    /// Initiating agent (`"{tenant}/{agent}"`, shared cheaply on the
+    /// per-frame route extraction).
+    pub source_agent: Arc<str>,
+    /// Target agent (`"{tenant}/{agent}"`).
+    pub target_agent: Arc<str>,
     /// Initiating agent's opaque data-plane identity.
     pub source_circuit: CircuitToken,
     /// Target agent's opaque data-plane identity.

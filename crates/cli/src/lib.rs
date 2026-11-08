@@ -2,6 +2,7 @@
 //! runtime-engine translation and manifest-derived deployment artifacts,
 //! shared by the CLI binary and the GUI.
 
+pub mod host_reconcile;
 pub mod manifest_edit;
 pub mod node_install;
 pub mod out;
@@ -9,3 +10,4 @@ pub mod plan;
 pub mod render;
 pub mod runtime;
 pub mod stale_exec;
+pub mod streams;

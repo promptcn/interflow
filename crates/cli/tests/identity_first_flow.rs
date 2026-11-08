@@ -2,15 +2,11 @@
 //! setup → plan validate/apply → pack inspect → doctor → seal/install →
 //! rotate → revoke. Exercises the real binary against a temp deployment.
 
+mod common;
+use common::bin;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop(); // deps/
-    p.pop(); // tests/
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
 
 fn run(args: &[&str], env: &[(&str, &str)]) {
     let mut cmd = Command::new(bin());
@@ -55,6 +51,29 @@ service = "default/desktop/asr"
     .to_owned()
 }
 
+/// The route host's public certificate pair, placed the way the runbook's
+/// certbot sequence would leave it — doctor's certificate-material section
+/// reads exactly this layout (via `--certs-dir`, the machine's
+/// `/etc/nginx/certs` in production).
+fn write_route_certificates(dir: &Path) -> String {
+    let certs_dir = dir.join("nginx-certs");
+    std::fs::create_dir_all(&certs_dir).unwrap();
+    let ca = interflow_certs::material::LoadedCa::generate(
+        "route-fixture",
+        interflow_certs::Validity::from_now(interflow_certs::CA_VALIDITY_DAYS),
+    )
+    .unwrap();
+    let leaf = ca
+        .build_server_cert(
+            &[interflow_certs::SanName::parse("asr.example.com").unwrap()],
+            interflow_certs::Validity::from_now(90),
+        )
+        .unwrap();
+    std::fs::write(certs_dir.join("asr.example.com.crt"), leaf.cert_pem).unwrap();
+    std::fs::write(certs_dir.join("asr.example.com.key"), leaf.key_pem).unwrap();
+    certs_dir.display().to_string()
+}
+
 #[test]
 fn full_identity_first_flow() {
     let dir = tempfile_dir();
@@ -92,12 +111,17 @@ fn full_identity_first_flow() {
         ],
         &[],
     );
+    // The frontend-proxy ingress terminates asr.example.com with
+    // operator-placed material; doctor's certificate section reads it.
+    let certs_dir = write_route_certificates(&dir);
     run(
         &[
             "doctor",
             "ingress",
             "--pack",
             &ingress.display().to_string(),
+            "--certs-dir",
+            &certs_dir,
         ],
         &[],
     );
@@ -108,6 +132,8 @@ fn full_identity_first_flow() {
             "asr.example.com",
             "--pack",
             &ingress.display().to_string(),
+            "--certs-dir",
+            &certs_dir,
         ],
         &[],
     );
@@ -319,4 +345,125 @@ fn uuid_like() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{nanos:x}")
+}
+
+/// The nginx fragment-set reconciliation through the real binary: a clean
+/// deployed set passes silently, and the rename leftover (the old vhost
+/// still deployed beside the current one — the epoch-2 redeploy's shape)
+/// is named as superseded AND red as a server-name conflict before include
+/// order decides which vintage serves.
+#[test]
+fn doctor_ingress_names_superseded_nginx_fragments() {
+    let dir = tempfile_dir();
+    let manifest_path = dir.join("interflow.toml");
+    std::fs::write(&manifest_path, manifest()).unwrap();
+    run(
+        &[
+            "plan",
+            "apply",
+            "--manifest",
+            &manifest_path.display().to_string(),
+            "--issuer",
+            &dir.join("issuer").display().to_string(),
+            "--out",
+            &dir.join("dist").display().to_string(),
+        ],
+        &[],
+    );
+    let ingress = dir.join("dist/packs/ingress-edge");
+    let certs_dir = write_route_certificates(&dir);
+
+    // Deploy the CURRENT render set under a temp --nginx-dir (real rendered
+    // bodies — the same bytes a `plan stage` tree ships).
+    let manifest = interflow_identity::Manifest::load(&manifest_path).unwrap();
+    let sha = interflow_util::sha256_hex(manifest.to_toml().unwrap().as_bytes());
+    let nginx_dir = dir.join("deployed-nginx");
+    for fragment in
+        interflow_cli::render::nginx_fragment_set(&manifest, &sha, Some(&["edge".to_owned()]))
+            .unwrap()
+    {
+        let path = nginx_dir.join(fragment.rel.strip_prefix("nginx/").unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, fragment.body).unwrap();
+    }
+    let nginx_str = nginx_dir.display().to_string();
+
+    // Clean set: silent pass — asserted on the actual stdout, not just the
+    // exit status. Warnings never fail the exit code, and "is not deployed"
+    // false alarms are exactly what an exit-status-only leg let slip
+    let out = Command::new(bin())
+        .args([
+            "doctor",
+            "ingress",
+            "--pack",
+            ingress.display().to_string().as_str(),
+            "--certs-dir",
+            certs_dir.as_str(),
+            "--nginx-dir",
+            nginx_str.as_str(),
+        ])
+        .output()
+        .expect("spawn interflow");
+    let clean_stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the in-form state must pass:\n{clean_stdout}"
+    );
+    assert!(
+        !clean_stdout.contains("is not deployed"),
+        "every fragment in place, each in its own directory — no false alarm:\n{clean_stdout}"
+    );
+
+    // The rename leftover: old vhost still deployed under its old node slot.
+    std::fs::copy(
+        nginx_dir.join("http/interflow-vhost-edge.conf"),
+        nginx_dir.join("http/interflow-vhost-old.conf"),
+    )
+    .unwrap();
+    let out = Command::new(bin())
+        .args([
+            "doctor",
+            "ingress",
+            "--pack",
+            ingress.display().to_string().as_str(),
+            "--certs-dir",
+            certs_dir.as_str(),
+            "--nginx-dir",
+            nginx_str.as_str(),
+        ])
+        .output()
+        .expect("spawn interflow");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "a loaded superseded vhost must be red:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("superseded fragment http/interflow-vhost-old.conf"),
+        "the leftover file is named:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("conflicting server name \"asr.example.com\""),
+        "the conflict is the readable verdict:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("interflow-vhost-edge.conf") && stdout.contains("interflow-vhost-old.conf"),
+        "both files are named in the conflict:\n{stdout}"
+    );
+
+    // Removing the leftover restores the silent pass.
+    std::fs::remove_file(nginx_dir.join("http/interflow-vhost-old.conf")).unwrap();
+    run(
+        &[
+            "doctor",
+            "ingress",
+            "--pack",
+            &ingress.display().to_string(),
+            "--certs-dir",
+            &certs_dir,
+            "--nginx-dir",
+            &nginx_str,
+        ],
+        &[],
+    );
 }

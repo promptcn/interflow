@@ -3,15 +3,11 @@
 //! explicit hatch, and revoke/rotate work on packs whose format the strict
 //! loader refuses — the emergency lane never inherits the usability gate.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+mod common;
+use common::bin;
 
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop();
-    p.pop();
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
+use std::path::Path;
+use std::process::Command;
 
 struct Run {
     success: bool,

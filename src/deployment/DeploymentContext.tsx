@@ -15,6 +15,9 @@ import {
   type EditActionDto,
   type FleetDto,
   type PublishResultDto,
+  onHubFloor,
+  onMeshListeners,
+  onNodeState,
 } from "../api";
 import { useT } from "../i18n";
 
@@ -138,6 +141,7 @@ export function DeploymentProvider({
         const composed = await api.fleetOverview(
           dep.manifest_path,
           dep.issuer_path,
+          dep.out_path,
           includeHub,
         );
         setFleet(composed);
@@ -153,7 +157,8 @@ export function DeploymentProvider({
   /// Opens a deployment folder (validated by the backend; a non-deployment
   /// path returns the bilingual error). The document and fleet land in one
   /// pass; the previous deployment's state is cleared first so switching
-  /// never shows a stale mix.
+  /// never shows a stale mix. The hub floor watcher follows the switch
+  /// (start pre-empts the previous task backend-side).
   const openDeployment = useCallback(
     async (root: string) => {
       setBusy(true);
@@ -169,6 +174,9 @@ export function DeploymentProvider({
         setLastPublish(null);
         setProposals(null);
         await load(dep, true);
+        // A failed start only degrades to the pre-watch behavior (no
+        // live invalidation) — not worth blocking the open for.
+        void api.hubFloorWatchStart(dep.manifest_path, dep.issuer_path).catch(() => {});
         return true;
       } catch (e) {
         reportError(String(e));
@@ -192,6 +200,9 @@ export function DeploymentProvider({
   );
 
   const closeDeployment = useCallback(async () => {
+    // The watcher outlives nothing: stop it before the state it watches
+    // for goes away.
+    void api.hubFloorWatchStop().catch(() => {});
     try {
       const prefs = await api.guiPrefsLoad();
       await api.guiPrefsSave({ ...prefs, current_deployment: null });
@@ -215,6 +226,7 @@ export function DeploymentProvider({
         const composed = await api.fleetOverview(
           deployment.manifest_path,
           deployment.issuer_path,
+          deployment.out_path,
           includeHub,
         );
         setFleet(composed);
@@ -291,7 +303,11 @@ export function DeploymentProvider({
         // dial) so the status cluster answers "what would publish do".
         try {
           setChangeState(
-            await api.deployChangeState(deployment.manifest_path, deployment.issuer_path),
+            await api.deployChangeState(
+              deployment.manifest_path,
+              deployment.issuer_path,
+              deployment.out_path,
+            ),
           );
         } catch {
           // Classification stays at its last reading; publish re-runs the
@@ -334,6 +350,7 @@ export function DeploymentProvider({
         const composed = await api.fleetOverview(
           dep.manifest_path,
           dep.issuer_path,
+          dep.out_path,
           true,
         );
         setFleet(composed);
@@ -358,6 +375,11 @@ export function DeploymentProvider({
         if (!cancelled && current !== null) {
           setDeployment(current);
           await load(current, true);
+          // Same degradation contract as openDeployment: a failed start
+          // just means no live invalidation for this session.
+          void api.hubFloorWatchStart(current.manifest_path, current.issuer_path).catch(
+            () => {},
+          );
         }
       } catch {
         // No deployment remembered (first run) — onboarding owns the shell.
@@ -369,6 +391,34 @@ export function DeploymentProvider({
       cancelled = true;
     };
   }, [load]);
+
+  // The composed fleet's invalidation signals (the push-not-poll contract
+  // the node telemetry faces already follow): the hub floor watcher's
+  // event — external writers (CLI pause/resume, maintenance, another
+  // operator's publish, agent re-reports) — re-pulls immediately; the
+  // LOCAL node faces (listener actuals, node lifecycle) also feed the
+  // fleet join (paused-locally, bound addresses, last errors) and
+  // re-pull through a trailing debounce that collapses their bursts
+  // (a publish converge fires several) into one read
+  const localFaceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const localFaceChanged = useCallback(() => {
+    if (localFaceTimer.current !== null) clearTimeout(localFaceTimer.current);
+    localFaceTimer.current = setTimeout(() => {
+      localFaceTimer.current = null;
+      void refresh(true);
+    }, 1_000);
+  }, [refresh]);
+
+  useEffect(() => {
+    const unsubs = [
+      onHubFloor(() => void refresh(true)),
+      onMeshListeners(() => localFaceChanged()),
+      onNodeState(() => localFaceChanged()),
+    ];
+    return () => {
+      unsubs.forEach((unsub) => void unsub.then((f) => f()));
+    };
+  }, [refresh, localFaceChanged]);
 
   // The proposal queue: fetched with the fleet and on a low-frequency
   // refresher — the operator sees "someone is waiting" without keeping any

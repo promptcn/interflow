@@ -123,6 +123,7 @@ async fn dead_route_storm_stops_at_the_edge() {
         hub_quic_addr: None,
 
         identity_offline: false,
+        renewal_face: None,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(

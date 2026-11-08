@@ -5,33 +5,10 @@
 //! points at a closed port so publication degrades to the manual-drop
 //! artifact (fast refusal, no network dependency).
 
+mod common;
+
+use common::{RunOutcome, run};
 use std::path::PathBuf;
-use std::process::Command;
-
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop(); // deps/
-    p.pop(); // tests/
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
-
-struct RunOutcome {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
-fn run(args: &[&str]) -> RunOutcome {
-    let output = Command::new(bin())
-        .args(args)
-        .output()
-        .expect("spawn interflow");
-    RunOutcome {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
 
 /// A mesh manifest: one hub + one stream. `ingress_port`/`remote_port` are
 /// the rule face (the part a policy-only change moves); the hub endpoint

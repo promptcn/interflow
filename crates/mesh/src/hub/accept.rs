@@ -5,7 +5,7 @@
 //! 1. PROXY protocol v2 negotiation under the fail-closed trust matrix —
 //!    the effective client IP restored here keys rate limiting, connection
 //!    caps and audit (never identity or ACL decisions)
-//! 2. per-IP rate limit + connection-cap check on the effective IP
+//! 2. per-client rate limit + connection-cap check on the effective IP
 //! 3. mTLS handshake (client certificates required — the acceptor is built
 //!    from the merged tenant roots)
 //! 4. tenant derivation: which tenant's root anchors the presented chain
@@ -19,10 +19,7 @@ use hyper::server::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use interflow_core::error::Result;
 use interflow_core::security::AuditKind;
-use interflow_core::security::proxy_protocol::{
-    PrefixedStream, ProxyError, ProxyOutcome, ProxyProtocolPolicy,
-};
-use interflow_core::tls::{extract_cn_from_chain, extract_leaf_validity_from_chain};
+use interflow_core::security::proxy_protocol::{PrefixedStream, ProxyError, ProxyOutcome};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,13 +45,10 @@ pub(crate) async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
 ) -> Result<()> {
-    // 1. PROXY protocol negotiation (budgeted).
-    let policy = {
-        let cfg = state.config.read().await;
-        Arc::new(ProxyProtocolPolicy::from_config(
-            &cfg.server.proxy_protocol,
-        )?)
-    };
+    // 1. PROXY protocol negotiation (budgeted). The policy is
+    // startup-fixed config, derived once at assembly (§3.8) — the accept
+    // path reuses the Arc instead of rebuilding per connection.
+    let policy = Arc::clone(&state.proxy_policy);
     let mut raw = stream;
     let (effective_ip, replay) =
         match tokio::time::timeout(PROXY_BUDGET, policy.read(&mut raw, addr.ip())).await {
@@ -88,7 +82,7 @@ pub(crate) async fn handle_connection(
             }
         };
 
-    // 2. Resource gating on the effective IP (per-IP new-conn rate +
+    // 2. Resource gating on the effective IP (per-client new-conn rate +
     // concurrency caps; behind nginx these key on the real client, not 127.0.0.1).
     if let Some(limiter) = &state.rate_limiter
         && !limiter.check(effective_ip)
@@ -197,7 +191,9 @@ where
             );
             return Ok(());
         };
-        if let Some(cn) = extract_cn_from_chain(certs) {
+        // The leaf facts (CN / validity / serial) ride the derivation —
+        // one DER parse instead of three follow-up re-parses (§3.3).
+        if let Some(cn) = tenant_ident.leaf_cn {
             debug!(
                 "mTLS identity derived and bound to this connection (gateway={})",
                 tenant_ident.trusted_gateway
@@ -206,8 +202,8 @@ where
                 tenant: tenant_ident.tenant,
                 agent: cn,
                 trusted_gateway: tenant_ident.trusted_gateway,
-                leaf_validity_unix: extract_leaf_validity_from_chain(certs),
-                leaf_serial_hex: interflow_core::tls::extract_leaf_serial_from_chain(certs),
+                leaf_validity_unix: tenant_ident.leaf_validity_unix,
+                leaf_serial_hex: tenant_ident.leaf_serial_hex,
             });
         } else {
             warn!("client certificate carries no CN — rejecting (peer={addr})");

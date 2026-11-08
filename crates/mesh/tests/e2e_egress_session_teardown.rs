@@ -160,9 +160,9 @@ async fn open_inner_tls(
         &key.display().to_string(),
     )
     .expect("inner material");
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+    let connector = tokio_rustls::TlsConnector::from(
         inner_client_config(&material, "eg").expect("inner connector"),
-    ));
+    );
     let adapter = E2eTunnelIo::ingress(rx, inj.clone(), sid);
     let mut tls = match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
         E2eHandshakeOutcome::Established(tls, _) => tls,

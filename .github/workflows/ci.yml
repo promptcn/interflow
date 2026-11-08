@@ -32,8 +32,12 @@ jobs:
           fetch-depth: 0
       - name: enforce version and rotation model
         run: python3 scripts/check_version_contract.py
+      - name: enforce CLI version surface (every clap root pins VERSION_WITH_TAG)
+        run: python3 scripts/check_version_surface.py
       - name: enforce changelog accumulation
         run: python3 scripts/check_changelog_debt.py
+      - name: enforce binary roster single source (release workflow in lockstep)
+        run: python3 scripts/check_binary_roster.py
 
   # The production-build discipline (scripts/lib/build_guard.sh):
   # self-test fixture (tree refusal, escape hatches, suffixing, content
@@ -226,3 +230,46 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  # Windows is a production platform (home-win is a mesh agent node) that
+  # had no automated coverage: every job above runs on ubuntu. This is the
+  # platform smoke: the
+  # workspace builds and lints clean on the msvc target, and the test set
+  # aimed at the Windows risk classes runs — atomic writes on NTFS and the
+  # SQLite store (util / identity), config and path handling (core /
+  # buildinfo / contract), pack assembly, and the agent lifecycle an actual
+  # Windows node exercises (platform_smoke: register → stream → restart →
+  # stream). The timer-bound mesh e2e tier stays on Linux (real timers,
+  # pebble service container — services are Linux-only, so the stage
+  # script is not reused here); interflow-gui needs the Node/dist toolchain
+  # and is covered by the `gui` job. The same clippy invocation runs
+  # locally through cargo-xwin (`cargo xwin clippy --target
+  # x86_64-pc-windows-msvc …`), which is how the cfg(not(unix)) branches
+  # were brought to zero before this job existed.
+  windows-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # aws-lc-sys assembles with NASM on the msvc target (the release
+      # workflow's step).
+      - name: Install NASM (aws-lc-sys asm on msvc)
+        shell: bash
+        run: |
+          choco install nasm -y
+          echo "C:/Program Files/NASM" >> $GITHUB_PATH
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: build (workspace, gui excluded)
+        run: cargo build --locked --workspace --exclude interflow-gui
+      - name: clippy (msvc target)
+        run: cargo clippy --workspace --exclude interflow-gui --all-targets --all-features
+      - name: unit tests on the Windows risk classes (NTFS atomic writes, SQLite store, config/paths)
+        run: cargo nextest run --all-features --lib -p interflow-util -p interflow-identity -p interflow-core -p interflow-buildinfo -p interflow-contract
+      - name: mesh smoke (version face, pack assembly, agent lifecycle)
+        run: cargo nextest run -p interflow-mesh --test platform_smoke --test version_face --test pack_quic_assembly

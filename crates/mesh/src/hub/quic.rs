@@ -34,7 +34,7 @@
     clippy::manual_let_else
 )]
 use crate::hub::state::{
-    AgentSession, HubState, QuicAgentConn, SessionWitness, SharedAgents, StreamFace, TunnelData,
+    AgentSession, HubState, QuicAgentConn, SessionWitness, StreamFace, TunnelData,
 };
 use bytes::{Bytes, BytesMut};
 use interflow_core::error::{InterflowError, Result};
@@ -74,8 +74,11 @@ async fn conn_for_datagram(hub: &HubState, agent_id: &str) -> Option<quinn::Conn
 }
 
 /// Whether the hub enables the DATAGRAM fast path.
-async fn quinn_caps_enabled(hub: &HubState) -> bool {
-    hub.config.read().await.transport.quic.datagram_enabled
+fn quinn_caps_enabled(hub: &HubState) -> bool {
+    // Startup-set atomic (§3.7): the per-Open config RwLock read is gone.
+    hub.limits
+        .datagram_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Read chunk size for traffic streams.
@@ -273,6 +276,8 @@ async fn handle_connection(hub: std::sync::Arc<HubState>, conn: quinn::Connectio
     // Transport-stats sampler (twin of the egress-side sampler in core
     // tunnel/quic.rs): the CC forensics anchor for the 2026-09-16 quic
     // egress-stall case file — cumulative counters, diff adjacent samples.
+    // Emitted under its own target so soak/forensics can enable it with
+    // `transport_stats=debug` without opening the crate-wide debug face.
     {
         let conn_stats = conn.clone();
         hub.tasks.spawn(async move {
@@ -285,6 +290,7 @@ async fn handle_connection(hub: std::sync::Arc<HubState>, conn: quinn::Connectio
                 }
                 let p = &conn_stats.stats().path;
                 debug!(
+                    target: interflow_core::telemetry::TARGET_TRANSPORT_STATS,
                     cwnd = p.cwnd,
                     rtt_us = p.rtt.as_micros(),
                     sent_packets = p.sent_packets,
@@ -373,7 +379,8 @@ async fn read_first_frame(
 }
 
 /// Control-stream registration: read Hello → authenticate → register
-/// (replace-in-place semantics identical to h2 /register) → HelloAck.
+/// through the shared registration core (`HubState::register_agent`, the
+/// same gates and side-effect list as the h2 arms) → HelloAck.
 async fn register_quic_agent(
     hub: &HubState,
     conn: &quinn::Connection,
@@ -414,8 +421,8 @@ async fn register_quic_agent(
     // (tenant from the chain's anchoring root, agent from the leaf CN); the
     // Hello's semantic identity must equal the CN. The tenant is derived against
     // the shared TLS plane (hot-reloadable generation).
-    let agent_datagram_cap = quinn_caps_enabled(hub).await
-        && (hello_caps & interflow_core::tunnel::quic::CAP_DATAGRAM != 0);
+    let agent_datagram_cap =
+        quinn_caps_enabled(hub) && (hello_caps & interflow_core::tunnel::quic::CAP_DATAGRAM != 0);
     let identity: Option<crate::hub::state::PeerIdentity> = 'auth: {
         let plane = hub
             .tls_plane
@@ -430,6 +437,13 @@ async fn register_quic_agent(
             warn!("QUIC registration rejected: no client certificate ({peer})");
             metrics::counter!("interflow_hub_auth_failures", "reason" => "quic_no_cert")
                 .increment(1);
+            hub.audit.record(
+                AuditKind::AgentRegisterDenied {
+                    reason: "quic_no_cert".to_string(),
+                },
+                None,
+                Some(peer.to_string()),
+            );
             send_error_and_close(conn, "client certificate required").await;
             break 'auth None;
         };
@@ -437,6 +451,13 @@ async fn register_quic_agent(
             warn!("QUIC registration rejected: chain claimed by no tenant ({peer})");
             metrics::counter!("interflow_hub_auth_failures", "reason" => "tenant_unclaimed")
                 .increment(1);
+            hub.audit.record(
+                AuditKind::AgentRegisterDenied {
+                    reason: "tenant_unclaimed".to_string(),
+                },
+                None,
+                Some(peer.to_string()),
+            );
             send_error_and_close(conn, "tenant unclaimed").await;
             break 'auth None;
         };
@@ -445,87 +466,74 @@ async fn register_quic_agent(
             warn!("QUIC registration rejected: mTLS CN does not match Hello identity ({peer})");
             metrics::counter!("interflow_hub_auth_failures", "reason" => "quic_mtls_cn")
                 .increment(1);
+            hub.audit.record(
+                AuditKind::AgentRegisterDenied {
+                    reason: "quic_mtls_cn".to_string(),
+                },
+                None,
+                Some(peer.to_string()),
+            );
             send_error_and_close(conn, "cn mismatch").await;
             break 'auth None;
         };
         let _ = cn;
+        // The leaf facts ride the derivation (§3.3: one DER parse, not
+        // three follow-up re-parses).
         break 'auth Some(crate::hub::state::PeerIdentity {
             tenant: tenant.tenant,
             agent: agent_id.clone(),
             trusted_gateway: tenant.trusted_gateway,
-            leaf_validity_unix: interflow_core::tls::extract_leaf_validity_from_chain(&chain),
-            leaf_serial_hex: interflow_core::tls::extract_leaf_serial_from_chain(&chain),
+            leaf_validity_unix: tenant.leaf_validity_unix,
+            leaf_serial_hex: tenant.leaf_serial_hex,
         });
     };
     let identity = identity?;
-    let agent_key = identity.qualified();
-    let circuit = CircuitToken::random().ok()?;
-    hub.route_leases
-        .write()
-        .await
-        .retain(|_, (_, source, _)| source != &agent_key);
-
-    // Register (reuses registration semantics: replace in place + sweep
-    // orphan streams + absolute-value gauge). The registry key is
-    // tenant-qualified — same-tenant reconnect preemption works, cross-tenant
-    // same-name ids never collide.
-    let state_arc = {
-        let mut agents = hub.agents.write().await;
-        if let Some(existing) = agents.get(&agent_key) {
-            // QUIC registration overwrites an h2 session (same preemption
-            // semantics, mirrored)
-            let mut session = existing.write().await;
-            session.install_channels(circuit, Some(quic_conn.clone()));
-            session.leaf_validity_unix = identity.leaf_validity_unix;
-            session.leaf_serial = identity
-                .leaf_serial_hex
-                .clone()
-                .map(|serial| (serial, crate::hub::crl::tenant_crl_stem(&identity.tenant)));
-            session.build.clone_from(&agent_build);
-            drop(session);
-            existing.clone()
-        } else {
-            let mut session = AgentSession::new(
-                circuit,
-                Some(quic_conn.clone()),
-                identity.leaf_validity_unix,
-                identity
-                    .leaf_serial_hex
-                    .clone()
-                    .map(|serial| (serial, crate::hub::crl::tenant_crl_stem(&identity.tenant))),
-            );
-            session.build.clone_from(&agent_build);
-            let arc = Arc::new(RwLock::new(session));
-            agents.insert(agent_key.clone(), arc.clone());
-            arc
+    let circuit = match CircuitToken::random() {
+        Ok(circuit) => circuit,
+        Err(e) => {
+            warn!("QUIC registration stalled: circuit mint failed ({e}) ({peer})");
+            send_error_and_close(conn, "internal error").await;
+            return None;
         }
     };
-    hub.route_leases
-        .write()
+    // The registration core: gates (control-principal, revocation),
+    // session install, and every registration implication — the same
+    // side-effect list the h2 arms ride.
+    let registered = match hub
+        .register_agent(
+            &identity,
+            circuit,
+            agent_build.clone(),
+            Some(quic_conn.clone()),
+            peer,
+        )
         .await
-        .retain(|_, (_, source, _)| source != &agent_key);
-    metrics::gauge!("interflow_hub_agents_registered").set(crate::hub::state::count_as_f64(
-        hub.agents.read().await.len(),
-    ));
+    {
+        Ok(registered) => registered,
+        Err(crate::hub::registration::RegistrationRefusal::ControlPrincipal) => {
+            send_error_and_close(conn, "control-plane principals cannot register as agents").await;
+            return None;
+        }
+        Err(crate::hub::registration::RegistrationRefusal::CredentialRevoked { serial }) => {
+            warn!("QUIC registration denied: credential revoked (serial {serial}) ({peer})");
+            send_error_and_close(conn, "credential revoked — rotate the node and re-register")
+                .await;
+            return None;
+        }
+    };
+    let agent_key = registered.key;
+    let state_arc = registered.session;
     quic_conn
         .datagram_cap
         .store(agent_datagram_cap, std::sync::atomic::Ordering::Relaxed);
     metrics::counter!("interflow_quic_agents_registered").increment(1);
-
-    crate::hub::service::HubService::sweep_agent_streams(
-        &hub.agents,
-        &hub.active_streams,
-        &hub.stream_counts,
-        &agent_key,
-    )
-    .await;
 
     // HelloAck payload: the capability declaration as the same JSON the h2
     // register response body carries (the caps word flattened in as a
     // top-level key; heartbeat cadence for the agent-side stall
     // derivation). QUIC Pongs ride the control stream, so there is nothing
     // transport-specific to declare.
-    let hub_caps = if quinn_caps_enabled(hub).await {
+    let hub_caps = if quinn_caps_enabled(hub) {
         interflow_core::tunnel::quic::CAP_DATAGRAM
     } else {
         0
@@ -544,8 +552,15 @@ async fn register_quic_agent(
             egress_ip: Some(conn.remote_address().ip().to_string()),
         }
     };
+    // The registration landed; the handshake's answer must land too. On an
+    // ack encode/send failure the row must not outlive the failed
+    // handshake: no watcher and no heartbeat would ever cover it (both
+    // spawn only after this point), and `online()` reads the row's QUIC
+    // handle as presence — a stale-green registration forever. Fail
+    // closed: evict + close (the audit trail reads registered →
+    // evicted(quic_hello_ack_failed), the honest sequence).
     let Ok(payload) = capability.encode_ack_payload(hub_caps) else {
-        warn!("QUIC HelloAck encode failed");
+        abort_failed_quic_ack(hub, &agent_key, &state_arc, circuit, conn).await;
         return None;
     };
     let mut ack = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
@@ -560,7 +575,7 @@ async fn register_quic_agent(
     {
         let mut control = quic_conn.control.lock().await;
         if control.write_all(&ack).await.is_err() {
-            warn!("QUIC HelloAck send failed");
+            abort_failed_quic_ack(hub, &agent_key, &state_arc, circuit, conn).await;
             return None;
         }
     }
@@ -609,14 +624,6 @@ async fn register_quic_agent(
         }
     });
 
-    hub.audit.record(
-        AuditKind::AgentRegistered {
-            circuit: circuit.to_hex(),
-            build: agent_build,
-        },
-        Some(circuit.to_hex()),
-        Some(peer.to_string()),
-    );
     let session_build = state_arc.read().await.build.clone();
     // Effective-parameter forensics (the 2026-10-09 case file §4's ask): the
     // idle timeout is min-negotiated across endpoints, so pin what this hub
@@ -638,6 +645,32 @@ async fn register_quic_agent(
         session_build.as_deref().unwrap_or("unknown")
     );
     Some((agent_key, state_arc))
+}
+
+/// The registration landed but the handshake's answer did not: evict the
+/// just-installed row (no watcher and no heartbeat will ever cover it —
+/// both spawn only after a successful ack) and close the connection, so
+/// the agent rebuilds instead of trusting a registration it never learned
+/// the circuit of.
+async fn abort_failed_quic_ack(
+    hub: &HubState,
+    agent_key: &str,
+    session: &Arc<RwLock<AgentSession>>,
+    circuit: CircuitToken,
+    conn: &quinn::Connection,
+) {
+    warn!("QUIC HelloAck failed — evicting the just-installed row (circuit={circuit})");
+    crate::hub::heartbeat::remove_agent_if_current(
+        hub,
+        agent_key,
+        crate::hub::state::SessionWitness {
+            session: session.clone(),
+            circuit,
+        },
+        "quic_hello_ack_failed",
+    )
+    .await;
+    conn.close(0_u32.into(), b"hub evicted: quic_hello_ack_failed");
 }
 
 /// Authentication failure: best-effort send of an Error frame (the JSON
@@ -906,9 +939,11 @@ pub(crate) async fn open_relay_stream(
 }
 
 /// Unified dispatch: go through the relay stream when a sink exists,
-/// otherwise through the poll channel (with timeout discipline).
+/// otherwise through the poll channel (with timeout discipline). The
+/// poll fallback resolves from the flat data-plane projection (one std
+/// read lock — the registry's two-level hop is control-plane business).
 pub(crate) async fn deliver_dataframe(
-    agents: &SharedAgents,
+    hub: &HubState,
     sink: Option<&mpsc::Sender<TunnelData>>,
     recipient: &str,
     df: TunnelData,
@@ -922,18 +957,8 @@ pub(crate) async fn deliver_dataframe(
             Err(_) => Err(RelayDeliveryError::Timeout),
         };
     }
-    // h2 peer: lookup_tx → poll channel (two short critical sections for
-    // locking; no awaiting while holding a lock)
-    let state_arc = {
-        let map = agents.read().await;
-        map.get(recipient).cloned()
-    };
-    let Some(state_arc) = state_arc else {
+    let Some(tx) = hub.lookup_tx(recipient) else {
         return Err(RelayDeliveryError::AgentMissing);
-    };
-    let tx = {
-        let st = state_arc.read().await;
-        st.tx.clone()
     };
     match tokio::time::timeout(timeout, tx.send(df)).await {
         Ok(Ok(())) => Ok(()),
@@ -987,30 +1012,36 @@ async fn datagram_relay_loop(
         // (request direction → target) or the target (response direction →
         // source)? Anti-forgery: it must match one of the stream's ends
         // (raw 16-byte circuit compare).
-        let (recipient, sink, origin, flags) = {
-            let streams = hub.active_streams.read().await;
-            let Some(st) = streams.get(&frame.stream_id) else {
-                metrics::counter!("interflow_quic_datagram_dropped").increment(1);
-                continue;
-            };
+        let route: Option<(
+            std::sync::Arc<str>,
+            mpsc::Sender<TunnelData>,
+            FrameOrigin,
+            u8,
+        )> = hub.active_streams.with(&frame.stream_id, |st| {
+            let st = st?;
             if frame.circuit == st.source_circuit {
-                (
-                    st.target_agent.clone(),
-                    st.target.relay_sender().cloned(),
+                Some((
+                    std::sync::Arc::clone(&st.target_agent),
+                    st.target.sender().clone(),
                     FrameOrigin::Agent(frame.circuit),
                     0u8,
-                )
+                ))
             } else if frame.circuit == st.target_circuit {
-                (
-                    st.source_agent.clone(),
-                    st.source.relay_sender().cloned(),
+                Some((
+                    std::sync::Arc::clone(&st.source_agent),
+                    st.source.sender().clone(),
                     FrameOrigin::Response,
                     FLAG_RESPONSE,
-                )
+                ))
             } else {
-                metrics::counter!("interflow_quic_datagram_dropped").increment(1);
-                continue;
+                None
             }
+        });
+        let Some((recipient, sink, origin, flags)) = route else {
+            // Unknown stream (late/reordered datagram) or circuit mismatch
+            // (forgery): drop and count.
+            metrics::counter!("interflow_quic_datagram_dropped").increment(1);
+            continue;
         };
         if recipient.is_empty() {
             continue;
@@ -1023,7 +1054,7 @@ async fn datagram_relay_loop(
             data: frame.payload,
         };
         let stream_id = df.stream_id;
-        if deliver_dataframe(&hub.agents, sink.as_ref(), &recipient, df, timeout_secs)
+        if deliver_dataframe(&hub, Some(&sink), &recipient, df, timeout_secs)
             .await
             .is_err()
         {
@@ -1032,12 +1063,9 @@ async fn datagram_relay_loop(
             // (response-direction data) → notify the source end with
             // response FIFO semantics; otherwise request direction →
             // guaranteed delivery via the control channel.
-            let sender_is_target = {
-                let streams = hub.active_streams.read().await;
-                streams
-                    .get(&stream_id)
-                    .is_some_and(|st| st.target_agent == agent_id)
-            };
+            let sender_is_target = hub.active_streams.with(&stream_id, |st| {
+                st.is_some_and(|st| *st.target_agent == agent_id)
+            });
             teardown_stream(&hub, stream_id, sender_is_target, CloseReason::CloseFrame).await;
         }
         metrics::counter!("interflow_quic_datagrams_relayed").increment(1);
@@ -1069,10 +1097,7 @@ pub(crate) async fn teardown_stream(
     response_dir: bool,
     reason: CloseReason,
 ) {
-    let removed = {
-        let mut streams = hub.active_streams.write().await;
-        streams.remove(&stream_id)
-    };
+    let removed = hub.active_streams.remove(&stream_id);
     if let Some(stream) = removed {
         metrics::gauge!("interflow_hub_streams_active").decrement(1.0);
         {
@@ -1082,10 +1107,10 @@ pub(crate) async fn teardown_stream(
                 .stream_counts
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(entry) = map.get_mut(&stream.source_agent) {
+            if let Some(entry) = map.get_mut(&*stream.source_agent) {
                 *entry = entry.saturating_sub(1);
                 if *entry == 0 {
-                    map.remove(&stream.source_agent);
+                    map.remove(&*stream.source_agent);
                 }
             }
         }
@@ -1307,6 +1332,148 @@ async fn handle_quic_stream(
         let _ = tx.finish();
         return Ok(());
     }
+    if matches!(opened.frame_type, FrameType::StreamIntentRequest) {
+        // The QUIC face of the stream-intent exchange: the session IS the
+        // registered agent (its qualified key is the reporter — the face
+        // and the operator's mailbox land under that identity only, never
+        // under anything the payload names). The payload is the JSON
+        // report of the node's paused streams; the answer is the pending
+        // ops, same shapes the h2 `POST /streams/intent` face serves.
+        let report: interflow_core::tunnel::transport::StreamIntentReport =
+            match serde_json::from_slice(&opened.payload) {
+                Ok(report) => report,
+                Err(e) => {
+                    warn!("QUIC stream-intent report malformed: {e}");
+                    let _ = tx.finish();
+                    return Ok(());
+                }
+            };
+        let ops = crate::hub::stream_intents::exchange_via_state(&hub, &source_agent, &report);
+        let payload = serde_json::to_vec(&ops).map_err(|e| {
+            InterflowError::protocol("QUIC StreamIntentResponse encode failed".to_string())
+                .with_source(e)
+        })?;
+        let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
+        wire::encode_frame(
+            FrameType::StreamIntentResponse,
+            FLAG_HUB_ORIGIN,
+            opened.stream_id,
+            CircuitToken::ZERO,
+            &payload,
+            &mut out,
+        );
+        tx.write_all(&out).await.map_err(|e| {
+            InterflowError::connection("QUIC stream-intent response write failed".to_string())
+                .with_source(e)
+        })?;
+        let _ = tx.finish();
+        return Ok(());
+    }
+    if matches!(opened.frame_type, FrameType::TargetRecoveredRequest) {
+        // The QUIC face of the out-of-band recovery notice: the session IS
+        // the registered agent (the notice acts under that identity only);
+        // the payload is the JSON notice, the answer the ack — same shapes
+        // the h2 `POST /breakers/recovered` face serves. On an old hub this
+        // arm simply never fires (unknown frame type, no MUST_UNDERSTAND —
+        // skipped), which is the additive-wire contract working as intended.
+        let notice: interflow_core::tunnel::transport::TargetRecoveredNotice =
+            match serde_json::from_slice(&opened.payload) {
+                Ok(notice) => notice,
+                Err(e) => {
+                    warn!("QUIC target-recovery notice malformed: {e}");
+                    let _ = tx.finish();
+                    return Ok(());
+                }
+            };
+        let ack =
+            crate::hub::target_recovery::deliver(&hub.target_recovery, &source_agent, &notice);
+        let payload = serde_json::to_vec(&ack).map_err(|e| {
+            InterflowError::protocol("QUIC TargetRecoveredResponse encode failed".to_string())
+                .with_source(e)
+        })?;
+        let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN + payload.len());
+        wire::encode_frame(
+            FrameType::TargetRecoveredResponse,
+            FLAG_HUB_ORIGIN,
+            opened.stream_id,
+            CircuitToken::ZERO,
+            &payload,
+            &mut out,
+        );
+        tx.write_all(&out).await.map_err(|e| {
+            InterflowError::connection("QUIC target-recovery response write failed".to_string())
+                .with_source(e)
+        })?;
+        let _ = tx.finish();
+        return Ok(());
+    }
+    if matches!(opened.frame_type, FrameType::CrlLivenessRequest) {
+        // The QUIC face of the CRL-poll liveness report: the session IS
+        // the registered agent (the report lands under that identity
+        // only); the payload is the JSON level, the answer an empty ack —
+        // same standing the h2 `POST /crls/liveness` face serves. On an
+        // old hub this arm simply never fires (unknown frame type, no
+        // MUST_UNDERSTAND — skipped): one dropped sample, the level
+        // re-arrives with the next report.
+        let report: interflow_core::tunnel::transport::CrlLivenessReport =
+            match serde_json::from_slice(&opened.payload) {
+                Ok(report) => report,
+                Err(e) => {
+                    warn!("QUIC CRL-liveness report malformed: {e}");
+                    let _ = tx.finish();
+                    return Ok(());
+                }
+            };
+        crate::hub::crl_liveness::record_via_state(&hub, &source_agent, &report);
+        let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN);
+        wire::encode_frame(
+            FrameType::CrlLivenessResponse,
+            FLAG_HUB_ORIGIN,
+            opened.stream_id,
+            CircuitToken::ZERO,
+            &[],
+            &mut out,
+        );
+        tx.write_all(&out).await.map_err(|e| {
+            InterflowError::connection("QUIC CRL-liveness response write failed".to_string())
+                .with_source(e)
+        })?;
+        let _ = tx.finish();
+        return Ok(());
+    }
+    if matches!(opened.frame_type, FrameType::NodeStatusRequest) {
+        // The QUIC face of the node-status report: the session IS the
+        // registered agent (the report lands under that identity only);
+        // the payload is the JSON level, the answer an empty ack — same
+        // standing the h2 `POST /node/status` face serves. On an old hub
+        // this arm never fires (unknown frame type, skipped): one
+        // dropped sample, the levels re-arrive with the next report.
+        let report: interflow_core::tunnel::transport::NodeStatusReport =
+            match serde_json::from_slice(&opened.payload) {
+                Ok(report) => report,
+                Err(e) => {
+                    warn!("QUIC node-status report malformed: {e}");
+                    let _ = tx.finish();
+                    return Ok(());
+                }
+            };
+        crate::hub::node_status::record_via_state(&hub, &source_agent, &report);
+        let mut out = BytesMut::with_capacity(wire::FRAME_HEADER_LEN);
+        wire::encode_frame(
+            FrameType::NodeStatusResponse,
+            FLAG_HUB_ORIGIN,
+            opened.stream_id,
+            CircuitToken::ZERO,
+            &[],
+            &mut out,
+        );
+        tx.write_all(&out).await.map_err(|e| {
+            InterflowError::connection("QUIC node-status response write failed".to_string())
+                .with_source(e)
+        })?;
+        let _ = tx.finish();
+        return Ok(());
+    }
     if matches!(opened.frame_type, FrameType::RouteRequest) {
         // The requester is identified by the connection (the RouteRequest
         // carries the correlation id + zero circuit; the codec enforces it).
@@ -1456,7 +1623,7 @@ async fn handle_quic_stream(
                 flags: proto.as_flag() | (u8::from(e2e) * FLAG_E2E),
                 data: Bytes::new(),
             };
-            match deliver_dataframe(&hub.agents, None, &target_agent, open_df, 1).await {
+            match deliver_dataframe(&hub, None, &target_agent, open_df, 1).await {
                 Ok(()) => (None, target_circuit), // goes via lookup_tx / poll
                 Err(e) => {
                     warn!("QUIC Open notification failed: {e:?}");
@@ -1476,7 +1643,7 @@ async fn handle_quic_stream(
         .quic
         .as_ref()
         .is_some_and(|qc| qc.datagram_cap.load(std::sync::atomic::Ordering::Relaxed));
-    let source_datagram_cap = quinn_caps_enabled(&hub).await;
+    let source_datagram_cap = quinn_caps_enabled(&hub);
     let datagram_ok = matches!(proto, StreamProto::Udp) && target_datagram_cap;
 
     // Source writer task (return-path frames → this stream of the source
@@ -1495,25 +1662,23 @@ async fn handle_quic_stream(
     ));
     let source_face = StreamFace::Relay(source_tx);
 
-    // Insert the ActiveStream
-    {
-        let mut streams = hub.active_streams.write().await;
-        streams.insert(
-            stream_id,
-            crate::hub::ActiveStream {
-                source_agent: source_agent.clone(),
-                target_agent: target_agent.clone(),
-                source_circuit,
-                target_circuit,
-                proto,
-                target: target_sink
-                    .clone()
-                    .map_or(StreamFace::Poll, StreamFace::Relay),
-                source: source_face,
-                datagram_ok,
-            },
-        );
-    }
+    // Insert the ActiveStream (both planes carry their delivery sender)
+    hub.active_streams.insert(
+        stream_id,
+        crate::hub::ActiveStream {
+            source_agent: std::sync::Arc::from(source_agent.as_str()),
+            target_agent: std::sync::Arc::from(target_agent.as_str()),
+            source_circuit,
+            target_circuit,
+            proto,
+            target: target_sink.map_or_else(
+                || StreamFace::Poll(hub.poll_sender(&target_agent)),
+                StreamFace::Relay,
+            ),
+            source: source_face,
+            datagram_ok,
+        },
+    );
 
     // OpenAck: only after the source (ingress) receives it does it switch
     // to DATAGRAM (eliminates the first-packet reordering/loss race)
@@ -1525,12 +1690,9 @@ async fn handle_quic_stream(
             flags: FLAG_HUB_ORIGIN,
             data: Bytes::new(),
         };
-        let sink = {
-            let streams = hub.active_streams.read().await;
-            streams
-                .get(&stream_id)
-                .and_then(|st| st.source.relay_sender().cloned())
-        };
+        let sink = hub
+            .active_streams
+            .with(&stream_id, |st| st.map(|st| st.source.sender().clone()));
         if let Some(sink) = sink {
             let _ = sink.send(ack).await;
         }
@@ -1549,7 +1711,7 @@ async fn handle_quic_stream(
 
     // Source read pump (request direction; buf carries residual bytes that
     // arrived after the Open frame in the same packet)
-    tracing::debug!(
+    tracing::trace!(
         "handle_quic_stream: entering relay_reader stream={stream_id} leftover={}",
         buf.len()
     );
@@ -1635,18 +1797,27 @@ async fn process_frames(
         // handle_data — egress relies on frame flags for stateless UDP
         // stream identification; the Data frames sent by ingress do not
         // carry the proto bit themselves).
-        let route = {
-            let streams = hub.active_streams.read().await;
-            streams.get(&stream_id).map(|s| {
+        let route = hub.active_streams.with(&stream_id, |s| {
+            s.map(|s| {
                 if response_dir {
-                    (s.source_agent.clone(), s.source.relay_sender().cloned())
+                    (
+                        std::sync::Arc::clone(&s.source_agent),
+                        s.source.sender().clone(),
+                    )
                 } else {
-                    (s.target_agent.clone(), s.target.relay_sender().cloned())
+                    (
+                        std::sync::Arc::clone(&s.target_agent),
+                        s.target.sender().clone(),
+                    )
                 }
             })
-        };
+        });
         let Some((recipient, sink)) = route else {
-            debug!("QUIC relay frame has no route: stream_id={stream_id}, dropping");
+            // Steady-state signal (a torn-down stream keeps receiving frames
+            // until the peer learns of the close) belongs to the counter;
+            // the per-frame line is trace-only.
+            metrics::counter!("interflow_hub_frames_dropped", "reason" => "no_route").increment(1);
+            tracing::trace!("QUIC relay frame has no route: stream_id={stream_id}, dropping");
             continue;
         };
 
@@ -1686,9 +1857,7 @@ async fn process_frames(
         if recipient.is_empty() {
             continue;
         }
-        if let Err(e) =
-            deliver_dataframe(&hub.agents, sink.as_ref(), &recipient, df, timeout_secs).await
-        {
+        if let Err(e) = deliver_dataframe(hub, Some(&sink), &recipient, df, timeout_secs).await {
             warn!("QUIC relay dispatch failed: stream_id={stream_id}: {e:?}");
             // Termination contract: poll-plane peer notification (direction
             // follows this read pump's semantics: the peer of a

@@ -1,35 +1,36 @@
 //! The issuer store's bookkeeping db (`store.db`): the binding contract,
-//! the applied-state accounting, and the applied-declaration history — the
-//! machine-owned state that used to be two bare JSON files (`binding.json`
-//! / `applied.json`).
+//! the applied-state accounting, and the applied-declaration history.
 //!
 //! Why a db and not files: the GUI's embedded apply and a terminal
 //! `rotate` can land on the same issuer directory at the same moment, and
-//! the JSON pair had no cross-process mutex — the check-then-write
-//! sequence raced and lost updates. SQLite gives the sequence one
-//! transactional home: WAL + busy_timeout serialize the writers properly
+//! file pairs have no cross-process mutex — the check-then-write sequence
+//! raced and lost updates. SQLite gives the sequence one transactional
+//! home: WAL + busy_timeout serialize the writers properly.
 //!
 //! The db is machine state, not an operator document: its shape lives in
-//! code and migrates via `user_version` (the versioning doctrine's
-//! "no counters in human-authored files" rule governs documents, not
-//! machine state). Creation mints the store's UUID — the store is itself,
-//! not the path it happens to sit at. Legacy JSON files next to a fresh db
-//! are absorbed once, then renamed `.migrated`.
+//! code and is declared by `user_version`. There is exactly one shape per
+//! build generation and no migration ladder — a store whose shape does not
+//! match was written by a different deployment generation and is refused
+//! loudly (re-provision it); stores are cheap, bookkeeping drift is not.
+//!
+//! The applied row's `stripped_manifest_digest` is a cache of the applied
+//! declaration snapshot (`manifest_text`) — the snapshot is the truth a
+//! digest mismatch is settled against, so the cache needs no label: the
+//! same text, stripped by the same rule, compares equal.
 
 use crate::issuance::{AppliedState, StoreBinding};
 use crate::{Error, Result};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::path::{Path, PathBuf};
 
 const DB_FILE: &str = "store.db";
-const LEGACY_BINDING: &str = "binding.json";
-const LEGACY_APPLIED: &str = "applied.json";
-const MIGRATED_SUFFIX: &str = "migrated";
 
-/// The db's shape. Bump and extend [`StateDb::create_or_migrate`] whenever
-/// a table changes; never reset (a higher number on disk than in code
-/// means a newer build ran last — refuse loudly).
-const SHAPE: i32 = 1;
+/// The db's shape — exactly one per build generation, never reset (a number
+/// on disk this build does not recognize means a different generation ran
+/// last — refuse loudly). Shape 3 retired the `digest_kind` column the
+/// shape-2 generation carried: the declaration snapshot arbitrates digest
+/// mismatches on its own, so the cache carries no label.
+const SHAPE: i32 = 3;
 
 /// The issuer store's bookkeeping db. Opened briefly per operation; every
 /// mutation is one transaction.
@@ -41,9 +42,9 @@ pub(crate) struct StateDb {
 
 impl StateDb {
     /// Opens the db without creating anything. `None` when no db exists
-    /// yet (a store that has never recorded a binding — reads must not
-    /// materialize files: the GUI treats `issuer/` existing as "an apply
-    /// has run here").
+    /// yet — reads must not materialize files (the GUI treats `issuer/`
+    /// existing as "an apply has run here"). `None` is the truth: this
+    /// store has no recorded bookkeeping.
     pub(crate) fn open_existing(root: &Path) -> Result<Option<Self>> {
         if !root.join(DB_FILE).is_file() {
             return Ok(None);
@@ -60,9 +61,8 @@ impl StateDb {
         Ok(Some(db))
     }
 
-    /// Opens the db, creating (and migrating) on first use — the write
-    /// paths only. Creation mints the store UUID and absorbs any legacy
-    /// JSON pair sitting in the directory.
+    /// Opens the db, creating it on first use — the write paths only.
+    /// Creation mints the store UUID.
     pub(crate) fn open_or_create(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root).map_err(|e| Error::Io {
             path: root.display().to_string(),
@@ -74,7 +74,7 @@ impl StateDb {
             conn,
             root: root.to_owned(),
         };
-        db.create_or_migrate()?;
+        db.create_if_absent()?;
         Ok(db)
     }
 
@@ -135,6 +135,7 @@ impl StateDb {
         Ok(())
     }
 
+    /// The applied row.
     pub(crate) fn applied_state(&self) -> Result<Option<AppliedState>> {
         match self.conn.query_row(
             "SELECT stripped_manifest_digest, policy_generation, policy_digest, packs
@@ -165,8 +166,7 @@ impl StateDb {
 
     /// The declaration text as it stood at the last record — the drift
     /// baseline `plan diff` compares the live manifest against. `None`
-    /// before the first apply, or for a state absorbed from the legacy
-    /// `applied.json` (which carried no snapshot).
+    /// before the first apply (every record writes the snapshot).
     pub(crate) fn applied_manifest_text(&self) -> Result<Option<String>> {
         match self.conn.query_row(
             "SELECT manifest_text FROM applied WHERE id = 1",
@@ -196,8 +196,8 @@ impl StateDb {
             .map_err(|e| db_err("record applied", &self.root, e))?;
         tx.execute(
             "INSERT INTO applied
-                (id, stripped_manifest_digest, policy_generation, policy_digest, packs,
-                 manifest_text)
+                (id, stripped_manifest_digest, policy_generation, policy_digest,
+                 packs, manifest_text)
              VALUES (1, ?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET
                 stripped_manifest_digest = excluded.stripped_manifest_digest,
@@ -225,19 +225,13 @@ impl StateDb {
         Ok(())
     }
 
+    /// One shape per build generation: any mismatch is refused loudly —
+    /// there is no ladder to walk and nothing to salvage. A store written
+    /// by another generation is re-provisioned, not migrated.
     fn check_shape(&self) -> Result<()> {
         let shape = self.read_shape()?;
-        if shape > SHAPE {
-            return Err(Error::issuance(format!(
-                "issuer store db {} is shape {shape}, newer than this build understands \
-                 ({SHAPE}) — upgrade before touching this store",
-                self.root.join(DB_FILE).display()
-            )));
-        }
-        if shape < SHAPE {
-            // An older-shape db is upgraded by the next write path; reads
-            // against it still work (the shape-1 tables are a subset).
-            return Ok(());
+        if shape != SHAPE {
+            return Err(shape_mismatch(&self.root, shape));
         }
         Ok(())
     }
@@ -248,27 +242,29 @@ impl StateDb {
             .map_err(|e| db_err("read shape", &self.root, e))
     }
 
-    /// Creates the db at [`SHAPE`] when absent, minting the store UUID and
-    /// absorbing the legacy JSON pair; one immediate transaction, so two
-    /// racing first-writes settle with one absorb.
-    fn create_or_migrate(&mut self) -> Result<()> {
+    /// Creates the db at [`SHAPE`] when absent; one immediate transaction,
+    /// so two racing first-writes settle with one creation and the loser
+    /// sees the finished shape.
+    fn create_if_absent(&mut self) -> Result<()> {
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| db_err("open", &self.root, e))?;
         let shape: i32 = tx
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| db_err("open", &self.root, e))?;
-        if shape > SHAPE {
-            return Err(Error::issuance(format!(
-                "issuer store db {} is shape {shape}, newer than this build understands \
-                 ({SHAPE}) — upgrade before touching this store",
-                self.root.join(DB_FILE).display()
-            )));
+        if shape == 0 {
+            Self::create_at_current_shape(&tx, &self.root)?;
+        } else if shape != SHAPE {
+            return Err(shape_mismatch(&self.root, shape));
         }
-        if shape == SHAPE {
-            return Ok(());
-        }
+        tx.commit().map_err(|e| db_err("open", &self.root, e))?;
+        Ok(())
+    }
+
+    /// The [`SHAPE`] DDL plus the creation rows (store id, the `created`
+    /// history row).
+    fn create_at_current_shape(tx: &rusqlite::Transaction<'_>, root: &Path) -> Result<()> {
         tx.execute_batch(
             "CREATE TABLE meta (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -296,104 +292,32 @@ impl StateDb {
                 kind TEXT NOT NULL,
                 policy_generation INTEGER NOT NULL,
                 manifest_text TEXT
-            );",
+            );
+            PRAGMA user_version = 3;",
         )
-        .map_err(|e| db_err("create tables", &self.root, e))?;
+        .map_err(|e| db_err("create tables", root, e))?;
         tx.execute(
             "INSERT INTO meta (id, store_uuid, created_at) VALUES (1, ?1, ?2)",
             rusqlite::params![mint_uuid()?, crate::timestamp::rfc3339_now()?],
         )
-        .map_err(|e| db_err("mint store id", &self.root, e))?;
+        .map_err(|e| db_err("mint store id", root, e))?;
         tx.execute(
             "INSERT INTO applied_log (at, kind, policy_generation, manifest_text)
              VALUES (?1, 'created', 0, NULL)",
             rusqlite::params![crate::timestamp::rfc3339_now()?],
         )
-        .map_err(|e| db_err("append applied history", &self.root, e))?;
-        Self::absorb_legacy(&tx, &self.root)?;
-        tx.pragma_update(None, "user_version", SHAPE)
-            .map_err(|e| db_err("set shape", &self.root, e))?;
-        tx.commit().map_err(|e| db_err("open", &self.root, e))?;
-        // File renames happen after commit: a crash between commit and
-        // rename re-absorbs idempotently on the next open.
-        rename_legacy(&self.root, LEGACY_BINDING);
-        rename_legacy(&self.root, LEGACY_APPLIED);
+        .map_err(|e| db_err("append applied history", root, e))?;
         Ok(())
     }
+}
 
-    /// Absorbs the legacy `binding.json` / `applied.json` into the fresh
-    /// db (their row shapes are the JSON shapes verbatim). Malformed
-    /// legacy files are errors — the same loudness their read paths had.
-    fn absorb_legacy(tx: &rusqlite::Transaction<'_>, root: &Path) -> Result<()> {
-        let binding_path = root.join(LEGACY_BINDING);
-        if binding_path.is_file() {
-            let raw = read_json(&binding_path)?;
-            let binding: StoreBinding = serde_json::from_str(&raw).map_err(|e| {
-                Error::issuance(format!(
-                    "issuer store has a malformed {LEGACY_BINDING} — inspect it, or rebind \
-                     deliberately by re-running with the allow-shared override"
-                ))
-                .with_source(e)
-            })?;
-            tx.execute(
-                "INSERT INTO binding (id, realm, manifest_path, manifest_digest, bound_at)
-                 VALUES (1, ?1, ?2, ?3, ?4)
-                 ON CONFLICT(id) DO UPDATE SET
-                    realm = excluded.realm,
-                    manifest_path = excluded.manifest_path,
-                    manifest_digest = excluded.manifest_digest,
-                    bound_at = excluded.bound_at",
-                rusqlite::params![
-                    binding.realm,
-                    binding.manifest_path,
-                    binding.manifest_digest,
-                    binding.bound_at
-                ],
-            )
-            .map_err(|e| db_err("absorb binding", root, e))?;
-        }
-        let applied_path = root.join(LEGACY_APPLIED);
-        if applied_path.is_file() {
-            let raw = read_json(&applied_path)?;
-            let state: AppliedState = serde_json::from_str(&raw).map_err(|e| {
-                Error::issuance(format!(
-                    "issuer store has a malformed {LEGACY_APPLIED} — delete it and re-run apply"
-                ))
-                .with_source(e)
-            })?;
-            let packs = serde_json::to_string(&state.packs)
-                .map_err(|e| Error::serialize("applied packs".to_owned()).with_source(e))?;
-            tx.execute(
-                "INSERT INTO applied
-                    (id, stripped_manifest_digest, policy_generation, policy_digest, packs,
-                     manifest_text)
-                 VALUES (1, ?1, ?2, ?3, ?4, NULL)
-                 ON CONFLICT(id) DO UPDATE SET
-                    stripped_manifest_digest = excluded.stripped_manifest_digest,
-                    policy_generation = excluded.policy_generation,
-                    policy_digest = excluded.policy_digest,
-                    packs = excluded.packs,
-                    manifest_text = excluded.manifest_text",
-                rusqlite::params![
-                    state.stripped_manifest_digest,
-                    state.policy_generation as i64,
-                    state.policy_digest,
-                    packs
-                ],
-            )
-            .map_err(|e| db_err("absorb applied", root, e))?;
-            tx.execute(
-                "INSERT INTO applied_log (at, kind, policy_generation, manifest_text)
-                 VALUES (?1, 'absorbed-legacy', ?2, NULL)",
-                rusqlite::params![
-                    crate::timestamp::rfc3339_now()?,
-                    state.policy_generation as i64
-                ],
-            )
-            .map_err(|e| db_err("append applied history", root, e))?;
-        }
-        Ok(())
-    }
+fn shape_mismatch(root: &Path, shape: i32) -> Error {
+    Error::issuance(format!(
+        "issuer store db {} is shape {shape}, this build expects {SHAPE} — the store was \
+         written by a different deployment generation; re-provision it (fresh deployment) \
+         rather than migrating bookkeeping",
+        root.join(DB_FILE).display()
+    ))
 }
 
 /// Applies the WAL pragmas every connection needs (WAL so a GUI-embedded
@@ -432,31 +356,6 @@ pub(crate) fn wal_checkpoint(root: &Path) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn read_json(path: &Path) -> Result<String> {
-    std::fs::read_to_string(path).map_err(|e| Error::Io {
-        path: path.display().to_string(),
-        source: e,
-    })
-}
-
-fn rename_legacy(root: &Path, name: &str) {
-    let from = root.join(name);
-    if !from.is_file() {
-        return;
-    }
-    let mut to = from.as_os_str().to_owned();
-    to.push(".");
-    to.push(MIGRATED_SUFFIX);
-    if let Err(e) = std::fs::rename(&from, &to) {
-        tracing::warn!(
-            "could not rename the absorbed {} to {}: {e} — it is no longer read, but move it \
-             aside to keep future opens clean",
-            from.display(),
-            Path::new(&to).display()
-        );
-    }
 }
 
 fn mint_uuid() -> Result<String> {
@@ -564,13 +463,11 @@ mod tests {
         db.record_applied(&state, Some("[realm]\nid = \"x\"\n"), "full-render")
             .unwrap();
         let db = StateDb::open_existing(dir.path()).unwrap().unwrap();
-        assert_eq!(db.applied_state().unwrap().unwrap().policy_generation, 7);
+        let read = db.applied_state().unwrap().unwrap();
+        assert_eq!(read.policy_generation, 7);
+        assert_eq!(read.stripped_manifest_digest, "sha256:s1");
         assert_eq!(
-            db.applied_state()
-                .unwrap()
-                .unwrap()
-                .packs
-                .get("hub-central"),
+            read.packs.get("hub-central"),
             Some(&"sha256:pk1".to_owned())
         );
         assert_eq!(
@@ -588,57 +485,27 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
-    /// The legacy JSON pair is absorbed verbatim on first creation and
-    /// renamed; the absorbed applied state carries no declaration
-    /// snapshot (the files never had one).
+    /// Any shape this build does not recognize — older OR newer — is
+    /// refused on both faces; there is no ladder and no salvage.
     #[test]
-    fn legacy_pair_is_absorbed_and_renamed() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join(LEGACY_BINDING),
-            r#"{"realm":"promptcn","manifest_path":"/old/interflow.toml","manifest_digest":"sha256:old","bound_at":"2026-10-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join(LEGACY_APPLIED),
-            r#"{"stripped_manifest_digest":"sha256:st","policy_generation":3,"policy_digest":"sha256:pd","packs":{"agent-a":"sha256:z"}}"#,
-        )
-        .unwrap();
-        let db = StateDb::open_or_create(root).unwrap();
-        let binding = db.binding().unwrap().unwrap();
-        assert_eq!(binding.realm, "promptcn");
-        assert_eq!(binding.manifest_path, "/old/interflow.toml");
-        let state = db.applied_state().unwrap().unwrap();
-        assert_eq!(state.policy_generation, 3);
-        assert!(db.applied_manifest_text().unwrap().is_none());
-        assert!(!root.join(LEGACY_BINDING).exists());
-        assert!(!root.join(LEGACY_APPLIED).exists());
-        assert!(
-            root.join(format!("{LEGACY_BINDING}.{MIGRATED_SUFFIX}"))
-                .exists()
-        );
-        assert!(
-            root.join(format!("{LEGACY_APPLIED}.{MIGRATED_SUFFIX}"))
-                .exists()
-        );
-        // Reopening never re-absorbs (the files are gone).
-        let again = StateDb::open_or_create(root).unwrap();
-        assert_eq!(again.applied_state().unwrap().unwrap().policy_generation, 3);
-    }
-
-    /// A db written by a newer build is refused, not mangled.
-    #[test]
-    fn newer_shape_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            StateDb::open_or_create(dir.path()).unwrap();
-            let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
-            conn.pragma_update(None, "user_version", 99).unwrap();
+    fn foreign_shapes_are_refused_on_both_faces() {
+        for shape in [1, 2, 99] {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                StateDb::open_or_create(dir.path()).unwrap();
+                let conn = Connection::open(dir.path().join(DB_FILE)).unwrap();
+                conn.pragma_update(None, "user_version", shape).unwrap();
+            }
+            let err = StateDb::open_or_create(dir.path()).unwrap_err();
+            assert!(
+                err.to_string().contains("re-provision"),
+                "wrong error: {err}"
+            );
+            let err = StateDb::open_existing(dir.path()).unwrap_err();
+            assert!(
+                err.to_string().contains("re-provision"),
+                "wrong error: {err}"
+            );
         }
-        let err = StateDb::open_or_create(dir.path()).unwrap_err();
-        assert!(err.to_string().contains("newer"), "wrong error: {err}");
-        let err = StateDb::open_existing(dir.path()).unwrap_err();
-        assert!(err.to_string().contains("newer"), "wrong error: {err}");
     }
 }

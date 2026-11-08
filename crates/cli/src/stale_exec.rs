@@ -221,7 +221,9 @@ fn owning_unit(proc_dir: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-#[cfg(test)]
+// The fixtures forge `/proc/<pid>/exe` symlinks — a Linux procfs shape;
+// the scanner itself is a no-op off Linux, so the tests are too.
+#[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

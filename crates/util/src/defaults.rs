@@ -6,7 +6,7 @@
 //! the one crate both the identity renderer and the expose engine depend on —
 //! so the two sides can never drift apart.
 
-/// Default per-IP new-connection rate limit per minute for direct topologies
+/// Default per-client new-connection rate limit per minute for direct topologies
 /// (the edge itself terminates the public listener).
 ///
 /// The browser's own HTTP keepalive keeps new connections rare, and there is
@@ -14,7 +14,7 @@
 /// its connect-loop defense.
 pub const DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE: u32 = 30;
 
-/// Default per-IP new-connection rate limit per minute for fronted topologies
+/// Default per-client new-connection rate limit per minute for fronted topologies
 /// (nginx/`proxy_pass` in front).
 ///
 /// Each proxied request opens a **new** edge connection (conn → tunnel stream

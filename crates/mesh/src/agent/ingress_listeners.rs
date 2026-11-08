@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// One rule's listener face: where it is serving, or why it is not.
+/// One rule's listener face: where it is serving, why it is not, or that
+/// it is deliberately not (paused by intent).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ListenerStatus {
     /// The actually-bound address (`None` = no listener is up for the rule).
@@ -28,6 +29,12 @@ pub struct ListenerStatus {
     /// `Some` error means a reconciler retry is pending (the previous
     /// listener keeps serving; see the replace path in `agent::ingress`).
     pub last_error: Option<String>,
+    /// The stream is paused by intent (planned unavailability): no
+    /// listener SHOULD be up and the port is deliberately free. Distinct
+    /// from both `Down` (bind failed, retrying) and a removed rule (no
+    /// row at all) — the faces render it as its own (yellow) state.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 impl ListenerStatus {
@@ -35,6 +42,7 @@ impl ListenerStatus {
         Self {
             bound_addr: Some(addr),
             last_error: None,
+            paused: false,
         }
     }
 
@@ -42,6 +50,15 @@ impl ListenerStatus {
         Self {
             bound_addr: None,
             last_error: Some(error),
+            paused: false,
+        }
+    }
+
+    const fn paused() -> Self {
+        Self {
+            bound_addr: None,
+            last_error: None,
+            paused: true,
         }
     }
 
@@ -93,6 +110,13 @@ impl IngressListeners {
     /// Record that the latest bind attempt for `rule` failed.
     pub(crate) fn set_failed(&self, rule: &str, error: String) {
         self.record(rule, ListenerStatus::failed(error));
+    }
+
+    /// Record that `rule` is paused by intent: no listener should be up,
+    /// the port is deliberately free, and the next resume rebinds (a
+    /// `:0` port keeps its pinned address across the pause).
+    pub(crate) fn set_paused(&self, rule: &str) {
+        self.record(rule, ListenerStatus::paused());
     }
 
     /// Forget a rule (explicit rule removal). Removing an absent rule does
@@ -212,5 +236,24 @@ mod tests {
         assert!(t.get("r").is_none());
         // Removing an absent rule is a no-op.
         t.remove("r");
+    }
+
+    #[test]
+    fn paused_is_its_own_face_state_distinct_from_down() {
+        let t = IngressListeners::new();
+        t.set_bound("r", addr(1));
+        t.set_paused("r");
+        let status = t.get("r").unwrap();
+        assert!(!status.is_bound());
+        assert!(status.paused, "paused is the face's own state");
+        assert_eq!(
+            status.last_error, None,
+            "paused is not a bind failure — no retry is pending"
+        );
+        // Resume is just a later bind: the paused flag clears with it.
+        t.set_bound("r", addr(2));
+        let status = t.get("r").unwrap();
+        assert!(status.is_bound());
+        assert!(!status.paused);
     }
 }

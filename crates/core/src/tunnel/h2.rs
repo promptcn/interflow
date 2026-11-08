@@ -27,13 +27,15 @@
 
 use crate::error::{InterflowError, Result};
 use crate::protocol::{
-    CircuitToken, CloseReason, FrameType, RouteToken, StreamId, StreamProto, frame as wire,
+    CircuitToken, CloseReason, FrameOrigin, FrameType, RouteToken, StreamId, StreamProto,
+    frame as wire,
 };
 use crate::tunnel::agent::H2Liveness;
 use crate::tunnel::chunking::ChunkHygiene;
 use crate::tunnel::session_tasks::{Beat, SessionTasks, beat_interval};
 use crate::tunnel::transport::{
-    SteadyStateLiveness, TunnelData, TunnelDispatch, TunnelTransport, unix_millis_now,
+    DeliverOutcome, SteadyStateLiveness, TunnelData, TunnelDispatch, TunnelTransport,
+    unix_millis_now,
 };
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -69,6 +71,15 @@ pub fn empty_request_body() -> H2RequestBody {
         .boxed()
 }
 
+/// One upstream frame as two segments: the fixed 41-byte header and the
+/// payload `Bytes` (which stays zero-copy from the tunnel data path).
+///
+/// One channel element per frame keeps frame boundaries atomic across
+/// concurrent senders — the reason the old per-send tokio Mutex existed is
+/// gone; the slot lock (std, never held across an await) only hands out
+/// the current sender while the upload loop rebuilds.
+type UpChunk = (Bytes, Bytes);
+
 /// The HTTP/2 tunnel backend.
 pub(crate) struct H2Tunnel {
     circuit: CircuitToken,
@@ -80,7 +91,7 @@ pub(crate) struct H2Tunnel {
     /// time it rebuilds the stream; during an upload death gap the channel is
     /// already closed, so `send` errors → the pump tears the stream down (TCP
     /// semantics, no silent frame drops).
-    up_tx: Arc<Mutex<mpsc::Sender<Bytes>>>,
+    up_tx: Arc<StdMutex<mpsc::Sender<UpChunk>>>,
     /// Shared h2 request sender used for route-lease control requests.
     sender: Arc<Mutex<SendRequest<H2RequestBody>>>,
     /// Semantic target → opaque route token, valid for this h2 session only.
@@ -401,6 +412,210 @@ impl H2Tunnel {
         })
     }
 
+    /// One stream-intent exchange (`POST /streams/intent`) over this
+    /// session's control plane — the h2 face of the intent watcher's
+    /// convergence loop. Rides the session connection with the circuit
+    /// header, like the proposals ops; the body is the JSON report of
+    /// this node's paused stream names, the answer the pending ops.
+    pub async fn exchange_stream_intents_h2(
+        &self,
+        report: &crate::tunnel::transport::StreamIntentReport,
+    ) -> Result<crate::tunnel::transport::StreamIntentOps> {
+        let payload = serde_json::to_vec(report).map_err(|e| {
+            InterflowError::protocol("stream-intent report encode failed".to_string())
+                .with_source(e)
+        })?;
+        let body = http_body_util::Full::new(Bytes::from(payload))
+            .map_err(|never| match never {})
+            .boxed();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/streams/intent")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .body(body)
+            .map_err(|e| {
+                InterflowError::connection("failed to build stream-intent request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("stream-intent exchange timed out"))??;
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let text = response
+                .into_body()
+                .collect()
+                .await
+                .map(|b| String::from_utf8_lossy(&b.to_bytes()).to_string())
+                .unwrap_or_default();
+            return Err(InterflowError::connection(format!(
+                "stream-intent exchange rejected: {status} — {text}"
+            )));
+        }
+        let body = response.into_body().collect().await?;
+        serde_json::from_slice(&body.to_bytes()).map_err(|e| {
+            InterflowError::protocol("stream-intent ops payload is malformed".to_string())
+                .with_source(e)
+        })
+    }
+
+    /// One out-of-band target-recovery notice (`POST /breakers/recovered`)
+    /// over this session's control plane — the h2 face of the recovery
+    /// prober's push. Same carriage as the intent exchange (session
+    /// connection + circuit header); an old hub answers 404, which the
+    /// caller treats as "notice dropped, harmless" (the receiver's
+    /// cooldown-based recovery remains the fallback).
+    pub async fn report_target_recovered_h2(
+        &self,
+        notice: &crate::tunnel::transport::TargetRecoveredNotice,
+    ) -> Result<crate::tunnel::transport::TargetRecoveredAck> {
+        let payload = serde_json::to_vec(notice).map_err(|e| {
+            InterflowError::protocol("target-recovery notice encode failed".to_string())
+                .with_source(e)
+        })?;
+        let body = http_body_util::Full::new(Bytes::from(payload))
+            .map_err(|never| match never {})
+            .boxed();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/breakers/recovered")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .body(body)
+            .map_err(|e| {
+                InterflowError::connection("failed to build target-recovery request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("target-recovery notice timed out"))??;
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let text = response
+                .into_body()
+                .collect()
+                .await
+                .map(|b| String::from_utf8_lossy(&b.to_bytes()).to_string())
+                .unwrap_or_default();
+            return Err(InterflowError::connection(format!(
+                "target-recovery notice rejected: {status} — {text}"
+            )));
+        }
+        let body = response.into_body().collect().await?;
+        serde_json::from_slice(&body.to_bytes()).map_err(|e| {
+            InterflowError::protocol("target-recovery ack payload is malformed".to_string())
+                .with_source(e)
+        })
+    }
+
+    /// One CRL-poll liveness report (`POST /crls/liveness`) over this
+    /// session's control plane — the h2 face of the renewal reporter's
+    /// push. Same carriage as the intent exchange (session connection +
+    /// circuit header); the body is this node's current liveness level,
+    /// the answer a bare 204-style ack (an empty 200 body). An old hub
+    /// answers 404, which the reporter treats as one dropped sample —
+    /// the level re-arrives with the next report.
+    pub async fn report_crl_liveness_h2(
+        &self,
+        report: &crate::tunnel::transport::CrlLivenessReport,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(report).map_err(|e| {
+            InterflowError::protocol("CRL-liveness report encode failed".to_string()).with_source(e)
+        })?;
+        let body = http_body_util::Full::new(Bytes::from(payload))
+            .map_err(|never| match never {})
+            .boxed();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/crls/liveness")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .body(body)
+            .map_err(|e| {
+                InterflowError::connection("failed to build CRL-liveness request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("CRL-liveness report timed out"))??;
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let text = response
+                .into_body()
+                .collect()
+                .await
+                .map(|b| String::from_utf8_lossy(&b.to_bytes()).to_string())
+                .unwrap_or_default();
+            return Err(InterflowError::connection(format!(
+                "CRL-liveness report rejected: {status} — {text}"
+            )));
+        }
+        // The ack carries no payload — landing IS the confirmation.
+        let _body = response.into_body().collect().await?;
+        Ok(())
+    }
+
+    /// One node-status report (`POST /node/status`) over this session's
+    /// control plane — the h2 face of the node-status reporter's push
+    /// (same carriage and ack discipline as the CRL-liveness report; an
+    /// old hub's 404 is one dropped sample, the levels re-arrive).
+    pub async fn report_node_status_h2(
+        &self,
+        report: &crate::tunnel::transport::NodeStatusReport,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(report).map_err(|e| {
+            InterflowError::protocol("node-status report encode failed".to_string()).with_source(e)
+        })?;
+        let body = http_body_util::Full::new(Bytes::from(payload))
+            .map_err(|never| match never {})
+            .boxed();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/node/status")
+            .header("x-circuit-token", self.circuit.to_hex())
+            .body(body)
+            .map_err(|e| {
+                InterflowError::connection("failed to build node-status request".to_string())
+                    .with_source(e)
+            })?;
+        let future = {
+            let mut sender = self.sender.lock().await;
+            sender.ready().await?;
+            sender.send_request(request)
+        };
+        let response = tokio::time::timeout(Duration::from_secs(10), future)
+            .await
+            .map_err(|_| InterflowError::connection("node-status report timed out"))??;
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let text = response
+                .into_body()
+                .collect()
+                .await
+                .map(|b| String::from_utf8_lossy(&b.to_bytes()).to_string())
+                .unwrap_or_default();
+            return Err(InterflowError::connection(format!(
+                "node-status report rejected: {status} — {text}"
+            )));
+        }
+        // The ack carries no payload — landing IS the confirmation.
+        let _body = response.into_body().collect().await?;
+        Ok(())
+    }
+
     /// Creates the tunnel backend from an established HTTP/2 connection.
     ///
     /// Registration is done by the caller (`AgentClient`); this method only
@@ -430,7 +645,7 @@ impl H2Tunnel {
         // as soon as the first request is up — eliminating the race in the
         // "tunnel constructed → upload ready" window.
         let (first_up_tx, first_up_rx) = mpsc::channel(UPLOAD_CHANNEL_CAP);
-        let up_tx = Arc::new(Mutex::new(first_up_tx));
+        let up_tx = Arc::new(StdMutex::new(first_up_tx));
 
         // Critical under the death contract: the task exiting for ANY reason
         // (return, panic, abort) ends the session for rebuild. Before the
@@ -494,7 +709,7 @@ impl H2Tunnel {
                 // them (forwarders/pumps get None from recv() and exit, backend
                 // fds released), without depending on the consumer remembering to
                 // call shutdown(). Coexists idempotently with explicit shutdown().
-                Self::release_all_streams(&dispatch_for_poll).await;
+                Self::release_all_streams(&dispatch_for_poll);
                 debug!("data receive task finished");
             }
         });
@@ -516,9 +731,9 @@ impl H2Tunnel {
     /// Shared by [`Self::shutdown`] (external cause: the consumer's teardown
     /// sequence) and poll-loop exit (internal cause: connection death /
     /// watchdog).
-    async fn release_all_streams(dispatch: &TunnelDispatch) {
-        let req = dispatch.close_all_request_streams().await;
-        let resp = dispatch.close_all_response_streams().await;
+    fn release_all_streams(dispatch: &TunnelDispatch) {
+        let req = dispatch.close_all_request_streams();
+        let resp = dispatch.close_all_response_streams();
         if req + resp > 0 {
             metrics::counter!("interflow_agent_session_teardown_streams_killed_total")
                 .increment(u64::try_from(req + resp).unwrap_or(u64::MAX));
@@ -549,11 +764,10 @@ impl H2Tunnel {
         self.send_up_bytes(buf.freeze()).await
     }
 
-    /// Data-frame path: header and payload go in as two separate body chunks, with the payload `Bytes`
-    /// reaching the h2 DATA frame zero-copy (the same shape as the hub-side
-    /// `RxStream` downlink). The two enqueues complete under the same
-    /// `up_tx` lock, guaranteeing frame boundaries are not interleaved by
-    /// concurrent senders.
+    /// Data-frame path: header and payload go in as ONE channel element —
+    /// the payload `Bytes` reaches the h2 DATA frame zero-copy (the same
+    /// shape as the hub-side `RxStream` downlink) and the frame boundary is
+    /// atomic by construction (no interleave across concurrent senders).
     async fn send_data_frame(&self, stream_id: StreamId, flags: u8, data: Bytes) -> Result<()> {
         let circuit = if flags & crate::protocol::FLAG_RESPONSE != 0 {
             CircuitToken::ZERO
@@ -574,19 +788,26 @@ impl H2Tunnel {
                 "frame encoding failed (flags/type-field contract violation)".to_string(),
             )
         })?;
-        let tx = self.up_tx.lock().await;
-        if let Err(e) = tx.send(header.freeze()).await {
-            return Err(Self::up_closed(e));
-        }
-        tx.send(data).await.map_err(Self::up_closed)
+        self.send_up((header.freeze(), data)).await
+    }
+
+    /// One enqueue per frame: fetch the CURRENT sender under the std slot
+    /// lock (never held across an await — the upload loop may be swapping a
+    /// rebuilt channel), then await the bounded send outside it.
+    async fn send_up(&self, chunk: UpChunk) -> Result<()> {
+        let tx = self
+            .up_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        tx.send(chunk).await.map_err(Self::up_closed)
     }
 
     async fn send_up_bytes(&self, bytes: Bytes) -> Result<()> {
-        let tx = self.up_tx.lock().await;
-        tx.send(bytes).await.map_err(Self::up_closed)
+        self.send_up((bytes, Bytes::new())).await
     }
 
-    fn up_closed(_: mpsc::error::SendError<Bytes>) -> InterflowError {
+    fn up_closed(_: mpsc::error::SendError<UpChunk>) -> InterflowError {
         InterflowError::connection(
             "upload stream unavailable (rebuilding or disconnected)".to_string(),
         )
@@ -614,9 +835,9 @@ impl H2Tunnel {
         sender: Arc<Mutex<SendRequest<H2RequestBody>>>,
         circuit: CircuitToken,
         hub_url: String,
-        up_tx_slot: Arc<Mutex<mpsc::Sender<Bytes>>>,
+        up_tx_slot: Arc<StdMutex<mpsc::Sender<UpChunk>>>,
         shutdown: CancellationToken,
-        mut first_rx: Option<mpsc::Receiver<Bytes>>,
+        mut first_rx: Option<mpsc::Receiver<UpChunk>>,
         establish_timeout: Duration,
         stall_timeout: Duration,
         beat: Beat,
@@ -724,7 +945,9 @@ impl H2Tunnel {
 
             // 200: swap in this round's channel; the pump's send path recovers
             if let Some(tx) = pending_tx {
-                *up_tx_slot.lock().await = tx;
+                *up_tx_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = tx;
             }
             if consecutive_failures > 0 {
                 info!("upload stream rebuilt");
@@ -764,7 +987,9 @@ impl H2Tunnel {
             {
                 let (dead_tx, dead_rx) = mpsc::channel(1);
                 drop(dead_rx);
-                *up_tx_slot.lock().await = dead_tx;
+                *up_tx_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = dead_tx;
             }
             info!("upload stream ended, rebuilding immediately");
         }
@@ -806,7 +1031,7 @@ impl H2Tunnel {
         hub_url: String,
         dispatch: &TunnelDispatch,
         shutdown: CancellationToken,
-        up_tx: Arc<Mutex<mpsc::Sender<Bytes>>>,
+        up_tx: Arc<StdMutex<mpsc::Sender<UpChunk>>>,
         liveness: H2Liveness,
         last_rx: Arc<AtomicU64>,
         tasks: SessionTasks,
@@ -935,7 +1160,7 @@ impl H2Tunnel {
         circuit: &CircuitToken,
         buffer: &mut BytesMut,
         dispatch: &TunnelDispatch,
-        up_tx: &Arc<Mutex<mpsc::Sender<Bytes>>>,
+        up_tx: &Arc<StdMutex<mpsc::Sender<UpChunk>>>,
         liveness: H2Liveness,
         last_rx: &Arc<AtomicU64>,
         shutdown: &CancellationToken,
@@ -997,12 +1222,51 @@ impl H2Tunnel {
                     };
                     last_rx.store(unix_millis_now(), Ordering::Relaxed);
                     buffer.extend_from_slice(&data);
+                    // §2.4 head-of-line fix: batch-decode, then deliver
+                    // non-blockingly. A full (backpressured) stream parks
+                    // its frames — per-stream order preserved, its Close
+                    // notifications included — while every OTHER stream in
+                    // the batch keeps flowing; the parked set resolves at
+                    // the end of the batch under the timed discipline. The
+                    // old serial `dispatch().await` let one stalled
+                    // consumer's channel block the whole poll loop for up
+                    // to `DISPATCH_SEND_TIMEOUT` per frame.
+                    let mut batch = Vec::new();
                     while let Some(tunnel_data) = TunnelDispatch::decode_tunnel_data(buffer) {
+                        batch.push(tunnel_data);
+                    }
+                    let mut parked: Vec<TunnelData> = Vec::new();
+                    let mut parked_ids = std::collections::HashSet::new();
+                    for tunnel_data in batch {
                         if tunnel_data.stream_type == FrameType::Ping {
                             Self::spawn_pong(tasks, circuit, up_tx);
                             continue;
                         }
-                        dispatch.dispatch(tunnel_data).await;
+                        // Open builds stream state through the async
+                        // request-stream machinery (its own bounded
+                        // queues) — handled inline, never parked.
+                        let opens_stream =
+                            !matches!(tunnel_data.origin, FrameOrigin::Response | FrameOrigin::Hub)
+                                && matches!(tunnel_data.stream_type, FrameType::Open);
+                        if opens_stream {
+                            dispatch.dispatch(tunnel_data).await;
+                            continue;
+                        }
+                        if parked_ids.contains(&tunnel_data.stream_id) {
+                            // Per-stream FIFO: once this stream parks, its
+                            // whole batch tail parks behind it (a Close on
+                            // the same channel must not overtake parked
+                            // Data).
+                            parked.push(tunnel_data);
+                            continue;
+                        }
+                        if let DeliverOutcome::Parked(td) = dispatch.try_deliver(tunnel_data) {
+                            parked_ids.insert(td.stream_id);
+                            parked.push(td);
+                        }
+                    }
+                    for tunnel_data in parked {
+                        dispatch.deliver_parked(tunnel_data).await;
                     }
                 }
                 Err(e) => {
@@ -1024,7 +1288,7 @@ impl H2Tunnel {
     fn spawn_pong(
         tasks: &SessionTasks,
         circuit: &CircuitToken,
-        up_tx: &Arc<Mutex<mpsc::Sender<Bytes>>>,
+        up_tx: &Arc<StdMutex<mpsc::Sender<UpChunk>>>,
     ) {
         let circuit = *circuit;
         let up_tx = up_tx.clone();
@@ -1036,8 +1300,11 @@ impl H2Tunnel {
                 return;
             }
             let sent = {
-                let tx = up_tx.lock().await;
-                tx.send(buf.freeze()).await.is_ok()
+                let tx = up_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                tx.send((buf.freeze(), Bytes::new())).await.is_ok()
             };
             if !sent {
                 debug!("upstream Pong send failed (upload rebuilding)");
@@ -1048,19 +1315,29 @@ impl H2Tunnel {
 
 /// `mpsc::Receiver<Bytes>` → hyper body stream adapter.
 ///
-/// Each `Bytes` is yielded as one DATA chunk; frame boundaries are
-/// guaranteed by the caller (header and payload are enqueued adjacently, see
-/// [`H2Tunnel::send_data_frame`]). The caller wraps this in
-/// [`ChunkHygiene`], which may coalesce adjacent chunks into one larger DATA
-/// frame — harmless: the hub-side reader accumulates body bytes and decodes
-/// frames incrementally, so DATA frame boundaries carry no semantics.
+/// Each channel element is one frame as `(header, payload)`; the two
+/// segments are yielded as two adjacent DATA chunks (payload `Bytes`
+/// zero-copy). The caller wraps this in [`ChunkHygiene`], which may coalesce
+/// adjacent chunks into one larger DATA frame — harmless: the hub-side
+/// reader accumulates body bytes and decodes frames incrementally, so DATA
+/// frame boundaries carry no semantics.
 fn upload_body_stream(
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::Receiver<UpChunk>,
 ) -> impl futures::Stream<Item = std::result::Result<Frame<Bytes>, InterflowError>> {
+    let mut pending_payload: Option<Bytes> = None;
     futures::stream::poll_fn(
         move |cx: &mut Context<'_>| -> Poll<Option<std::result::Result<Frame<Bytes>, InterflowError>>> {
-            rx.poll_recv(cx)
-                .map(|item| item.map(|bytes| Ok(Frame::data(bytes))))
+            if let Some(payload) = pending_payload.take() {
+                return Poll::Ready(Some(Ok(Frame::data(payload))));
+            }
+            rx.poll_recv(cx).map(|item| {
+                item.map(|(header, payload)| {
+                    if !payload.is_empty() {
+                        pending_payload = Some(payload);
+                    }
+                    Ok(Frame::data(header))
+                })
+            })
         },
     )
 }
@@ -1084,6 +1361,34 @@ impl TunnelTransport for H2Tunnel {
 
     async fn my_proposals(&self) -> Result<Vec<crate::tunnel::transport::ProposalReceipt>> {
         self.my_proposals_h2().await
+    }
+
+    async fn exchange_stream_intents(
+        &self,
+        report: &crate::tunnel::transport::StreamIntentReport,
+    ) -> Result<crate::tunnel::transport::StreamIntentOps> {
+        self.exchange_stream_intents_h2(report).await
+    }
+
+    async fn report_target_recovered(
+        &self,
+        notice: &crate::tunnel::transport::TargetRecoveredNotice,
+    ) -> Result<crate::tunnel::transport::TargetRecoveredAck> {
+        self.report_target_recovered_h2(notice).await
+    }
+
+    async fn report_crl_liveness(
+        &self,
+        report: &crate::tunnel::transport::CrlLivenessReport,
+    ) -> Result<()> {
+        self.report_crl_liveness_h2(report).await
+    }
+
+    async fn report_node_status(
+        &self,
+        report: &crate::tunnel::transport::NodeStatusReport,
+    ) -> Result<()> {
+        self.report_node_status_h2(report).await
     }
 
     async fn liveness_roundtrip(&self) -> Result<()> {
@@ -1146,11 +1451,11 @@ impl TunnelTransport for H2Tunnel {
         &self,
         stream_id: StreamId,
     ) -> tokio::sync::mpsc::Receiver<TunnelData> {
-        self.dispatch.register_stream(stream_id).await
+        self.dispatch.register_stream(stream_id)
     }
 
     async fn unregister_stream(&self, stream_id: StreamId) {
-        self.dispatch.unregister_stream(stream_id).await;
+        self.dispatch.unregister_stream(stream_id);
     }
 
     async fn take_incoming_streams(
@@ -1160,7 +1465,7 @@ impl TunnelTransport for H2Tunnel {
     }
 
     async fn unregister_incoming_stream(&self, stream_id: StreamId) {
-        self.dispatch.unregister_incoming_stream(stream_id).await;
+        self.dispatch.unregister_incoming_stream(stream_id);
     }
 
     /// Termination contract (external-cause channel): called explicitly by the consumer's teardown sequence.
@@ -1172,14 +1477,17 @@ impl TunnelTransport for H2Tunnel {
     /// internal-cause table cleanup on poll exit.
     async fn shutdown(&self) {
         self.token.cancel();
-        Self::release_all_streams(&self.dispatch).await;
+        Self::release_all_streams(&self.dispatch);
         // Seal the uplink channel: sends in the death gap fail fast (same
         // sealing semantics as the upload rebuild gap), preventing the
         // close-out path from hanging on a send to a full channel.
         {
             let (dead_tx, dead_rx) = mpsc::channel(1);
             drop(dead_rx);
-            *self.up_tx.lock().await = dead_tx;
+            *self
+                .up_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = dead_tx;
         }
     }
 

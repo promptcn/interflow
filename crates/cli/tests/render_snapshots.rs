@@ -1,6 +1,15 @@
 //! Byte-stable snapshot tests for the manifest-derived deployment artifacts
 //! (systemd units, nginx fragments, install.sh).
 //!
+//! One component is exempt from byte-stability BY POLICY: every artifact's
+//! vintage line names the compiling build (`# rendered by interflow-cli
+//! <BUILD_TAG> …`), so the tag component legitimately varies per commit and
+//! a golden tree is not supposed to pin it. The test therefore (a) asserts
+//! every vintage line is present and exactly formed — built by the same
+//! `render::vintage_comment`/`render::build_vintage_comment` the renderer
+//! uses, digest included — and only then (b) normalizes the tag on BOTH
+//! sides before the byte compare. Everything else stays byte-locked.
+//!
 //! Regenerate intentionally with:
 //!   UPDATE_SNAPSHOTS=1 cargo test -p interflow-cli --test render_snapshots
 
@@ -118,7 +127,8 @@ service = "main/desktop/asr"
 
 /// Mirrors the artifact section of `plan::apply` (everything but the packs,
 /// which carry issuance timestamps and are covered by the flow tests).
-fn write_artifacts(manifest: &Manifest, out: &Path) {
+fn write_artifacts(manifest: &Manifest, manifest_text: &str, out: &Path) {
+    let manifest_sha = interflow_util::sha256_hex(manifest_text.as_bytes());
     let mut nodes: Vec<(PackKind, String, bool)> = Vec::new();
     for node in manifest.mesh.hub.keys() {
         nodes.push((PackKind::Hub, node.clone(), true));
@@ -138,11 +148,11 @@ fn write_artifacts(manifest: &Manifest, out: &Path) {
             .expect("node unit renders");
     }
     if render::has_registrar(manifest) {
-        render::write_registrar_unit(out, manifest, render::DEFAULT_INSTALL_ROOT)
+        render::write_registrar_unit(out, manifest, render::DEFAULT_INSTALL_ROOT, &manifest_sha)
             .expect("registrar unit renders");
     }
-    render::write_nginx_fragments(out, manifest).expect("nginx fragments render");
-    render::write_install_sh(out, manifest).expect("install.sh renders");
+    render::write_nginx_fragments(out, manifest, &manifest_sha).expect("nginx fragments render");
+    render::write_install_sh(out, manifest, &manifest_sha).expect("install.sh renders");
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
@@ -163,22 +173,33 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn copy_tree(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).expect("create golden dir");
-    for entry in std::fs::read_dir(from).expect("read dir") {
-        let entry = entry.expect("dir entry");
-        let target = to.join(entry.file_name());
-        if entry.file_type().expect("file type").is_dir() {
-            copy_tree(&entry.path(), &target);
+    interflow_util::copy_dir_recursive(from, to).expect("copy golden tree");
+}
+
+/// Replaces the build-tag component of ANY vintage line with a
+/// placeholder. Golden trees carry the tag of the commit that last
+/// regenerated them, which legitimately differs from this build's — the
+/// manifest digest (the line's other component) stays byte-locked.
+fn normalize_vintage(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("# rendered by interflow-cli ") {
+            out.push_str("# rendered by interflow-cli <BUILD_TAG>");
+            if let Some((_, tail)) = rest.split_once(" from ") {
+                out.push_str(" from ");
+                out.push_str(tail);
+            }
         } else {
-            std::fs::copy(entry.path(), target).expect("copy golden file");
+            out.push_str(line);
         }
     }
+    out
 }
 
 fn assert_stable(case: &str, manifest_text: &str) {
     let manifest = Manifest::parse(manifest_text).expect("manifest parses");
     let tmp = tempfile::tempdir().expect("tempdir");
-    write_artifacts(&manifest, tmp.path());
+    write_artifacts(&manifest, manifest_text, tmp.path());
     let golden = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/snapshots/render")
         .join(case);
@@ -200,12 +221,36 @@ fn assert_stable(case: &str, manifest_text: &str) {
         "rendered file set for {case} differs from the snapshot tree \
          (regenerate with UPDATE_SNAPSHOTS=1 if intentional)"
     );
+    // The vintage lines come first, exactly formed and digest-locked:
+    // built by the same functions the renderer uses, so an absent or
+    // malformed line fails HERE — the normalization below must never be
+    // able to hide it.
+    let manifest_sha = interflow_util::sha256_hex(manifest_text.as_bytes());
+    for rel in &got {
+        let produced = std::fs::read_to_string(tmp.path().join(rel)).expect("produced file");
+        let rel_s = rel.to_string_lossy();
+        let expected_line = if rel_s.starts_with("nginx/")
+            || rel_s == "install.sh"
+            || rel_s == "systemd/interflow-registrar.service"
+        {
+            render::vintage_comment(&manifest_sha)
+        } else if rel_s.starts_with("systemd/") {
+            render::build_vintage_comment()
+        } else {
+            continue;
+        };
+        assert!(
+            produced.contains(&expected_line),
+            "{case}/{} must carry its vintage line (built by the same source as the renderer)",
+            rel.display()
+        );
+    }
     for rel in &got {
         let produced = std::fs::read_to_string(tmp.path().join(rel)).expect("produced file");
         let expected = std::fs::read_to_string(golden.join(rel)).expect("golden file");
         assert_eq!(
-            produced,
-            expected,
+            normalize_vintage(&produced),
+            normalize_vintage(&expected),
             "byte drift in {case}/{} (regenerate with UPDATE_SNAPSHOTS=1 if intentional)",
             rel.display()
         );
@@ -232,6 +277,14 @@ fn assert_stable(case: &str, manifest_text: &str) {
         !install_sh.contains("/etc/systemd"),
         "install.sh for {case} must not install units — a machine gets a unit only \
          when that node's pack lands on it (node install)"
+    );
+    // The staging gate ships with every install.sh (the execution-level
+    // gates live in plan_stage.rs; this keeps the template honest even
+    // where a tree is never staged).
+    assert!(
+        install_sh.contains("--verify-staging") && install_sh.contains("SCRIPT_DIR="),
+        "install.sh for {case} must anchor paths at its own directory and carry \
+         the staging verification gate"
     );
 }
 

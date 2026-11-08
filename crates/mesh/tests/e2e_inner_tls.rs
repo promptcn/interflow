@@ -642,9 +642,8 @@ async fn a4c_forged_src_agent_rejected_zero_dial() {
         // Present a valid tenant cert whose CN != the declared source
         // (`test/rogue`): the CN binding must reject it.
         let client_material = tenant_material("someone-else");
-        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
-            inner_client_config(&client_material, "eg").unwrap(),
-        ));
+        let connector =
+            tokio_rustls::TlsConnector::from(inner_client_config(&client_material, "eg").unwrap());
         let adapter = E2eTunnelIo::ingress(rx, attacker.clone(), sid);
         match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
             E2eHandshakeOutcome::Established(mut tls, _) => {
@@ -919,9 +918,8 @@ async fn gateway_stream_against_egress(
     let tenant_ca = certs().ca_path().display().to_string();
     let gw_material =
         InnerTlsMaterial::from_paths(&[tenant_ca.as_str()], gateway_cert, gateway_key).unwrap();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(
-        inner_client_config(&gw_material, egress_id).unwrap(),
-    ));
+    let connector =
+        tokio_rustls::TlsConnector::from(inner_client_config(&gw_material, egress_id).unwrap());
     let adapter = E2eTunnelIo::ingress(rx, tunnel.clone(), sid);
     match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
         E2eHandshakeOutcome::Established(mut tls, _) => {

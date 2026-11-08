@@ -112,6 +112,43 @@ pub fn make_pinned_verifier(hex: &str) -> Result<Arc<PinnedCertVerifier>, PinErr
     Ok(Arc::new(PinnedCertVerifier::from_hex(hex)?))
 }
 
+/// Reads a PEM cert file and returns its SHA256 fingerprint.
+///
+/// Extracts the DER of the first CERTIFICATE block — the fingerprint
+/// [`PinnedCertVerifier`] pins; the verifier and the fingerprint
+/// computation live together so the two halves of the pin can never drift.
+/// The canonical caller is same-process/loopback self-dial (the edge's
+/// internal agents pinning the control endpoint's own cert); `context`
+/// names the role in error messages.
+pub fn sha256_of_pem_cert(
+    path: &std::path::Path,
+    context: &str,
+) -> Result<String, crate::error::InterflowError> {
+    let path_display = path.display().to_string();
+    let pem_bytes = std::fs::read(path).map_err(|e| {
+        crate::error::InterflowError::config(format!(
+            "failed to read {context} cert {path_display}"
+        ))
+        .with_source(e)
+    })?;
+    let der = rustls_pemfile::certs(&mut &pem_bytes[..])
+        .next()
+        .ok_or_else(|| {
+            crate::error::InterflowError::config(format!(
+                "{context} cert {path_display} has no PEM CERTIFICATE block"
+            ))
+        })?
+        .map_err(|e| {
+            crate::error::InterflowError::config(format!(
+                "failed to parse {context} cert {path_display}"
+            ))
+            .with_source(e)
+        })?;
+    let mut hasher = Sha256::new();
+    hasher.update(der.as_ref());
+    Ok(hex::encode(hasher.finalize()))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::panic,
@@ -150,5 +187,23 @@ mod tests {
             "e3:b0:c4:42:98:fc:1c:14:9a:fb:f4:c8:99:6f:b9:24:27:ae:41:e4:64:9b:93:4c:a4:95:99:1b:78:52:b8:55",
         );
         assert!(v.is_ok());
+    }
+
+    #[test]
+    fn sha256_of_pem_cert_handles_missing_file() {
+        let result = sha256_of_pem_cert(
+            &std::path::PathBuf::from("/nonexistent/hub.crt"),
+            "control endpoint",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sha256_of_pem_cert_rejects_non_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk.pem");
+        std::fs::write(&junk, b"not a pem file").unwrap();
+        let result = sha256_of_pem_cert(&junk, "control endpoint");
+        assert!(result.is_err());
     }
 }

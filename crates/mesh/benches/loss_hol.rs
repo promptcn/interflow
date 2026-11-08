@@ -61,6 +61,7 @@ fn certs() -> &'static interflow_testkit::certs::TestCerts {
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "loss_hol",
+    version = interflow_buildinfo::VERSION_WITH_TAG,
     about = "QUIC vs h2 concurrent-stream loss comparison (SSE-style long-lived streams)"
 )]
 struct Args {

@@ -61,7 +61,10 @@ fn local_face(info: &NodeInfo) -> LocalFaceDto {
 }
 
 /// The hub's row for one agent, matched by the qualified id's agent segment
-/// (`tenant/agent` — the manifest's workspace + node).
+/// (`tenant/agent` — the manifest's workspace + node). Carries the level
+/// face's recency pair (confirmation instant + the overview's capture
+/// anchor); the silent threshold rides the overview itself
+/// (`HubOverviewDto::policy_silent_after_secs`).
 fn remote_face(
     hub: &crate::contract::HubOverviewDto,
     workspace: &str,
@@ -73,6 +76,22 @@ fn remote_face(
         .map(|row| RemoteFaceDto {
             online: row.online,
             seen_generation: row.seen,
+            policy_last_pull_unix: row.policy_last_pull_unix,
+            face_captured_at_unix: hub.captured_at_unix,
+            paused_streams: row.paused_streams.clone(),
+            maintenance: row.maintenance,
+            crl_last_success_unix: row.crl_last_success_unix,
+            crl_failures_total: row.crl_failures_total,
+            pending_ops: row.pending_ops.clone(),
+            streams_in_flight: row.streams_in_flight,
+            streams: row.streams.clone(),
+            leaf_not_before_unix: row.leaf_not_before_unix,
+            leaf_not_after_unix: row.leaf_not_after_unix,
+            credential_mode: row.credential_mode.clone(),
+            credential_last_seen_unix: row.credential_last_seen_unix,
+            connection: row.connection,
+            renewal_backoff_failures: row.renewal_backoff_failures,
+            renewal_backoff_max_today: row.renewal_backoff_max_today,
         })
 }
 
@@ -166,35 +185,48 @@ pub fn compose(
             });
             let bound_addr = listener.and_then(|l| l.bound_addr.clone());
             let last_error = listener.and_then(|l| l.last_error.clone());
-            let status = match (local, hub.as_ref()) {
-                (Some(info), maybe_hub) => {
-                    let applied = info.policy.as_ref().map(|p| p.generation);
-                    let behind = maybe_hub
-                        .and_then(|h| converged(h, applied))
-                        .is_some_and(|caught_up| !caught_up);
-                    if behind {
-                        StreamStatusDto::CatchingUp
-                    } else {
-                        match listener.map(|l| l.bound_addr.is_some()) {
-                            Some(true) => StreamStatusDto::Serving,
-                            Some(false) => StreamStatusDto::Down,
-                            // Running with no listener face (not yet
-                            // reconciled, or the node just started).
-                            None => StreamStatusDto::Unknown,
+            // Planned unavailability is its own face and outranks every
+            // other reading: the local listener face says paused, or (a
+            // remote source) the hub's reported pause set names the rule.
+            let paused_locally = listener.is_some_and(|l| l.paused);
+            let paused_remotely = hub
+                .as_ref()
+                .and_then(|h| remote_face(h, &agent.workspace, &agent.node))
+                .and_then(|r| r.paused_streams)
+                .is_some_and(|paused| paused.iter().any(|p| p == &rule.name));
+            let status = if paused_locally || paused_remotely {
+                StreamStatusDto::Paused
+            } else {
+                match (local, hub.as_ref()) {
+                    (Some(info), maybe_hub) => {
+                        let applied = info.policy.as_ref().map(|p| p.generation);
+                        let behind = maybe_hub
+                            .and_then(|h| converged(h, applied))
+                            .is_some_and(|caught_up| !caught_up);
+                        if behind {
+                            StreamStatusDto::CatchingUp
+                        } else {
+                            match listener.map(|l| l.bound_addr.is_some()) {
+                                Some(true) => StreamStatusDto::Serving,
+                                Some(false) => StreamStatusDto::Down,
+                                // Running with no listener face (not yet
+                                // reconciled, or the node just started).
+                                None => StreamStatusDto::Unknown,
+                            }
                         }
                     }
-                }
-                (None, Some(h)) => {
-                    // Remote source: only convergence is observable. A
-                    // converged remote still cannot prove its bind state —
-                    // stay honest and lean on the remote face.
-                    let row = remote_face(h, &agent.workspace, &agent.node);
-                    match row.and_then(|r| converged(h, r.seen_generation)) {
-                        Some(true) | None => StreamStatusDto::Unknown,
-                        Some(false) => StreamStatusDto::CatchingUp,
+                    (None, Some(h)) => {
+                        // Remote source: only convergence is observable. A
+                        // converged remote still cannot prove its bind state —
+                        // stay honest and lean on the remote face.
+                        let row = remote_face(h, &agent.workspace, &agent.node);
+                        match row.and_then(|r| converged(h, r.seen_generation)) {
+                            Some(true) | None => StreamStatusDto::Unknown,
+                            Some(false) => StreamStatusDto::CatchingUp,
+                        }
                     }
+                    (None, None) => StreamStatusDto::Unknown,
                 }
-                (None, None) => StreamStatusDto::Unknown,
             };
             streams.push(StreamDto {
                 agent: agent.node.clone(),
@@ -305,6 +337,7 @@ mod tests {
     fn local_node(id: &str, name: &str, extras: Extras) -> NodeInfo {
         let (policy, listeners) = extras();
         NodeInfo {
+            breakers: None,
             id: id.into(),
             kind: NodeKindDto::MeshAgent,
             name: name.into(),
@@ -325,6 +358,7 @@ mod tests {
             credential: None,
             policy,
             peers: None,
+            crl: None,
             proposals: None,
             listeners,
             deployment: None,
@@ -342,19 +376,67 @@ mod tests {
     #[test]
     fn stream_status_joins_local_listeners_and_hub_convergence() {
         let hub = HubOverviewDto {
+            route_breakers_open: vec![],
+            watchers: vec![],
+            watcher_silent_factor: 3,
+            proposals_pending: None,
+            streams_in_flight_total: None,
+            stream_limits: None,
+            fossil_idle_multiple: 10,
+            fossil_unbudgeted_days: 7,
+            headroom_warn_pct: 20,
+            offline_warn_days: 14,
+            offline_critical_days: 7,
+            registrar_warn_pct: 20,
+            registrar_critical_pct: 10,
+            crl_silent_after_secs: 200,
+            crl_last_success_unix: None,
+            crl_failures_total: None,
             hub: None,
             floor: 5,
             serving: Some(5),
+            captured_at_unix: None,
+            policy_silent_after_secs: 30,
             agents: vec![
                 HubAgentRowDto {
+                    crl_last_success_unix: None,
+                    crl_failures_total: None,
+                    pending_ops: None,
+                    streams_in_flight: None,
+                    streams: vec![],
+                    leaf_not_before_unix: None,
+                    leaf_not_after_unix: None,
+                    credential_mode: None,
+                    credential_last_seen_unix: None,
+                    connection: None,
+                    renewal_backoff_failures: None,
+                    renewal_backoff_max_today: None,
                     agent: "main/laptop".into(),
                     online: true,
                     seen: Some(5),
+                    policy_last_pull_unix: None,
+                    paused_streams: None,
+                    maintenance: false,
                 },
                 HubAgentRowDto {
+                    crl_last_success_unix: None,
+                    crl_failures_total: None,
+                    pending_ops: None,
+                    streams_in_flight: None,
+                    streams: vec![],
+                    leaf_not_before_unix: None,
+                    leaf_not_after_unix: None,
+                    credential_mode: None,
+                    credential_last_seen_unix: None,
+                    connection: None,
+                    renewal_backoff_failures: None,
+                    renewal_backoff_max_today: None,
                     agent: "main/srv".into(),
                     online: true,
                     seen: Some(4),
+                    policy_last_pull_unix: None,
+                    paused_streams: None,
+                    maintenance: false,
                 },
             ],
         };
@@ -370,6 +452,7 @@ mod tests {
                     rule: "db".into(),
                     bound_addr: Some("127.0.0.1:15432".into()),
                     last_error: None,
+                    paused: false,
                 }]),
             )
         })];
@@ -401,15 +484,112 @@ mod tests {
         assert_eq!(row.remote.as_ref().unwrap().seen_generation, Some(5));
     }
 
+    /// Planned unavailability outranks every other reading: the local
+    /// listener face says paused, or a remote source's hub-reported pause
+    /// set names the rule — either way the row reads Paused (yellow),
+    /// never Down/CatchingUp.
+    #[test]
+    fn paused_reads_as_its_own_status_locally_and_remotely() {
+        let hub = HubOverviewDto {
+            route_breakers_open: vec![],
+            watchers: vec![],
+            watcher_silent_factor: 3,
+            proposals_pending: None,
+            streams_in_flight_total: None,
+            stream_limits: None,
+            fossil_idle_multiple: 10,
+            fossil_unbudgeted_days: 7,
+            headroom_warn_pct: 20,
+            offline_warn_days: 14,
+            offline_critical_days: 7,
+            registrar_warn_pct: 20,
+            registrar_critical_pct: 10,
+            crl_silent_after_secs: 200,
+            crl_last_success_unix: None,
+            crl_failures_total: None,
+            hub: None,
+            floor: 5,
+            serving: Some(5),
+            captured_at_unix: None,
+            policy_silent_after_secs: 30,
+            agents: vec![HubAgentRowDto {
+                crl_last_success_unix: None,
+                crl_failures_total: None,
+                pending_ops: None,
+                streams_in_flight: None,
+                streams: vec![],
+                agent: "main/srv".into(),
+                online: true,
+                seen: Some(5),
+                policy_last_pull_unix: None,
+                paused_streams: Some(vec!["db".into()]),
+                maintenance: false,
+                leaf_not_before_unix: None,
+                leaf_not_after_unix: None,
+                credential_mode: None,
+                credential_last_seen_unix: None,
+                connection: None,
+                renewal_backoff_failures: None,
+                renewal_backoff_max_today: None,
+            }],
+        };
+        let nodes = vec![local_node("id-laptop", "laptop", || {
+            (
+                Some(PolicyPlaneDto {
+                    generation: 5,
+                    source: crate::contract::PolicySourceDto::Pack,
+                    hub_generation: Some(5),
+                    pull: None,
+                }),
+                Some(vec![ListenerStatusDto {
+                    rule: "db".into(),
+                    bound_addr: None,
+                    last_error: None,
+                    paused: true,
+                }]),
+            )
+        })];
+        let fleet = compose(
+            summary(),
+            ChangeStateDto::Applied { generation: 5 },
+            Some(hub),
+            nodes,
+        );
+        let laptop = fleet.streams.iter().find(|s| s.agent == "laptop").unwrap();
+        assert_eq!(laptop.status, StreamStatusDto::Paused);
+        assert_eq!(laptop.bound_addr, None, "no listener is up — by intent");
+        // srv's stream is remote but hub-reported paused: also Paused.
+        let srv = fleet.streams.iter().find(|s| s.agent == "srv").unwrap();
+        assert_eq!(srv.status, StreamStatusDto::Paused);
+    }
+
     /// A local agent serving an OLD policy (applied 4 < hub 5) is
     /// CatchingUp even though its listener is bound — the row must not say
     /// "serving" while the current generation has not landed.
     #[test]
     fn behind_policy_downgrades_to_catching_up() {
         let hub = HubOverviewDto {
+            route_breakers_open: vec![],
+            watchers: vec![],
+            watcher_silent_factor: 3,
+            proposals_pending: None,
+            streams_in_flight_total: None,
+            stream_limits: None,
+            fossil_idle_multiple: 10,
+            fossil_unbudgeted_days: 7,
+            headroom_warn_pct: 20,
+            offline_warn_days: 14,
+            offline_critical_days: 7,
+            registrar_warn_pct: 20,
+            registrar_critical_pct: 10,
+            crl_silent_after_secs: 200,
+            crl_last_success_unix: None,
+            crl_failures_total: None,
             hub: None,
             floor: 5,
             serving: Some(5),
+            captured_at_unix: None,
+            policy_silent_after_secs: 30,
             agents: vec![],
         };
         let nodes = vec![local_node("id-a", "laptop", || {
@@ -424,6 +604,7 @@ mod tests {
                     rule: "db".into(),
                     bound_addr: Some("127.0.0.1:15432".into()),
                     last_error: None,
+                    paused: false,
                 }]),
             )
         })];
@@ -467,6 +648,7 @@ mod tests {
                     rule: "db".into(),
                     bound_addr: None,
                     last_error: Some("bind 127.0.0.1:15432: address in use".into()),
+                    paused: false,
                 }]),
             )
         })];

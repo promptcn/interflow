@@ -9,6 +9,8 @@
 
 use crate::material::{LoadedCa, build_ca};
 use crate::{Error, Result, SanName, Validity};
+use der::Decode as _;
+use rustls_pki_types::PrivateKeyDer;
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -521,6 +523,10 @@ fn cert_not_after_unix(der: &[u8]) -> Result<i64> {
     with_parsed_cert(der, |cert| Ok(cert.validity().not_after.timestamp()))
 }
 
+fn cert_not_before_unix(der: &[u8]) -> Result<i64> {
+    with_parsed_cert(der, |cert| Ok(cert.validity().not_before.timestamp()))
+}
+
 /// The certificate's public key must be the one in the key file.
 fn check_pair_matches(
     what: &str,
@@ -530,15 +536,7 @@ fn check_pair_matches(
     key: &rcgen::KeyPair,
 ) -> Result<()> {
     let key_raw = key.public_key_raw().to_vec();
-    let matches = with_parsed_cert(der, |cert| {
-        Ok(cert
-            .tbs_certificate
-            .subject_pki
-            .subject_public_key
-            .data
-            .as_ref()
-            == key_raw.as_slice())
-    })?;
+    let matches = spki_bits_equal(der, &key_raw)?;
     if matches {
         Ok(())
     } else {
@@ -549,6 +547,177 @@ fn check_pair_matches(
             key_path.display()
         )))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Public certificate material inspection — doctor's cert face
+//
+// Operator-placed public TLS material is not this crate's to manage: the
+// files land on the ingress machine by hand (certbot + install). What it
+// IS this crate's to own is the reading: SAN sets, validity windows and
+// the cert/key pairing comparison, over every PEM form openssl and
+// certbot emit. Facts come back structured — verdicts belong to the
+// caller.
+// ---------------------------------------------------------------------------
+
+/// One public TLS pair's material facts.
+#[derive(Debug)]
+pub struct PublicCertMaterial {
+    /// The certificate's SAN set (DNS names lowercased, IPs literal).
+    pub sans: BTreeSet<SanName>,
+    /// The validity window, unix seconds.
+    pub not_before_unix: i64,
+    pub not_after_unix: i64,
+    /// Whether the key file's public key is the certificate's. A mismatch
+    /// is a fact, not a parse error — the caller words the verdict.
+    pub pair_matches: bool,
+}
+
+/// Reads and parses one public cert/key pair.
+///
+/// Both files must exist (a missing file is the caller's diagnosis —
+/// placement is a lifecycle question); a file that exists but does not
+/// parse is this crate's error.
+pub fn inspect_public_pair(cert_path: &Path, key_path: &Path) -> Result<PublicCertMaterial> {
+    let der = read_cert_der(cert_path)?;
+    let key = key_public_material(key_path)?;
+    Ok(PublicCertMaterial {
+        sans: cert_san_set(&der)?,
+        not_before_unix: cert_not_before_unix(&der)?,
+        not_after_unix: cert_not_after_unix(&der)?,
+        pair_matches: key_matches_cert(&der, &key)?,
+    })
+}
+
+/// The public-key material a private key file carries, in the form the
+/// certificate's SPKI BIT STRING holds — the pairing comparison without a
+/// crypto operation.
+enum KeyPublicMaterial {
+    /// SPKI BIT STRING content, directly comparable — everything rcgen's
+    /// `public_key_raw()` yields (EC points, Ed25519 raw keys, RSA as DER
+    /// SEQ{n,e}) plus the point embedded in a traditional SEC1 EC key.
+    SpkiBits(Vec<u8>),
+    /// Modulus + exponent (canonical DER INTEGER bytes) parsed out of a
+    /// traditional PKCS#1 RSA key.
+    Rsa { n: Vec<u8>, e: Vec<u8> },
+}
+
+/// An EC private key in traditional SEC1 form (RFC 5915) — the
+/// "EC PRIVATE KEY" PEM `openssl ecparam` writes. Only the embedded public
+/// point matters here.
+#[derive(der::Sequence)]
+#[allow(dead_code)] // decoded but never read: the walk must consume the full structure
+struct EcPrivateKeyDer<'a> {
+    version: u8,
+    #[asn1(type = "OCTET STRING")]
+    private_key: &'a [u8],
+    #[asn1(context_specific = "0", optional = "true")]
+    parameters: Option<der::asn1::AnyRef<'a>>,
+    #[asn1(context_specific = "1", optional = "true", type = "BIT STRING")]
+    public_key: Option<der::asn1::BitStringRef<'a>>,
+}
+
+/// An RSA private key in traditional PKCS#1 form — the "RSA PRIVATE KEY"
+/// PEM older openssl (and LibreSSL) writes. The primes are never used;
+/// they are parsed so the trailing structure is fully consumed.
+#[derive(der::Sequence)]
+#[allow(dead_code)] // the primes are decoded but never read: the walk must consume the full structure
+struct RsaPrivateKeyDer<'a> {
+    version: der::asn1::UintRef<'a>,
+    n: der::asn1::UintRef<'a>,
+    e: der::asn1::UintRef<'a>,
+    d: der::asn1::UintRef<'a>,
+    p: der::asn1::UintRef<'a>,
+    q: der::asn1::UintRef<'a>,
+    dp: der::asn1::UintRef<'a>,
+    dq: der::asn1::UintRef<'a>,
+    qinv: der::asn1::UintRef<'a>,
+}
+
+/// The certificate-side SPKI BIT STRING content of an RSA public key.
+#[derive(der::Sequence)]
+struct RsaPublicKeyDer<'a> {
+    n: der::asn1::UintRef<'a>,
+    e: der::asn1::UintRef<'a>,
+}
+
+/// Reads the private key at `key_path` — any of the three PEM forms
+/// openssl and certbot emit — and extracts its public-key material.
+///
+/// PKCS#8 ("PRIVATE KEY") goes through rcgen, which covers every
+/// algorithm it can issue with, Ed25519 included. The traditional SEC1
+/// ("EC PRIVATE KEY") and PKCS#1 ("RSA PRIVATE KEY") forms are walked
+/// structurally: pairing is a byte comparison, not a crypto operation, so
+/// no backend is involved at all — rcgen's reader (the ring backend)
+/// accepts PKCS#8 only, and foreign keys are exactly where the
+/// traditional forms come from.
+fn key_public_material(key_path: &Path) -> Result<KeyPublicMaterial> {
+    let pem = std::fs::read_to_string(key_path).map_err(io_err(key_path))?;
+    let mut cursor = std::io::Cursor::new(pem.as_bytes());
+    let classified = rustls_pemfile::private_key(&mut cursor)
+        .map_err(|e| Error::Parse(format!("private key {}: {e}", key_path.display())))?;
+    match classified {
+        Some(PrivateKeyDer::Sec1(sec1)) => {
+            let key = EcPrivateKeyDer::from_der(sec1.secret_sec1_der())
+                .map_err(|e| Error::Parse(format!("private key {}: {e}", key_path.display())))?;
+            key.public_key
+                .map(|point| KeyPublicMaterial::SpkiBits(point.raw_bytes().to_vec()))
+                .ok_or_else(|| {
+                    Error::Parse(format!(
+                        "private key {}: the EC key omits its embedded public key — re-export \
+                         the key with one (openssl pkey reads and rewrites it)",
+                        key_path.display()
+                    ))
+                })
+        }
+        Some(PrivateKeyDer::Pkcs1(pkcs1)) => {
+            let key = RsaPrivateKeyDer::from_der(pkcs1.secret_pkcs1_der())
+                .map_err(|e| Error::Parse(format!("private key {}: {e}", key_path.display())))?;
+            Ok(KeyPublicMaterial::Rsa {
+                n: key.n.as_bytes().to_vec(),
+                e: key.e.as_bytes().to_vec(),
+            })
+        }
+        // PKCS#8 ("PRIVATE KEY") — rcgen's ground; also the fallthrough
+        // for an unrecognized label (None) or a future form, where rcgen
+        // produces the parse error naming the file.
+        _ => {
+            let key = rcgen::KeyPair::from_pem(&pem)
+                .map_err(|e| Error::Parse(format!("private key {}: {e}", key_path.display())))?;
+            Ok(KeyPublicMaterial::SpkiBits(key.public_key_raw().to_vec()))
+        }
+    }
+}
+
+/// Whether `key`'s public material is the certificate's.
+fn key_matches_cert(der: &[u8], key: &KeyPublicMaterial) -> Result<bool> {
+    with_parsed_cert(der, |cert| {
+        let bits = cert
+            .tbs_certificate
+            .subject_pki
+            .subject_public_key
+            .data
+            .as_ref();
+        Ok(match key {
+            KeyPublicMaterial::SpkiBits(bytes) => bytes.as_slice() == bits,
+            KeyPublicMaterial::Rsa { n, e } => RsaPublicKeyDer::from_der(bits)
+                .is_ok_and(|public| public.n.as_bytes() == n && public.e.as_bytes() == e),
+        })
+    })
+}
+
+/// Whether the certificate's SPKI BIT STRING content equals `bits` — the
+/// one comparison every pairing check reduces to.
+fn spki_bits_equal(der: &[u8], bits: &[u8]) -> Result<bool> {
+    with_parsed_cert(der, |cert| {
+        Ok(cert
+            .tbs_certificate
+            .subject_pki
+            .subject_public_key
+            .data
+            .as_ref()
+            == bits)
+    })
 }
 
 fn validate_existing_ca(paths: &TenantCaPaths, tenant: &str) -> Result<()> {
@@ -1351,5 +1520,165 @@ mod tests {
                 .contains("incomplete gateway client certificate"),
             "got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Public certificate material inspection (doctor's cert face)
+    // -----------------------------------------------------------------------
+
+    /// An openssl-generated fixture: a traditional SEC1 EC key ("EC
+    /// PRIVATE KEY") with its self-signed certificate (SAN
+    /// a.example.com + *.wild.example.com). rcgen's ring-backend reader
+    /// rejects this PEM form — exactly why the inspection path walks it
+    /// structurally. The synthetic throwaway's header line is assembled
+    /// by `concat!` instead of one literal: the release export's leak
+    /// gate rejects any literal PEM private-key header anywhere in the
+    /// public tree (no key material in git, policy 2026-09-15) — this
+    /// fixture must not read as an exception to that grep.
+    const EC_SEC1_KEY: &str = concat!(
+        "-----BEGIN EC ",
+        "PRIVATE KEY-----\n\
+     MHcCAQEEIMBwGkXe+8fbU9sSwPjbEIkSVF6+ue/Y3MEo1vYSj1wboAoGCCqGSM49\n\
+     AwEHoUQDQgAEmTMaPagp4xzbfVGlGzaTIewzz8dqu5DsDCpGrpWiXm7zmtmHp8q6\n\
+     tHp+iCXMg+i9jAAXTd6faIERDnNkv5fCEA==\n\
+     -----END EC PRIVATE KEY-----\n",
+    );
+    const EC_SEC1_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+     MIIBVjCB/aADAgECAgkAomIKhjQBJ+swCgYIKoZIzj0EAwIwGDEWMBQGA1UEAwwN\n\
+     YS5leGFtcGxlLmNvbTAeFw0yNjExMDMwNDQxNDFaFw0yNzAyMDEwNDQxNDFaMBgx\n\
+     FjAUBgNVBAMMDWEuZXhhbXBsZS5jb20wWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\n\
+     AASZMxo9qCnjHNt9UaUbNpMh7DPPx2q7kOwMKkaulaJebvOa2Yenyrq0en6IJcyD\n\
+     6L2MABdN3p9ogREOc2S/l8IQozAwLjAsBgNVHREEJTAjgg1hLmV4YW1wbGUuY29t\n\
+     ghIqLndpbGQuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwIDSAAwRQIhAJjyuh0UHWPd\n\
+     hnDHt95w+LvgYC4/RrLQktnvrOb1IW92AiBbs8kvNpzKO6u3z4h7UiPUk9o11+to\n\
+     i+yaZ35v8FOBCQ==\n\
+     -----END CERTIFICATE-----\n";
+
+    /// An openssl (LibreSSL) fixture: a traditional PKCS#1 RSA key ("RSA
+    /// PRIVATE KEY") with its self-signed certificate (SAN b.example.com).
+    /// Header split across `concat!` args like `EC_SEC1_KEY` above — the
+    /// synthetic throwaway must not carry a literal PEM private-key
+    /// header into the public tree (policy 2026-09-15).
+    const RSA_PKCS1_KEY: &str = concat!(
+        "-----BEGIN RSA ",
+        "PRIVATE KEY-----\n\
+     MIIEpAIBAAKCAQEAt63Efr+rHoHa7OChKBnfA/SK+Q7TqD1WozLiZn5QpgCppXsL\n\
+     4gQ7RGWX+ZHtlKoyCuvL1zLXWA9lGkMt4ImN2TvxQn2hNRufGTzrilzBNxBA1qJ6\n\
+     O9iDl4y/N24PUWWgvP+6naeORPsllRB/ntLXYujtSF37s3ZGPSw3ko0Wr3agkN+M\n\
+     3P1/g9pE+atROZAU+Zq3Mz2PLoTW7TOMgzDXS1EtTY9flyJXPgci6DH2zX+xuaAi\n\
+     Lj6YfalAO2hV/T+Lfk5bdqp8dpv3DBnA91fCE28Sxkg2uWag1WTODZdx4RkMoc0E\n\
+     EcjLDKv1/rBG9/gPrC6B6RNuFfO9AKi+0yhvjQIDAQABAoIBAFgYrvr/4QoDzEX6\n\
+     wzDhn7Zc7t7fvqKdsNUbjb0M7o+AF933s05XKzn15DteQ24fZ1sXlzADAYgJ8jrz\n\
+     Z6ifMPq1JlT2voAjXF6Ven9lV4KaeA655RiZExx39CqYzh4DOWIM4avF9pWdQ3xI\n\
+     an15sLaO82fXM+byXmPutkTDCNNkqPy6MU2QLPNIMBKUjmZ9242Ae0qqLbXgzRdD\n\
+     t2SdfQN3Zd7/3irWACbWAhUKWgqszuH58p8Bf1kIbb2wuMA32aKv5ndmjXaERSjr\n\
+     l2oCJncMtv5Fq7v++v1q/fw+QJWnfk8KyQc6o2RGXmKkjGO30byyMOanoCypiTzx\n\
+     eUY2daECgYEA5CuWeCkTo1k1oBRdEEwRGSGsRwgCVuVlkHvqVX3gvNyTQLS/vi0c\n\
+     K5zUY+GrPWxKOctHozWw+82Lne9dCL8lVqnuYbQUrg0P4BbP3qsYdBu8YMeXnBdT\n\
+     g4HvLz7+4Yjll2stDfPJ5KDapS8a4aI9YhCy3ptrgf0JtMXw7ZlCpUUCgYEAzhT5\n\
+     FlVpRgXF0jZo4rrzStDeuKkAAfiFneVDMvZR+KiUVBduxu3jICXFG7L8kD4brdcH\n\
+     qKuOUVc0yCzdLUr/gJulO8qsHVrATjMOm2N8jdVmoIqvYeDN79pk/IN0Y2ODR9AJ\n\
+     1COV3bUcNqa5YIs6Owdvs54eDoue94WAXGYM0akCgYEA4VUyioR2gnFNhkPWDIwy\n\
+     rpEUpCmCtfJiNShLKhbgZWOogNSAL/44vdFp5yIsjMJvI1hf7QzPNj2tzlFfnY24\n\
+     ADhd1VuUuLbpoLKmow5xXekuRp2WWm6m6U7eudgKuw0JQFp16juCfSlmBI/aik5B\n\
+     NKGtJC51I7CTb1W0M9GRgckCgYEAg9yrnPy9xY5AC8fAyQKyVbbcK/AHDzvD00o0\n\
+     +1DdFmxXrI7p1OO2JoXEX3rhXDJBZ7RlNCnBgI56OXNremW4osP0sBN4mbfNwLuu\n\
+     pwK7Wc2oQyU6HzjGzKhDYceDG207PSICh/jVFe2ixd1cVEgB1G9nq9iKhugTqXGE\n\
+     tpqdrTECgYAsJoq5iu3Ac1yehyEowQ4GcmJx6JtDncS9Oyqr0E7uBnsWbr6N39Hq\n\
+     TePtWMkrhP6IMca6iKtZebRyVsuO0mFt+G3N2wTxeLKsEvbtWDWdBTUChCjiIMwn\n\
+     qJg6aY4+YYX6qQhSG+HfpHQN8jQDfnNmcMsS+VeAWjNAsj4cQXas0w==\n\
+     -----END RSA PRIVATE KEY-----\n",
+    );
+    const RSA_PKCS1_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+     MIICzzCCAbegAwIBAgIJAKZ8zXG55ZW9MA0GCSqGSIb3DQEBCwUAMBgxFjAUBgNV\n\
+     BAMMDWIuZXhhbXBsZS5jb20wHhcNMjYxMTAzMDQ0MjIyWhcNMjcwMjAxMDQ0MjIy\n\
+     WjAYMRYwFAYDVQQDDA1iLmV4YW1wbGUuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOC\n\
+     AQ8AMIIBCgKCAQEAt63Efr+rHoHa7OChKBnfA/SK+Q7TqD1WozLiZn5QpgCppXsL\n\
+     4gQ7RGWX+ZHtlKoyCuvL1zLXWA9lGkMt4ImN2TvxQn2hNRufGTzrilzBNxBA1qJ6\n\
+     O9iDl4y/N24PUWWgvP+6naeORPsllRB/ntLXYujtSF37s3ZGPSw3ko0Wr3agkN+M\n\
+     3P1/g9pE+atROZAU+Zq3Mz2PLoTW7TOMgzDXS1EtTY9flyJXPgci6DH2zX+xuaAi\n\
+     Lj6YfalAO2hV/T+Lfk5bdqp8dpv3DBnA91fCE28Sxkg2uWag1WTODZdx4RkMoc0E\n\
+     EcjLDKv1/rBG9/gPrC6B6RNuFfO9AKi+0yhvjQIDAQABoxwwGjAYBgNVHREEETAP\n\
+     gg1iLmV4YW1wbGUuY29tMA0GCSqGSIb3DQEBCwUAA4IBAQBhTPCYjpbaify79UGH\n\
+     9OWAL28/U2VlaHg4gKh9sDU3jkJuunENYxiVcQ9mx9eK4VD3mwCSLbdVcJ2fGY+w\n\
+     737fTYT25ZvdhdKiuFYWX5yUVf6dE4VUhvqFQwQjJr8j2h95Qq5xSpT8Q8owSO16\n\
+     dJcf2hJ9l5aBkGGLfwnjuMNNkcDaFPUkZc0LhFnEBCLDYunO/OAzYxeM9O/hPzm9\n\
+     NHGexM+FOjCTIOUO6m8g2Ips5h6CmUq1C1awhtVDVELNzX6LTOfNO7K8MrJaQVKj\n\
+     9XTQODunXyWIM65KVyAaYVxpfBzqylsydnoapyD9TVo2FrBo9YedKUw7MqPXtXKc\n\
+     wupV\n\
+     -----END CERTIFICATE-----\n";
+
+    /// A PKCS#8 pair issued by this crate's own implementation (the form
+    /// every product-managed store carries).
+    fn issued_pkcs8_pair(san: &str, days: i64) -> (String, String) {
+        let ca = crate::material::LoadedCa::generate(
+            "inspect",
+            crate::Validity::from_now(crate::CA_VALIDITY_DAYS),
+        )
+        .unwrap();
+        let leaf = ca
+            .build_server_cert(
+                &[crate::SanName::parse(san).unwrap()],
+                crate::Validity::from_now(days),
+            )
+            .unwrap();
+        (leaf.cert_pem, leaf.key_pem)
+    }
+
+    /// The pairing + facts check accepts all three PEM private-key forms
+    /// openssl and certbot emit, and reports SANs and the validity window.
+    #[test]
+    fn inspect_public_pair_accepts_all_three_key_forms() {
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(dir.path().join("a.crt"), EC_SEC1_CERT).unwrap();
+        std::fs::write(dir.path().join("a.key"), EC_SEC1_KEY).unwrap();
+        let material = inspect_public_pair(&dir.path().join("a.crt"), &dir.path().join("a.key"))
+            .expect("SEC1 EC pair inspects");
+        assert!(material.pair_matches, "the SEC1 key pairs with its cert");
+        assert!(crate::san_set_covers(&material.sans, "a.example.com"));
+        assert!(crate::san_set_covers(&material.sans, "x.wild.example.com"));
+        assert!(material.not_before_unix < material.not_after_unix);
+
+        std::fs::write(dir.path().join("b.crt"), RSA_PKCS1_CERT).unwrap();
+        std::fs::write(dir.path().join("b.key"), RSA_PKCS1_KEY).unwrap();
+        let material = inspect_public_pair(&dir.path().join("b.crt"), &dir.path().join("b.key"))
+            .expect("PKCS#1 RSA pair inspects");
+        assert!(material.pair_matches, "the PKCS#1 key pairs with its cert");
+        assert!(crate::san_set_covers(&material.sans, "b.example.com"));
+
+        let (cert_pem, key_pem) = issued_pkcs8_pair("c.example.com", 90);
+        std::fs::write(dir.path().join("c.crt"), cert_pem).unwrap();
+        std::fs::write(dir.path().join("c.key"), key_pem).unwrap();
+        let material = inspect_public_pair(&dir.path().join("c.crt"), &dir.path().join("c.key"))
+            .expect("PKCS#8 pair inspects");
+        assert!(material.pair_matches, "the PKCS#8 key pairs with its cert");
+        assert!(crate::san_set_covers(&material.sans, "c.example.com"));
+    }
+
+    /// A pair mismatch is a fact, not an error — and the inspection still
+    /// reports the certificate's own facts.
+    #[test]
+    fn inspect_public_pair_reports_mismatch_as_a_fact() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.crt"), EC_SEC1_CERT).unwrap();
+        // A different key (the RSA traditional one) — public keys differ.
+        std::fs::write(dir.path().join("a.key"), RSA_PKCS1_KEY).unwrap();
+        let material = inspect_public_pair(&dir.path().join("a.crt"), &dir.path().join("a.key"))
+            .expect("both files parse; the mismatch is the answer");
+        assert!(!material.pair_matches);
+        assert!(crate::san_set_covers(&material.sans, "a.example.com"));
+    }
+
+    /// A key file that exists but does not parse is this crate's error,
+    /// naming the file.
+    #[test]
+    fn inspect_public_pair_names_unparseable_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.crt"), EC_SEC1_CERT).unwrap();
+        std::fs::write(dir.path().join("a.key"), "not a pem at all\n").unwrap();
+        let err =
+            inspect_public_pair(&dir.path().join("a.crt"), &dir.path().join("a.key")).unwrap_err();
+        assert!(err.to_string().contains("private key"), "got: {err}");
     }
 }

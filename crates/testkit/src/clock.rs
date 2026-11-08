@@ -11,6 +11,24 @@
 //! Wakeups are deadline-driven: `advance` wakes every parked sleep whose
 //! deadline came due, including intermediate ones (advancing one hour past
 //! ten stacked 60s sleeps fires all ten).
+//!
+//! Two fault axes ride on top of the lockstep model
+//!:
+//!
+//! - **Skew** — [`FakeClock::at_real_now_skewed`] starts the wall reading
+//!   a fixed offset away from real time. Credentials are issued against
+//!   the registrar's (real) clock, so the scheduler under test then reads
+//!   expiry math through a host clock that runs ahead of or behind its
+//!   issuer — the two-ends-disagree shape every wall-anchored decision
+//!   must be judged under.
+//! - **Wall jumps vs. monotonic time** — [`FakeClock::step_wall`] moves the
+//!   wall alone (an NTP step; parked sleeps are keyed on the monotonic
+//!   reading, so nothing wakes) and [`FakeClock::advance_monotonic_only`]
+//!   moves the monotonic reading alone. Together they let a test ask which
+//!   axis an arbitration follows: the `Clock` contract pins threshold /
+//!   warning / expiry math to the wall and the CRL freshness bound to the
+//!   monotonic clock, and that assignment is now assertable rather than
+//!   documented.
 
 use interflow_renewal::Clock;
 use std::future::Future;
@@ -60,6 +78,16 @@ impl FakeClock {
         Self::new(OffsetDateTime::now_utc())
     }
 
+    /// A fake clock whose wall reading starts `skew` away from the real
+    /// current time: the view of a host whose clock runs ahead of
+    /// (positive) or behind (negative) the registrar that issued the
+    /// credentials under test. Expiry math on this clock disagrees with the
+    /// issuer by exactly `skew` — the fault the skew cases are about.
+    #[must_use]
+    pub fn at_real_now_skewed(skew: time::Duration) -> Self {
+        Self::new(OffsetDateTime::now_utc() + skew)
+    }
+
     /// The current fake wall reading.
     #[must_use]
     pub fn now(&self) -> OffsetDateTime {
@@ -69,10 +97,37 @@ impl FakeClock {
     /// Advances fake time (wall and monotonic together) by `by`, waking
     /// every parked sleep whose deadline came due.
     pub fn advance(&self, by: std::time::Duration) {
+        self.step(
+            time::Duration::try_from(by).unwrap_or(time::Duration::MAX),
+            by,
+        );
+    }
+
+    /// Steps the wall reading alone by `by` (signed: a forward or backward
+    /// NTP-style correction) while the monotonic reading stands still.
+    /// Parked sleeps are deadline-keyed on the monotonic reading, so none
+    /// wake — exactly the behavior of a real monotonic clock through a
+    /// wall step. Wall-anchored decisions see the jump on their next pass;
+    /// monotonic-anchored ones must not.
+    pub fn step_wall(&self, by: time::Duration) {
+        self.step(by, Duration::ZERO);
+    }
+
+    /// Advances the monotonic reading alone by `by` (waking due sleeps)
+    /// while the wall reading stands still — the complement of
+    /// [`Self::step_wall`]: a monotonic-anchored bound crosses, a
+    /// wall-anchored threshold does not.
+    pub fn advance_monotonic_only(&self, by: Duration) {
+        self.step(time::Duration::ZERO, by);
+    }
+
+    /// The one mutation path: moves each axis by its own amount, then
+    /// wakes every parked sleep whose (monotonic) deadline came due.
+    fn step(&self, wall: time::Duration, monotonic: Duration) {
         let due: Vec<Waker> = {
             let mut state = self.state.lock().expect("fake clock lock poisoned");
-            state.monotonic += by;
-            state.wall += time::Duration::try_from(by).unwrap_or(time::Duration::MAX);
+            state.monotonic += monotonic;
+            state.wall += wall;
             let now = state.monotonic;
             let mut still_parked = Vec::with_capacity(state.parked.len());
             let mut due = Vec::new();
@@ -226,6 +281,71 @@ mod tests {
             assert!(sleep.as_mut().poll(&mut cx).is_ready());
         }
         assert_eq!(clock.sleep_requests().len(), 10);
+    }
+
+    /// A wall step (either direction) moves only the wall: the monotonic
+    /// reading holds and no parked sleep wakes — the monotonic axis is
+    /// blind to NTP corrections by construction.
+    #[test]
+    fn wall_step_moves_the_wall_alone_and_wakes_nothing() {
+        let clock = FakeClock::new(OffsetDateTime::UNIX_EPOCH);
+        let mut sleep = std::pin::pin!(clock.sleep(Duration::from_secs(60)));
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        assert!(sleep.as_mut().poll(&mut cx).is_pending());
+
+        clock.step_wall(time::Duration::hours(2));
+        assert_eq!(
+            clock.now(),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2)
+        );
+        assert_eq!(clock.monotonic(), Duration::ZERO, "monotonic holds");
+        assert!(sleep.as_mut().poll(&mut cx).is_pending(), "no wake");
+
+        clock.step_wall(-time::Duration::hours(3));
+        assert_eq!(
+            clock.now(),
+            OffsetDateTime::UNIX_EPOCH - time::Duration::hours(1),
+            "a backward step is a legal wall correction"
+        );
+        assert_eq!(clock.monotonic(), Duration::ZERO);
+        assert!(sleep.as_mut().poll(&mut cx).is_pending());
+    }
+
+    /// A monotonic-only advance wakes due sleeps while the wall holds —
+    /// the complement: wall-anchored math sees nothing, deadlines fire.
+    #[test]
+    fn monotonic_only_advance_wakes_sleeps_and_holds_the_wall() {
+        let clock = FakeClock::new(OffsetDateTime::UNIX_EPOCH);
+        let mut sleep = std::pin::pin!(clock.sleep(Duration::from_secs(60)));
+        let waker = Waker::from(Arc::new(NoopWaker));
+        let mut cx = Context::from_waker(&waker);
+        assert!(sleep.as_mut().poll(&mut cx).is_pending());
+
+        clock.advance_monotonic_only(Duration::from_secs(60));
+        assert!(sleep.as_mut().poll(&mut cx).is_ready());
+        assert_eq!(clock.monotonic(), Duration::from_secs(60));
+        assert_eq!(clock.now(), OffsetDateTime::UNIX_EPOCH, "wall holds");
+    }
+
+    /// The skewed constructor offsets the wall from real time by exactly
+    /// the requested amount, either direction.
+    #[test]
+    fn skewed_constructor_offsets_the_wall_from_real_time() {
+        let behind = FakeClock::at_real_now_skewed(-time::Duration::minutes(30));
+        let real = OffsetDateTime::now_utc();
+        let gap = real - behind.now();
+        assert!(
+            gap >= time::Duration::minutes(30) && gap < time::Duration::minutes(31),
+            "behind by ~30m: {gap}"
+        );
+        let ahead = FakeClock::at_real_now_skewed(time::Duration::hours(2));
+        let gap = ahead.now() - OffsetDateTime::now_utc();
+        assert!(
+            gap > time::Duration::minutes(119) && gap <= time::Duration::hours(2),
+            "ahead by ~2h: {gap}"
+        );
+        assert_eq!(behind.monotonic(), Duration::ZERO, "skew is wall-only");
     }
 
     struct NoopWaker;

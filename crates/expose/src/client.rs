@@ -112,6 +112,13 @@ pub struct ExposeArgs {
     /// deliberately does not depend on the identity crate, so the pack
     /// loader fills this from `pack.metadata.identity_mode`).
     pub identity_offline: bool,
+    /// The renewal loop's CRL-poll liveness face, when this node runs one
+    /// beside the client (the pack paths hand the SAME `Arc` to the
+    /// scheduler spawn — one face, one truth). `None` keeps the reporter
+    /// off: in-memory embedders and offline-identity nodes (nothing
+    /// polls, so nothing reports; a hub-side silent row must always mean
+    /// a hung poller, never "offline by design").
+    pub renewal_face: Option<std::sync::Arc<interflow_renewal::CrlPollFace>>,
 }
 
 impl ExposeArgs {
@@ -168,8 +175,9 @@ fn raise_nofile_limit(node: &str) {
     }
 }
 
+/// No rlimit face off unix: a constant no-op (the unix variant does I/O).
 #[cfg(not(unix))]
-fn raise_nofile_limit(_node: &str) {}
+const fn raise_nofile_limit(_node: &str) {}
 
 /// Assemble an in-memory AgentConfig and start the agent supervisor, returning the
 /// handle immediately.
@@ -205,7 +213,7 @@ pub fn start(args: &ExposeArgs) -> Result<AgentHandle, interflow_core::error::In
         },
         args.agent_id
     );
-    Ok(AgentClient::new(cfg)?.start())
+    Ok(AgentClient::with_renewal_face(cfg, args.renewal_face.clone())?.start())
 }
 
 fn build_config(args: &ExposeArgs) -> Result<AgentConfig, interflow_core::error::InterflowError> {
@@ -364,6 +372,7 @@ mod tests {
             transport,
             hub_quic_addr: hub_quic_addr.map(str::to_string),
             identity_offline: false,
+            renewal_face: None,
         }
     }
 

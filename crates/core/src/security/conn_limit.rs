@@ -1,8 +1,10 @@
-//! Hub connection-level limiting: per-IP cap + global cap.
+//! Hub connection-level limiting: per-client cap + global cap.
 //!
-//! Unlike [`crate::hub::rate_limit`] (per-IP request rate, against brute-force
-//! token enumeration), this is connection-level: preventing a single IP from
-//! overwhelming the hub and global resource exhaustion.
+//! Unlike [`crate::security::rate_limit`] (per-client request rate, against
+//! brute-force token enumeration), this is connection-level: preventing a
+//! single client from overwhelming the hub and global resource exhaustion.
+//! One client is one [`ClientKey`] — an IPv4 address (IPv4-mapped spellings
+//! folded), an IPv6 /64.
 //!
 //! Uses [`ConnGuard`]'s RAII: when a cap is exceeded,
 //! [`ConnTracker::try_acquire`] returns `None` and the caller should
@@ -15,12 +17,14 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::client_key::ClientKey;
+
 /// Connection counter (shared, clone-friendly — no inner Arc because the
 /// fields are already atomics/locks).
 pub struct ConnTracker {
-    inner: Mutex<HashMap<IpAddr, usize>>,
+    inner: Mutex<HashMap<ClientKey, usize>>,
     total: AtomicUsize,
-    /// Per-IP cap; 0 means unlimited.
+    /// Per-client cap; 0 means unlimited.
     per_ip_limit: usize,
     /// Global cap; 0 means unlimited.
     total_limit: usize,
@@ -44,6 +48,7 @@ impl ConnTracker {
     /// on failure.
     #[allow(clippy::significant_drop_tightening)]
     pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<ConnGuard> {
+        let key = ClientKey::from(ip);
         // 1. Unconditionally increment the global count (total() is also the
         //    metrics gauge and shutdown-drain basis; it must reflect the real
         //    connection count even when no cap is configured)
@@ -63,7 +68,7 @@ impl ConnTracker {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entry = map.entry(ip).or_insert(0);
+            let entry = map.entry(key).or_insert(0);
             *entry += 1;
             if *entry > self.per_ip_limit {
                 *entry -= 1;
@@ -84,12 +89,12 @@ impl ConnTracker {
 
         Some(ConnGuard {
             tracker: Arc::clone(self),
-            ip,
+            key,
             active: true,
         })
     }
 
-    fn release(&self, ip: IpAddr) {
+    fn release(&self, key: ClientKey) {
         self.total.fetch_sub(1, Ordering::AcqRel);
         if self.per_ip_limit > 0 {
             // Poison recovery by into_inner: the counters' invariants hold
@@ -99,10 +104,10 @@ impl ConnTracker {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(entry) = map.get_mut(&ip) {
+            if let Some(entry) = map.get_mut(&key) {
                 *entry = entry.saturating_sub(1);
                 if *entry == 0 {
-                    map.remove(&ip);
+                    map.remove(&key);
                 }
             }
         }
@@ -118,14 +123,14 @@ impl ConnTracker {
 /// Arc<ConnTracker>), so it can cross spawn / 'static boundaries.
 pub struct ConnGuard {
     tracker: Arc<ConnTracker>,
-    ip: IpAddr,
+    key: ClientKey,
     active: bool,
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         if self.active {
-            self.tracker.release(self.ip);
+            self.tracker.release(self.key);
             self.active = false;
         }
     }
@@ -163,6 +168,28 @@ mod tests {
         assert!(g1.is_some());
         assert!(g2.is_none(), "second from same IP should be blocked");
         assert!(g3.is_some(), "different IP should pass");
+    }
+
+    #[test]
+    fn one_ipv6_slash64_shares_one_connection_budget() {
+        let t = Arc::new(ConnTracker::new(1, 100));
+        let g1 = t.try_acquire("2001:db8:1:2::1".parse().unwrap());
+        // A different address in the same /64: same client, cap applies.
+        let g2 = t.try_acquire("2001:db8:1:2::ffff".parse().unwrap());
+        // The neighbouring /64 has its own budget.
+        let g3 = t.try_acquire("2001:db8:1:3::1".parse().unwrap());
+        assert!(g1.is_some());
+        assert!(g2.is_none(), "same /64 must share the connection cap");
+        assert!(g3.is_some(), "a different /64 has its own budget");
+    }
+
+    #[test]
+    fn mapped_ipv4_spelling_shares_the_ipv4_budget() {
+        let t = Arc::new(ConnTracker::new(1, 100));
+        let g1 = t.try_acquire("198.51.100.7".parse().unwrap());
+        let g2 = t.try_acquire("::ffff:198.51.100.7".parse().unwrap());
+        assert!(g1.is_some());
+        assert!(g2.is_none(), "mapped spelling must be the same client");
     }
 
     #[test]

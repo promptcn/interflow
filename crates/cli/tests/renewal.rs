@@ -1,11 +1,7 @@
 //! End-to-end pack → registrar → active-credential renewal test.
 
-fn bin() -> std::path::PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop();
-    path.pop();
-    path.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
+mod common;
+use common::bin;
 
 #[tokio::test]
 async fn agent_pack_renews_without_operator_intervention() {
@@ -81,9 +77,12 @@ service = "main/desktop/web"
         .await
         .unwrap();
     assert_eq!(ingress_report.renewed.len(), 2);
-    interflow_renewal::renewal_scheduler(&pack_dir)
-        .await
-        .unwrap();
+    interflow_renewal::renewal_scheduler(
+        &pack_dir,
+        std::sync::Arc::new(interflow_renewal::CrlPollFace::new()),
+    )
+    .await
+    .unwrap();
     assert!(
         dir.path()
             .join("dist/packs/agent-desktop/state/crls/workspace-main.crl.pem")

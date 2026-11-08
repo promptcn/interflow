@@ -2,21 +2,11 @@
 //! against a temp deployment — first install, idempotent upgrade, sealed
 //! `.iflowpack` input, non-root refusal, missing pack.
 
+mod common;
+use common::{RunOutcome, bin};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop(); // deps/
-    p.pop(); // tests/
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
-
-struct RunOutcome {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
 
 fn run(args: &[&str], env: &[(&str, &str)]) -> RunOutcome {
     let mut cmd = Command::new(bin());
@@ -74,8 +64,12 @@ struct Deployment {
 
 impl Deployment {
     fn apply() -> Self {
+        Self::apply_manifest(MANIFEST)
+    }
+
+    fn apply_manifest(manifest: &str) -> Self {
         let dir = tempfile::tempdir().expect("tempdir").keep();
-        std::fs::write(dir.join("interflow.toml"), MANIFEST).unwrap();
+        std::fs::write(dir.join("interflow.toml"), manifest).unwrap();
         let manifest = dir.join("interflow.toml").display().to_string();
         let issuer = dir.join("issuer").display().to_string();
         let out = dir.join("dist").display().to_string();
@@ -93,6 +87,30 @@ impl Deployment {
             &[],
         );
         Self { dir }
+    }
+
+    /// Re-applies an edited manifest over the SAME issuer/out — the real
+    /// rename flow: generations rise above the watermark and the previous
+    /// render's packs stay behind on disk (the host-side leftovers this
+    /// batch's reconciliation names).
+    fn reapply_manifest(&self, manifest: &str) {
+        std::fs::write(self.dir.join("interflow.toml"), manifest).unwrap();
+        let manifest = self.dir.join("interflow.toml").display().to_string();
+        let issuer = self.dir.join("issuer").display().to_string();
+        let out = self.dir.join("dist").display().to_string();
+        run_ok(
+            &[
+                "plan",
+                "apply",
+                "--manifest",
+                &manifest,
+                "--issuer",
+                &issuer,
+                "--out",
+                &out,
+            ],
+            &[],
+        );
     }
 
     fn pack(&self, name: &str) -> String {
@@ -476,5 +494,161 @@ fn downgrade_requires_the_allow_downgrade_flag() {
             .join("packs/ingress-edge.previous/pack.toml")
             .exists(),
         "the rolled-over gen-2 install is kept as .previous"
+    );
+}
+
+/// The rename lifecycle, end to end on a real layout (real directories, real
+/// unit files): install the old name, re-apply the manifest with the node
+/// renamed (same issuer — generations rise, the old render stays on disk),
+/// install the new name — the closing sweep names the old unit AND the old
+/// pack (the pair cross-reference alone cannot see), `doctor host` agrees,
+/// and `node retire` closes the pair to a silent host.
+#[test]
+fn rename_leftovers_are_named_and_retired() {
+    let deploy = Deployment::apply();
+    // Preserve the OLD render exactly as it shipped before the rename.
+    let corner = tempfile::tempdir().expect("tempdir");
+    interflow_util::copy_dir_recursive(
+        std::path::Path::new(&deploy.pack("ingress-edge")),
+        &corner.path().join("ingress-edge"),
+    )
+    .expect("copy old pack");
+    deploy.reapply_manifest(&MANIFEST.replace("[ingress.edge]", "[ingress.ecs-edge]"));
+
+    let srv = tempfile::tempdir().expect("tempdir");
+    let root = srv.path().display().to_string();
+
+    // The old install itself is clean — its roster is the newest there is.
+    let first = run_ok(
+        &[
+            "node",
+            "install",
+            "--pack",
+            &corner.path().join("ingress-edge").display().to_string(),
+            "--root",
+            &root,
+        ],
+        &[],
+    );
+    assert!(
+        !first.stdout.contains("host reconciliation"),
+        "an in-service install is silent:\n{}",
+        first.stdout
+    );
+
+    // The renamed install's closing sweep names the old unit AND old pack.
+    let second = run_ok(
+        &[
+            "node",
+            "install",
+            "--pack",
+            &deploy.pack("ingress-ecs-edge"),
+            "--root",
+            &root,
+        ],
+        &[],
+    );
+    assert!(
+        second.stdout.contains("host reconciliation"),
+        "the sweep must fire:\n{}",
+        second.stdout
+    );
+    assert!(
+        second
+            .stdout
+            .contains("ingress-edge (pack packs/ingress-edge + unit"),
+        "the finding names the pack AND its unit:\n{}",
+        second.stdout
+    );
+    assert!(
+        second
+            .stdout
+            .contains("node retire --pack packs/ingress-edge"),
+        "the executable remedy rides the finding:\n{}",
+        second.stdout
+    );
+
+    // The standalone face agrees — and says the machine is fine once the
+    // leftovers are retired (archive, never delete).
+    let doctor = run_ok(&["doctor", "host", "--root", &root], &[]);
+    assert!(
+        doctor
+            .stdout
+            .contains("NOT in the realm's current signed roster"),
+        "{}",
+        doctor.stdout
+    );
+
+    let retire = run_ok(
+        &[
+            "node",
+            "retire",
+            "--pack",
+            "packs/ingress-edge",
+            "--root",
+            &root,
+        ],
+        &[],
+    );
+    assert!(
+        retire.stdout.contains("✔ retired ingress node edge"),
+        "{}",
+        retire.stdout
+    );
+    assert!(
+        retire.stdout.contains("archived to"),
+        "retirement archives rather than deletes:\n{}",
+        retire.stdout
+    );
+    assert!(
+        !srv.path().join("packs/ingress-edge").exists(),
+        "the retired pack left its live slot"
+    );
+    assert!(
+        !srv.path()
+            .join("systemd/interflow-ingress-edge.service")
+            .exists(),
+        "the retired unit file is gone"
+    );
+    let archived: Vec<_> = std::fs::read_dir(srv.path().join("packs"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("ingress-edge.retired-"))
+        .collect();
+    assert_eq!(archived.len(), 1, "the archive sits beside the packs root");
+
+    let after = run_ok(&["doctor", "host", "--root", &root], &[]);
+    assert!(
+        after.stdout.contains("no orphans"),
+        "after the retirement the host is silent:\n{}",
+        after.stdout
+    );
+}
+
+/// Retire names an INSTALLED pack or refuses — never guesses at directories.
+#[test]
+fn retire_of_a_non_pack_fails_cleanly() {
+    let srv = tempfile::tempdir().expect("tempdir");
+    let root = srv.path().display().to_string();
+    std::fs::create_dir_all(srv.path().join("packs/not-a-pack")).unwrap();
+    let refused = run(
+        &[
+            "node",
+            "retire",
+            "--pack",
+            "packs/not-a-pack",
+            "--root",
+            &root,
+        ],
+        &[],
+    );
+    assert!(!refused.success);
+    assert!(
+        refused
+            .stderr
+            .contains("does not read as an installed pack"),
+        "{}",
+        refused.stderr
     );
 }

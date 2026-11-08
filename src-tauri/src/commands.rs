@@ -16,8 +16,8 @@ use crate::contract::{
     EditActionDto, EditedManifestDto, FleetDto, GuiPrefsDto, HubOverviewDto, ImportedPackDto,
     IssueNodeParams, LocalNodeRefDto, ManifestSummaryDto, ManifestTemplateParams,
     MeshTemplateParams, NodeInfo, NodePrefs, NodeUpdateFailureDto, PackInspection,
-    ProposalSubmitOutcomeDto, PublishKindDto, PublishResultDto, SealedPackDto,
-    StreamProposalRequestDto, UpdatedNodeDto, VersionInfo,
+    ProposalSubmitOutcomeDto, PublishKindDto, PublishResultDto, SealedPackDto, StartupNoticeDto,
+    StartupNoticeKindDto, StreamProposalRequestDto, UpdatedNodeDto, VersionInfo,
 };
 use crate::deploy;
 use crate::i18n;
@@ -83,6 +83,10 @@ pub fn node_infos(manager: &node::NodeManager) -> Vec<NodeInfo> {
             info.credential = manager.credential_health(&id).map(Into::into);
             info.policy = manager.policy_plane(&id).map(Into::into);
             info.peers = manager.peers_plane(&id).map(Into::into);
+            info.crl = manager.crl_plane(&id).map(Into::into);
+            info.breakers = manager
+                .breakers_plane(&id)
+                .map(|rows| rows.into_iter().map(Into::into).collect());
             info.proposals = manager
                 .proposals_plane(&id)
                 .map(|receipts| receipts.into_iter().map(Into::into).collect());
@@ -521,17 +525,20 @@ pub async fn deploy_apply(
 
 /// The bookkeeping-level "would apply do anything" pre-check — the Deploy
 /// overview's "unapplied changes" badge and next-steps face. No minting,
-/// no hub dial (apply re-runs the full watermark-aware funnel).
+/// no hub dial (apply re-runs the full watermark-aware funnel); the dist
+/// tree and the deny list are local reads, so the answer covers the stale
+/// trees and local watermark divergences the funnel would act on.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
 pub async fn deploy_change_state(
     manifest: String,
     issuer: String,
+    out: String,
 ) -> Result<ChangeStateDto, String> {
-    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    let (manifest, issuer, out) = (expanded(&manifest), expanded(&issuer), expanded(&out));
     tauri::async_runtime::spawn_blocking(move || {
-        interflow_cli::plan::change_state(&manifest, &issuer)
+        interflow_cli::plan::change_state(&manifest, &issuer, &out)
             .map(ChangeStateDto::from)
             .map_err(|e| e.to_string())
     })
@@ -558,6 +565,65 @@ pub async fn deploy_hub_overview(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Stream pause/resume, hub path (for streams whose source node runs
+/// elsewhere): queues the op under a minted control credential. The
+/// face converges within one watch interval; the caller refreshes as
+/// usual. `None` = the manifest names no hub endpoint.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
+pub async fn stream_pause_hub(
+    manifest: String,
+    issuer: String,
+    agent: String,
+    name: String,
+    pause: bool,
+) -> Result<bool, String> {
+    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::streams::queue_stream_op(&manifest, &issuer, &agent, &name, pause)
+            .map(|queued| queued.is_some_and(|q| q.pending))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Node maintenance on/off, hub path (control credential).
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
+pub async fn maintenance_hub(
+    manifest: String,
+    issuer: String,
+    agent: String,
+    on: bool,
+) -> Result<bool, String> {
+    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    tauri::async_runtime::spawn_blocking(move || {
+        interflow_cli::streams::hub_maintenance(&manifest, &issuer, &agent, on)
+            .map(|note| note.is_some())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Stream pause/resume on a LOCAL node (in-process; no hub dependency —
+/// the node reports the change upstream itself). Idempotent.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters must be injected by value
+pub fn stream_pause_local(
+    state: State<'_, SharedState>,
+    node_id: String,
+    name: String,
+    pause: bool,
+) -> Result<bool, String> {
+    let manager = manager(&state)?;
+    manager.stream_pause_resume(&node_id, &name, pause)
 }
 
 /// The hub's stream-proposal queue (the operator's approve/reject face).
@@ -1031,6 +1097,36 @@ pub fn deployment_current() -> Result<Option<DeploymentDto>, String> {
         .map(Into::into))
 }
 
+/// Startup notices — the retirements this build NARRATES instead of
+/// silently absorbing: preferences it cannot read (a different GUI
+/// generation wrote them) and a remembered deployment that no longer opens
+/// as one. The shell shows each once; the dismissal key (`id`, tied to the
+/// format epoch) makes each era notify exactly once.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::unnecessary_wraps)] // Tauri command shape
+pub fn gui_startup_notices() -> Result<Vec<StartupNoticeDto>, String> {
+    let epoch = interflow_contract::FORMAT_VERSION;
+    let mut notices = Vec::new();
+    match crate::gui_prefs::load_status() {
+        Ok(prefs) => {
+            if let Some(root) = prefs.current_deployment
+                && crate::deployment::DeploymentDir::probe(std::path::Path::new(&root)).is_none()
+            {
+                notices.push(StartupNoticeDto {
+                    id: format!("deployment-gone@{epoch}"),
+                    kind: StartupNoticeKindDto::DeploymentGone,
+                });
+            }
+        }
+        Err(_) => notices.push(StartupNoticeDto {
+            id: format!("prefs-retired@{epoch}"),
+            kind: StartupNoticeKindDto::PrefsRetired,
+        }),
+    }
+    Ok(notices)
+}
+
 /// Opens (and persists) the current deployment. The folder must be a
 /// deployment (an `interflow.toml`); the error names the path in the
 /// user's language.
@@ -1069,9 +1165,10 @@ pub async fn fleet_overview(
     state: State<'_, SharedState>,
     manifest: String,
     issuer: String,
+    out: String,
     include_hub: bool,
 ) -> Result<FleetDto, String> {
-    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    let (manifest, issuer, out) = (expanded(&manifest), expanded(&issuer), expanded(&out));
     let issuer_for_hub = issuer.clone();
     let manifest_for_hub = manifest.clone();
     let hub = if include_hub {
@@ -1089,14 +1186,18 @@ pub async fn fleet_overview(
     // Local faces + bookkeeping classification in one blocking batch.
     let manifest_for_state = manifest.clone();
     let issuer_for_state = issuer.clone();
+    let out_for_state = out.clone();
     let (summary, change_state) = tauri::async_runtime::spawn_blocking(move || {
         let text = std::fs::read_to_string(&manifest_for_state)
             .map_err(|e| format!("{}: {e}", manifest_for_state.display()))?;
         let summary = interflow_cli::manifest_edit::summarize(&text)
             .map_err(|e| interflow_cli::manifest_edit::error_chain(&e))?;
-        let change_state =
-            interflow_cli::plan::change_state(&manifest_for_state, &issuer_for_state)
-                .map_err(|e| e.to_string())?;
+        let change_state = interflow_cli::plan::change_state(
+            &manifest_for_state,
+            &issuer_for_state,
+            &out_for_state,
+        )
+        .map_err(|e| e.to_string())?;
         Ok::<_, String>((summary, change_state))
     })
     .await
@@ -1109,6 +1210,41 @@ pub async fn fleet_overview(
         hub.map(Into::into),
         nodes,
     ))
+}
+
+/// Starts the deployment's hub floor watcher — the background task that
+/// holds one blocking watch on the hub's floor version and emits
+/// `hub-floor` on every advance (the fleet read model's invalidation
+/// signal; see `hub_watch`). Pre-empts any previous watcher, so a
+/// deployment switch never leaves the old hub's task running.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
+pub fn hub_floor_watch_start(
+    state: State<'_, SharedState>,
+    manifest: String,
+    issuer: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let (manifest, issuer) = (expanded(&manifest), expanded(&issuer));
+    let mut guard = state.lock().map_err(|_| lock_error())?;
+    if let Some(previous) = guard.hub_watch.take() {
+        previous.abort();
+    }
+    guard.hub_watch = Some(crate::hub_watch::spawn_watcher(app, manifest, issuer));
+    Ok(())
+}
+
+/// Stops the hub floor watcher (deployment close). Idempotent.
+#[tauri::command]
+#[specta::specta]
+#[allow(clippy::needless_pass_by_value)] // Tauri command parameters arrive by value
+pub fn hub_floor_watch_stop(state: State<'_, SharedState>) -> Result<(), String> {
+    let mut guard = state.lock().map_err(|_| lock_error())?;
+    if let Some(previous) = guard.hub_watch.take() {
+        previous.abort();
+    }
+    Ok(())
 }
 
 /// The 发布 button's single backend entry: save (when the editor hands
@@ -1140,11 +1276,12 @@ pub async fn deployment_publish(
     }
 
     // 2. The pre-apply classification (never minted, never dialed) decides
-    //    the orchestration shape.
+    //    the orchestration shape — the same fork the apply below executes.
     let manifest_for_state = manifest.clone();
     let issuer_for_state = issuer.clone();
+    let out_for_state = out.clone();
     let kind = tauri::async_runtime::spawn_blocking(move || {
-        interflow_cli::plan::change_state(&manifest_for_state, &issuer_for_state)
+        interflow_cli::plan::change_state(&manifest_for_state, &issuer_for_state, &out_for_state)
             .map_err(|e| e.to_string())
     })
     .await
@@ -1188,15 +1325,17 @@ pub async fn deployment_publish(
     }
 
     match kind {
-        interflow_cli::plan::ChangeState::PolicyEditsPending => {
+        interflow_cli::plan::ChangeState::PolicyEditsPending
+        | interflow_cli::plan::ChangeState::WatermarksDiverged => {
             // Hot: nothing to touch — the watcher plane converges each node
-            // within its own period.
+            // within its own period (the re-publish rides the same lane).
             for info in &owned {
                 hot_nodes.push(info.name.clone());
             }
         }
         interflow_cli::plan::ChangeState::NeverApplied
-        | interflow_cli::plan::ChangeState::IdentityEditsPending => {
+        | interflow_cli::plan::ChangeState::IdentityEditsPending
+        | interflow_cli::plan::ChangeState::PackTreeStale => {
             // Packs were (re)rendered: swap every STALE local pack in place;
             // `update_pack` stops, swaps, and restores the start intent.
             let dist_packs = tauri::async_runtime::spawn_blocking({
@@ -1248,9 +1387,12 @@ pub async fn deployment_publish(
 
     Ok(PublishResultDto {
         kind: match kind {
-            interflow_cli::plan::ChangeState::PolicyEditsPending => PublishKindDto::PolicyOnly,
+            interflow_cli::plan::ChangeState::PolicyEditsPending
+            | interflow_cli::plan::ChangeState::WatermarksDiverged => PublishKindDto::PolicyOnly,
             interflow_cli::plan::ChangeState::Applied { .. } => PublishKindDto::NoOp,
-            _ => PublishKindDto::FullRender,
+            interflow_cli::plan::ChangeState::NeverApplied
+            | interflow_cli::plan::ChangeState::IdentityEditsPending
+            | interflow_cli::plan::ChangeState::PackTreeStale => PublishKindDto::FullRender,
         },
         apply: report.into(),
         hot_nodes,

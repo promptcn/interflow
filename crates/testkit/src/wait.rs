@@ -78,6 +78,34 @@ where
     }
 }
 
+/// The async-probe twin of [`eventually`]: for conditions whose
+/// observation is itself an await (an HTTP face, a network read). Same
+/// contract — the budget is the promise, `POLL_PERIOD` an implementation
+/// detail, the timeout panic embeds the last observation, fail-fast
+/// terminal states panic inside the probe.
+pub async fn eventually_async<T, E, F, Fut>(what: &str, budget: Duration, mut probe: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: Display,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut last = None;
+    loop {
+        match probe().await {
+            Ok(v) => return v,
+            Err(obs) => drop(last.insert(obs)),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out after {budget:?} waiting for {what} (last observation: {})",
+                observation(&last)
+            );
+        }
+        tokio::time::sleep(POLL_PERIOD).await;
+    }
+}
+
 /// The std twin of [`eventually`] for plain (non-async) unit tests:
 /// `std::thread::sleep` between probes, same semantics and same timeout
 /// message shape.
@@ -114,6 +142,40 @@ fn observation<E: Display>(last: &Option<E>) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The async twin holds the same contract: an awaiting probe yields
+    /// its value within the budget, and the timeout panic embeds the last
+    /// observation (asserted via the message shape in the sync twin's
+    /// tests — here we lock the await-path yield only; the timeout path
+    /// shares the body by construction).
+    #[tokio::test(start_paused = true)]
+    async fn eventually_async_yields_the_awaited_condition() {
+        let flips = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = std::sync::Arc::clone(&flips);
+        let v = eventually_async(
+            "the async counter to reach 2",
+            Duration::from_secs(5),
+            move || {
+                let counter = std::sync::Arc::clone(&counter);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n >= 2 {
+                        Ok(n)
+                    } else {
+                        Err(format!("at {n}"))
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(v, 2);
+        assert_eq!(
+            flips.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the probe stops at the first Ok"
+        );
+    }
 
     /// Returns the awaited value once the probe is satisfied, after any
     /// number of misses.

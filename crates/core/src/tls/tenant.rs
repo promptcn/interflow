@@ -41,6 +41,12 @@ pub struct TenantTrustRoot {
     /// Content fingerprint of `store` (sorted per-cert SHA-256, re-hashed) —
     /// the duplicate-tenant-CA detection key.
     fingerprint: [u8; 32],
+    /// SHA-256 fingerprints of the roots' SUBJECT DNs (one per certificate
+    /// in the PEM) — the derivation pre-filter key (§3.3): a chain can only
+    /// anchor here if one of its certificates' ISSUER DNs equals one of
+    /// these subjects. Empty when no certificate's subject parsed (the
+    /// pre-filter then declines to prune — every tenant stays a candidate).
+    subject_fingerprints: std::collections::HashSet<[u8; 32]>,
 }
 
 impl TenantTrustRoot {
@@ -82,6 +88,12 @@ impl TenantTrustRoot {
         for h in &cert_hashes {
             hasher.update(h);
         }
+        let mut subject_fingerprints = std::collections::HashSet::new();
+        for cert in &certs {
+            if let Ok((_, parsed)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
+                subject_fingerprints.insert(Sha256::digest(parsed.subject().as_raw()).into());
+            }
+        }
         Ok(Self {
             name: name.into(),
             trusted_gateway,
@@ -89,6 +101,7 @@ impl TenantTrustRoot {
             certs,
             crls: crls.to_vec(),
             fingerprint: hasher.finalize().into(),
+            subject_fingerprints,
         })
     }
 
@@ -107,6 +120,16 @@ pub struct TenantIdentity {
     pub tenant: Arc<str>,
     /// Whether the owning tenant may open streams across tenant boundaries.
     pub trusted_gateway: bool,
+    /// The leaf's CN (the agent id) — parsed ONCE here (§3.3: the accept
+    /// paths previously re-parsed the same DER three more times for CN,
+    /// validity and serial).
+    pub leaf_cn: Option<String>,
+    /// The leaf's validity window as unix seconds `(not_before, not_after)`
+    /// (`None` when the leaf did not parse).
+    pub leaf_validity_unix: Option<(i64, i64)>,
+    /// The leaf's serial in canonical hex (`None` when the leaf did not
+    /// parse) — the revocation gate's input.
+    pub leaf_serial_hex: Option<String>,
 }
 
 /// The per-tenant verifier set used for post-handshake tenant derivation.
@@ -186,7 +209,42 @@ impl TenantVerifier {
     pub fn derive(&self, chain: &[CertificateDer<'_>]) -> Option<TenantIdentity> {
         let (leaf, intermediates) = chain.split_first()?;
         let now = UnixTime::now();
-        for (root, verifier) in self.roots.iter().zip(&self.verifiers) {
+
+        // Issuer pre-filter (§3.3): a chain can only anchor in tenant T if
+        // some certificate's ISSUER DN equals T's root SUBJECT DN. The
+        // candidate set keeps roots order; an unparseable chain or an
+        // unregistered issuer shape falls back to every tenant (the
+        // pre-filter only ever prunes provably-impossible anchors — webpki
+        // remains the sole authority).
+        let mut candidates: Option<Vec<usize>> = None;
+        let mut chain_issuers = std::collections::HashSet::new();
+        for cert in chain {
+            if let Ok((_, parsed)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
+                chain_issuers.insert(Sha256::digest(parsed.issuer().as_raw()).into());
+            }
+        }
+        if !chain_issuers.is_empty() {
+            let mut hits = Vec::new();
+            for (idx, root) in self.roots.iter().enumerate() {
+                if root
+                    .subject_fingerprints
+                    .intersection(&chain_issuers)
+                    .next()
+                    .is_some()
+                {
+                    hits.push(idx);
+                }
+            }
+            if !hits.is_empty() {
+                candidates = Some(hits);
+            }
+        }
+
+        let leaf_facts = parse_leaf_facts(leaf);
+        let try_indices = candidates.unwrap_or_else(|| (0..self.roots.len()).collect::<Vec<_>>());
+        for idx in try_indices {
+            let root = &self.roots[idx];
+            let verifier = &self.verifiers[idx];
             if verifier
                 .verify_client_cert(leaf, intermediates, now)
                 .is_ok()
@@ -194,11 +252,52 @@ impl TenantVerifier {
                 return Some(TenantIdentity {
                     tenant: root.name.clone(),
                     trusted_gateway: root.trusted_gateway,
+                    leaf_cn: leaf_facts.as_ref().map(|f| f.cn.clone()),
+                    leaf_validity_unix: leaf_facts.as_ref().map(|f| f.validity),
+                    leaf_serial_hex: leaf_facts.as_ref().map(|f| f.serial_hex.clone()),
                 });
             }
         }
         None
     }
+}
+
+/// The once-per-derivation leaf parse: CN, validity window and canonical
+/// serial, extracted in one pass (the same facts `server.rs`'s per-field
+/// helpers produce, minus the two extra DER parses).
+struct LeafFacts {
+    cn: String,
+    validity: (i64, i64),
+    serial_hex: String,
+}
+
+fn parse_leaf_facts(leaf: &CertificateDer<'_>) -> Option<LeafFacts> {
+    let (_, parsed) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;
+    // CN (OID 2.5.4.3) — the same extraction as `extract_cn_from_chain`.
+    let cn = parsed
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|cn| cn.as_str().ok())
+        .map(str::to_owned);
+    let validity = (
+        parsed.validity().not_before.timestamp(),
+        parsed.validity().not_after.timestamp(),
+    );
+    // Canonical minimal hex (sign byte stripped) — the same shape
+    // `extract_leaf_serial_from_chain` produces.
+    let raw = parsed.raw_serial();
+    let canonical = if raw.first() == Some(&0) {
+        &raw[1..]
+    } else {
+        raw
+    };
+    let serial_hex = hex::encode(canonical);
+    Some(LeafFacts {
+        cn: cn?,
+        validity,
+        serial_hex,
+    })
 }
 
 /// The complete server TLS plane, swapped atomically on reload.

@@ -24,8 +24,9 @@ use tokio_util::sync::CancellationToken;
 async fn readiness_signal_fires_once_both_listener_faces_accept() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,interflow=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug".into()
+            }),
         )
         .try_init();
 

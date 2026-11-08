@@ -94,6 +94,10 @@ pub struct AgentHandle {
     ingress_ready: watch::Receiver<bool>,
     ingress_addrs: Arc<IngressAddrs>,
     ingress_listeners: Arc<IngressListeners>,
+    /// The pause-intent truth (planned unavailability): the embedder's
+    /// in-process command path for pause/resume (the GUI's local nodes —
+    /// no wire, no hub dependency) and the read face for tests.
+    paused_streams: Arc<crate::agent::paused_streams::PausedStreams>,
     /// The intrinsic policy watcher's live telemetry; `None` when the
     /// config carried no policy plane (in-memory embedders). The watcher
     /// task itself rides this handle's tracker — it ends with
@@ -106,6 +110,16 @@ pub struct AgentHandle {
     /// The proposal receipts face (same task as the peer watcher): this
     /// node's own stream proposals and their decision state.
     proposal_state: Arc<crate::agent::peer_watch::ProposalWatchState>,
+    /// The renewal loop's CRL-poll liveness face, when this node runs one
+    /// (the assembly attached it at construction and feeds the same `Arc`
+    /// to the scheduler). The GUI's node detail reads it locally; the
+    /// reporter task (on this handle's tracker) ships it to the hub.
+    renewal_face: Option<Arc<interflow_renewal::CrlPollFace>>,
+    /// The egress breaker table's open-set face (present exactly when the
+    /// table exists): the GUI node detail's "Egress breakers" panel
+    /// subscribes; the table publishes on every open-set change
+    /// (2026-10-19 open-set face).
+    breaker_state: Option<Arc<crate::agent::target_breaker::BreakerWatchState>>,
 }
 
 /// Context used inside the supervisor to emit state/events.
@@ -115,12 +129,18 @@ pub(crate) struct EventSink {
     pub(crate) event_tx: mpsc::Sender<AgentEvent>,
     /// Monotonic session-establishment count, mirrored to the handle.
     pub(crate) established: Arc<AtomicU64>,
+    /// The connection-quality face's reconnect ring (the establish
+    /// observation point — every session establishment lands here).
+    pub(crate) connection_rings: std::sync::Arc<crate::agent::connection_quality::ConnectionRings>,
 }
 
 impl EventSink {
     pub(crate) fn set_state(&self, state: AgentState) {
         if matches!(state, AgentState::Connected { .. }) {
             self.established.fetch_add(1, Ordering::Relaxed);
+            self.connection_rings.note_established(
+                u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0),
+            );
         }
         // watch's send only errors when every receiver is gone; a GUI/CLI
         // going away must not affect the agent itself.
@@ -146,9 +166,12 @@ impl AgentHandle {
         ingress_ready: watch::Receiver<bool>,
         ingress_addrs: Arc<IngressAddrs>,
         ingress_listeners: Arc<IngressListeners>,
+        paused_streams: Arc<crate::agent::paused_streams::PausedStreams>,
         policy_state: Option<Arc<crate::agent::policy_watch::PolicyWatchState>>,
         peer_state: Arc<crate::agent::peer_watch::PeerWatchState>,
         proposal_state: Arc<crate::agent::peer_watch::ProposalWatchState>,
+        renewal_face: Option<Arc<interflow_renewal::CrlPollFace>>,
+        breaker_state: Option<Arc<crate::agent::target_breaker::BreakerWatchState>>,
     ) -> Self {
         Self {
             state_rx,
@@ -161,9 +184,12 @@ impl AgentHandle {
             ingress_ready,
             ingress_addrs,
             ingress_listeners,
+            paused_streams,
             policy_state,
             peer_state,
             proposal_state,
+            renewal_face,
+            breaker_state,
         }
     }
 
@@ -186,6 +212,23 @@ impl AgentHandle {
     /// stream proposals and their decision state.
     pub fn proposal_state(&self) -> Arc<crate::agent::peer_watch::ProposalWatchState> {
         Arc::clone(&self.proposal_state)
+    }
+
+    /// The renewal loop's CRL-poll liveness face, when this node runs one
+    /// beside the engine (`None` = no renewal loop attached — the
+    /// in-memory embedders and offline-identity nodes). The face's
+    /// atomics read lock-free; the renewal scheduler holds the other
+    /// half of the same `Arc`.
+    pub fn renewal_face(&self) -> Option<Arc<interflow_renewal::CrlPollFace>> {
+        self.renewal_face.clone()
+    }
+
+    /// The egress breaker table's open-set face (`None` = the breaker is
+    /// disabled by config). Subscribe for the currently-OPEN rows with
+    /// their transition and probe instants — the dead-target and
+    /// dead-prober signatures both live in those fields.
+    pub fn breaker_state(&self) -> Option<Arc<crate::agent::target_breaker::BreakerWatchState>> {
+        self.breaker_state.clone()
     }
 
     /// The session slot's control-plane tunnel (clone-safe; tracks session
@@ -299,8 +342,31 @@ impl AgentHandle {
     /// the policy face can say `generation 8, all green` while a listener
     /// is gone (the 2026-10-07 incident); this answers what is really
     /// listening.
+    /// One registered agent's listener face, by rule name (see
+    /// [`IngressListeners::get`]).
     pub fn ingress_listener_status(&self, rule: &str) -> Option<ListenerStatus> {
         self.ingress_listeners.get(rule)
+    }
+
+    /// The pause-intent truth (planned unavailability): read face for
+    /// embedders/tests, command face via [`Self::pause_stream`] /
+    /// [`Self::resume_stream`].
+    pub fn paused_streams(&self) -> Arc<crate::agent::paused_streams::PausedStreams> {
+        Arc::clone(&self.paused_streams)
+    }
+
+    /// Pause one stream in-process (the local embedder's command path —
+    /// the GUI's local nodes; remote operators go through the hub's
+    /// control plane, which reaches this same store via the intent
+    /// watcher). Idempotent; the listener stops and the port releases on
+    /// the next reconcile (level-triggered, immediate).
+    pub fn pause_stream(&self, name: &str) -> bool {
+        self.paused_streams.pause(name)
+    }
+
+    /// Resume one stream in-process (the only unpause). Idempotent.
+    pub fn resume_stream(&self, name: &str) -> bool {
+        self.paused_streams.resume(name)
     }
 
     /// Snapshot of every ingress rule's listener face.

@@ -57,12 +57,21 @@ test-e2e: _gc-target
     command -v cargo-nextest >/dev/null 2>&1 || { echo 'cargo-nextest missing: brew install cargo-nextest / cargo install cargo-nextest --locked'; exit 1; }
     cargo nextest run --workspace --all-features --test '*'
 
+# All criterion benchmarks (microbench + e2e anchors; see also `bench-loss`
+# for the scenario bench). Not part of `ci` — criterion runs are slow and
+# machine-sensitive; benches still compile in CI via clippy --all-targets.
+bench: _gc-target
+    cargo bench -p interflow-core --bench frame_codec --bench tunnel_dispatch --bench inner_tls_config
+    cargo bench -p interflow-mesh --bench hub_relay --bench quic_send --bench e2e_throughput --bench e2e_throughput_multi --bench ping_pong_latency --bench udp_throughput
+    cargo bench -p interflow-expose --bench expose_rps
+
 # QUIC vs h2 concurrent-stream loss comparison (scenario benchmark; see --help for options)
 bench-loss:
     cargo bench -p interflow-mesh --bench loss_hol
 
-# soak long-run guardrail (real process topology: soak-node hub/agent processes + impairment proxy + six assertions;
-# run several rounds nightly / before releases. Smoke test: `just soak -- --quick`; see --help for options)
+# soak long-run guardrail (real process topology: soak-node hub/agent processes + impairment proxy + assertion suite;
+# run several rounds nightly / before releases. Smoke test: `just soak -- --quick`; see --help for options.
+# Run logs under bench-results/soak-* are capacity-bounded (--retention-mb, results.json always kept) and gzipped after the run)
 soak *args:
     cargo build --release -p interflow-testkit --features fault-injection --bin interflow-soak-node
     cargo run --release -p interflow-testkit --bin soak {{args}}
@@ -77,6 +86,14 @@ deny:
 
 version-contract:
     python3 scripts/check_version_contract.py
+
+# CLI version-surface guard: every clap `Parser` root in the workspace
+# carries `version = interflow_buildinfo::VERSION_WITH_TAG`, so `--version`
+# answers with the shared build identity on every binary (mesh's `version`
+# subcommand prints the same line). Ships with the public export — it
+# scans crate sources (also in ci.yml and the export preflight).
+version-surface:
+    python3 scripts/check_version_surface.py
 
 # Changelog accumulation guard: product-surface commits after the last
 # version bump must be visible in CHANGELOG.md (entries under [Unreleased],
@@ -98,11 +115,23 @@ product-language:
 doc-surfaces:
     python3 scripts/check_doc_surfaces.py
 
+# Binary-roster single-source guard: scripts/lib/binaries.list is the one
+# roster; build-*.sh derive from it and the release workflow's hand-written
+# matrix is asserted in lockstep (also in ci.yml).
+binary-roster:
+    python3 scripts/check_binary_roster.py
+
 # Local CI-equivalent checks
-ci: fmt-check lint test changelog-debt product-language doc-surfaces
+# deny rides the ci line (public ci.yml has the same job): the advisory-db
+# snapshot decides red/green, not the tree's cleanliness — without it a
+# locally-green refactor can ship into advisories disclosed since the last
+# fetch (2026-10-17 and 2026-11-03 both bit exactly there). machete stays a
+# standalone recipe: it has no missing-tool auto-install fallback, and a
+# contributor without cargo-machete would get a hard red from `just ci`.
+ci: fmt-check lint test deny version-surface changelog-debt product-language doc-surfaces binary-roster
     @echo "Local CI passed"
 
-# Release build (produces the interflow-cli, interflow-mesh, interflow-registrar binaries)
+# Release build (produces the binaries on the roster: scripts/lib/binaries.list)
 build-release:
     cargo build --release --locked
 

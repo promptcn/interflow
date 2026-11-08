@@ -67,7 +67,13 @@ const fn lenient_risky(mode: u32) -> bool {
     mode & 0o133 != 0
 }
 
+/// Off unix there are no mode bits to judge: the check is vacuous and the
+/// private-key permission discipline is not enforced on this platform
+/// (recorded in the Windows platform inventory,
+/// (internal design notes)). The fallible shape is
+/// the unix contract callers compile against.
 #[cfg(not(unix))]
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 pub(crate) fn check_secret_file_perms(_path: &str, _strictness: Strictness) -> Result<()> {
     Ok(())
 }

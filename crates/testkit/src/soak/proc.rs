@@ -11,6 +11,7 @@ use super::error::{SoakError, SoakResult};
 use crate::certs::TestCerts;
 use crate::config::TEST_TENANT;
 use interflow_core::protocol::StreamProto;
+use interflow_core::security::{ProxyProtocolConfig, ProxyProtocolMode};
 use interflow_core::tls::TlsMinVersion;
 use interflow_mesh::config::{
     AclConfig, AgentConfig, AgentInfo, AgentTlsConfig, AuthConfig, ControlConfig, EgressRule,
@@ -22,20 +23,64 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
+/// Default log filter handed to every soak node. `info` is the product
+/// default; the QUIC transport-stats sampler (CC forensics anchor of the
+/// 2026-09-16 quic-stall case file) rides its own target so it stays visible
+/// without the crate-wide debug face — that face carried per-frame lines and
+/// turned a single run's `hub.log` into hundreds of MB. Per-frame / per-beat
+/// lines live at `trace` now; a forensic rerun opens them explicitly with
+/// `--node-log-filter`.
+pub fn default_log_level() -> String {
+    format!(
+        "info,{}=debug",
+        interflow_core::telemetry::TARGET_TRANSPORT_STATS
+    )
+}
+
+/// The soak hub's per-client rate-limit quota. High enough that the soak's
+/// own agents — all one client key, `127.0.0.1`, re-registering across
+/// churn waves and gated again on every HTTP request — never trip it; the
+/// identity-churn phase's clients are each their own key and spend one
+/// cell apiece. The quota's shape (per minute) sets the store's rotation
+/// period, which the phase's recede schedule derives from
+/// ([`super::identity_churn::rotation_period`]).
+pub const HUB_RATE_LIMIT_PER_MINUTE: u32 = 30_000;
+
+/// The soak hub's tracked-client bound (`[auth] max_tracked_clients`): the
+/// deployment-sized memory cap the identity-churn phase drives past so the
+/// capacity-eviction path runs for real. Small enough that a phase of a few
+/// thousand synthetic clients overflows generations within one rotation
+/// period; large enough to be a realistic operator value, not a toy.
+pub const HUB_MAX_TRACKED_CLIENTS: usize = 8_192;
+
 /// Hub config (real TOML): TLS + QUIC dual stack, mTLS (single test tenant),
 /// default heartbeat (liveness deadline 75s), metrics endpoint enabled (canary
-/// assertions go through the production telemetry path).
-#[allow(clippy::too_many_arguments)]
-pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) -> HubConfig {
+/// assertions go through the production telemetry path), PROXY protocol
+/// accepted from loopback (the identity-churn phase presents synthetic
+/// client addresses through it — the same path a front proxy uses) and the
+/// per-client limiter on with a deployment-sized tracked-client bound.
+pub fn hub_config(
+    listen: SocketAddr,
+    metrics: SocketAddr,
+    certs: &TestCerts,
+    log_level: &str,
+) -> HubConfig {
     HubConfig {
         server: ServerConfig {
             listen_addr: listen,
             node_name: None,
             hub_name: None,
-            proxy_protocol: Default::default(),
+            // `On`, not `Required`: the soak's own agents dial without a
+            // preamble; only the churn phase (from loopback, trusted by
+            // default) speaks it.
+            proxy_protocol: ProxyProtocolConfig {
+                mode: ProxyProtocolMode::On,
+                ..ProxyProtocolConfig::default()
+            },
         },
         auth: AuthConfig {
-            rate_limit_per_minute: 0,
+            rate_limit_per_minute: HUB_RATE_LIMIT_PER_MINUTE,
+            max_tracked_clients: HUB_MAX_TRACKED_CLIENTS,
             tenants: vec![TenantConfig {
                 name: TEST_TENANT.to_string(),
                 ca_path: certs.ca_path().display().to_string(),
@@ -62,10 +107,7 @@ pub fn hub_config(listen: SocketAddr, metrics: SocketAddr, certs: &TestCerts) ->
         policy: Default::default(),
         audit: Default::default(),
         logging: LoggingConfig {
-            // Own-crate debug on top of info: the QUIC transport-stats sampler
-            // (CC forensics anchor, 2026-09-16 quic-stall case file) logs at
-            // debug — soak is the diagnostic context where it must appear.
-            level: "info,interflow_core=debug,interflow_mesh=debug".to_string(),
+            level: log_level.to_string(),
             format: interflow_mesh::config::LogFormat::Plain,
         },
         transport: interflow_mesh::config::HubTransportConfig {
@@ -86,8 +128,9 @@ pub fn egress_agent_config(
     transport: TransportKind,
     certs: &TestCerts,
     backend: SocketAddr,
+    log_level: &str,
 ) -> AgentConfig {
-    let mut cfg = base_agent_config("egress", hub_endpoint, transport, certs);
+    let mut cfg = base_agent_config("egress", hub_endpoint, transport, certs, log_level);
     cfg.egress = vec![EgressRule {
         name: "sse".to_string(),
         target: EgressTarget::Addr(backend),
@@ -107,8 +150,9 @@ pub fn ingress_agent_config(
     listen: SocketAddr,
     backend: SocketAddr,
     idle_timeout_secs: u64,
+    log_level: &str,
 ) -> AgentConfig {
-    let mut cfg = base_agent_config("ingress", hub_endpoint, transport, certs);
+    let mut cfg = base_agent_config("ingress", hub_endpoint, transport, certs, log_level);
     cfg.ingress = vec![IngressRule {
         name: "sse".to_string(),
         listen_addr: listen,
@@ -134,8 +178,9 @@ pub fn churn_agent_config(
     certs: &TestCerts,
     listen: SocketAddr,
     backend: SocketAddr,
+    log_level: &str,
 ) -> AgentConfig {
-    let mut cfg = base_agent_config("churn", hub_endpoint, transport, certs);
+    let mut cfg = base_agent_config("churn", hub_endpoint, transport, certs, log_level);
     cfg.ingress = vec![IngressRule {
         name: "churn".to_string(),
         listen_addr: listen,
@@ -155,6 +200,7 @@ fn base_agent_config(
     hub_endpoint: SocketAddr,
     transport: TransportKind,
     certs: &TestCerts,
+    log_level: &str,
 ) -> AgentConfig {
     let (client_cert, client_key) = certs.named_client_cert(id);
     AgentConfig {
@@ -179,10 +225,7 @@ fn base_agent_config(
             hub_cert_fingerprint: None,
         }),
         logging: LoggingConfig {
-            // Own-crate debug on top of info: the QUIC transport-stats sampler
-            // (CC forensics anchor, 2026-09-16 quic-stall case file) logs at
-            // debug — soak is the diagnostic context where it must appear.
-            level: "info,interflow_core=debug,interflow_mesh=debug".to_string(),
+            level: log_level.to_string(),
             format: interflow_mesh::config::LogFormat::Plain,
         },
         ..AgentConfig::default()
@@ -448,7 +491,8 @@ mod tests {
         let certs = TestCerts::generate("soak-proc-test", "soak-egress");
         let listen: SocketAddr = "127.0.0.1:16666".parse().expect("listen");
         let metrics: SocketAddr = "127.0.0.1:16667".parse().expect("metrics");
-        let cfg = hub_config(listen, metrics, &certs);
+        let level = default_log_level();
+        let cfg = hub_config(listen, metrics, &certs, &level);
         let text = serde_json::to_string(&cfg).expect("hub json");
         let loaded: HubConfig = serde_json::from_str(&text).expect("hub round-trip");
         assert_eq!(loaded.server.listen_addr, listen);
@@ -457,6 +501,7 @@ mod tests {
         assert!(loaded.tls.as_ref().is_some_and(|t| t.enabled));
         assert!(loaded.transport.quic.enabled);
         assert!(loaded.heartbeat.enabled);
+        assert_eq!(loaded.logging.level, level);
     }
 
     #[test]
@@ -465,20 +510,46 @@ mod tests {
         let endpoint: SocketAddr = "127.0.0.1:16666".parse().expect("endpoint");
         let listen: SocketAddr = "127.0.0.1:17777".parse().expect("listen");
         let backend: SocketAddr = "127.0.0.1:18888".parse().expect("backend");
+        let level = default_log_level();
 
         for transport in [TransportKind::H2, TransportKind::Quic] {
-            let egress = egress_agent_config(endpoint, transport, &certs, backend);
+            let egress = egress_agent_config(endpoint, transport, &certs, backend, &level);
             let text = serde_json::to_string(&egress).expect("egress json");
             let l1: AgentConfig = serde_json::from_str(&text).expect("egress round-trip");
             assert_eq!(l1.agent.id, "egress");
             assert_eq!(l1.agent.transport, transport);
             assert_eq!(l1.agent.connect_timeout_secs, 10);
 
-            let ingress = ingress_agent_config(endpoint, transport, &certs, listen, backend, 300);
+            let ingress =
+                ingress_agent_config(endpoint, transport, &certs, listen, backend, 300, &level);
             let text = serde_json::to_string(&ingress).expect("ingress json");
             let l2: AgentConfig = serde_json::from_str(&text).expect("ingress round-trip");
             assert_eq!(l2.ingress.len(), 1);
             assert_eq!(l2.ingress[0].idle_timeout_secs, Some(300));
+            assert_eq!(l2.logging.level, level);
+        }
+    }
+
+    /// Lock on the default filter: the sampler target is opened, nothing
+    /// crate-wide is. Re-opening `interflow_mesh=debug` by default is how a
+    /// single run's hub.log reached hundreds of MB.
+    #[test]
+    fn default_log_level_opens_only_the_sampler_target() {
+        let level = default_log_level();
+        assert!(
+            tracing_subscriber::EnvFilter::try_new(&level).is_ok(),
+            "default soak filter must parse: {level}"
+        );
+        assert!(level.starts_with("info,"));
+        assert!(level.contains(&format!(
+            "{}=debug",
+            interflow_core::telemetry::TARGET_TRANSPORT_STATS
+        )));
+        for crate_wide in ["interflow_core=", "interflow_mesh=", "trace"] {
+            assert!(
+                !level.contains(crate_wide),
+                "default soak filter must not open {crate_wide}: {level}"
+            );
         }
     }
 }

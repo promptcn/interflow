@@ -152,40 +152,35 @@ pub fn install(sealed: &Path, out_dir: &Path, passphrase: &str) -> Result<Creden
     CredentialPack::load(out_dir)
 }
 
+/// Tightens every `*.key` under an unpacked pack to 0600 (unix) — the
+/// sealed distribution may land anywhere; the on-disk posture must not
+/// depend on where.
 fn tighten_dir(dir: &Path) -> Result<()> {
-    fn walk(dir: &Path) -> Result<()> {
-        for entry in std::fs::read_dir(dir).map_err(|e| Error::Io {
-            path: dir.display().to_string(),
-            source: e,
-        })? {
-            let entry = entry.map_err(|e| Error::Io {
-                path: dir.display().to_string(),
+    let entries = interflow_util::walk_sorted(dir).map_err(|e| Error::Io {
+        path: dir.display().to_string(),
+        source: e,
+    })?;
+    #[cfg(unix)]
+    for entry in entries {
+        use std::os::unix::fs::PermissionsExt;
+        if !entry.is_dir && entry.rel.ends_with(".key") {
+            let path = dir.join(&entry.rel);
+            let mut perms = std::fs::metadata(&path)
+                .map_err(|e| Error::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                })?
+                .permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms).map_err(|e| Error::Io {
+                path: path.display().to_string(),
                 source: e,
             })?;
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path)?;
-            } else if path.extension().is_some_and(|e| e == "key") {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = std::fs::metadata(&path)
-                        .map_err(|e| Error::Io {
-                            path: path.display().to_string(),
-                            source: e,
-                        })?
-                        .permissions();
-                    perms.set_mode(0o600);
-                    std::fs::set_permissions(&path, perms).map_err(|e| Error::Io {
-                        path: path.display().to_string(),
-                        source: e,
-                    })?;
-                }
-            }
         }
-        Ok(())
     }
-    walk(dir)
+    #[cfg(not(unix))]
+    let _ = entries;
+    Ok(())
 }
 
 #[cfg(test)]

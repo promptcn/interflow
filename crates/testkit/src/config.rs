@@ -59,6 +59,7 @@ pub fn hub_config_tuned(
         },
         auth: AuthConfig {
             rate_limit_per_minute: 0, // rate limiting disabled for tests
+            max_tracked_clients: interflow_core::security::MAX_TRACKED_CLIENTS,
             tenants: vec![TenantConfig {
                 name: TEST_TENANT.to_string(),
                 ca_path: certs.ca_path().display().to_string(),

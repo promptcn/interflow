@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 /// Top-level CLI arguments.
 #[derive(Parser)]
-#[command(name = "interflow-soak-node")]
+#[command(name = "interflow-soak-node", version = interflow_buildinfo::VERSION_WITH_TAG)]
 #[command(about = "Soak-gate node: run the real engine from a JSON config handoff (dev-only)")]
 struct Cli {
     #[command(subcommand)]

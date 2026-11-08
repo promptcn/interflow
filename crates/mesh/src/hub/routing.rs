@@ -14,10 +14,9 @@
 //!   stream-teardown path (consistent with the existing "stream not found"
 //!   convention).
 
-use crate::config::AclRule;
 use crate::hub::service::HubService;
 use crate::hub::state::{
-    PeerIdentity, SessionWitness, StreamFace, TunnelData, release_stream_slot,
+    HubState, PeerIdentity, SessionWitness, StreamFace, TunnelData, release_stream_slot,
 };
 use bytes::Bytes;
 use interflow_core::protocol::{
@@ -25,13 +24,23 @@ use interflow_core::protocol::{
     StreamId, StreamProto,
 };
 use interflow_core::security::AuditKind;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 /// Maximum agent_id length (128B), character allowlist `[A-Za-z0-9_.-]`.
 pub(crate) const MAX_AGENT_ID_LEN: usize = 128;
+
+/// The session-headroom warn ratio.
+///
+/// A scope (global or per-agent) whose remaining capacity falls under this
+/// fraction reads ⚠ on the fleet faces — chronic growth (`incremental
+/// sessions unbounded`) surfaces BEFORE the `Global stream limit reached`
+/// wall, not at it. Single source: doctor reads it directly, the GUI reads
+/// the self-reported overview field
+pub const HEADROOM_WARN_RATIO: f64 = 0.2;
 
 /// A frame-level stream rejection: the wire reason code plus the
 /// hub-internal diagnostic.
@@ -41,7 +50,7 @@ pub(crate) const MAX_AGENT_ID_LEN: usize = 128;
 /// rejection site cannot silently fall into the ordinary-close fallback.
 /// The diagnostic never rides the wire (logs / metrics attribution only).
 #[derive(Debug, Clone)]
-pub(crate) struct StreamReject {
+pub struct StreamReject {
     /// The Close reason code delivered to the sender.
     pub code: CloseReason,
     /// The hub-internal diagnostic text.
@@ -57,7 +66,7 @@ impl StreamReject {
 
 /// Frame direction (determined at the wire layer by `FLAG_RESPONSE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Direction {
+pub enum Direction {
     /// Request direction (initiated by ingress → target agent).
     Request,
     /// Response direction (egress return path → source agent).
@@ -144,12 +153,9 @@ pub(crate) async fn tenant_policy_allows(
         return true;
     }
     let config = config.read().await;
-    config.acl.contains(&AclRule {
-        source_tenant: source_tenant.to_string(),
-        source: source_bare.to_string(),
-        target_tenant: target_tenant.to_string(),
-        target: target_bare.to_string(),
-    })
+    config
+        .acl
+        .allows(source_tenant, source_bare, target_tenant, target_bare)
 }
 
 /// Verdict of the shared stream-admission gate.
@@ -206,7 +212,7 @@ pub(crate) async fn admit_stream(
         .limits
         .max_streams_total
         .load(std::sync::atomic::Ordering::Relaxed);
-    if max_total > 0 && hub.active_streams.read().await.len() >= max_total {
+    if max_total > 0 && hub.active_streams.total() >= max_total {
         metrics::counter!("interflow_hub_stream_limit_denied", "scope" => "total").increment(1);
         hub.audit.record(
             AuditKind::StreamDenied {
@@ -299,12 +305,14 @@ pub(crate) async fn issue_route(
 
 /// Resolution result of frame-level Data dispatch.
 enum DataRoute {
-    /// Normal route: recipient, frame origin, flags, dispatch sink.
+    /// Normal route: recipient (for the re-registration fallback), frame
+    /// origin, flags, the delivery sender and which plane it belongs to.
     Deliver {
-        recipient: String,
+        recipient: Arc<str>,
         origin: FrameOrigin,
         flags: u8,
-        sink: Option<mpsc::Sender<TunnelData>>,
+        sink: mpsc::Sender<TunnelData>,
+        relay_plane: bool,
     },
     /// Sender owns neither end of the stream (forged/late frame): drop.
     Forged,
@@ -312,22 +320,29 @@ enum DataRoute {
     Missing,
 }
 
-impl HubService {
-    /// Looks up the `mpsc::Sender` of the given agent.
-    /// Locks are taken only within two very short critical sections (outer
-    /// read takes the Arc, inner read clones tx); no awaiting while holding
-    /// a lock.
-    pub(crate) async fn lookup_tx(&self, agent_id: &str) -> Option<mpsc::Sender<TunnelData>> {
-        let state_arc = {
-            let agents = self.state.agents.read().await;
-            agents.get(agent_id).cloned()
-        };
-        if let Some(state_arc) = state_arc {
-            let state = state_arc.read().await;
-            Some(state.tx.clone())
-        } else {
-            None
-        }
+/// Data-plane relay core, owned by [`HubState`]: every transport face (the
+/// h2 upload reader, the QUIC relay loops, benches) drives the same frame
+/// routing through these methods — the per-connection service object only
+/// carries handshake context (identity, circuit, effective IP).
+impl HubState {
+    /// Looks up the `mpsc::Sender` of the given agent — the flat
+    /// [`HubState::data_tx`] projection (one std read lock; the registry's
+    /// two-level hop is a control-plane concern, never a per-frame one).
+    pub fn lookup_tx(&self, agent_id: &str) -> Option<mpsc::Sender<TunnelData>> {
+        self.data_tx(agent_id)
+    }
+
+    /// The agent's session sender for a poll-plane [`StreamFace`] at Open
+    /// time. An agent that is not (yet) registered gets a sealed dummy
+    /// channel: such an Open is rolled back by its failed notification
+    /// moments later, and any stray frame in the window resolves
+    /// Closed → flat-table miss → NoTarget (fail closed, never silent).
+    pub(crate) fn poll_sender(&self, agent_id: &str) -> mpsc::Sender<TunnelData> {
+        self.data_tx(agent_id).unwrap_or_else(|| {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx); // sealed: every send fails closed immediately
+            tx
+        })
     }
 
     /// Removes by agent_id (entry point for runtime death signals such as
@@ -337,21 +352,298 @@ impl HubService {
     /// here because the signal (a send already observed stalled on this very
     /// entry) travels with the resolution itself; a re-registration between
     /// arming and the funnel's check still voids the removal.
-    pub(crate) async fn evict_agent_by_id(&self, agent_id: &str, reason: &'static str) {
+    pub async fn evict_agent_by_id(&self, agent_id: &str, reason: &'static str) {
         let session = {
-            let agents = self.state.agents.read().await;
+            let agents = self.agents.read().await;
             agents.get(agent_id).cloned()
         };
         if let Some(session) = session {
             let circuit = session.read().await.circuit;
             crate::hub::heartbeat::remove_agent_if_current(
-                &self.state,
+                self,
                 agent_id,
                 SessionWitness { session, circuit },
                 reason,
             )
             .await;
         }
+    }
+
+    /// Frame-level Data handling. Direction is given by [`Direction`]
+    /// (determined at the frame layer via `FLAG_RESPONSE`);
+    /// authorization: request direction must be the stream's source,
+    /// response direction must be the stream's target.
+    ///
+    /// `Err(reject)` = dispatch failed (the caller informs the sender that
+    /// the stream is unusable); stream-not-found / forged frames are handled
+    /// per the existing convention (notify or drop) and return `Ok` — a
+    /// single anomalous frame does not tear down the upload.
+    pub async fn frame_data(
+        &self,
+        agent_id: &str,
+        circuit: CircuitToken,
+        stream_id: StreamId,
+        direction: Direction,
+        data: Bytes,
+    ) -> std::result::Result<(), StreamReject> {
+        trace!(
+            "Data frame received: stream_id={}, source={circuit}",
+            stream_id
+        );
+
+        // Look up the stream info to determine the receiving agent (also
+        // taking the stream protocol and dispatch plane: a quic peer goes
+        // through the relay channel, an h2 peer through poll). Loopback
+        // (source == target) converges naturally: both directions'
+        // recipient/frame-source conclusions match the explicit branches.
+        // One shard read resolves the whole route (owner check, recipient,
+        // delivery sender — both plane kinds carry their sender in the
+        // entry since the §2.2 restructure).
+        let route = self.active_streams.with(&stream_id, |stream| match stream {
+            None => DataRoute::Missing,
+            Some(stream) => {
+                let forged = match direction {
+                    Direction::Response => stream.target_circuit != circuit,
+                    Direction::Request => stream.source_circuit != circuit,
+                };
+                if forged {
+                    error!(
+                        "Forgery check: {}-direction frame does not match the stream owner",
+                        direction.label()
+                    );
+                    DataRoute::Forged
+                } else if direction == Direction::Response {
+                    trace!("Route direction: response path");
+                    DataRoute::Deliver {
+                        recipient: Arc::clone(&stream.source_agent),
+                        origin: FrameOrigin::Response,
+                        // UDP/E2E only ride Open; relaying Data with
+                        // the stream's proto bits would violate the
+                        // contract and kill the receiving decode.
+                        flags: FLAG_RESPONSE,
+                        sink: stream.source.sender().clone(),
+                        relay_plane: stream.source.is_relay(),
+                    }
+                } else {
+                    trace!("Route direction: request path");
+                    DataRoute::Deliver {
+                        recipient: Arc::clone(&stream.target_agent),
+                        origin: FrameOrigin::Agent(circuit),
+                        flags: 0,
+                        sink: stream.target.sender().clone(),
+                        relay_plane: stream.target.is_relay(),
+                    }
+                }
+            }
+        });
+
+        let (recipient, origin, frame_flags, sink, relay_plane) = match route {
+            DataRoute::Deliver {
+                recipient,
+                origin,
+                flags,
+                sink,
+                relay_plane,
+            } => (recipient, origin, flags, sink, relay_plane),
+            DataRoute::Missing => {
+                // Stream does not exist (late frame / already swept): notify
+                // the sender so it disconnects the local connection
+                metrics::counter!("interflow_hub_frames_dropped", "reason" => "no_route")
+                    .increment(1);
+                self.notify_sender_close(
+                    agent_id,
+                    stream_id,
+                    &StreamReject::new(CloseReason::NoTarget, "Stream not found"),
+                )
+                .await;
+                return Ok(());
+            }
+            DataRoute::Forged => {
+                metrics::counter!("interflow_hub_frames_dropped", "reason" => "forged")
+                    .increment(1);
+                return Ok(());
+            }
+        };
+
+        trace!("Data received: {} bytes", data.len());
+        metrics::counter!("interflow_hub_bytes_rx").increment(data.len() as u64);
+        metrics::counter!("interflow_hub_frames_rx", "type" => "data").increment(1);
+
+        let data_frame = TunnelData {
+            stream_id,
+            origin,
+            stream_type: FrameType::Data,
+            flags: frame_flags,
+            data,
+        };
+
+        // Execute send().await outside the shard lock, with a timeout: when
+        // an agent dies and the channel (capacity 256) fills, an un-timed
+        // send would hang forever, pinning hub connections and memory, with
+        // upstream only able to wait for nginx to time out with a 502 (the
+        // second root cause of the 2026-09-11 incident).
+        //
+        // Both planes carry their sender in the stream entry since the
+        // §2.2 restructure; the planes differ in failure semantics:
+        // - relay plane (QUIC peer): a Closed sink is the relay writer
+        //   gone (the stream is being torn down) — fail the frame, no
+        //   fallback; a timeout is the peer's disconnect watcher's
+        //   business;
+        // - poll plane (h2 peer): a Closed sink is an in-place
+        //   re-registration having replaced the channels — re-resolve ONCE
+        //   from the flat data_tx projection (the old receiver is dropped
+        //   synchronously at replacement, so a stale sender always
+        //   presents as Closed, never as silent loss); a timeout means no
+        //   consumer has drained the channel — evict.
+        let send_timeout = Duration::from_secs(
+            self.limits
+                .channel_send_timeout_secs
+                .load(Ordering::Relaxed),
+        );
+        match tokio::time::timeout(send_timeout, sink.send(data_frame)).await {
+            Ok(Ok(())) => {
+                if relay_plane {
+                    trace!("Data relayed over QUIC");
+                } else {
+                    trace!("Data sent to receiving endpoint");
+                }
+                Ok(())
+            }
+            Ok(Err(send_err)) if !relay_plane => {
+                // Poll-plane stale sender: one flat-table re-resolution
+                // (the failed send hands the frame back).
+                if let Some(tx) = self.data_tx(&recipient) {
+                    match tokio::time::timeout(send_timeout, tx.send(send_err.0)).await {
+                        Ok(Ok(())) => {
+                            trace!("Data sent to re-resolved endpoint channel");
+                            Ok(())
+                        }
+                        Ok(Err(e)) => {
+                            error!("Failed to send data (channel closed): {e}");
+                            Err(StreamReject::new(
+                                CloseReason::BackendClosed,
+                                "Target agent channel closed",
+                            ))
+                        }
+                        Err(_) => {
+                            error!(
+                                "Send data timed out (>{send_timeout:?}): channel has no consumer, evicting the endpoint"
+                            );
+                            self.evict_agent_by_id(&recipient, "send_timeout").await;
+                            Err(StreamReject::new(
+                                CloseReason::DispatchPoison,
+                                "Target agent stalled",
+                            ))
+                        }
+                    }
+                } else {
+                    error!("Receiving endpoint has no data channel");
+                    Err(StreamReject::new(
+                        CloseReason::NoTarget,
+                        "Target agent not registered",
+                    ))
+                }
+            }
+            Ok(Err(_)) => {
+                error!("QUIC relay channel closed");
+                Err(StreamReject::new(
+                    CloseReason::BackendClosed,
+                    "Target agent channel closed",
+                ))
+            }
+            Err(_) if relay_plane => {
+                error!("QUIC relay send timed out (>{send_timeout:?})");
+                Err(StreamReject::new(
+                    CloseReason::DispatchPoison,
+                    "Target agent stalled",
+                ))
+            }
+            Err(_) => {
+                // Poll-plane timeout: the receiving end has had no consumer
+                // for a long time; declare it dead — evict (closing the
+                // channel immediately unblocks the remaining blocked
+                // senders) so subsequent requests take the fast-fail
+                // "agent does not exist" path.
+                error!(
+                    "Send data timed out (>{send_timeout:?}): channel has no consumer, evicting the endpoint"
+                );
+                self.evict_agent_by_id(&recipient, "send_timeout").await;
+                Err(StreamReject::new(
+                    CloseReason::DispatchPoison,
+                    "Target agent stalled",
+                ))
+            }
+        }
+    }
+
+    /// Sends a hub-origin Close rejection notification back to `agent_id`
+    /// via the **control channel** (guaranteed delivery).
+    ///
+    /// The wire payload is the single u8 reason code from
+    /// [`StreamReject::code`]; the reject's diagnostic stays in logs and
+    /// metrics. The pump side tears down the stream via the existing Close
+    /// path.
+    ///
+    /// Before 2026-09-14 this function used `try_send` into the data
+    /// channel: a full channel meant a **silent drop**, the egress
+    /// forwarder never saw a Close, and the backend fd lingered for the
+    /// whole session (EMFILE,
+    /// (internal design notes)). The drop
+    /// was harmless to stream state (the hub side had already torn the
+    /// stream down) but harmful to the peer's fd — after control/data plane
+    /// separation, "delivery while online".
+    ///
+    /// All call sites of this function (open rejection / forgery / late
+    /// frames) carry "termination first" semantics; the only FIFO-sensitive
+    /// case, a normal response-direction close, does not go through this
+    /// function (see `frame_close`).
+    pub async fn notify_sender_close(
+        &self,
+        agent_id: &str,
+        stream_id: StreamId,
+        reject: &StreamReject,
+    ) {
+        debug!(
+            "close notification: stream_id={stream_id}, code={}, diagnostic={}",
+            reject.code, reject.diagnostic
+        );
+        let _ = crate::hub::control::deliver_close_via_control(
+            &self.agents,
+            agent_id,
+            stream_id,
+            reject.code.clone(),
+        )
+        .await;
+    }
+}
+
+impl HubService {
+    /// Data-plane relay core lives on [`HubState`] (shared by every
+    /// transport face); the service delegates with its connection context.
+    pub(crate) async fn frame_data(
+        &self,
+        agent_id: &str,
+        circuit: CircuitToken,
+        stream_id: StreamId,
+        direction: Direction,
+        data: Bytes,
+    ) -> std::result::Result<(), StreamReject> {
+        self.state
+            .frame_data(agent_id, circuit, stream_id, direction, data)
+            .await
+    }
+
+    /// [`HubState::notify_sender_close`] delegate (upload reader call
+    /// sites).
+    pub(crate) async fn notify_sender_close(
+        &self,
+        agent_id: &str,
+        stream_id: StreamId,
+        reject: &StreamReject,
+    ) {
+        self.state
+            .notify_sender_close(agent_id, stream_id, reject)
+            .await;
     }
 
     /// Frame-level Open handling (called by the `/stream/up` reader;
@@ -500,33 +792,25 @@ impl HubService {
 
         // DATAGRAM eligibility (an h2 source only looks at the target side):
         // UDP stream + target capability + hub toggle
-        let target_face = target_sink
-            .clone()
-            .map_or(StreamFace::Poll, StreamFace::Relay);
+        let target_face = target_sink.map_or_else(
+            || StreamFace::Poll(self.state.poll_sender(target_agent)),
+            StreamFace::Relay,
+        );
         let datagram_ok = matches!(proto, StreamProto::Udp)
             && target_face.is_relay()
-            && self
-                .state
-                .config
-                .read()
-                .await
-                .transport
-                .quic
-                .datagram_enabled;
+            && self.state.limits.datagram_enabled.load(Ordering::Relaxed);
         let stream = crate::hub::ActiveStream {
-            source_agent: source_agent.to_string(),
-            target_agent: target_agent.to_string(),
+            source_agent: Arc::from(source_agent),
+            target_agent: Arc::from(target_agent),
             source_circuit,
             target_circuit,
             proto,
             target: target_face.clone(),
-            source: StreamFace::Poll, // h2 source: return path goes via poll
+            // h2 source: return path goes via the source's own session channel
+            source: StreamFace::Poll(self.state.poll_sender(source_agent)),
             datagram_ok,
         };
-        {
-            let mut streams = self.state.active_streams.write().await;
-            streams.insert(stream_id, stream);
-        }
+        self.state.active_streams.insert(stream_id, stream);
         metrics::gauge!("interflow_hub_streams_active").increment(1.0);
         metrics::counter!("interflow_hub_streams_total", "direction" => "request").increment(1);
         self.state.audit.record(
@@ -588,11 +872,8 @@ impl HubService {
         if let Err(reason) = notify_result {
             // Roll back the just-inserted active stream + release the stream
             // slot + correct metrics/audit
-            {
-                let mut streams = self.state.active_streams.write().await;
-                if streams.remove(&stream_id).is_some() {
-                    metrics::gauge!("interflow_hub_streams_active").decrement(1.0);
-                }
+            if self.state.active_streams.remove(&stream_id).is_some() {
+                metrics::gauge!("interflow_hub_streams_active").decrement(1.0);
             }
             release_stream_slot(&self.state.stream_counts, source_agent);
             self.state.audit.record(
@@ -607,189 +888,6 @@ impl HubService {
         }
 
         Ok(())
-    }
-
-    /// Frame-level Data handling. Direction is given by [`Direction`]
-    /// (determined at the frame layer via `FLAG_RESPONSE`);
-    /// authorization: request direction must be the stream's source,
-    /// response direction must be the stream's target.
-    ///
-    /// `Err(reject)` = dispatch failed (the caller informs the sender that
-    /// the stream is unusable); stream-not-found / forged frames are handled
-    /// per the existing convention (notify or drop) and return `Ok` — a
-    /// single anomalous frame does not tear down the upload.
-    pub(crate) async fn frame_data(
-        &self,
-        agent_id: &str,
-        circuit: CircuitToken,
-        stream_id: StreamId,
-        direction: Direction,
-        data: Bytes,
-    ) -> std::result::Result<(), StreamReject> {
-        debug!(
-            "Data frame received: stream_id={}, source={circuit}",
-            stream_id
-        );
-
-        // Look up the stream info to determine the receiving agent (also
-        // taking the stream protocol and dispatch plane: a quic peer goes
-        // through the relay channel, an h2 peer through poll). Loopback
-        // (source == target) converges naturally: both directions'
-        // recipient/frame-source conclusions match the explicit branches.
-        let route = {
-            let streams = self.state.active_streams.read().await;
-            match streams.get(&stream_id) {
-                None => DataRoute::Missing,
-                Some(stream) => {
-                    let forged = match direction {
-                        Direction::Response => stream.target_circuit != circuit,
-                        Direction::Request => stream.source_circuit != circuit,
-                    };
-                    if forged {
-                        error!(
-                            "Forgery check: {}-direction frame does not match the stream owner",
-                            direction.label()
-                        );
-                        DataRoute::Forged
-                    } else if direction == Direction::Response {
-                        debug!("Route direction: response path");
-                        DataRoute::Deliver {
-                            recipient: stream.source_agent.clone(),
-                            origin: FrameOrigin::Response,
-                            // UDP/E2E only ride Open; relaying Data with
-                            // the stream's proto bits would violate the
-                            // contract and kill the receiving decode.
-                            flags: FLAG_RESPONSE,
-                            sink: stream.source.relay_sender().cloned(),
-                        }
-                    } else {
-                        debug!("Route direction: request path");
-                        DataRoute::Deliver {
-                            recipient: stream.target_agent.clone(),
-                            origin: FrameOrigin::Agent(circuit),
-                            flags: 0,
-                            sink: stream.target.relay_sender().cloned(),
-                        }
-                    }
-                }
-            }
-        };
-
-        let (recipient, origin, frame_flags, recipient_sink) = match route {
-            DataRoute::Deliver {
-                recipient,
-                origin,
-                flags,
-                sink,
-            } => (recipient, origin, flags, sink),
-            DataRoute::Missing => {
-                // Stream does not exist (late frame / already swept): notify
-                // the sender so it disconnects the local connection
-                self.notify_sender_close(
-                    agent_id,
-                    stream_id,
-                    &StreamReject::new(CloseReason::NoTarget, "Stream not found"),
-                )
-                .await;
-                return Ok(());
-            }
-            DataRoute::Forged => return Ok(()),
-        };
-
-        debug!("Data received: {} bytes", data.len());
-        metrics::counter!("interflow_hub_bytes_rx").increment(data.len() as u64);
-        metrics::counter!("interflow_hub_frames_rx", "type" => "data").increment(1);
-
-        let data_frame = TunnelData {
-            stream_id,
-            origin,
-            stream_type: FrameType::Data,
-            flags: frame_flags,
-            data,
-        };
-
-        // Execute send().await outside the lock, with a timeout: when an
-        // agent dies and the channel (capacity 256) fills, an un-timed send
-        // would hang forever, pinning hub connections and memory, with
-        // upstream only able to wait for nginx to time out with a 502
-        // (the second root cause of the 2026-09-11 incident).
-        //
-        // quic peer: sink channel write (same timeout discipline; its
-        // disconnect watcher is responsible for eviction).
-        // h2 peer: lookup_tx → poll channel (existing path).
-        if let Some(sink) = recipient_sink {
-            let send_timeout = Duration::from_secs(
-                self.state
-                    .limits
-                    .channel_send_timeout_secs
-                    .load(Ordering::Relaxed),
-            );
-            match tokio::time::timeout(send_timeout, sink.send(data_frame)).await {
-                Ok(Ok(())) => {
-                    debug!("Data relayed over QUIC");
-                    Ok(())
-                }
-                Ok(Err(_)) => {
-                    error!("QUIC relay channel closed");
-                    Err(StreamReject::new(
-                        CloseReason::BackendClosed,
-                        "Target agent channel closed",
-                    ))
-                }
-                Err(_) => {
-                    error!("QUIC relay send timed out (>{send_timeout:?})");
-                    Err(StreamReject::new(
-                        CloseReason::DispatchPoison,
-                        "Target agent stalled",
-                    ))
-                }
-            }
-        } else {
-            let Some(tx) = self.lookup_tx(&recipient).await else {
-                error!("Receiving endpoint has no data channel");
-                return Err(StreamReject::new(
-                    CloseReason::NoTarget,
-                    "Target agent not registered",
-                ));
-            };
-            let send_timeout = Duration::from_secs(
-                self.state
-                    .limits
-                    .channel_send_timeout_secs
-                    .load(Ordering::Relaxed),
-            );
-            match tokio::time::timeout(send_timeout, tx.send(data_frame)).await {
-                Ok(Ok(())) => {
-                    debug!("Data sent to receiving endpoint");
-                    Ok(())
-                }
-                Ok(Err(e)) => {
-                    // Channel closed: the agent was just evicted or
-                    // re-registered. Fail honestly so upstream disconnects;
-                    // never fake success and throw data into a black hole.
-                    error!("Failed to send data (channel closed): {e}");
-                    Err(StreamReject::new(
-                        CloseReason::BackendClosed,
-                        "Target agent channel closed",
-                    ))
-                }
-                Err(_) => {
-                    // Timeout = the receiving end has had no consumer for a
-                    // long time; declare it dead: evict that agent (closing
-                    // the channel immediately unblocks the remaining blocked
-                    // senders), and subsequent requests take the fast-fail
-                    // "agent does not exist" path.
-                    error!(
-                        "Send data timed out (>{send_timeout:?}): channel has no consumer, evicting the endpoint"
-                    );
-                    self.evict_agent_by_id(&recipient, "send_timeout").await;
-                    Err(StreamReject::new(
-                        CloseReason::DispatchPoison,
-                        "Target agent stalled",
-                    ))
-                }
-            }
-        }
     }
 
     /// Frame-level Close handling: notify the peer, remove the active
@@ -810,43 +908,43 @@ impl HubService {
         // Look up the stream info and decide which peer to notify
         // (directional authorization: request direction must be the source,
         // response direction must be the target — otherwise drop as forgery)
-        let (notify_agent, owner_agent) = {
-            let streams = self.state.active_streams.read().await;
-            let Some(stream) = streams.get(&stream_id) else {
-                return;
-            };
-            let authorized = match direction {
-                Direction::Response => stream.target_circuit == circuit,
-                Direction::Request => stream.source_circuit == circuit,
-            };
-            if !authorized {
-                warn!("Forgery check: Close frame does not own either end of stream {stream_id}");
-                return;
-            }
-            let notify = if direction == Direction::Response {
-                stream.source_agent.clone()
-            } else {
-                stream.target_agent.clone()
-            };
-            (notify, stream.source_agent.clone())
+        let Some((notify_agent, owner_agent)) =
+            self.state.active_streams.with(&stream_id, |stream| {
+                let stream = stream?;
+                let authorized = match direction {
+                    Direction::Response => stream.target_circuit == circuit,
+                    Direction::Request => stream.source_circuit == circuit,
+                };
+                if !authorized {
+                    warn!(
+                        "Forgery check: Close frame does not own either end of stream {stream_id}"
+                    );
+                    return None;
+                }
+                let notify = if direction == Direction::Response {
+                    Arc::clone(&stream.source_agent)
+                } else {
+                    Arc::clone(&stream.target_agent)
+                };
+                Some((notify, Arc::clone(&stream.source_agent)))
+            })
+        else {
+            return;
         };
 
-        // Remove the active stream + decrement the count in the same
-        // critical section (prevents drift)
-        {
-            let mut streams = self.state.active_streams.write().await;
-            if streams.remove(&stream_id).is_some() {
-                metrics::gauge!("interflow_hub_streams_active").decrement(1.0);
-                release_stream_slot(&self.state.stream_counts, &owner_agent);
-                self.state.audit.record(
-                    AuditKind::StreamClosed {
-                        stream_id: stream_id.to_string(),
-                        source_circuit: circuit.to_hex(),
-                    },
-                    Some(circuit.to_hex()),
-                    None,
-                );
-            }
+        // Remove the active stream + decrement the count together
+        // (prevents drift)
+        if self.state.active_streams.remove(&stream_id).is_some() {
+            metrics::gauge!("interflow_hub_streams_active").decrement(1.0);
+            release_stream_slot(&self.state.stream_counts, &owner_agent);
+            self.state.audit.record(
+                AuditKind::StreamClosed {
+                    stream_id: stream_id.to_string(),
+                    source_circuit: circuit.to_hex(),
+                },
+                Some(circuit.to_hex()),
+                None,
+            );
         }
 
         // Notify the peer agent that the stream is closed (dispatched by
@@ -877,46 +975,6 @@ impl HubService {
             )
             .await;
         }
-    }
-
-    /// Sends a hub-origin Close rejection notification back to `agent_id`
-    /// via the **control channel** (guaranteed delivery).
-    ///
-    /// The wire payload is the single u8 reason code from
-    /// [`StreamReject::code`]; the reject's diagnostic stays in logs and
-    /// metrics. The pump side tears down the stream via the existing Close
-    /// path.
-    ///
-    /// Before 2026-09-14 this function used `try_send` into the data
-    /// channel: a full channel meant a **silent drop**, the egress
-    /// forwarder never saw a Close, and the backend fd lingered for the
-    /// whole session (EMFILE,
-    /// (internal design notes)). The drop
-    /// was harmless to stream state (the hub side had already torn the
-    /// stream down) but harmful to the peer's fd — after control/data plane
-    /// separation, "delivery while online".
-    ///
-    /// All call sites of this function (open rejection / forgery / late
-    /// frames) carry "termination first" semantics; the only FIFO-sensitive
-    /// case, a normal response-direction close, does not go through this
-    /// function (see `frame_close`).
-    pub(crate) async fn notify_sender_close(
-        &self,
-        agent_id: &str,
-        stream_id: StreamId,
-        reject: &StreamReject,
-    ) {
-        debug!(
-            "close notification: stream_id={stream_id}, code={}, diagnostic={}",
-            reject.code, reject.diagnostic
-        );
-        let _ = crate::hub::control::deliver_close_via_control(
-            &self.state.agents,
-            agent_id,
-            stream_id,
-            reject.code.clone(),
-        )
-        .await;
     }
 }
 
@@ -1004,5 +1062,138 @@ mod tests {
         for _ in 0..1000 {
             assert!(try_acquire_stream_slot(&counts, "a1", 0));
         }
+    }
+
+    /// §2.2 data-plane restructure: a poll face whose captured sender went
+    /// stale (an in-place re-registration replaced the session channels)
+    /// must deliver via ONE flat-table re-resolution — the old receiver is
+    /// dropped at replacement, so the stale sender presents as Closed, and
+    /// the current session's channel receives the frame.
+    #[tokio::test]
+    async fn poll_face_stale_sender_falls_back_to_current_session() {
+        use crate::hub::state::{ActiveStream, StreamFace};
+        use interflow_core::protocol::StreamProto;
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::hub::test_support::test_state(dir.path());
+
+        let source = "test/src".to_owned();
+        let target = "test/dst".to_owned();
+        let identity = crate::hub::state::PeerIdentity {
+            tenant: std::sync::Arc::from("test"),
+            agent: "dst".to_owned(),
+            trusted_gateway: false,
+            leaf_validity_unix: None,
+            leaf_serial_hex: None,
+        };
+        let circuit =
+            interflow_core::protocol::CircuitToken::from_hex("12078a05e14f4e2c99b1679be1df7c31")
+                .unwrap();
+        state
+            .register_agent(&identity, circuit, None, None, "bench")
+            .await
+            .unwrap();
+
+        // The stream's poll face captured a sender whose receiver is gone
+        // (the re-registration shape: install_channels replaces channels in
+        // place, dropping the old receiver synchronously).
+        let (stale_tx, stale_rx) = tokio::sync::mpsc::channel(256);
+        drop(stale_rx);
+        let stream_id =
+            interflow_core::protocol::StreamId::from_hex("12078a05e14f4e2c99b1679be1df7c31")
+                .unwrap();
+        state.active_streams.insert(
+            stream_id,
+            ActiveStream {
+                source_agent: std::sync::Arc::from(source.as_str()),
+                target_agent: std::sync::Arc::from(target.as_str()),
+                source_circuit: circuit,
+                target_circuit: circuit,
+                proto: StreamProto::Tcp,
+                target: StreamFace::Poll(stale_tx),
+                source: StreamFace::Poll(state.data_tx(&source).unwrap_or_else(|| {
+                    let (tx, rx) = tokio::sync::mpsc::channel(1);
+                    drop(rx);
+                    tx
+                })),
+                datagram_ok: false,
+            },
+        );
+
+        // The current session's receiver (the poll consumer's shape).
+        let mut current_rx = {
+            let agents = state.agents.read().await;
+            let session = agents.get(&target).cloned().unwrap();
+            drop(agents);
+            let mut guard = session.write().await;
+            guard.rx.take().unwrap()
+        };
+
+        state
+            .frame_data(
+                &source,
+                circuit,
+                stream_id,
+                Direction::Request,
+                bytes::Bytes::from_static(b"payload"),
+            )
+            .await
+            .unwrap();
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), current_rx.recv())
+            .await
+            .expect("fallback delivery within timeout")
+            .expect("frame delivered via the re-resolved session channel");
+        assert_eq!(frame.data.as_ref(), b"payload");
+    }
+
+    /// The sharded table's cross-shard behavior: entries spread across
+    /// shards route, sweep and count correctly (the sweep paths iterate
+    /// every shard).
+    #[tokio::test]
+    async fn sharded_streams_sweep_across_shards() {
+        use crate::hub::state::{ActiveStream, StreamFace};
+        use interflow_core::protocol::StreamProto;
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::hub::test_support::test_state(dir.path());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let face = StreamFace::Poll(tx);
+        let circuit =
+            interflow_core::protocol::CircuitToken::from_hex("12078a05e14f4e2c99b1679be1df7c31")
+                .unwrap();
+        // 64 distinct ids hash across all 16 shards with certainty.
+        for i in 0..64u64 {
+            let id =
+                interflow_core::protocol::StreamId::from_hex(&format!("{:032x}", i + 1)).unwrap();
+            state.active_streams.insert(
+                id,
+                ActiveStream {
+                    source_agent: std::sync::Arc::from("test/src"),
+                    target_agent: std::sync::Arc::from("test/dst"),
+                    source_circuit: circuit,
+                    target_circuit: circuit,
+                    proto: StreamProto::Tcp,
+                    target: face.clone(),
+                    source: face.clone(),
+                    datagram_ok: false,
+                },
+            );
+        }
+        assert_eq!(state.active_streams.total(), 64);
+
+        // Sweep one agent's streams: every shard's retain runs.
+        super::HubService::sweep_agent_streams(
+            &state.agents,
+            &state.active_streams,
+            &state.stream_counts,
+            "test/src",
+        )
+        .await;
+        assert_eq!(
+            state.active_streams.total(),
+            0,
+            "sweep must reach entries in every shard"
+        );
     }
 }

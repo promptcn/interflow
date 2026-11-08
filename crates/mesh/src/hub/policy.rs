@@ -120,6 +120,8 @@ impl HubService {
         write_atomic(&dir.join("policy.sig"), &signature)?;
 
         channel.floor.store(policy.generation, Ordering::Release);
+        // The floor the version endpoint watches moved with the publish.
+        self.state.floor_clock.bump();
         self.state.audit.record(
             AuditKind::PolicyPublished {
                 generation: policy.generation,
@@ -271,10 +273,13 @@ impl HubService {
     /// registered fleet member (ALL tenants; this is the control-gated
     /// operator face, so a cross-tenant listing is in-bounds here, unlike
     /// the tenant-scoped `GET /agents`) with its presence reading and its
-    /// last-pulled watermark from the `policy_pulled` ledger (`seen: null`
-    /// = no completed pull since this hub process started). The Apply
-    /// convergence view renders from exactly this array. Additive fields —
-    /// older clients ignore them.
+    /// LEVEL policy face from the watermark table (`seen: null` = no
+    /// completed pull since this hub process started; `last_pull_unix`
+    /// carries the confirmation instant — the two fields together make
+    /// "present but silent" legible). `captured_at_unix` anchors every
+    /// recency judgment to this hub's clock. The Apply convergence view
+    /// renders from exactly this array. Additive fields — older clients
+    /// ignore them.
     /// Denials are plain status answers — the audit kind belongs to the
     /// publish face, and a wrong-principal GET leaks nothing to record.
     pub(crate) async fn handle_policy_floor(&self) -> Result<Response<HubResponseBody>> {
@@ -297,40 +302,158 @@ impl HubService {
             ));
         }
         let floor = channel.floor.load(Ordering::Acquire);
-        // Registry (presence, all tenants) ∪ ledger (pulled watermarks):
-        // an agent that pulled but was since evicted still shows its
+        // Registry (presence, all tenants) ∪ watermark table (the level
+        // face): an agent that pulled but was since evicted still shows its
         // watermark (offline); an agent that never pulled shows
         // `seen: null`.
-        let mut agents: Vec<(String, bool, Option<u64>)> = {
+        let mut agents: Vec<(String, bool)> = {
             let registry = self.state.agents.read().await;
-            let mut rows: Vec<(String, bool, Option<u64>)> = Vec::with_capacity(registry.len());
+            let mut rows: Vec<(String, bool)> = Vec::with_capacity(registry.len());
             for (key, session) in registry.iter() {
                 let online = session.read().await.online();
-                rows.push((key.clone(), online, None));
+                rows.push((key.clone(), online));
             }
             rows.sort();
             rows
         };
-        {
-            let ledger = self
-                .state
-                .policy_pull_ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (agent, seen) in ledger.iter() {
-                if let Some(entry) = agents.iter_mut().find(|(a, _, _)| a == agent) {
-                    entry.2 = Some(*seen);
-                } else {
-                    agents.push((agent.clone(), false, Some(*seen)));
+        let watermarks = self.state.policy_watermarks.face();
+        for agent in watermarks.keys() {
+            if !agents.iter().any(|(a, _)| a == agent) {
+                agents.push((agent.clone(), false));
+            }
+        }
+        // The credential windows carry their own remembrance rows (a leg
+        // that registered but never pulled still counts down).
+        for agent in self.state.credential_watermarks.face().keys() {
+            if !agents.iter().any(|(a, _)| a == agent) {
+                agents.push((agent.clone(), false));
+            }
+        }
+        agents.sort();
+        // Planned-unavailability faces (additive, tolerant-parse on the
+        // client): the agents' reported paused streams and the maintenance
+        // declarations — the GUI's streams/fleet views render them yellow.
+        let paused_face: std::collections::HashMap<String, Vec<String>> = {
+            let intents = self.state.stream_intents.clone();
+            agents
+                .iter()
+                .filter_map(|(agent, _)| intents.face(agent).map(|paused| (agent.clone(), paused)))
+                .collect()
+        };
+        // The mailbox watermark face (queued ops waiting on each leg):
+        // additive per-agent block, present exactly when something is
+        // waiting or a drop ever happened.
+        let mailbox_face: std::collections::HashMap<
+            String,
+            crate::hub::stream_intents::MailboxFace,
+        > = {
+            let intents = &self.state.stream_intents;
+            let mut map = std::collections::HashMap::new();
+            for (agent, _) in &agents {
+                if let Some(face) = intents.mailbox_face(agent) {
+                    map.insert(agent.clone(), face);
                 }
             }
-            agents.sort();
-        }
+            map
+        };
+        let maintenance_face = self.state.maintenance.face();
+        // The node-status face (per-stream byte activity) and the
+        // admission table (per-leg in-flight counts) — additive per-agent
+        // keys, present exactly when a report / a live count exists.
+        let node_status_face = self.state.node_status.face();
+        // The credential-expiry face's windows (last-seen per leg,
+        // retained across eviction).
+        let credential_face = self.state.credential_watermarks.face();
+        let stream_counts = self
+            .state
+            .stream_counts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // The CRL-poll liveness face (agents + the hub's own self slot):
+        // additive fields, present exactly when a level was reported —
+        // clients judge `crl_last_success_unix` against
+        // `captured_at_unix` (same discipline as `last_pull_unix`).
+        let crl_face = self.state.crl_liveness.face();
+        let crl_self = self.state.crl_liveness.self_face();
         let agents_json = agents
             .iter()
-            .map(|(agent, online, seen)| {
-                let seen = seen.map_or_else(|| "null".to_string(), |s| s.to_string());
-                format!("{{\"agent\":\"{agent}\",\"online\":{online},\"seen\":{seen}}}")
+            .map(|(agent, online)| {
+                // `seen` keeps its always-present shape (null = no
+                // completed pull this process); `last_pull_unix` is the
+                // additive confirmation instant, present exactly when a
+                // watermark row exists.
+                let seen = watermarks
+                    .get(agent)
+                    .map_or_else(|| "null".to_string(), |w| w.seen_generation.to_string());
+                let last_pull_json = watermarks.get(agent).map_or_else(String::new, |w| {
+                    format!(",\"last_pull_unix\":{}", w.last_pull_unix)
+                });
+                let paused_json = paused_face.get(agent).map_or_else(String::new, |names| {
+                    format!(",\"paused_streams\":{}", serde_json::to_string(names).expect("Vec<String> serializes"))
+                });
+                let maintenance_json = if maintenance_face.contains_key(agent) {
+                    ",\"maintenance\":true".to_string()
+                } else {
+                    String::new()
+                };
+                let crl_json = crl_face.get(agent).map_or_else(String::new, |row| {
+                    format!(
+                        ",\"crl_last_success_unix\":{},\"crl_failures_total\":{}",
+                        row.last_success_unix, row.failures_total
+                    )
+                });
+                let pending_ops_json = mailbox_face.get(agent).map_or_else(String::new, |face| {
+                    format!(
+                        ",\"pending_ops\":{}",
+                        serde_json::to_string(face).expect("MailboxFace serializes")
+                    )
+                });
+                let streams_json = node_status_face
+                    .get(agent)
+                    .filter(|status| !status.streams.is_empty())
+                    .map_or_else(String::new, |status| {
+                        format!(
+                            ",\"streams\":{}",
+                            serde_json::to_string(&status.streams).expect("activity serializes")
+                        )
+                    });
+                let in_flight_json = stream_counts.get(agent).map_or_else(String::new, |count| {
+                    format!(
+                        ",\"streams_in_flight\":{}",
+                        u64::try_from(*count).unwrap_or(u64::MAX)
+                    )
+                });
+                let connection_json = node_status_face
+                    .get(agent)
+                    .and_then(|status| status.connection)
+                    .map_or_else(String::new, |connection| {
+                        format!(
+                            ",\"connection\":{}",
+                            serde_json::to_string(&connection)
+                                .expect("ConnectionQualityWire serializes")
+                        )
+                    });
+                let backoff_json = crl_face.get(agent).map_or_else(String::new, |row| {
+                    format!(
+                        ",\"renewal_backoff_failures\":{},\"renewal_backoff_max_today\":{}",
+                        row.renewal_backoff_failures, row.renewal_backoff_max_today
+                    )
+                });
+                let credential_json = credential_face.get(agent).map_or_else(String::new, |window| {
+                    format!(
+                        ",\"leaf_not_before_unix\":{},\"leaf_not_after_unix\":{},\"credential_mode\":\"{}\",\"credential_last_seen_unix\":{}",
+                        window.not_before_unix,
+                        window.not_after_unix,
+                        crate::hub::credential_watermarks::tier_from_span(
+                            window.not_after_unix - window.not_before_unix
+                        ),
+                        window.last_seen_unix
+                    )
+                });
+                format!(
+                    "{{\"agent\":\"{agent}\",\"online\":{online},\"seen\":{seen}{last_pull_json}{paused_json}{maintenance_json}{crl_json}{pending_ops_json}{streams_json}{in_flight_json}{credential_json}{connection_json}{backoff_json}}}"
+                )
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -345,16 +468,198 @@ impl HubService {
             field.push(',');
             field
         });
+        // The hub's own CRL-poll liveness (self slot) and its plane-reload
+        // instant: additive, omitted when this process runs no renewal
+        // loop (a missing key reads as unknown, never as zero).
+        let crl_self_json = crl_self.map_or_else(String::new, |row| {
+            format!(
+                ",\"crl_last_success_unix\":{},\"crl_failures_total\":{}",
+                row.last_success_unix, row.failures_total
+            )
+        });
+        let crl_reload_json = self
+            .state
+            .crl_channel
+            .as_ref()
+            .map(|channel| channel.last_reload_unix())
+            .filter(|unix| *unix != 0)
+            .map_or_else(String::new, |unix| {
+                format!(",\"crl_last_reload_unix\":{unix}")
+            });
+        // The route-breaker open set (edge gateways): hosts + instants,
+        // omitted when this hub carries no edge face.
+        let route_breakers_json = {
+            let guard = self
+                .state
+                .route_breaker_face
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.as_ref() {
+                Some(face) => {
+                    let mut rows: Vec<serde_json::Value> = face
+                        .snapshot()
+                        .into_iter()
+                        .map(|row| {
+                            serde_json::json!({
+                                "host": row.target,
+                                "opened_unix": row.opened_unix,
+                                "last_probe_unix": row.last_probe_unix,
+                            })
+                        })
+                        .collect();
+                    rows.sort_by(|a, b| {
+                        a.get("host")
+                            .and_then(serde_json::Value::as_str)
+                            .cmp(&b.get("host").and_then(serde_json::Value::as_str))
+                    });
+                    if rows.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            ",\"route_breakers_open\":{}",
+                            serde_json::to_string(&rows).expect("Value serializes")
+                        )
+                    }
+                }
+                None => String::new(),
+            }
+        };
+        // The resident-task watchdog's rows (the armed-assertion face):
+        // additive, omitted when this hub reports no resident tasks (a
+        // missing key reads as unknown, never as all-armed).
+        let watchers_json = {
+            let rows = self.state.watchdog.face_rows();
+            if rows.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ",\"watchers\":{}",
+                    serde_json::to_string(&rows).expect("Vec<WatcherFaceRow> serializes")
+                )
+            }
+        };
+        // The proposals queue's watermark (decisions awaiting the
+        // operator): additive, omitted when nothing is pending or the hub
+        // carries no proposal store.
+        let proposals_json = self
+            .state
+            .proposals
+            .as_ref()
+            .and_then(|proposals| proposals.pending_face())
+            .map_or_else(String::new, |face| {
+                format!(
+                    ",\"proposals_pending\":{}",
+                    serde_json::to_string(&face).expect("ProposalsPendingFace serializes")
+                )
+            });
+        // The session-headroom pair (global count + the admission caps):
+        // additive, the denominators of the headroom judgments.
+        let headroom_json = format!(
+            ",\"streams_in_flight_total\":{},\"stream_limits\":{}",
+            u64::try_from(stream_counts.values().sum::<usize>()).unwrap_or(u64::MAX),
+            serde_json::to_string(&crate::hub::snapshot::StreamLimitsFace {
+                total: self.state.limits.max_streams_total.load(Ordering::Relaxed) as u64,
+                per_agent: self
+                    .state
+                    .limits
+                    .max_streams_per_agent
+                    .load(Ordering::Relaxed) as u64,
+            })
+            .expect("StreamLimitsFace serializes")
+        );
         // `serving` is omitted (not faked as 0) when nothing servable is on
         // disk — clients treat a missing key as "this hub cannot report
-        // it" rather than "it reports zero".
+        // it" rather than "it reports zero". `captured_at_unix` anchors
+        // recency judgments (`last_pull_unix`) to this hub's clock — the
+        // same discipline as the snapshot face's field of that name.
+        let captured_at_unix = interflow_identity::expiry::now_unix();
         let body = match serve_cached(&channel) {
             Some((_, _, serving)) => format!(
-                "{{\"hub\":{hub_json}\"floor\":{floor},\"serving\":{serving},\"agents\":[{agents_json}]}}"
+                "{{\"hub\":{hub_json}\"floor\":{floor},\"serving\":{serving},\"captured_at_unix\":{captured_at_unix}{crl_self_json}{crl_reload_json}{route_breakers_json}{watchers_json}{proposals_json}{headroom_json},\"agents\":[{agents_json}]}}"
             ),
-            None => format!("{{\"hub\":{hub_json}\"floor\":{floor},\"agents\":[{agents_json}]}}"),
+            None => format!(
+                "{{\"hub\":{hub_json}\"floor\":{floor},\"captured_at_unix\":{captured_at_unix}{crl_self_json}{crl_reload_json}{route_breakers_json}{watchers_json}{proposals_json}{headroom_json},\"agents\":[{agents_json}]}}"
+            ),
         };
         Ok(super::service::json_response(StatusCode::OK, body))
+    }
+
+    /// `GET /policy/floor/version[?since=N&wait_secs=S]` — the floor read
+    /// model's change signal (the blocking-watch sibling of
+    /// [`Self::handle_policy_floor`]).
+    ///
+    /// Without `since`: an immediate `{"version": N}` probe. With
+    /// `since=N`: an immediate answer whenever the current version
+    /// diverges from `N` (behind = changes were missed; ahead = this hub
+    /// restarted and its in-memory clock reset — either way the caller
+    /// owes itself a fresh read), and otherwise the request HOLDS until
+    /// the version advances or `wait_secs` (clamped to 30s) elapses,
+    /// then answers with the current version either way. The caller
+    /// compares the answer against its `since` — equality means "nothing
+    /// moved, re-issue the watch".
+    ///
+    /// Unlike its sibling this answers on EVERY hub (no policy-channel
+    /// gate): the clock tracks the fleet face — registry presence, pull
+    /// watermarks (advances and fresh↔silent recency transitions — see
+    /// `hub::policy_watermarks`), the paused-stream and maintenance faces —
+    /// which exists independently of the policy publication channel. The
+    /// payload stays with the floor endpoint itself (2026-10-13 ruling:
+    /// `/policy/floor`'s contract is watermark arbitration, no field
+    /// accretion) — this face pushes the invalidation signal only, under
+    /// the same control-principal gate.
+    pub(crate) async fn handle_policy_floor_version(
+        &self,
+        req: hyper::Request<hyper::body::Incoming>,
+    ) -> Result<Response<HubResponseBody>> {
+        /// The hold ceiling: a held request is re-issued by the caller on
+        /// answer, so a modest cap bounds server-held connections while
+        /// keeping the wake latency at bump time.
+        const MAX_WATCH_WAIT_SECS: u64 = 30;
+        let Some(identity) = self.identity().await else {
+            return Ok(super::service::text_response(
+                StatusCode::UNAUTHORIZED,
+                "Client certificate required",
+            ));
+        };
+        if identity.tenant.as_ref() != CONTROL_TENANT {
+            return Ok(super::service::text_response(
+                StatusCode::FORBIDDEN,
+                "policy floor watch requires a control-plane principal (realm-anchored)",
+            ));
+        }
+        let mut since: Option<u64> = None;
+        let mut wait_secs: Option<u64> = None;
+        if let Some(query) = req.uri().query() {
+            for pair in query.split('&') {
+                let Some((key, value)) = pair.split_once('=') else {
+                    continue;
+                };
+                match key {
+                    "since" => since = value.parse().ok(),
+                    "wait_secs" => wait_secs = value.parse().ok(),
+                    _ => {}
+                }
+            }
+        }
+        let clock = &self.state.floor_clock;
+        let answer_now = |version: u64| {
+            super::service::json_response(StatusCode::OK, format!("{{\"version\":{version}}}"))
+        };
+        let current = clock.version();
+        let Some(seen) = since.filter(|&value| value == current) else {
+            return Ok(answer_now(current));
+        };
+        let mut rx = clock.subscribe();
+        // Close the read→subscribe race: a bump between the version read
+        // and the subscription would otherwise wait for the NEXT bump.
+        if clock.version() != seen {
+            return Ok(answer_now(clock.version()));
+        }
+        let wait = std::time::Duration::from_secs(wait_secs.unwrap_or(0).min(MAX_WATCH_WAIT_SECS));
+        // A timeout is not an error — the answer is the (unchanged)
+        // current version and the caller re-issues the watch.
+        let _ = tokio::time::timeout(wait, rx.changed()).await;
+        Ok(answer_now(clock.version()))
     }
 }
 
@@ -388,8 +693,18 @@ pub(crate) enum PolicyServe {
     },
 }
 
+/// The capture instant for watermark-face rows (unix seconds) — the same
+/// clock the snapshot face stamps (`FleetSnapshotHub::captured_at_unix`),
+/// so recency judgments across faces share one time base.
+fn watermarks_now_unix() -> u64 {
+    u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0)
+}
+
 /// The shared arbitration (see [`PolicyServe`]). `agent` is the puller's
 /// qualified name, `peer` the peer address string for the audit trail.
+/// Every completed pull — not-modified answers included — also lands in
+/// the level-triggered watermark face (`state.policy_watermarks`), the
+/// material the fleet faces render from.
 pub(crate) fn serve_policy_conditional(
     state: &crate::hub::state::HubState,
     agent: &str,
@@ -424,7 +739,12 @@ pub(crate) fn serve_policy_conditional(
             // machine-observable instead of operator-carried lore. An
             // inflated report only inflates the next minted generation
             // (a monotonic counter); it cannot wedge the channel.
-            channel.floor.fetch_max(seen, Ordering::AcqRel);
+            // An absorbed watermark moves the reported floor — bump only
+            // when fetch_max actually raised it.
+            let prev_floor = channel.floor.fetch_max(seen, Ordering::AcqRel);
+            if prev_floor < seen {
+                state.floor_clock.bump();
+            }
             if crate::hub::state::should_report_stale_watermark(
                 &state.stale_watermark_ledger,
                 agent,
@@ -437,6 +757,13 @@ pub(crate) fn serve_policy_conditional(
                 );
             }
         }
+        // The level face: even a not-modified pull is a CONFIRMATION — the
+        // agent's watermark and its liveness land in the watermark table
+        // (this is the record steady-state pulls never reached when the
+        // face read the edge ledger, the "healthy but reads never" defect).
+        state
+            .policy_watermarks
+            .record(agent, seen, watermarks_now_unix());
         return PolicyServe::UpToDate {
             serving_generation: generation,
         };
@@ -454,6 +781,13 @@ pub(crate) fn serve_policy_conditional(
             Some(peer.to_owned()),
         );
     }
+    // The level face records the SERVED generation (the pull hands the
+    // agent this generation; its next pull will report it back as `seen`).
+    // Its advancing watermark is the face-visible change — the bump lives
+    // in the watermark table, not here.
+    state
+        .policy_watermarks
+        .record(agent, generation, watermarks_now_unix());
     metrics::counter!("interflow_hub_policy_served_total").increment(1);
     PolicyServe::Update {
         body,
@@ -540,13 +874,27 @@ pub enum PublishOutcome {
     Rejected { status: u16, detail: String },
 }
 
+/// How a control-plane dial verifies the hub's server certificate — the
+/// two trust models the product actually uses, typed at the dial instead
+/// of re-derived from flags at every caller.
+#[derive(Debug, Clone, Copy)]
+pub enum ServerTrust<'a> {
+    /// Verify the hub against a realm issuer anchor (operator CLI dials:
+    /// the hub is a remote peer with a real chain).
+    Ca(&'a std::path::Path),
+    /// Pin the control cert's SHA256 fingerprint (same-process/loopback
+    /// dials: the edge self-dial trust model — no CA chain, no SAN
+    /// fabrication, no IP/IPv6 resolution pitfalls).
+    Pinned(&'a str),
+}
+
 /// Dials one control-plane mTLS h2 connection to a hub (shared by the
-/// publish and the floor-query clients). The caller holds the returned
-/// request sender; the connection driver is kept alive by a spawned task
-/// for the sender's lifetime.
+/// publish, floor-query, snapshot, and agents-list clients). The caller
+/// holds the returned request sender; the connection driver is kept alive
+/// by a spawned task for the sender's lifetime.
 pub(crate) async fn control_plane_dial(
     hub_endpoint: &str,
-    ca_path: &std::path::Path,
+    trust: ServerTrust<'_>,
     client_cert_path: &std::path::Path,
     client_key_path: &std::path::Path,
 ) -> Result<hyper::client::conn::http2::SendRequest<interflow_core::tunnel::H2RequestBody>> {
@@ -569,9 +917,13 @@ pub(crate) async fn control_plane_dial(
         .map_err(|e| InterflowError::config(format!("hub host {host:?}")).with_source(e))?
         .to_owned();
 
+    let (pin, ca) = match trust {
+        ServerTrust::Ca(path) => (None, Some(path.display().to_string())),
+        ServerTrust::Pinned(hex) => (Some(hex.to_owned()), None),
+    };
     let tls_config = interflow_core::tls::client::build_client_config(
-        None,
-        Some(&ca_path.display().to_string()),
+        pin.as_deref(),
+        ca.as_deref(),
         Some(&client_cert_path.display().to_string()),
         Some(&client_key_path.display().to_string()),
         &["h2"],
@@ -614,8 +966,13 @@ pub async fn publish_policy(
     use http_body_util::{BodyExt, Full};
 
     let future = async {
-        let mut send_request =
-            control_plane_dial(hub_endpoint, ca_path, client_cert_path, client_key_path).await?;
+        let mut send_request = control_plane_dial(
+            hub_endpoint,
+            ServerTrust::Ca(ca_path),
+            client_cert_path,
+            client_key_path,
+        )
+        .await?;
         let body = Full::new(bytes::Bytes::copy_from_slice(policy_bytes))
             .map_err(|never| match never {})
             .boxed();
@@ -697,9 +1054,46 @@ pub struct HubOverview {
     pub floor: u64,
     /// Same as [`PolicyFloorQuery::serving`].
     pub serving: Option<u64>,
+    /// The hub-side capture instant (unix seconds) — the anchor every
+    /// recency judgment of `last_pull_unix` reads against (`None` = an
+    /// older hub that does not self-report it; consumers must then not
+    /// judge recency rather than guess).
+    pub captured_at_unix: Option<i64>,
     /// Every registered fleet member with presence and last-pulled
     /// watermark. Empty on older hubs that do not report the array.
     pub agents: Vec<PolicyAgentWatermark>,
+    /// Unix seconds of THIS hub process's own last successful CRL poll
+    /// (the renewal loop's liveness face, self slot; `None` = an older
+    /// hub or a process without a renewal loop).
+    pub crl_last_success_unix: Option<u64>,
+    /// Failed CRL polls since this hub process started.
+    pub crl_failures_total: Option<u64>,
+    /// The currently-OPEN route breakers (edge gateways; empty on plain
+    /// mesh hubs and older hubs).
+    pub route_breakers_open: Vec<RouteBreakerOpen>,
+    /// The resident-task watchdog's rows (the armed-assertion face; empty
+    /// on older hubs — the assertion is then unjudgeable, not passed).
+    pub watchers: Vec<crate::hub::watchdog::WatcherFaceRow>,
+    /// The proposals queue's watermark face (`None` when nothing is
+    /// pending or the hub carries no store).
+    pub proposals_pending: Option<crate::hub::proposals::ProposalsPendingFace>,
+    /// The hub's currently-admitted streams across all agents (`None` on
+    /// older hubs).
+    pub streams_in_flight_total: Option<u64>,
+    /// The admission caps the headroom judgments read against (`None` on
+    /// older hubs).
+    pub stream_limits: Option<crate::hub::snapshot::StreamLimitsFace>,
+}
+
+/// One OPEN route breaker as the floor payload carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteBreakerOpen {
+    /// The public host whose route breaker is OPEN.
+    pub host: String,
+    /// Unix seconds of the trip.
+    pub opened_unix: u64,
+    /// Unix seconds of the last admitted probe/touch.
+    pub last_probe_unix: u64,
 }
 
 /// One fleet member's row in a [`HubOverview`].
@@ -713,6 +1107,47 @@ pub struct PolicyAgentWatermark {
     /// The generation this agent last pulled (`None` = no completed pull
     /// since the hub process started).
     pub seen: Option<u64>,
+    /// Unix seconds of the agent's last completed pull (`None` = an older
+    /// hub, or no completed pull — a `seen` without this field must not be
+    /// judged for recency).
+    pub last_pull_unix: Option<u64>,
+    /// The stream names this agent last reported paused (planned
+    /// unavailability, stream-level). `None` = never reported (or an
+    /// older hub without the field).
+    pub paused_streams: Option<Vec<String>>,
+    /// Whether the node is declared under maintenance (planned
+    /// unavailability, node-level).
+    pub maintenance: bool,
+    /// Unix seconds of the node's last successful CRL poll (its liveness
+    /// reporter's level; `None` = never reported or an older hub).
+    pub crl_last_success_unix: Option<u64>,
+    /// Failed CRL polls since the node's process started.
+    pub crl_failures_total: Option<u64>,
+    /// The operator's queued stream ops waiting on this leg (the mailbox
+    /// watermark face; `None` = nothing waiting and nothing ever
+    /// dropped, or an older hub).
+    pub pending_ops: Option<crate::hub::stream_intents::MailboxFace>,
+    /// This agent's currently-admitted hub streams (`None` on older
+    /// hubs / legs with no live count).
+    pub streams_in_flight: Option<u64>,
+    /// The agent's last-seen leaf validity window (the
+    /// credential-expiry face); `None` on older hubs.
+    pub leaf_not_before_unix: Option<i64>,
+    /// See [`Self::leaf_not_before_unix`].
+    pub leaf_not_after_unix: Option<i64>,
+    /// The tier the span implies (`registrar` / `offline`).
+    pub credential_mode: Option<String>,
+    /// Unix seconds of the registration that last presented the window.
+    pub credential_last_seen_unix: Option<u64>,
+    /// The agent's per-stream byte-activity levels (the fossil face;
+    /// empty on older agents / agents without mesh stream rules).
+    pub streams: Vec<interflow_core::tunnel::transport::NodeStreamActivity>,
+    /// The connection-quality window stats (`None` on older agents).
+    pub connection: Option<interflow_core::tunnel::transport::ConnectionQualityWire>,
+    /// The renewal backoff ladder's current stage (`None` on older hubs).
+    pub renewal_backoff_failures: Option<u32>,
+    /// The stage's observed maximum today.
+    pub renewal_backoff_max_today: Option<u32>,
 }
 
 /// Queries a hub's policy floor (`GET /policy/floor`) — the watermark
@@ -731,8 +1166,13 @@ pub async fn query_policy_floor(
     use http_body_util::BodyExt;
 
     let future = async {
-        let mut send_request =
-            control_plane_dial(hub_endpoint, ca_path, client_cert_path, client_key_path).await?;
+        let mut send_request = control_plane_dial(
+            hub_endpoint,
+            ServerTrust::Ca(ca_path),
+            client_cert_path,
+            client_key_path,
+        )
+        .await?;
         let request = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri("/policy/floor")
@@ -788,6 +1228,76 @@ pub async fn query_policy_floor(
         })?
 }
 
+/// One blocking-watch cycle of `GET /policy/floor/version` — the floor
+/// read model's change signal.
+///
+/// Sends `since` (the version the caller's read model was built at) and
+/// `wait_secs`; the hub answers immediately on divergence and otherwise
+/// holds the request until the version advances or the wait elapses.
+/// Returns the hub's CURRENT version either way: the caller decides
+/// "changed" by comparison (`answer == since` means nothing moved —
+/// re-issue the watch; any other answer, ahead or behind, is a change).
+/// The overall budget is `wait_secs + 10s` (dial + hold + answer), NOT
+/// the 10s courtesy bound of the one-shot operator calls — a watch that
+/// outlived its own timeout would be useless.
+pub async fn watch_floor_version(
+    hub_endpoint: &str,
+    ca_path: &std::path::Path,
+    client_cert_path: &std::path::Path,
+    client_key_path: &std::path::Path,
+    since: u64,
+    wait_secs: u64,
+) -> Result<u64> {
+    use http_body_util::BodyExt;
+
+    let future = async {
+        let mut send_request = control_plane_dial(
+            hub_endpoint,
+            ServerTrust::Ca(ca_path),
+            client_cert_path,
+            client_key_path,
+        )
+        .await?;
+        let uri = format!("/policy/floor/version?since={since}&wait_secs={wait_secs}");
+        let request = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .body(
+                http_body_util::Full::<bytes::Bytes>::new(bytes::Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .map_err(|e| {
+                InterflowError::protocol("floor version watch build".to_string()).with_source(e)
+            })?;
+        let response = send_request.send_request(request).await?;
+        let status = response.status();
+        let collected = BodyExt::collect(response.into_body()).await.map_err(|e| {
+            InterflowError::protocol("floor version watch body".to_string()).with_source(e)
+        })?;
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        if status != http::StatusCode::OK {
+            return Err(InterflowError::connection(format!(
+                "floor version watch rejected: {status} — {text}"
+            )));
+        }
+        serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
+            .ok_or_else(|| {
+                InterflowError::protocol(format!(
+                    "floor version watch 200 without a version: {text:?}"
+                ))
+            })
+    };
+    let budget = std::time::Duration::from_secs(wait_secs + 10);
+    tokio::time::timeout(budget, future).await.map_err(|_| {
+        InterflowError::connection(format!(
+            "floor version watch timed out (>{wait_secs}s hold + dial) — is the mesh hub reachable?"
+        ))
+    })?
+}
+
 /// Queries the operator overview — the same `GET /policy/floor` endpoint's
 /// full client view ([`HubOverview`]).
 ///
@@ -802,8 +1312,13 @@ pub async fn query_hub_overview(
     use http_body_util::BodyExt;
 
     let future = async {
-        let mut send_request =
-            control_plane_dial(hub_endpoint, ca_path, client_cert_path, client_key_path).await?;
+        let mut send_request = control_plane_dial(
+            hub_endpoint,
+            ServerTrust::Ca(ca_path),
+            client_cert_path,
+            client_key_path,
+        )
+        .await?;
         let request = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri("/policy/floor")
@@ -826,6 +1341,14 @@ pub async fn query_hub_overview(
                 hub: None,
                 floor: 0,
                 serving: None,
+                captured_at_unix: None,
+                crl_last_success_unix: None,
+                crl_failures_total: None,
+                route_breakers_open: Vec::new(),
+                watchers: Vec::new(),
+                proposals_pending: None,
+                streams_in_flight_total: None,
+                stream_limits: None,
                 agents: Vec::new(),
             });
         }
@@ -852,6 +1375,12 @@ pub async fn query_hub_overview(
             .get("hub")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
+        // Tolerant parse: `captured_at_unix` is additive (an older hub
+        // self-reports no capture instant — recency is then unjudgeable,
+        // not zero).
+        let captured_at_unix = value
+            .get("captured_at_unix")
+            .and_then(serde_json::Value::as_i64);
         // Tolerant parse: `agents` is additive (an older hub reports no
         // array — the convergence view then shows watermarks only).
         let agents = value
@@ -864,6 +1393,127 @@ pub async fn query_hub_overview(
                             agent: row.get("agent")?.as_str()?.to_owned(),
                             online: row.get("online")?.as_bool()?,
                             seen: row.get("seen").and_then(serde_json::Value::as_u64),
+                            last_pull_unix: row
+                                .get("last_pull_unix")
+                                .and_then(serde_json::Value::as_u64),
+                            paused_streams: row.get("paused_streams").and_then(|v| {
+                                v.as_array().map(|names| {
+                                    names
+                                        .iter()
+                                        .filter_map(|n| n.as_str().map(str::to_owned))
+                                        .collect()
+                                })
+                            }),
+                            maintenance: row
+                                .get("maintenance")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                            crl_last_success_unix: row
+                                .get("crl_last_success_unix")
+                                .and_then(serde_json::Value::as_u64),
+                            crl_failures_total: row
+                                .get("crl_failures_total")
+                                .and_then(serde_json::Value::as_u64),
+                            pending_ops: row
+                                .get("pending_ops")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                            streams_in_flight: row
+                                .get("streams_in_flight")
+                                .and_then(serde_json::Value::as_u64),
+                            streams: row
+                                .get("streams")
+                                .cloned()
+                                .and_then(|v| serde_json::from_value(v).ok())
+                                .unwrap_or_default(),
+                            leaf_not_before_unix: row
+                                .get("leaf_not_before_unix")
+                                .and_then(serde_json::Value::as_i64),
+                            leaf_not_after_unix: row
+                                .get("leaf_not_after_unix")
+                                .and_then(serde_json::Value::as_i64),
+                            credential_mode: row
+                                .get("credential_mode")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
+                            credential_last_seen_unix: row
+                                .get("credential_last_seen_unix")
+                                .and_then(serde_json::Value::as_u64),
+                            connection: row
+                                .get("connection")
+                                .cloned()
+                                .and_then(|v| serde_json::from_value(v).ok()),
+                            renewal_backoff_failures: row
+                                .get("renewal_backoff_failures")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|v| u32::try_from(v).ok()),
+                            renewal_backoff_max_today: row
+                                .get("renewal_backoff_max_today")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|v| u32::try_from(v).ok()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let crl_last_success_unix = value
+            .get("crl_last_success_unix")
+            .and_then(serde_json::Value::as_u64);
+        let crl_failures_total = value
+            .get("crl_failures_total")
+            .and_then(serde_json::Value::as_u64);
+        // Tolerant parse: `route_breakers_open` is additive (edge
+        // gateways only; older hubs report nothing).
+        let route_breakers_open = value
+            .get("route_breakers_open")
+            .and_then(serde_json::Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        Some(RouteBreakerOpen {
+                            host: row.get("host")?.as_str()?.to_owned(),
+                            opened_unix: row
+                                .get("opened_unix")
+                                .and_then(serde_json::Value::as_u64)?,
+                            last_probe_unix: row
+                                .get("last_probe_unix")
+                                .and_then(serde_json::Value::as_u64)?,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Tolerant parse: `watchers` is additive (an older hub reports no
+        // watchdog face — the assertion is then unjudgeable, not passed).
+        // Tolerant parse: `proposals_pending` is additive (an older hub
+        // reports no proposals face).
+        let proposals_pending = value
+            .get("proposals_pending")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        // Tolerant parse: the headroom pair is additive (an older hub
+        // reports neither).
+        let streams_in_flight_total = value
+            .get("streams_in_flight_total")
+            .and_then(serde_json::Value::as_u64);
+        let stream_limits = value
+            .get("stream_limits")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let watchers = value
+            .get("watchers")
+            .and_then(serde_json::Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        Some(crate::hub::watchdog::WatcherFaceRow {
+                            name: row.get("name")?.as_str()?.to_owned(),
+                            interval_secs: row
+                                .get("interval_secs")
+                                .and_then(serde_json::Value::as_u64)?,
+                            started_unix: row
+                                .get("started_unix")
+                                .and_then(serde_json::Value::as_u64)?,
+                            last_tick_unix: row
+                                .get("last_tick_unix")
+                                .and_then(serde_json::Value::as_u64)?,
                         })
                     })
                     .collect()
@@ -873,7 +1523,15 @@ pub async fn query_hub_overview(
             hub,
             floor,
             serving,
+            captured_at_unix,
             agents,
+            crl_last_success_unix,
+            crl_failures_total,
+            route_breakers_open,
+            watchers,
+            proposals_pending,
+            streams_in_flight_total,
+            stream_limits,
         })
     };
     tokio::time::timeout(std::time::Duration::from_secs(10), future)

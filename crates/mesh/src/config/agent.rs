@@ -101,6 +101,30 @@ pub struct AgentConfig {
     /// (self-healing), one that fails re-arms it.
     #[serde(default = "default_egress_target_breaker_cooldown_secs")]
     pub egress_target_breaker_cooldown_secs: u64,
+    /// Master switch for the background recovery prober (2026-10-18 active
+    /// recovery): a bare-TCP dial task that watches the breaker table's OPEN
+    /// entries and calls `note_success` the moment a dead backend answers —
+    /// recovery stops waiting out the cooldown. The prober consumes no
+    /// stream-open budget (its dial is not a stream), so the cooldown's
+    /// budget-isolation purpose is untouched. Defaults to true; inert when
+    /// `egress_target_breaker_enabled` is false.
+    #[serde(default = "default_egress_recovery_probe_enabled")]
+    pub egress_recovery_probe_enabled: bool,
+    /// Prober cadence (seconds) toward loopback OPEN targets. Loopback dials
+    /// are effectively free, so the fast default keeps a restarted local
+    /// dev backend recoverable within ~1s.
+    #[serde(default = "default_egress_recovery_probe_loopback_interval_secs")]
+    pub egress_recovery_probe_loopback_interval_secs: u64,
+    /// Prober cadence (seconds) toward non-loopback OPEN targets — a
+    /// politeness budget toward remote hosts (SYN rate), deliberately slower
+    /// than the loopback lane while still decoupling recovery from the
+    /// breaker cooldown.
+    #[serde(default = "default_egress_recovery_probe_remote_interval_secs")]
+    pub egress_recovery_probe_remote_interval_secs: u64,
+    /// Per-dial connect timeout (seconds) for the recovery prober. Bounded
+    /// so a black-hole remote target cannot pin the prober's dial slot.
+    #[serde(default = "default_egress_recovery_probe_connect_timeout_secs")]
+    pub egress_recovery_probe_connect_timeout_secs: u64,
     /// Control API.
     #[serde(default)]
     pub control: ControlConfig,
@@ -273,6 +297,13 @@ impl Default for AgentConfig {
                 default_egress_target_breaker_failure_threshold(),
             egress_target_breaker_window_secs: default_egress_target_breaker_window_secs(),
             egress_target_breaker_cooldown_secs: default_egress_target_breaker_cooldown_secs(),
+            egress_recovery_probe_enabled: default_egress_recovery_probe_enabled(),
+            egress_recovery_probe_loopback_interval_secs:
+                default_egress_recovery_probe_loopback_interval_secs(),
+            egress_recovery_probe_remote_interval_secs:
+                default_egress_recovery_probe_remote_interval_secs(),
+            egress_recovery_probe_connect_timeout_secs:
+                default_egress_recovery_probe_connect_timeout_secs(),
             control: ControlConfig::default(),
             security: SecurityConfig::default(),
             tls: None,
@@ -491,7 +522,7 @@ impl IngressRule {
         }
     }
 
-    /// Ingress per-IP rate limiter (returns `None` when both values are 0,
+    /// Ingress per-client rate limiter (returns `None` when both values are 0,
     /// meaning disabled).
     pub fn udp_ingress_limiter(&self) -> Option<Arc<UdpIngressLimiter>> {
         UdpIngressLimiter::new(self.udp_per_ip_pps, self.udp_per_ip_bytes_per_sec).map(Arc::new)
@@ -741,6 +772,22 @@ const fn default_egress_target_breaker_window_secs() -> u64 {
 
 const fn default_egress_target_breaker_cooldown_secs() -> u64 {
     BreakerPolicy::EGRESS_DEFAULT.cooldown.as_secs()
+}
+
+const fn default_egress_recovery_probe_enabled() -> bool {
+    true
+}
+
+const fn default_egress_recovery_probe_loopback_interval_secs() -> u64 {
+    1
+}
+
+const fn default_egress_recovery_probe_remote_interval_secs() -> u64 {
+    5
+}
+
+const fn default_egress_recovery_probe_connect_timeout_secs() -> u64 {
+    1
 }
 
 #[cfg(test)]

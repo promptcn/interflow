@@ -187,6 +187,7 @@ async fn route_breaker_recovers_after_backend_returns() {
         hub_quic_addr: None,
 
         identity_offline: false,
+        renewal_face: None,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(

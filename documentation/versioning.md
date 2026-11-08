@@ -5,7 +5,7 @@ Interflow deliberately separates four user-visible ideas:
 | Concept | Example | Purpose |
 |---|---:|---|
 | Product version | `0.9.0` | Identifies a source release or binary, and tells the operator what the upgrade asks of them (SemVer scopes below). It never decides wire compatibility. |
-| Format epoch | `FORMAT_VERSION = 1` | The single compatibility epoch for Interflow-owned frames, inner hello, and Credential Packs. |
+| Format epoch | `FORMAT_VERSION = 2` | The single compatibility epoch for Interflow-owned frames, inner hello, and Credential Packs. |
 | Generation | `1, 2, 3, …` | The single signed-object rotation counter used for anti-rollback. |
 | Local migration counter | `backup.json` v1 → v2 | Versions an operator-machine-local file with a single writer; legacy shapes migrate on read instead of failing closed (below). |
 
@@ -47,6 +47,19 @@ on a bump; the checker holds that structure. If publishing ever starts,
 versions go into the root declarations — one file — and the checker's rule
 flips to value-matching the workspace version.
 
+The CLI version surface follows the same single-source rule. Every clap
+`Parser` root in the workspace declares `version =
+interflow_buildinfo::VERSION_WITH_TAG`, so `--version` (and `-V`) on any
+binary — product CLIs and dev tools alike — answers
+`<name> <semver> (<build tag>)`, the identity the hub's startup log and
+the GUI header also carry. `interflow-mesh` keeps its pre-flag `version`
+subcommand as a second spelling of the identical line (a test holds the
+byte-for-byte parity). `check_version_surface.py` holds the attribute on
+every root, fail-closed and without an opt-out: a new binary can neither
+ship without a version face nor regress to clap's bare `version`
+(CARGO_PKG_VERSION without the tag — the "which code is this" gap the tag
+exists to close).
+
 ## Format epoch
 
 Every Interflow-owned machine format — data-plane frames, the inner-stream
@@ -72,7 +85,11 @@ expected to repeat):
 
 The 2026-10-10 frame-type renumbering and signed-policy strictening happened
 under the old "redefine in place" doctrine and is archived as the last
-in-place change of epoch 1; the first breaking change after it opens epoch 2.
+in-place change of epoch 1. Epoch 2 opened with the 2026-11-03
+breaking-refactor batch: the signed Runtime Policy's `services[].address`
+and `mesh_egress` became required keys (the absent-field serde shims that
+read older policies retired with the epoch), every pack re-rendered, and
+every deployment re-provisioned — no migration path, by design.
 
 ### Additive changes never bump the epoch
 
@@ -110,13 +127,16 @@ migration counter: it migrates on read.
 
 Current membership:
 
-- `backup.json`'s `version` field (`crates/identity/src/backup.rs`): v1
-  stored the configure-time `backup_dir` exactly as passed — CWD-relative
-  when the operator ran from the deployment tree; v2 pins it absolute.
-  Reads normalize the v1 shape in memory; the next mutation persists it.
+- `backup.json`'s `version` field (`crates/identity/src/backup.rs`): v2 is
+  the one and only shape — the `version` field is required and
+  `backup_dir` is absolute (the v1 CWD-relative quirk retired with the
+  2026-11-03 breaking batch, which re-provisions every store). The counter
+  stays: it is how a future local shape change stays narrow instead of
+  growing an epoch.
 - The SQLite `user_version` stores in "State and rotation planes" below
-  are the same doctrine in engine form: machine-owned, forward-only, a
-  store written by a newer build refused rather than guessed at.
+  are the same doctrine in engine form: machine-owned, one shape per build
+  generation, a store written by another generation refused rather than
+  guessed at.
 
 Declaration form — the guard. A local migration counter whose constant name
 would otherwise hit `check_version_contract.py`'s forbidden legacy terms is

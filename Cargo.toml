@@ -6,7 +6,7 @@ resolver = "2"
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.11.1"
+version = "0.12.0"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -25,6 +25,7 @@ toml_edit = "0.25"
 thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
+tar = "0.4"
 # Home-directory lookup for tilde expansion in config paths (core) and the
 # profile directory (expose)
 dirs = "6"
@@ -37,6 +38,28 @@ fs2 = "0.4"
 rusqlite = { version = "0.40", features = ["bundled"] }
 # Line diff for `plan diff` (declaration vs applied snapshot) — pure Rust.
 similar = "3.2"
+# ---- Cross-crate externals: one version decision per dependency, members
+# |      add crate-specific features on top of `workspace = true` and never
+# |      restate a version. The rustls family moves in lockstep by name.
+serde_json = "1.0.150"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+tempfile = "3"
+clap = { version = "4.6", features = ["derive"] }
+time = "0.3"
+uuid = "1.23"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = "0.23"
+tokio-rustls = "0.26.4"
+rustls-pemfile = "2.2.0"
+x509-parser = "0.18"
+rcgen = "0.14"
+hyper = "1.10"
+hyper-util = "0.1.20"
+http = "1.4"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+ipnetwork = "0.21.1"
+criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
 
 # Internal crates — path + version dual specs, declared once here so members
 # inherit with `interflow-x.workspace = true`. Nothing is published to
@@ -46,18 +69,18 @@ similar = "3.2"
 # is pinned to the workspace version by check_version_contract.py, so it
 # cannot drift the way the v0.11.0 bump's 39 stale member-manifest pins did
 # (fixed in c458728). scripts/bump_version.py moves it with every bump.
-interflow-buildinfo = { path = "crates/buildinfo", version = "0.11.1" }
-interflow-certs = { path = "crates/certs", version = "0.11.1" }
-interflow-cli = { path = "crates/cli", version = "0.11.1" }
-interflow-contract = { path = "crates/contract", version = "0.11.1" }
-interflow-core = { path = "crates/core", version = "0.11.1" }
-interflow-expose = { path = "crates/expose", version = "0.11.1" }
-interflow-identity = { path = "crates/identity", version = "0.11.1" }
-interflow-mesh = { path = "crates/mesh", version = "0.11.1" }
-interflow-registrar = { path = "crates/registrar", version = "0.11.1" }
-interflow-renewal = { path = "crates/renewal", version = "0.11.1" }
-interflow-testkit = { path = "crates/testkit", version = "0.11.1" }
-interflow-util = { path = "crates/util", version = "0.11.1" }
+interflow-buildinfo = { path = "crates/buildinfo", version = "0.12.0" }
+interflow-certs = { path = "crates/certs", version = "0.12.0" }
+interflow-cli = { path = "crates/cli", version = "0.12.0" }
+interflow-contract = { path = "crates/contract", version = "0.12.0" }
+interflow-core = { path = "crates/core", version = "0.12.0" }
+interflow-expose = { path = "crates/expose", version = "0.12.0" }
+interflow-identity = { path = "crates/identity", version = "0.12.0" }
+interflow-mesh = { path = "crates/mesh", version = "0.12.0" }
+interflow-registrar = { path = "crates/registrar", version = "0.12.0" }
+interflow-renewal = { path = "crates/renewal", version = "0.12.0" }
+interflow-testkit = { path = "crates/testkit", version = "0.12.0" }
+interflow-util = { path = "crates/util", version = "0.12.0" }
 
 # ============================================================================
 # Lints — applied uniformly via [workspace.lints]; sub-crates inherit with `[lints] workspace = true`

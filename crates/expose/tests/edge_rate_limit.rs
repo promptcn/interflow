@@ -87,6 +87,7 @@ async fn spawn_stack(rate_per_ip_per_min: u32) -> SocketAddr {
         transport: TransportKind::H2,
         hub_quic_addr: None,
         identity_offline: false,
+        renewal_face: None,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(

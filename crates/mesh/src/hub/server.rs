@@ -17,7 +17,9 @@ use crate::hub::SharedHubConfig;
 use crate::hub::state::HubState;
 use crate::hub::state::SharedTlsPlane;
 use interflow_core::error::{InterflowError, Result};
-use interflow_core::security::{AuditKind, AuditSink, AuthRateLimiter, ConnTracker};
+use interflow_core::security::{
+    AuditKind, AuditSink, AuthRateLimiter, ConnTracker, RateLimitScope,
+};
 use interflow_core::tls::{TenantTrustRoot, TlsPlane};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -139,11 +141,17 @@ impl HubServer {
             config.security.max_connections_per_ip,
             config.security.max_connections_total,
         ));
-        let rate_limiter = AuthRateLimiter::new(config.auth.rate_limit_per_minute).map(Arc::new);
-        if rate_limiter.is_some() {
+        let rate_limiter = AuthRateLimiter::with_max_tracked_clients(
+            RateLimitScope::Hub,
+            config.auth.rate_limit_per_minute,
+            config.auth.max_tracked_clients,
+        )
+        .map(Arc::new);
+        if let Some(limiter) = &rate_limiter {
             info!(
-                "Auth rate limiting enabled: {} requests/min/IP",
-                config.auth.rate_limit_per_minute
+                "Auth rate limiting enabled: {} requests/min/client, tracking at most {} clients",
+                config.auth.rate_limit_per_minute,
+                limiter.max_tracked_clients()
             );
         }
         let tls_plane: SharedTlsPlane = Arc::new(std::sync::RwLock::new(Arc::new(plane)));
@@ -201,11 +209,15 @@ impl HubServer {
                     current.insert(choice.stem, pem);
                 }
             }
-            Arc::new(crate::hub::crl::CrlChannel {
+            let channel = crate::hub::crl::CrlChannel {
                 dir: pack_dir.join("state").join("crls"),
                 floors: std::sync::Mutex::new(floors),
-                current: std::sync::Mutex::new(current),
-            })
+                current: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                revoked: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+                last_reload_unix: std::sync::atomic::AtomicU64::new(0),
+            };
+            channel.swap_current(current);
+            Arc::new(channel)
         });
         // The proposal queue rides the policy channel's presence (its
         // funnel validates against the serving policy) and its state dir
@@ -264,12 +276,28 @@ impl HubServer {
             }
         };
         let proposals = proposals.map(Arc::new);
+        // The maintenance ledger rides the same state dir as the proposal
+        // queue (`<pack>/state/`); `None` on non-pack hubs (in-memory only).
+        let state_dir = policy_channel
+            .as_ref()
+            .and_then(|channel| channel.dir.parent())
+            .map(std::path::PathBuf::from);
+        // The floor version clock: one counter shared by every ledger that
+        // feeds the floor read model (`GET /policy/floor/version` holds on
+        // it — see `hub::floor_clock`).
+        let floor_clock = crate::hub::floor_clock::FloorClock::new();
+        // Startup-fixed config faces derive ONCE here (§3.8): the
+        // per-connection accept path reuses the compiled policy.
+        let proxy_policy = Arc::new(interflow_core::security::ProxyProtocolPolicy::from_config(
+            &config.server.proxy_protocol,
+        )?);
         let config: SharedHubConfig = Arc::new(RwLock::new(config));
         let state = Arc::new(HubState {
             agents: Arc::new(RwLock::new(HashMap::new())),
             route_leases: Arc::new(RwLock::new(HashMap::new())),
             config,
-            active_streams: Arc::new(RwLock::new(HashMap::new())),
+            active_streams: Arc::new(crate::hub::state::ShardedStreams::new()),
+            data_tx: Arc::new(std::sync::RwLock::new(HashMap::new())),
             tls_plane,
             limits,
             rate_limiter,
@@ -278,10 +306,36 @@ impl HubServer {
             policy_channel,
             crl_channel,
             policy_pull_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            policy_watermarks: Arc::new(crate::hub::policy_watermarks::PolicyWatermarks::new(
+                floor_clock.clone(),
+            )),
+            crl_liveness: Arc::new(crate::hub::crl_liveness::CrlLiveness::new(
+                floor_clock.clone(),
+            )),
+            watchdog: Arc::new(crate::hub::watchdog::WatchdogRegistry::new(
+                floor_clock.clone(),
+            )),
+            node_status: Arc::new(crate::hub::node_status::NodeStatus::new(
+                floor_clock.clone(),
+            )),
+            credential_watermarks: Arc::new(
+                crate::hub::credential_watermarks::CredentialWatermarks::new(floor_clock.clone()),
+            ),
             evicted_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             proposals,
             stale_watermark_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             expiry_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stream_intents: Arc::new(crate::hub::stream_intents::StreamIntents::new(
+                floor_clock.clone(),
+            )),
+            maintenance: crate::hub::maintenance::MaintenanceLedger::load(
+                state_dir.as_deref(),
+                floor_clock.clone(),
+            ),
+            floor_clock,
+            target_recovery: Arc::new(std::sync::RwLock::new(None)),
+            route_breaker_face: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            proxy_policy,
             conn_tracker,
             tasks: tokio_util::task::TaskTracker::new(),
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -403,6 +457,38 @@ impl HubServer {
             state.shutdown.clone(),
         );
 
+        // The policy-face recency sweeper: turns a leg's fresh→silent
+        // crossing into a floor-clock bump so the push contract carries the
+        // ABSENCE of pulls (a dead watcher writes nothing — this sweeper is
+        // the only structural path for that transition to reach floor
+        // watchers). Same managed-task discipline as the heartbeat above.
+        crate::hub::policy_watermarks::spawn_policy_watermark_sweeper(
+            state.clone(),
+            &state.tasks,
+            state.shutdown.clone(),
+        );
+
+        // The CRL-liveness recency sweeper: same shape, one face over — a
+        // frozen renewal level (a hung poll loop whose reporter keeps
+        // shipping the same confirmation instant) crosses the silent
+        // threshold HERE and only here, because the hung side itself
+        // writes nothing that changes.
+        crate::hub::crl_liveness::spawn_crl_liveness_sweeper(
+            state.clone(),
+            &state.tasks,
+            state.shutdown.clone(),
+        );
+
+        // The resident-task watchdog's silence sweeper: same shape, one
+        // face over — a wedged task (registered at spawn, ticks frozen)
+        // crosses its own interval-multiple threshold HERE, because the
+        // wedged task itself writes nothing that changes.
+        crate::hub::watchdog::spawn_watchdog_sweeper(
+            state.clone(),
+            &state.tasks,
+            state.shutdown.clone(),
+        );
+
         // The signed-policy ACL hot-swap watcher: intrinsic to a pack-built
         // hub (the config's policy plane names the pack) — every runner of
         // this future (the binary, the GUI handle, each e2e) gets it by
@@ -412,6 +498,7 @@ impl HubServer {
             crate::pack::spawn_hub_policy_reload(
                 &pack_dir,
                 Arc::clone(&state.config),
+                Arc::clone(&state.watchdog),
                 &state.shutdown,
                 &state.tasks,
             );

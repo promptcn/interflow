@@ -23,9 +23,350 @@ import { principalRealm } from "./shellFace";
 /// online answer flips to false).
 export const HUB_FRESH_SECS = 120;
 
-/// Leaf health, normalized across the two carriers: a peer row's
-/// `leaf_phase` and a local node's own credential face say the same thing
-/// in slightly different shapes.
+/// The CRL-poll silent threshold for the LOCAL panel's judgment — the
+/// TS mirror of the Rust single source
+/// (`interflow_renewal::CRL_SILENT_AFTER_SECS`, 3× the 60s poll cadence
+/// + sweep slack). The hub faces carry the threshold self-reported; the
+/// local face (plain atomics, no hub round trip) has no carrier for it,
+/// so this mirror is the one place the frontend owns a cadence number.
+export const CRL_SILENT_AFTER_SECS = 200;
+
+/// The policy face's recency reading (the LEVEL face the hub reports per
+/// leg: watermark + confirmation instant). `null` on rows without a hub
+/// face (hubs, expose agents, the degraded local view).
+export type PolicyFaceReading =
+  /// No completed pull since the hub process started — the one honest
+  /// meaning of "never" now that steady-state pulls land in the face.
+  | { state: "never" }
+  /// Confirming within the silent threshold, judged at the face's own
+  /// capture instant (hub truth, not the render clock).
+  | { state: "current"; ageSecs: number }
+  /// The watermark holds but its confirmation instant is older than the
+  /// threshold — present but fossilized (a dead policy watcher); the
+  /// hub-side sweeper pushes exactly this transition.
+  | { state: "silent"; ageSecs: number }
+  /// No verdict: an older hub without the field, or a face too stale to
+  /// support a judgment (degrade, never guess).
+  | { state: "unknown" };
+
+/// Classifies one leg's policy recency. Pure on purpose (the injected
+/// `nowUnix` is the render clock; the judgment itself anchors on the
+/// hub-side `faceCapturedAtUnix`). Inputs arrive as the bindings' optional
+/// properties — `null` and `undefined` both read "absent" (an older hub),
+/// never a zero that would fabricate a verdict. A face older than the
+/// silent threshold cannot support a per-leg verdict — between its
+/// capture and now a crossing could have happened unseen — so it reads
+/// unknown, not a possibly-stale current.
+export function policyFaceReading(
+  seenGeneration: number | null | undefined,
+  lastPullUnix: number | null | undefined,
+  faceCapturedAtUnix: number | null | undefined,
+  silentAfterSecs: number | undefined,
+  nowUnix: number,
+): PolicyFaceReading {
+  if (seenGeneration == null && lastPullUnix == null) return { state: "never" };
+  if (silentAfterSecs == null || !(silentAfterSecs > 0)) return { state: "unknown" };
+  if (lastPullUnix == null || faceCapturedAtUnix == null) return { state: "unknown" };
+  if (nowUnix - faceCapturedAtUnix > silentAfterSecs) return { state: "unknown" };
+  const ageSecs = Math.max(0, faceCapturedAtUnix - lastPullUnix);
+  return ageSecs > silentAfterSecs
+    ? { state: "silent", ageSecs }
+    : { state: "current", ageSecs };
+}
+
+/// The CRL-poll liveness reading (the 2026-10-19 face: the renewal loop's
+/// level = confirmation instant + failure counter). `null` on rows
+/// without a hub face.
+export type CrlFaceReading =
+  /// No report ever landed — an older node, or one without a renewal
+  /// loop. Unknown, not silent.
+  | { state: "never" }
+  /// Polling (no-change polls included — "polled, nothing moved").
+  | { state: "current"; ageSecs: number; failures: number }
+  /// The confirmation instant froze past the threshold — the poll loop
+  /// wedged without erroring (the 1h fail-closed bound never fires: the
+  /// loop itself is the thing that checks it).
+  | { state: "silent"; ageSecs: number; failures: number }
+  /// No verdict: an older hub without the field, or a face too stale to
+  /// support a judgment (degrade, never guess).
+  | { state: "unknown" };
+
+/// Classifies one member's CRL-poll liveness. Same discipline as
+/// [`policyFaceReading`]: pure, anchored on the hub-side capture instant,
+/// absent inputs read unknown — never a zero that would fabricate a
+/// verdict.
+export function crlFaceReading(
+  lastSuccessUnix: number | null | undefined,
+  faceCapturedAtUnix: number | null | undefined,
+  silentAfterSecs: number | undefined,
+  nowUnix: number,
+  failuresTotal: number | null | undefined,
+): CrlFaceReading {
+  const failures = failuresTotal ?? 0;
+  if (lastSuccessUnix == null) return { state: "never" };
+  if (silentAfterSecs == null || !(silentAfterSecs > 0)) return { state: "unknown" };
+  if (faceCapturedAtUnix == null) return { state: "unknown" };
+  if (nowUnix - faceCapturedAtUnix > silentAfterSecs) return { state: "unknown" };
+  const ageSecs = Math.max(0, faceCapturedAtUnix - lastSuccessUnix);
+  return ageSecs > silentAfterSecs
+    ? { state: "silent", ageSecs, failures }
+    : { state: "current", ageSecs, failures };
+}
+
+
+/// One resident hub task's silence, pre-aged for rendering (the
+/// armed-assertion face's failure row).
+export interface WatcherSilentRow {
+  name: string;
+  intervalSecs: number;
+  quietSecs: number;
+}
+
+/// The hub's resident-task armed assertion (the 2026-10-20 watchdog
+/// face): every long-lived task judged against its OWN cadence — a row
+/// quiet past `silentFactor` multiples of its interval is a task wedged
+/// while the hub keeps serving.
+export type WatchersFaceReading =
+  /// No rows / older hub without the field — unjudgeable, never "passed".
+  | { state: "unknown" }
+  /// Every registered task ticked within its own threshold.
+  | { state: "allArmed"; count: number }
+  /// At least one row went quiet past its own threshold.
+  | { state: "silent"; armed: number; silent: WatcherSilentRow[] };
+
+/// Classifies the watchdog face. Same discipline as the per-leg faces:
+/// pure, anchored on the hub-side capture instant, absent inputs read
+/// unknown — never a zero that would fabricate a verdict. The face-stale
+/// guard uses the LARGEST row threshold (beyond it every row's verdict
+/// could have changed unseen since capture).
+export function watchersFaceReading(
+  rows: { name: string; interval_secs: number; last_tick_unix: number }[] | null | undefined,
+  faceCapturedAtUnix: number | null | undefined,
+  silentFactor: number | undefined,
+  nowUnix: number,
+): WatchersFaceReading {
+  if (rows == null || rows.length === 0) return { state: "unknown" };
+  if (silentFactor == null || !(silentFactor > 0) || faceCapturedAtUnix == null) {
+    return { state: "unknown" };
+  }
+  const maxThreshold = Math.max(...rows.map((r) => silentFactor * r.interval_secs));
+  if (nowUnix - faceCapturedAtUnix > maxThreshold) return { state: "unknown" };
+  const silent: WatcherSilentRow[] = [];
+  for (const row of rows) {
+    const quietSecs = Math.max(0, faceCapturedAtUnix - row.last_tick_unix);
+    if (quietSecs > silentFactor * row.interval_secs) {
+      silent.push({ name: row.name, intervalSecs: row.interval_secs, quietSecs });
+    }
+  }
+  return silent.length === 0
+    ? { state: "allArmed", count: rows.length }
+    : { state: "silent", armed: rows.length - silent.length, silent };
+}
+
+
+/// The mailbox watermark's reading for one leg
+/// — the
+/// "queued, applies on next check-in" instant made continuous: what is
+/// waiting, since when, and whether anything was ever dropped.
+export type QueuedOpsFaceReading =
+  /// Nothing waiting (or an older hub without the field).
+  | { state: "clear" }
+  /// Ops waiting; `stuck` = the leg is ONLINE and the ops outlived the
+  /// delivery budget (a working intent watcher delivers within one watch
+  /// interval — waiting past that is a loop not consuming).
+  | { state: "waiting"; count: number; ageSecs: number; oldestOp: string | null; stuck: boolean }
+  /// Only drops on record (nothing waiting now, an op was dropped).
+  | { state: "dropped"; droppedTotal: number };
+
+/// Classifies one leg's mailbox watermark. Same discipline as the sibling
+/// faces: pure, anchored on the hub-side capture instant, absent inputs
+/// read clear — never a zero that would fabricate a verdict.
+export function queuedOpsFaceReading(
+  pendingCount: number | null | undefined,
+  oldestQueuedUnix: number | null | undefined,
+  faceCapturedAtUnix: number | null | undefined,
+  oldestOp: string | null | undefined,
+  droppedTotal: number | null | undefined,
+  online: boolean,
+  deliveryBudgetSecs: number | undefined,
+): QueuedOpsFaceReading {
+  const dropped = droppedTotal ?? 0;
+  if (pendingCount == null || !(pendingCount > 0)) {
+    return dropped > 0
+      ? { state: "dropped", droppedTotal: dropped }
+      : { state: "clear" };
+  }
+  const budgetKnown =
+    deliveryBudgetSecs != null &&
+    deliveryBudgetSecs > 0 &&
+    faceCapturedAtUnix != null &&
+    oldestQueuedUnix != null;
+  const ageSecs = budgetKnown
+    ? Math.max(0, (faceCapturedAtUnix as number) - (oldestQueuedUnix as number))
+    : 0;
+  const stuck =
+    online && budgetKnown && ageSecs > (deliveryBudgetSecs as number);
+  return {
+    state: "waiting",
+    count: pendingCount,
+    ageSecs,
+    oldestOp: oldestOp ?? null,
+    stuck,
+  };
+}
+
+/// One stream the fossil face flags: quiet past a multiple of its own
+/// idle budget (or the unbudgeted default), pre-aged for rendering.
+export interface FossilStreamRow {
+  name: string;
+  idleSecs: number;
+}
+
+/// The fossil reading for one leg's streams. Pure, anchored on the
+/// hub-side capture instant, per-row budget anchors — never a global
+/// threshold.
+export function fossilStreamsFaceReading(
+  streams: { name: string; last_byte_unix: number; idle_budget_secs?: number | null }[] | null | undefined,
+  faceCapturedAtUnix: number | null | undefined,
+  idleMultiple: number | undefined,
+  unbudgetedDays: number | undefined,
+): FossilStreamRow[] {
+  if (
+    streams == null ||
+    streams.length === 0 ||
+    faceCapturedAtUnix == null ||
+    idleMultiple == null ||
+    unbudgetedDays == null
+  ) {
+    return [];
+  }
+  const fossils: FossilStreamRow[] = [];
+  for (const stream of streams) {
+    const idleSecs = Math.max(0, faceCapturedAtUnix - stream.last_byte_unix);
+    const line =
+      stream.idle_budget_secs != null && stream.idle_budget_secs > 0
+        ? stream.idle_budget_secs * idleMultiple
+        : unbudgetedDays * 86_400;
+    if (idleSecs > line) {
+      fossils.push({ name: stream.name, idleSecs });
+    }
+  }
+  return fossils;
+}
+
+/// The headroom reading for one admission scope: remaining capacity in
+/// percent, tight when under the self-reported warn ratio. `null` when
+/// the scope is unlimited or the inputs are absent (no wall, no
+/// reading).
+export interface HeadroomReading {
+  inFlight: number;
+  cap: number;
+  remainingPct: number;
+  tight: boolean;
+}
+
+export function headroomFaceReading(
+  inFlight: number | null | undefined,
+  cap: number | null | undefined,
+  warnPct: number | undefined,
+): HeadroomReading | null {
+  if (inFlight == null || cap == null || cap <= 0 || warnPct == null) return null;
+  const remainingPct = Math.max(0, Math.round(((cap - inFlight) / cap) * 100));
+  return { inFlight, cap, remainingPct, tight: remainingPct < warnPct };
+}
+
+/// The credential-expiry reading for one leg
+/// the
+/// countdown as a level, judged per-tier against the self-reported
+/// thresholds. "Don't forget to rotate" as a display, not a discipline.
+export type CredentialFaceReading =
+  | { state: "green"; mode: "registrar" | "offline"; remainingSecs: number }
+  | { state: "yellow"; mode: "registrar" | "offline"; remainingSecs: number }
+  | { state: "red"; mode: "registrar" | "offline"; remainingSecs: number }
+  /// No window on the face (an older hub) — unjudgeable, never green.
+  | { state: "unknown" };
+
+/// Classifies one leg's credential window. Same discipline as the
+/// sibling faces: pure, anchored on the hub-side capture instant,
+/// absent inputs read unknown.
+export function credentialFaceReading(
+  notBeforeUnix: number | null | undefined,
+  notAfterUnix: number | null | undefined,
+  faceCapturedAtUnix: number | null | undefined,
+  offlineWarnDays: number | undefined,
+  offlineCriticalDays: number | undefined,
+  registrarWarnPct: number | undefined,
+  registrarCriticalPct: number | undefined,
+): CredentialFaceReading {
+  if (
+    notBeforeUnix == null ||
+    notAfterUnix == null ||
+    faceCapturedAtUnix == null ||
+    offlineWarnDays == null ||
+    offlineCriticalDays == null ||
+    registrarWarnPct == null ||
+    registrarCriticalPct == null
+  ) {
+    return { state: "unknown" };
+  }
+  const remaining = notAfterUnix - faceCapturedAtUnix;
+  const span = notAfterUnix - notBeforeUnix;
+  const mode: "registrar" | "offline" = span < 3 * 86_400 ? "registrar" : "offline";
+  if (remaining < 0) return { state: "red", mode, remainingSecs: remaining };
+  if (mode === "offline") {
+    const days = Math.floor(remaining / 86_400);
+    if (days < offlineCriticalDays) return { state: "red", mode, remainingSecs: remaining };
+    if (days < offlineWarnDays) return { state: "yellow", mode, remainingSecs: remaining };
+    return { state: "green", mode, remainingSecs: remaining };
+  }
+  const pct = (remaining / Math.max(1, span)) * 100;
+  if (pct < registrarCriticalPct) return { state: "red", mode, remainingSecs: remaining };
+  if (pct < registrarWarnPct) return { state: "yellow", mode, remainingSecs: remaining };
+  return { state: "green", mode, remainingSecs: remaining };
+}
+
+/// The connection-quality reading for one leg
+/// the
+/// window stats a point reading can never show — reconnect rate, the
+/// backoff ladder's stage, liveness RTT percentiles.
+export type ConnectionFaceReading =
+  | { state: "unknown" }
+  | {
+      state: "healthy" | "reconnecting" | "probesUnanswered";
+      reconnects: number;
+      backoffStage: number;
+      timeouts: number;
+      p50Ms: number | null;
+      p99Ms: number | null;
+    };
+
+/// Classifies one leg's connection window. Pure; the countable signals
+/// drive the state (timeouts outrank reconnects — the blackhole's
+/// leading signal fires while the session object stays alive), the
+/// percentiles ride as diagnostic material.
+export function connectionFaceReading(
+  connection: {
+    reconnects_last_hour: number;
+    rtt_p50_ms?: number | null;
+    rtt_p99_ms?: number | null;
+    rtt_timeouts: number;
+  } | null | undefined,
+  backoffFailures: number | null | undefined,
+): ConnectionFaceReading {
+  if (connection == null) return { state: "unknown" };
+  const backoffStage = Math.min(backoffFailures ?? 0, 5);
+  const base = {
+    reconnects: connection.reconnects_last_hour,
+    backoffStage,
+    timeouts: connection.rtt_timeouts,
+    p50Ms: connection.rtt_p50_ms ?? null,
+    p99Ms: connection.rtt_p99_ms ?? null,
+  };
+  if (connection.rtt_timeouts > 0) return { state: "probesUnanswered", ...base };
+  if (connection.reconnects_last_hour > 0) return { state: "reconnecting", ...base };
+  return { state: "healthy", ...base };
+}
+
 export interface LeafHealth {
   phase: string | null;
   remaining_secs: number;
@@ -46,6 +387,12 @@ export interface FleetRow {
   /// The generation the hub last saw this agent pull (the floor
   /// watermark for hubs — the lineage anchor).
   gen: number | null;
+  /// The policy face's recency reading (mesh agent rows with a hub face;
+  /// `null` elsewhere — hubs, expose agents, the degraded local view).
+  policy: PolicyFaceReading | null;
+  /// The CRL-poll liveness reading (rows with a hub face); `null`
+  /// elsewhere — same shape as `policy`.
+  crl: CrlFaceReading | null;
   leaf: LeafHealth | null;
   /// The NodeManager id when the member runs on this machine — the 本机
   /// badge and the cross-link into the 本机 entry.
@@ -53,6 +400,28 @@ export interface FleetRow {
   /// Whether the manifest declares this member (false = a stray the hub
   /// registered or a local pack without a declaration).
   declared: boolean;
+  /// The member is declared under maintenance (planned unavailability,
+  /// node level): its absence is expected, not an accident. Reads from
+  /// the hub's face; `false` when there is no face to read.
+  maintenance: boolean;
+  /// How many of the member's streams the hub face reports paused
+  /// (planned unavailability, stream level) — the row's hover note.
+  pausedStreams: number;
+  /// The mailbox watermark reading (queued ops waiting on this leg);
+  /// `null` on rows without a hub face.
+  queuedOps: QueuedOpsFaceReading | null;
+  /// The mailbox's cumulative drop counter (rendered apart from the
+  /// waiting reading; 0 when no face).
+  queuedDropped: number;
+  /// The leg's fossil streams (pre-aged rows); empty on rows without
+  /// the face.
+  fossils: FossilStreamRow[];
+  /// The per-leg session headroom; `null` when unjudgeable.
+  headroom: HeadroomReading | null;
+  /// The credential-expiry reading; `null` on rows without a hub face.
+  credential: CredentialFaceReading | null;
+  /// The connection-quality reading; `null` on rows without a hub face.
+  connection: ConnectionFaceReading | null;
 }
 
 /// The qualified id of a signed principal's agent face
@@ -154,9 +523,19 @@ function hubRow(
     kind: "hub",
     online,
     gen,
+    policy: null,
+    crl: null,
     leaf: localLeaf(local),
     localNodeId: local?.id ?? null,
     declared,
+    maintenance: false,
+    pausedStreams: 0,
+    queuedOps: null,
+    queuedDropped: 0,
+    fossils: [],
+    headroom: null,
+    credential: null,
+    connection: null,
   };
 }
 
@@ -169,8 +548,44 @@ function agentRow(
   leaf: LeafHealth | null,
   localNodeId: string | null,
   declared: boolean,
+  maintenance = false,
+  pausedStreams = 0,
+  policy: PolicyFaceReading | null = null,
+  crl: CrlFaceReading | null = null,
+  queuedOps: QueuedOpsFaceReading | null = null,
+  queuedDropped = 0,
+  fossils: FossilStreamRow[] = [],
+  headroom: HeadroomReading | null = null,
+  credential: CredentialFaceReading | null = null,
+  connection: ConnectionFaceReading | null = null,
 ): FleetRow {
-  return { key: id, name, kind, online, gen, leaf, localNodeId, declared };
+  return {
+    key: id,
+    name,
+    kind,
+    online,
+    gen,
+    policy,
+    crl,
+    leaf,
+    localNodeId,
+    declared,
+    maintenance,
+    pausedStreams,
+    queuedOps,
+    queuedDropped,
+    fossils,
+    headroom,
+    credential,
+    connection,
+  };
+}
+
+/// One OPEN route breaker on the answering hub, pre-aged for rendering.
+export interface RouteBreakerRow {
+  host: string;
+  openSecs: number;
+  probeAgoSecs: number;
 }
 
 /// The deployment scope's rows: the manifest's declared members with the
@@ -185,9 +600,18 @@ export function buildDeploymentRows(
 ): {
   rows: FleetRow[];
   floorServing: { floor: number; serving: number | null } | null;
+  routeBreakers: RouteBreakerRow[];
+  watchers: WatchersFaceReading;
 } {
   const realm = fleet.summary.realm.id;
   const obs = realmObservers(nodes, realm);
+  // The hub's route-breaker open set (edge gateways), aged against the
+  // hub's own capture anchor — same never-guess discipline as the faces.
+  const routeBreakers: RouteBreakerRow[] = (fleet.hub?.route_breakers_open ?? []).map((row) => ({
+    host: row.host,
+    openSecs: Math.max(0, (fleet.hub?.captured_at_unix ?? 0) - row.opened_unix),
+    probeAgoSecs: Math.max(0, (fleet.hub?.captured_at_unix ?? 0) - row.last_probe_unix),
+  }));
   const byId = new Map(nodes.map((n) => [n.id, n]));
   const seen = new Set<string>();
   const hubReachable = fleet.hub !== null;
@@ -273,6 +697,66 @@ export function buildDeploymentRows(
           peersLeaf(obs, id) ?? localLeaf(localNode),
           row.local?.id ?? null,
           true,
+          row.remote?.maintenance ?? false,
+          row.remote?.paused_streams?.length ?? 0,
+          row.kind === "mesh_agent" && row.remote !== null && fleet.hub !== null
+            ? policyFaceReading(
+                row.remote.seen_generation,
+                row.remote.policy_last_pull_unix,
+                row.remote.face_captured_at_unix,
+                fleet.hub.policy_silent_after_secs,
+                nowUnix,
+              )
+            : null,
+          row.kind === "mesh_agent" && row.remote !== null && fleet.hub !== null
+            ? crlFaceReading(
+                row.remote.crl_last_success_unix,
+                row.remote.face_captured_at_unix,
+                fleet.hub.crl_silent_after_secs,
+                nowUnix,
+                row.remote.crl_failures_total,
+              )
+            : null,
+          row.kind === "mesh_agent" && row.remote !== null && fleet.hub !== null
+            ? queuedOpsFaceReading(
+                row.remote.pending_ops?.pending_count ?? null,
+                row.remote.pending_ops?.oldest_queued_unix ?? null,
+                row.remote.face_captured_at_unix,
+                row.remote.pending_ops?.oldest_op ?? null,
+                row.remote.pending_ops?.dropped_total ?? null,
+                online === true,
+                fleet.hub.policy_silent_after_secs,
+              )
+            : null,
+          row.remote?.pending_ops?.dropped_total ?? 0,
+          fossilStreamsFaceReading(
+            row.remote?.streams ?? null,
+            row.remote?.face_captured_at_unix ?? null,
+            fleet.hub?.fossil_idle_multiple,
+            fleet.hub?.fossil_unbudgeted_days,
+          ),
+          headroomFaceReading(
+            row.remote?.streams_in_flight ?? null,
+            fleet.hub?.stream_limits?.per_agent ?? null,
+            fleet.hub?.headroom_warn_pct,
+          ),
+          row.kind === "mesh_agent" && row.remote !== null && fleet.hub !== null
+            ? credentialFaceReading(
+                row.remote.leaf_not_before_unix ?? null,
+                row.remote.leaf_not_after_unix ?? null,
+                row.remote.face_captured_at_unix,
+                fleet.hub.offline_warn_days,
+                fleet.hub.offline_critical_days,
+                fleet.hub.registrar_warn_pct,
+                fleet.hub.registrar_critical_pct,
+              )
+            : null,
+          row.kind === "mesh_agent" && row.remote !== null
+            ? connectionFaceReading(
+                row.remote.connection ?? null,
+                row.remote.renewal_backoff_failures ?? null,
+              )
+            : null,
         ),
       );
     } else if (row.kind === "ingress") {
@@ -284,9 +768,19 @@ export function buildDeploymentRows(
         kind: "ingress",
         online: row.local ? isRunning(row.local.state) : null,
         gen: null,
+        policy: null,
+        crl: null,
         leaf: localLeaf(localNode),
         localNodeId: row.local?.id ?? null,
         declared: true,
+        maintenance: false,
+        pausedStreams: 0,
+        queuedOps: null,
+        queuedDropped: 0,
+        fossils: [],
+        headroom: null,
+        credential: null,
+        connection: null,
       });
     }
   }
@@ -294,7 +788,8 @@ export function buildDeploymentRows(
   // Tail 1: hub-registered agents the manifest does not declare — the
   // hub's registry is the realm's live truth; a stray stays visible.
   if (fleet.hub) {
-    for (const row of fleet.hub.agents) {
+    const overview = fleet.hub;
+    for (const row of overview.agents) {
       if (seen.has(row.agent)) continue;
       seen.add(row.agent);
       const localNode = nodes.find((n) => agentId(n.principal) === row.agent);
@@ -308,6 +803,58 @@ export function buildDeploymentRows(
           peersLeaf(obs, row.agent) ?? localLeaf(localNode),
           localNode?.id ?? null,
           false,
+          row.maintenance,
+          row.paused_streams?.length ?? 0,
+          policyFaceReading(
+            row.seen,
+            row.policy_last_pull_unix,
+            overview.captured_at_unix,
+            overview.policy_silent_after_secs,
+            nowUnix,
+          ),
+          crlFaceReading(
+            row.crl_last_success_unix,
+            overview.captured_at_unix,
+            overview.crl_silent_after_secs,
+            nowUnix,
+            row.crl_failures_total,
+          ),
+          queuedOpsFaceReading(
+            row.pending_ops?.pending_count ?? null,
+            row.pending_ops?.oldest_queued_unix ?? null,
+            overview.captured_at_unix,
+            row.pending_ops?.oldest_op ?? null,
+            row.pending_ops?.dropped_total ?? null,
+            row.online,
+            overview.policy_silent_after_secs,
+          ),
+          row.pending_ops?.dropped_total ?? 0,
+          fossilStreamsFaceReading(
+            row.pending_ops === null && row.streams === undefined
+              ? null
+              : (row.streams ?? null),
+            overview.captured_at_unix,
+            overview.fossil_idle_multiple,
+            overview.fossil_unbudgeted_days,
+          ),
+          headroomFaceReading(
+            row.streams_in_flight ?? null,
+            overview.stream_limits?.per_agent ?? null,
+            overview.headroom_warn_pct,
+          ),
+          credentialFaceReading(
+            row.leaf_not_before_unix ?? null,
+            row.leaf_not_after_unix ?? null,
+            overview.captured_at_unix,
+            overview.offline_warn_days,
+            overview.offline_critical_days,
+            overview.registrar_warn_pct,
+            overview.registrar_critical_pct,
+          ),
+          connectionFaceReading(
+            row.connection ?? null,
+            row.renewal_backoff_failures ?? null,
+          ),
         ),
       );
     }
@@ -333,9 +880,19 @@ export function buildDeploymentRows(
         kind: "ingress",
         online: isRunning(node.state),
         gen: null,
+        policy: null,
+        crl: null,
         leaf: localLeaf(node),
         localNodeId: node.id,
         declared: false,
+        maintenance: false,
+        pausedStreams: 0,
+        queuedOps: null,
+        queuedDropped: 0,
+        fossils: [],
+        headroom: null,
+        credential: null,
+        connection: null,
       });
     } else {
       const id = agentId(node.principal) ?? node.name;
@@ -365,6 +922,16 @@ export function buildDeploymentRows(
     floorServing: fleet.hub
       ? { floor: fleet.hub.floor, serving: fleet.hub.serving }
       : null,
+    routeBreakers,
+    watchers:
+      fleet.hub !== null
+        ? watchersFaceReading(
+            fleet.hub.watchers,
+            fleet.hub.captured_at_unix,
+            fleet.hub.watcher_silent_factor,
+            nowUnix,
+          )
+        : { state: "unknown" },
   };
 }
 

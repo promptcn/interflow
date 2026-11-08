@@ -37,6 +37,7 @@
 
 pub mod backend;
 pub mod certs;
+pub mod control;
 pub use certs::{tls_client_connect, tls_client_connect_with};
 pub mod clock;
 pub mod config;
@@ -48,6 +49,7 @@ pub mod impair;
 pub mod logging;
 pub mod metrics;
 pub mod metrics_harness;
+pub mod plan_corpus;
 pub mod registrar;
 pub mod soak;
 pub mod stack;
@@ -95,8 +97,14 @@ pub fn opaque_stream_id(label: &str) -> interflow_core::protocol::StreamId {
 /// that hardcode `cargo test` should switch (rust-analyzer:
 /// `rust-analyzer.runnables.command = "nextest"`); the
 /// `INTERFLOW_LIBTEST_OK=1` escape hatch exists for libtest-specific
-/// debugging only.
+/// debugging only. Standalone dev binaries built on this crate (the soak
+/// gate) are not a libtest queue either: they say so once at the top of
+/// `main` via [`declare_standalone_runner`], before the first stack/cert
+/// construction — an explicit declaration, not an env/argv heuristic.
 pub fn assert_nextest_runner() {
+    if STANDALONE_RUNNER.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     // cargo bench runs these same binaries in bench mode (`--bench` on the
     // argv); benches are single-binary invocations, not the slow queue
     // this guard exists for.
@@ -121,4 +129,13 @@ pub fn assert_nextest_runner() {
          full run:    just test\n\
          override:    INTERFLOW_LIBTEST_OK=1 (libtest-specific debugging only)"
     );
+}
+
+static STANDALONE_RUNNER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declares the current process a standalone dev runner (the soak gate's
+/// `soak` binary) rather than a libtest queue, exempting it from
+/// [`assert_nextest_runner`]. Call once at the top of `main`.
+pub fn declare_standalone_runner() {
+    STANDALONE_RUNNER.store(true, std::sync::atomic::Ordering::Relaxed);
 }

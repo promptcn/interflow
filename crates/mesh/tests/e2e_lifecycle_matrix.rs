@@ -20,6 +20,7 @@
 //! | 9 | One-way transport blackhole | Liveness roundtrip detection + rebuild | `matrix_row9a_one_way_blackhole_hub_heartbeat_evicts_notifies_and_agent_rebuilds` (hub notice fast path) + `matrix_row9b_blackhole_demanding_probe_backstops_without_hub_notice` (agent-side backstop) |
 //! | 10 | Session death (peer unresponsive) | Detection within a deadline, not on the next business stream | Row 9a's `quic_heartbeat_timeout` assertions (QUIC) + `e2e_hub_eviction::heartbeat_evicts_pong_aware_wedge_and_ends_poll` (h2, tuned 1s×1) |
 //! | 11 | Old-generation policy pull/reject | Rejection is observable, never silent | `pack_site_to_site::policy_publish_endpoint_verifies_persists_and_rejects` (hub face: 409 + floor). Agent-face observability has no non-log assertion surface (the no-log-grep discipline) — explicit exemption |
+//! | 12 | Planned unavailability (node maintenance) | Declared absence is not an accident: removal lands, eviction accounting exempted; rejoin lifts the declaration | `matrix_row12_maintenance_declared_shutdown_exempts_accounting_and_rejoin_lifts` (below) |
 //!
 //! Fault-injection equipment (shared by rows 1/2/4/9/10):
 //! - **Hard kill** (no close frame): soak tier has real SIGKILL
@@ -622,4 +623,108 @@ async fn matrix_row9b_blackhole_demanding_probe_backstops_without_hub_notice() {
         .await
         .expect("round trip after disarm");
     assert_eq!(resp, payload);
+}
+
+// ---------------------------------------------------------------------------
+// Matrix row 12 — planned unavailability, node level: a declared
+// maintenance window turns a leg's departure from an accident into an
+// expectation.
+// ---------------------------------------------------------------------------
+
+/// Row 12: declare → clean shutdown (the home-win 关机维护 shape) → the
+/// registry removal still lands (the offline fact stands) but the
+/// eviction accounting is EXEMPT (no `evicted_total`, its own
+/// maintenance-departure counter) → the node rejoins and the declaration
+/// lifts ITSELF (zero-operation recovery, no residual exemption).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn matrix_row12_maintenance_declared_shutdown_exempts_accounting_and_rejoin_lifts() {
+    init_tracing();
+    // Poll grace compressed to 2s: a graceful h2 shutdown drops the poll
+    // body, and the departure lands via the poll-grace path within
+    // grace + bookkeeping headroom. Heartbeat stays at defaults (the
+    // poll-grace path fires first on a clean disconnect).
+    let security = interflow_mesh::config::HubSecurityConfig {
+        poll_grace_secs: 2,
+        ..Default::default()
+    };
+    let certs = certs();
+    let control = interflow_testkit::certs::TestCerts::generate("lifecycle-ctl", "operator");
+    let hub = spawn_hub(interflow_testkit::control::hub_config_tuned_with_control(
+        0,
+        certs,
+        &control,
+        Vec::new(),
+        security,
+        HeartbeatConfig::default(),
+    ))
+    .await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
+    let endpoint = format!("127.0.0.1:{hub_port}");
+
+    let agent = spawn_agent(interflow_testkit::agent_config("leg", hub_port, certs));
+    assert!(
+        wait_agent_connected(&agent, Duration::from_secs(15)).await,
+        "the leg must register before the window"
+    );
+    let qualified = format!("{}/{}", interflow_testkit::config::TEST_TENANT, "leg");
+
+    // Declare the window BEFORE the shutdown (the operator's actual
+    // order — the whole point is declaring ahead of the downtime).
+    interflow_testkit::control::set_maintenance(&endpoint, certs, &control, &qualified, true)
+        .await
+        .expect("declaration accepted");
+    interflow_testkit::control::wait_maintenance(
+        &endpoint,
+        certs,
+        &control,
+        &qualified,
+        true,
+        "face shows the declaration",
+    )
+    .await;
+    let baseline = interflow_testkit::control::evicted_total(&endpoint, certs, &control).await;
+
+    // Clean shutdown: the 2026-10-18 home-win shape.
+    agent.shutdown_graceful().await.expect("leg shuts down");
+
+    // The departure lands via the poll-grace path (grace 2s) with the
+    // maintenance-departure accounting — NOT the eviction counter.
+    wait_counter_at_least(
+        "interflow_hub_agent_maintenance_departed{reason=\"poll_grace_expired\"}",
+        1,
+        Duration::from_secs(15),
+    )
+    .await;
+    let after = interflow_testkit::control::evicted_total(&endpoint, certs, &control).await;
+    assert_eq!(
+        baseline, after,
+        "a declared-maintenance departure must not move the eviction counter"
+    );
+
+    // The node returns: the rejoin lifts the declaration itself.
+    let agent = spawn_agent(interflow_testkit::agent_config("leg", hub_port, certs));
+    assert!(
+        wait_agent_connected(&agent, Duration::from_secs(15)).await,
+        "the leg must re-register after the window"
+    );
+    interflow_testkit::control::wait_maintenance(
+        &endpoint,
+        certs,
+        &control,
+        &qualified,
+        false,
+        "rejoin lifted the declaration",
+    )
+    .await;
+    // No residual exemption: a LATER departure would count as an eviction
+    // again — the ledger is empty by construction now (proven by the face
+    // above); this counter is the belt to that braces.
+    agent.shutdown_graceful().await.expect("second shutdown");
+    wait_counter_at_least(
+        "interflow_hub_agent_evicted{reason=\"poll_grace_expired\"}",
+        1,
+        Duration::from_secs(15),
+    )
+    .await;
+    hub.shutdown_graceful().await.expect("hub down");
 }

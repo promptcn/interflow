@@ -556,6 +556,15 @@ struct ProtoState {
     lost: Option<quinn_proto::ConnectionError>,
     received_datagrams: VecDeque<Bytes>,
     received_datagram_bytes: usize,
+    /// Scratch buffers reused across packets (§3.9): the endpoint's
+    /// response writer and the transmit staging area are per-carrier, not
+    /// per-packet allocations. `response_buf` is cleared at the top of
+    /// every `handle_packet`; `transmit_buf` is cleared after each
+    /// transmit read.
+    response_buf: Vec<u8>,
+    transmit_buf: Vec<u8>,
+    /// Collected outbound packets within one `drive` pass (reused).
+    outbox: Vec<Bytes>,
 }
 
 #[derive(Debug)]
@@ -1151,6 +1160,9 @@ impl ProtoState {
             lost: None,
             received_datagrams: VecDeque::new(),
             received_datagram_bytes: 0,
+            response_buf: Vec::new(),
+            transmit_buf: Vec::new(),
+            outbox: Vec::new(),
         }
     }
 
@@ -1174,20 +1186,27 @@ impl ProtoState {
     }
 
     fn handle_packet(&mut self, packet: Bytes) -> std::result::Result<(), InnerQuicError> {
-        let mut response = Vec::with_capacity(2048);
+        // The response scratch is cleared per packet: only this packet's
+        // transmits may be staged in it.
+        self.response_buf.clear();
         let event = self.endpoint.handle(
             std::time::Instant::now(),
             SYNTHETIC_PEER,
             None,
             None,
             BytesMut::from(packet),
-            &mut response,
+            &mut self.response_buf,
         );
         match event {
             Some(quinn_proto::DatagramEvent::NewConnection(incoming)) => {
                 let (handle, connection) = self
                     .endpoint
-                    .accept(incoming, std::time::Instant::now(), &mut response, None)
+                    .accept(
+                        incoming,
+                        std::time::Instant::now(),
+                        &mut self.response_buf,
+                        None,
+                    )
                     .map_err(|e| InnerQuicError::proto_with("inner QUIC accept failed", e.cause))?;
                 self.handle = Some(handle);
                 self.connection = Some(connection);
@@ -1200,7 +1219,7 @@ impl ProtoState {
                 }
             }
             Some(quinn_proto::DatagramEvent::Response(transmit)) => {
-                let packet = Bytes::copy_from_slice(&response[..transmit.size]);
+                let packet = Bytes::copy_from_slice(&self.response_buf[..transmit.size]);
                 let _ = self.send_packet(packet);
             }
             None => {}
@@ -1247,16 +1266,20 @@ impl ProtoState {
             }
         }
 
-        let mut packets = Vec::new();
         if let Some(conn) = self.connection.as_mut() {
-            let mut buffer = Vec::with_capacity(2048);
-            while let Some(transmit) = conn.poll_transmit(std::time::Instant::now(), 1, &mut buffer)
+            let Self {
+                transmit_buf,
+                outbox,
+                ..
+            } = self;
+            while let Some(transmit) =
+                conn.poll_transmit(std::time::Instant::now(), 1, transmit_buf)
             {
-                packets.push(Bytes::copy_from_slice(&buffer[..transmit.size]));
-                buffer.clear();
+                outbox.push(Bytes::copy_from_slice(&transmit_buf[..transmit.size]));
+                transmit_buf.clear();
             }
         }
-        for packet in packets {
+        for packet in std::mem::take(&mut self.outbox) {
             self.send_packet(packet)?;
         }
 
@@ -1351,8 +1374,35 @@ async fn input_pump(mut frames: mpsc::Receiver<TunnelData>, carrier: InnerQuicCa
 }
 
 async fn timer_pump(carrier: InnerQuicCarrier) {
+    // Deadline-driven sleeping (§3.9): the fixed 50 ms tick woke every
+    // session 20×/s whether or not anything was due. The wake points are
+    // (a) the connection's own timer deadline and (b) the shared notify —
+    // input pumps poke it after advancing the state machine, so an
+    // earlier deadline appearing between sleeps is never missed (the
+    // Notified future is created BEFORE the deadline is read, and a
+    // permit from a notify that already fired is consumed immediately).
     while !carrier.shared.shutdown.load(Ordering::Relaxed) {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let notified = carrier.shared.notify.notified();
+        let deadline = {
+            let mut guard = carrier.lock_state();
+            guard
+                .connection
+                .as_mut()
+                .and_then(quinn_proto::Connection::poll_timeout)
+        };
+        let sleep = match deadline {
+            Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)),
+            // No connection yet (pre-handshake idleness): a slow poll, not
+            // a busy one.
+            None => tokio::time::sleep(Duration::from_millis(50)),
+        };
+        tokio::select! {
+            () = sleep => {}
+            () = notified => {
+                // State advanced elsewhere: re-derive the deadline.
+                continue;
+            }
+        }
         let (timer_due, already_lost) = {
             let mut guard = carrier.lock_state();
             if let Some(conn) = guard.connection.as_mut()
@@ -1417,7 +1467,7 @@ pub async fn connect_inner_quic(
     tunnel: AgentTunnel,
     stream_id: crate::protocol::StreamId,
     frames: mpsc::Receiver<TunnelData>,
-    client_config: tokio_rustls::rustls::ClientConfig,
+    client_config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
     server_name: String,
     source_principal: String,
     source_fingerprint: [u8; 32],
@@ -1480,8 +1530,9 @@ pub async fn accept_inner_quic(
     direction: CarrierDirection,
     handshake_timeout: Duration,
 ) -> Result<InnerQuicCarrier> {
-    let mut rustls_config = crate::tls::inner_server_config_unbound(material)?;
-    rustls_config.alpn_protocols = vec![crate::tls::INNER_QUIC_ALPN.as_bytes().to_vec()];
+    // Cached on the material (ALPN pre-attached): per-association assembly
+    // is an Arc clone, not a rebuild.
+    let rustls_config = crate::tls::inner_quic_server_config_unbound(material)?;
     let quic_crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(rustls_config)
         .map_err(|e| {
             InterflowError::config("inner QUIC server config".to_string()).with_source(e)

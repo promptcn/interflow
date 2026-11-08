@@ -16,6 +16,11 @@ export function streamStatusKey(status: StreamStatusDto): StatusKey | null {
       return "success";
     case "down":
       return "critical";
+    // Planned unavailability reads YELLOW, not red: the listener is down
+    // by intent and one resume away from serving — a deliberate state,
+    // not a fault.
+    case "paused":
+      return "warn";
     case "catching_up":
       return "warn";
     default:
@@ -29,6 +34,7 @@ export function streamStatusKey(status: StreamStatusDto): StatusKey | null {
 export const streamStatusWordKey = {
   serving: "dep.streams.status.serving",
   down: "dep.streams.status.down",
+  paused: "dep.streams.status.paused",
   catching_up: "dep.streams.status.catchingUp",
   unknown: "dep.streams.status.unknown",
 } as const;

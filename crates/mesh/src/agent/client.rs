@@ -106,6 +106,39 @@ pub struct AgentClient {
     /// counterpart of the rule store, so "the listener is gone" is a
     /// queryable state, not archaeology.
     ingress_listeners: std::sync::Arc<IngressListeners>,
+    /// Stream pause-intent truth (planned unavailability), shared across
+    /// sessions and observable from the
+    /// [`AgentHandle`](crate::agent::AgentHandle). Loaded at construction —
+    /// BEFORE any session's first reconcile — so a restarted agent never
+    /// re-grabs a port the operator paused (that quiet re-grab was the
+    /// whole reason the intent must persist).
+    paused_streams: std::sync::Arc<crate::agent::paused_streams::PausedStreams>,
+    /// The renewal loop's CRL-poll liveness face, when this node runs one
+    /// beside the engine (the assembly's choice — the pack/CLI/GUI paths
+    /// hand the SAME `Arc` to the scheduler spawn, so the face reads the
+    /// loop that actually polls). `None` = no reporter: in-memory test
+    /// assemblies and offline-identity nodes (nothing polls, so nothing
+    /// reports — a hub-side silent reading must always mean a hung
+    /// poller, never "offline by design").
+    renewal_face: Option<std::sync::Arc<interflow_renewal::CrlPollFace>>,
+    /// The engine's per-rule byte-activity ledger (the fossil face's
+    /// node-side half): armed by the ingress handlers, touched by the
+    /// pumps beside their idle-deadline resets, shipped by the
+    /// engine-intrinsic node-status reporter.
+    stream_activity: std::sync::Arc<crate::agent::stream_activity::StreamActivity>,
+    /// The engine's connection-quality windows (reconnect instants +
+    /// liveness RTT samples) — the connection-quality face's node-side
+    /// half, shipped on the same report.
+    connection_rings: std::sync::Arc<crate::agent::connection_quality::ConnectionRings>,
+    /// Hub-plane TLS client configs, keyed by (pin, CA, cert, key, ALPN):
+    /// the TLS file paths are startup-fixed, so every reconnect reuses the
+    /// assembled `Arc` instead of re-reading the PEMs and the system trust
+    /// store. The first build runs on the blocking pool (native-certs
+    /// loading touches disk). Bounded by the distinct ALPN × TLS-shape
+    /// combinations the config can produce (in practice ≤ 2).
+    hub_client_configs: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<rustls::ClientConfig>>>,
+    >,
 }
 
 /// The current session's rule command channels (ingress listeners + egress
@@ -173,12 +206,34 @@ impl AgentClient {
     /// edge) passes through here, so the identity pre-validation below
     /// cannot be bypassed.
     pub fn new(config: AgentConfig) -> Result<Self> {
+        Self::with_renewal_face(config, None)
+    }
+
+    /// [`AgentClient::new`] with the renewal loop's CRL-poll liveness face
+    /// attached: the assembly creates the face once, hands it to BOTH this
+    /// constructor (whose start spawns the reporter task) and the renewal
+    /// scheduler spawn — one `Arc`, one truth. `None` keeps the reporter
+    /// off entirely (the default every non-pack caller already has).
+    pub fn with_renewal_face(
+        config: AgentConfig,
+        face: Option<std::sync::Arc<interflow_renewal::CrlPollFace>>,
+    ) -> Result<Self> {
         Self::validate_identity_binding(&config)?;
         let rule_store = RuleStore::from_config(&config);
         let egress_runtime = Arc::new(crate::agent::egress::EgressRuntime::from_config(&config));
         // E2e (inner TLS) material: startup-only assembly — a bad anchor
         // set fails the agent here instead of per-stream at runtime.
         let e2e_runtime = crate::agent::e2e::E2eRuntime::from_config(&config)?;
+        // Pause-intent truth: restored from the pack's `state/` channel
+        // (when there is one) at construction, before any listener exists.
+        let paused_streams = crate::agent::paused_streams::PausedStreams::load(
+            config
+                .policy
+                .as_ref()
+                .map(|plane| plane.pack_dir.join("state"))
+                .as_deref(),
+            config.agent.effective_log_name(),
+        );
         Ok(Self {
             security_tx: tokio::sync::watch::channel(config.security.clone()).0,
             session_commands: Arc::new(tokio::sync::RwLock::new(None)),
@@ -189,6 +244,15 @@ impl AgentClient {
             ingress_ready: tokio::sync::watch::channel(false).0,
             ingress_addrs: std::sync::Arc::new(IngressAddrs::new()),
             ingress_listeners: std::sync::Arc::new(IngressListeners::new()),
+            stream_activity: std::sync::Arc::new(
+                crate::agent::stream_activity::StreamActivity::new(),
+            ),
+            hub_client_configs: std::sync::Arc::default(),
+            connection_rings: std::sync::Arc::new(
+                crate::agent::connection_quality::ConnectionRings::new(),
+            ),
+            paused_streams,
+            renewal_face: face,
         })
     }
 
@@ -288,10 +352,93 @@ impl AgentClient {
         let peer_shutdown = shutdown.clone();
         let peer_tracker = tracker.clone();
 
+        // The intrinsic stream-intent plane: like the peer plane, it needs
+        // no pack — every mesh agent reports its pause set and applies
+        // operator ops (no embedder wiring to forget).
+        let intent_log_name = self.config.agent.effective_log_name().to_string();
+        let intent_state_rx = state_rx.clone();
+        let intent_shutdown = shutdown.clone();
+        let intent_tracker = tracker.clone();
+        let intent_paused = std::sync::Arc::clone(&self.paused_streams);
+        crate::agent::intent_watch::spawn(
+            intent_log_name,
+            slot.tunnel(),
+            intent_state_rx,
+            intent_paused,
+            &intent_shutdown,
+            &intent_tracker,
+        );
+
+        // The engine-intrinsic node-status reporter: every mesh agent
+        // ships its stream-activity levels (the fossil face) — like the
+        // intent plane, no embedder wiring exists to forget.
+        crate::agent::node_status_report::spawn(
+            self.config.agent.effective_log_name().to_string(),
+            slot.tunnel(),
+            state_rx.clone(),
+            std::sync::Arc::clone(&self.stream_activity),
+            std::sync::Arc::clone(&self.connection_rings),
+            &shutdown,
+            &tracker,
+        );
+
+        // The CRL-poll liveness reporter: spawned only when the assembly
+        // attached a renewal face (a node that runs the poll loop beside
+        // the engine). Same tracker/token discipline; reads the face's
+        // atomics at send time, so its own health only affects sampling,
+        // never the level.
+        if let Some(renewal_face) = self.renewal_face.clone() {
+            crate::agent::crl_liveness_report::spawn(
+                self.config.agent.effective_log_name().to_string(),
+                slot.tunnel(),
+                state_rx.clone(),
+                renewal_face,
+                &shutdown,
+                &tracker,
+            );
+        }
+
+        // The intrinsic breaker-recovery prober (2026-10-18 active
+        // recovery): every mesh agent with a breaker table gets it — the
+        // task is inert without one (disabled breaker or disabled prober ⇒
+        // no spawn), and no embedder wiring exists to forget. Same
+        // tracker/token discipline as the planes above; ends with
+        // `shutdown_graceful`.
+        if self.config.egress_recovery_probe_enabled {
+            crate::agent::breaker_probe::spawn(
+                self.config.agent.effective_log_name().to_string(),
+                &self.egress_runtime,
+                slot.tunnel(),
+                std::sync::Arc::clone(&self.rule_store),
+                crate::agent::breaker_probe::ProbePolicy {
+                    loopback_interval: std::time::Duration::from_secs(
+                        self.config.egress_recovery_probe_loopback_interval_secs,
+                    ),
+                    remote_interval: std::time::Duration::from_secs(
+                        self.config.egress_recovery_probe_remote_interval_secs,
+                    ),
+                    connect_timeout: std::time::Duration::from_secs(
+                        self.config.egress_recovery_probe_connect_timeout_secs,
+                    ),
+                },
+                &shutdown,
+                &tracker,
+            );
+        }
+        // The handle's pause face (command + read) — extracted before
+        // `self` moves into the supervisor, like the faces above.
+        let handle_paused = std::sync::Arc::clone(&self.paused_streams);
+        let handle_renewal_face = self.renewal_face.clone();
+        // The breaker open-set face (present exactly when the egress
+        // breaker table exists) — extracted before `self` moves into the
+        // supervisor, like the faces above.
+        let handle_breaker_state = self.egress_runtime.breaker_face().cloned();
+
         let sink = EventSink {
             state_tx,
             event_tx,
             established: Arc::clone(&established),
+            connection_rings: std::sync::Arc::clone(&self.connection_rings),
         };
 
         let ingress_ready_rx = self.ingress_ready.subscribe();
@@ -346,9 +493,12 @@ impl AgentClient {
             ingress_ready_rx,
             ingress_addrs,
             ingress_listeners,
+            handle_paused,
             policy_state,
             peer_state,
             proposal_state,
+            handle_renewal_face,
+            handle_breaker_state,
         )
     }
 
@@ -421,6 +571,7 @@ impl AgentClient {
                     Arc::clone(&death_note),
                     ProbeParams::from(&self.config.liveness_probe),
                     node.clone(),
+                    Arc::clone(&self.connection_rings),
                 ) => Waited::ProbeFired,
             };
             // Both arms yield `Result<Result<SessionOutcome>, InterflowError>`
@@ -642,6 +793,8 @@ impl AgentClient {
         let handler_ingress_ready = self.ingress_ready.clone();
         let handler_ingress_addrs = std::sync::Arc::clone(&self.ingress_addrs);
         let handler_ingress_listeners = std::sync::Arc::clone(&self.ingress_listeners);
+        let handler_paused = std::sync::Arc::clone(&self.paused_streams);
+        let handler_activity = std::sync::Arc::clone(&self.stream_activity);
         let mut handler_task = session_tracker.spawn(async move {
             info!(node = %handler_node, "Starting agent services (ingress & egress)");
 
@@ -664,6 +817,8 @@ impl AgentClient {
                 Some(ingress_rx),
                 handler_ingress_addrs,
                 handler_ingress_listeners,
+                handler_paused,
+                handler_activity,
                 Arc::clone(&e2e_runtime),
                 handler_ingress_ready,
             );
@@ -974,7 +1129,7 @@ impl AgentClient {
 
         // TLS client config (isomorphic with the h2 path: CA / cert-pin /
         // mTLS client certificate)
-        let tls_config = self.build_quic_tls_config()?;
+        let tls_config = self.build_quic_tls_config().await?;
 
         // Critical-task stall timeout: `None` derives from the hub-advertised
         // heartbeat cadence (the HelloAck capability suffix; disabled
@@ -1044,8 +1199,62 @@ impl AgentClient {
         ))
     }
 
+    /// The hub-plane client config for the given TLS shape (cached — see
+    /// [`Self::hub_client_configs`]). The first build for a shape pays the
+    /// PEM/system-store reads on the blocking pool; every reconnect is an
+    /// `Arc` clone.
+    async fn hub_client_config(
+        &self,
+        pin_hex: Option<&str>,
+        ca_path: Option<&str>,
+        client_cert_path: Option<&str>,
+        client_key_path: Option<&str>,
+        alpn: &'static str,
+    ) -> Result<Arc<rustls::ClientConfig>> {
+        let key =
+            format!("{pin_hex:?}|{ca_path:?}|{client_cert_path:?}|{client_key_path:?}|{alpn}");
+        {
+            let cache = self
+                .hub_client_configs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(hit) = cache.get(&key) {
+                return Ok(Arc::clone(hit));
+            }
+        }
+        let pin = pin_hex.map(str::to_owned);
+        let ca = ca_path.map(str::to_owned);
+        let cert = client_cert_path.map(str::to_owned);
+        let key_path = client_key_path.map(str::to_owned);
+        let config = tokio::task::spawn_blocking(move || {
+            build_client_config(
+                pin.as_deref(),
+                ca.as_deref(),
+                cert.as_deref(),
+                key_path.as_deref(),
+                &[alpn],
+            )
+        })
+        .await
+        .map_err(|e| {
+            InterflowError::config("hub TLS config assembly task".to_string()).with_source(e)
+        })??;
+        let config = Arc::new(config);
+        let mut cache = self
+            .hub_client_configs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A concurrent first-build for the same shape may have landed while
+        // this one was building: keep the winner, hand out the cached Arc.
+        let shared = cache
+            .entry(key)
+            .or_insert_with(|| Arc::clone(&config))
+            .clone();
+        Ok(shared)
+    }
+
     /// Build the rustls ClientConfig for QUIC (ALPN `interflow`).
-    fn build_quic_tls_config(&self) -> Result<rustls::ClientConfig> {
+    async fn build_quic_tls_config(&self) -> Result<Arc<rustls::ClientConfig>> {
         let Some(tls) = &self.config.tls else {
             // Fail fast at config assembly: QUIC has no plaintext mode, and
             // without [tls] there is no trust basis to verify the hub with.
@@ -1054,13 +1263,14 @@ impl AgentClient {
                     .to_string(),
             ));
         };
-        build_client_config(
+        self.hub_client_config(
             tls.hub_cert_fingerprint.as_deref(),
             tls.ca_path.as_deref(),
             tls.client_cert_path.as_deref(),
             tls.client_key_path.as_deref(),
-            &[interflow_core::tunnel::quic::QUIC_ALPN],
+            interflow_core::tunnel::quic::QUIC_ALPN,
         )
+        .await
     }
 
     /// Connect to the hub and register the agent, returning the session
@@ -1138,7 +1348,7 @@ impl AgentClient {
                     node = %self.config.agent.effective_log_name(),
                     "cert pinning enabled (bypasses system CAs, trusts only hub certificates with matching fingerprint)"
                 );
-                Self::connect_tls_pinned(
+                self.connect_tls_pinned(
                     http_builder,
                     &addr,
                     host,
@@ -1151,14 +1361,16 @@ impl AgentClient {
             } else {
                 // Client TLS assembly (shared with the QUIC and pinned
                 // paths): CA roots + optional mTLS client certificate.
-                let config = build_client_config(
-                    None,
-                    tls_config.ca_path.as_deref(),
-                    tls_config.client_cert_path.as_deref(),
-                    tls_config.client_key_path.as_deref(),
-                    &["h2"],
-                )?;
-                let connector = TlsConnector::from(Arc::new(config));
+                let config = self
+                    .hub_client_config(
+                        None,
+                        tls_config.ca_path.as_deref(),
+                        tls_config.client_cert_path.as_deref(),
+                        tls_config.client_key_path.as_deref(),
+                        "h2",
+                    )
+                    .await?;
+                let connector = TlsConnector::from(config);
                 let stream = TcpStream::connect(&addr).await?;
 
                 let domain = ServerName::try_from(host)
@@ -1224,6 +1436,7 @@ impl AgentClient {
     /// Establish a TLS connection with cert pinning (bypasses system CAs;
     /// trusts only hub certificates whose SHA256 fingerprint matches).
     async fn connect_tls_pinned(
+        &self,
         builder: hyper::client::conn::http2::Builder<TokioExecutor>,
         addr: &str,
         host: &str,
@@ -1232,14 +1445,10 @@ impl AgentClient {
         client_key_path: Option<&str>,
         node: String,
     ) -> Result<(SendRequest<H2RequestBody>, tokio::task::JoinHandle<()>)> {
-        let config = build_client_config(
-            Some(pin_hex),
-            None,
-            client_cert_path,
-            client_key_path,
-            &["h2"],
-        )?;
-        let connector = TlsConnector::from(Arc::new(config));
+        let config = self
+            .hub_client_config(Some(pin_hex), None, client_cert_path, client_key_path, "h2")
+            .await?;
+        let connector = TlsConnector::from(config);
         let stream = TcpStream::connect(addr).await?;
         let domain = ServerName::try_from(host)
             .map_err(|e| InterflowError::config(format!("invalid domain {host}")).with_source(e))?
@@ -1545,6 +1754,7 @@ async fn out_of_tree_liveness_probe(
     note: std::sync::Arc<AttemptDeathNote>,
     params: ProbeParams,
     log_name: String,
+    connection: std::sync::Arc<crate::agent::connection_quality::ConnectionRings>,
 ) {
     let mut tick = tokio::time::interval(params.tick);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1572,8 +1782,19 @@ async fn out_of_tree_liveness_probe(
             continue;
         }
         last_demand_at = now;
+        let started = tokio::time::Instant::now();
         let demand =
             tokio::time::timeout(params.demand_deadline, slot.tunnel().liveness_roundtrip()).await;
+        // The RTT window's sample: the elapsed of an answer, a timeout
+        // mark otherwise — the existing observation point, no new probe.
+        connection.note_rtt(
+            if demand.is_ok() && demand.as_ref().unwrap().is_ok() {
+                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+            } else {
+                None
+            },
+            now_unix_ms,
+        );
         // `Err` (the probe-level deadline elapsed) and `Ok(Err(_))` (the
         // backend's own refusal/error) are the same verdict to the strike
         // counter — both mean "no answer arrived in time".
@@ -1687,6 +1908,9 @@ impl AgentClient {
         let body = response.into_body();
         let collected = BodyExt::collect(body).await?;
         let negotiated = RegisterResponse::parse(&collected.to_bytes())?;
+        // The cross-machine correlation key: this session's circuit in
+        // its short form, shared with the hub's audit/journal lines.
+        crate::agent::correlation::set_circuit(&negotiated.circuit_token);
         info!(
             node = %self.config.agent.effective_log_name(),
             "Agent registered: {} (hub heartbeat: {:?})",
@@ -2123,6 +2347,7 @@ mod tests {
             Arc::clone(&note),
             fast_probe(),
             "test-node".to_string(),
+            std::sync::Arc::new(crate::agent::connection_quality::ConnectionRings::new()),
         )
         .await;
 
@@ -2167,6 +2392,7 @@ mod tests {
             Arc::clone(&note),
             fast_probe(),
             "test-node".to_string(),
+            std::sync::Arc::new(crate::agent::connection_quality::ConnectionRings::new()),
         ));
         // Paused clock auto-advances through the ticks, demands and their
         // deadlines; three strikes ≈ 3×(10+30)ms of virtual time.
@@ -2214,6 +2440,7 @@ mod tests {
             Arc::clone(&note),
             fast_probe(),
             "test-node".to_string(),
+            std::sync::Arc::new(crate::agent::connection_quality::ConnectionRings::new()),
         ));
         // Give the loop far more virtual time than three strike cycles.
         tokio::time::sleep(Duration::from_millis(600)).await;
@@ -2240,6 +2467,7 @@ mod tests {
             Arc::clone(&note),
             fast_probe(),
             "test-node".to_string(),
+            std::sync::Arc::new(crate::agent::connection_quality::ConnectionRings::new()),
         ));
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!token.is_cancelled(), "empty slot must not trip the probe");

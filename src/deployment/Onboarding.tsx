@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, type DeploymentDto } from "../api";
 import { useT } from "../i18n";
+import AddNodeDialog from "../components/AddNodeDialog";
 import CreateDeploymentDialog from "../components/CreateDeploymentDialog";
 import { Button, EmptyState, SectionPanel } from "../components/ui";
 import { useDeployment } from "./DeploymentContext";
@@ -8,16 +9,22 @@ import { useDeployment } from "./DeploymentContext";
 /// The true-new-operator state: the shell's whole content area ONLY where
 /// zero deployments AND zero nodes exist — node-carrying machines never
 /// see it (their node view is the shell; deployment guidance there was the
-/// wrong-direction onboarding this gating fixes). Open an existing
-/// deployment (native picker or the discovered list) or create one from a
-/// template — the two entries the old Nodes-face dead end never pointed
-/// at (audit friction #1).
-export default function Onboarding() {
+/// wrong-direction onboarding this gating fixes).
+///
+/// Three entries, two audiences: Open/Create speak to the OPERATOR (the
+/// machine that holds the deployment tree), "Import a node pack" speaks to
+/// a pure agent machine — a `.iflowpack` carries identity, hub endpoint
+/// and transport on its own, so a node machine never needs the manifest
+/// the other two entries assume. Creating a deployment is demoted behind
+/// an Advanced fold: for a deployed-end machine it is exactly the
+/// wrong-direction button, and it used to sit on the first screen.
+export default function Onboarding({ onNodesChanged }: { onNodesChanged?: () => Promise<void> }) {
   const { t } = useT();
   const { openDeployment, openPickedManifest } = useDeployment();
   const [discovered, setDiscovered] = useState<DeploymentDto[]>([]);
   const [root, setRoot] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -65,10 +72,18 @@ export default function Onboarding() {
           <Button disabled={busy} onClick={() => void choose()}>
             {t("dep.onboarding.open")}
           </Button>
-          <Button variant="secondary" onClick={() => setCreateOpen(true)}>
-            {t("dep.onboarding.create")}
+          <Button
+            variant="secondary"
+            onClick={() => {
+              setImportOpen(true);
+            }}
+          >
+            {t("dep.onboarding.importPack")}
           </Button>
         </div>
+        <p className="m-0 text-center text-micro text-fg-3">
+          {t("dep.onboarding.importPackHint")}
+        </p>
         {discovered.length > 0 && (
           <SectionPanel title={t("dep.onboarding.discovered")}>
             <div className="flex flex-col gap-1">
@@ -84,6 +99,33 @@ export default function Onboarding() {
               ))}
             </div>
           </SectionPanel>
+        )}
+        <details className="group px-1">
+          <summary className="cursor-pointer list-none text-micro text-fg-3 outline-none transition-colors duration-150 hover:text-fg-2 focus-visible:ring-[3px] focus-visible:ring-accent-tint">
+            {t("dep.onboarding.advanced")}
+          </summary>
+          <div className="pt-2">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setCreateOpen(true);
+              }}
+            >
+              {t("dep.onboarding.create")}
+            </Button>
+            <p className="m-0 pt-1.5 text-micro text-fg-3">{t("dep.onboarding.createHint")}</p>
+          </div>
+        </details>
+        {importOpen && (
+          <AddNodeDialog
+            onClose={() => setImportOpen(false)}
+            onAdded={async () => {
+              setImportOpen(false);
+              // The refresh is the whole handoff: with a node on board the
+              // shell flips out of onboarding on its own.
+              await onNodesChanged?.();
+            }}
+          />
         )}
         {createOpen && (
           <CreateDeploymentDialog

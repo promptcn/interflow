@@ -10,6 +10,7 @@ cd "$(dirname "$0")/.."
 # Production-artifact tree discipline (refuse dirty; escape hatches leave
 # marks). Runs before any tool check so refusal costs nothing.
 source "$(dirname "$0")/lib/build_guard.sh"
+BINARIES="$(grep -v '^#' "$(dirname "$0")/lib/binaries.list")"
 build_guard_check "build-windows.sh" "$@"
 
 # Check for cargo-zigbuild
@@ -31,16 +32,19 @@ if ! rustup target list --installed | grep -q x86_64-pc-windows-gnu; then
 fi
 
 echo "Starting build for x86_64-pc-windows-gnu using cargo-zigbuild..."
-# cargo-zigbuild handles the cross-compilation setup automatically
-cargo zigbuild --release --target x86_64-pc-windows-gnu \
-    --bin interflow-cli --bin interflow-mesh --bin interflow-registrar
+# cargo-zigbuild handles the cross-compilation setup automatically.
+# binaries.list is newline-separated; a plain string substitution can't turn
+# that into repeated --bin flags, so build the argv as an array.
+BIN_FLAGS=()
+for BIN in $BINARIES; do BIN_FLAGS+=(--bin "$BIN"); done
+cargo zigbuild --release --target x86_64-pc-windows-gnu "${BIN_FLAGS[@]}"
 
 # Ship the artifacts through the guard: exact staging names, content gate
 # (embedded BUILD_TAG must equal this tree's), provenance with sources.
 # Dirty escapes carry the -dirty suffix in the name; the manifest records
 # provenance either way.
 mkdir -p artifacts
-for BIN in interflow-cli interflow-mesh interflow-registrar; do
+for BIN in $BINARIES; do
     OUTPUT_FILE="$(guard_ship_artifact \
         "target/x86_64-pc-windows-gnu/release/${BIN}.exe" \
         "artifacts/${BIN}-windows-x86_64.exe" raw)"

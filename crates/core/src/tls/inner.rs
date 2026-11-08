@@ -26,7 +26,9 @@
 
 use crate::error::{InterflowError, Result};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::RootCertStore;
 use tokio_rustls::rustls::ServerConfig;
@@ -55,7 +57,21 @@ pub const INNER_QUIC_ALPN: &str = "interflow-inner-quic-v1";
 /// derived from it by [`inner_client_config`] / [`inner_server_config`].
 /// (Not `Clone`: `PrivateKeyDer` is not cloneable as a whole; configs take
 /// a `clone_key()` copy.)
-#[derive(Debug)]
+///
+/// Derived-config caches (2026-11-04 hot-path audit §2.1) are embedded in
+/// the material itself: the anchor set, CRLs and own pair are material-wide
+/// invariants, so every derived config is a pure function of
+/// `(material, expected CN)` — rebuilt only on a cache miss and shared as
+/// [`Arc`] afterwards. Invalidation is identity-keyed: a rebuilt material
+/// (the expose edge's per-workspace sequence rotation) is a fresh instance
+/// with fresh (empty) caches. Cache policy: per-CN maps hold at most
+/// [`CONFIG_CACHE_CAP`] entries, cleared wholesale on overflow (deployment
+/// agent counts are bounded; a cleared entry rebuilds on next use).
+///
+/// The per-stream **full handshake** security design is untouched: TCP
+/// configs keep resumption disabled (the shared placeholder SNI makes a
+/// resumed session skip verification), QUIC configs keep the per-CN
+/// deterministic SNI with its isolated in-memory session store.
 pub struct InnerTlsMaterial {
     /// The merged anchor set (own-tenant CA ∪ gateway anchor ∪ extra
     /// cross-tenant anchors) for verifying the peer's chain.
@@ -67,7 +83,59 @@ pub struct InnerTlsMaterial {
     pub cert_chain: Vec<CertificateDer<'static>>,
     /// The private key of [`Self::cert_chain`]'s leaf.
     pub key: PrivateKeyDer<'static>,
+    /// The chain verifier shared by every derived config (anchor set + CRLs
+    /// are material-wide): built once, wrapped per expected CN.
+    webpki_verifier: OnceLock<Arc<dyn ClientCertVerifier>>,
+    /// CN-agnostic server acceptor (TCP shape, no ALPN): identical for every
+    /// stream, built once.
+    unbound_server_config: OnceLock<Arc<ServerConfig>>,
+    /// CN-agnostic server config carrying the inner-QUIC ALPN (the inner UDP
+    /// association acceptor): built once.
+    unbound_quic_server_config: OnceLock<Arc<ServerConfig>>,
+    /// Per-expected-CN TCP client configs (ingress role).
+    client_configs: Mutex<HashMap<String, Arc<ClientConfig>>>,
+    /// Per-expected-CN QUIC client configs (inner UDP association role; the
+    /// per-CN session store lives inside the shared config).
+    quic_client_configs: Mutex<HashMap<String, Arc<ClientConfig>>>,
 }
+
+impl std::fmt::Debug for InnerTlsMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The derived-config caches are summarized (the verifiers/configs
+        // they hold are not Debug); every material field is represented.
+        f.debug_struct("InnerTlsMaterial")
+            .field("roots", &self.roots)
+            .field("crls", &self.crls.len())
+            .field("cert_chain", &self.cert_chain.len())
+            .field("key", &"<private>")
+            .field(
+                "webpki_verifier",
+                &self.webpki_verifier.get().map(|_| "built"),
+            )
+            .field(
+                "unbound_server_config",
+                &self.unbound_server_config.get().map(|_| "built"),
+            )
+            .field(
+                "unbound_quic_server_config",
+                &self.unbound_quic_server_config.get().map(|_| "built"),
+            )
+            .field(
+                "client_configs",
+                &self.client_configs.lock().map(|c| c.len()),
+            )
+            .field(
+                "quic_client_configs",
+                &self.quic_client_configs.lock().map(|c| c.len()),
+            )
+            .finish()
+    }
+}
+
+/// Per-CN derived-config cache bound. Overflow clears the whole map (the
+/// pre-existing `E2eRuntime` QUIC cache policy, now shared by every
+/// derived-config kind).
+const CONFIG_CACHE_CAP: usize = 128;
 
 impl InnerTlsMaterial {
     /// Loads the material from disk: every entry of `anchor_paths` is merged
@@ -96,12 +164,167 @@ impl InnerTlsMaterial {
         }
         let cert_chain = super::server::load_certs(cert_path)?;
         let key = super::server::load_key(key_path)?;
-        Ok(Self {
+        Ok(Self::from_parts(roots, crls.to_vec(), cert_chain, key))
+    }
+
+    /// Assembles from already-loaded parts (the loader above, and tests
+    /// that mint material in memory). The derived-config caches start
+    /// empty; the shared verifier builds lazily on first use.
+    pub(crate) fn from_parts(
+        roots: RootCertStore,
+        crls: Vec<CertificateRevocationListDer<'static>>,
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Self {
+        Self {
             roots,
-            crls: crls.to_vec(),
+            crls,
             cert_chain,
             key,
-        })
+            webpki_verifier: OnceLock::new(),
+            unbound_server_config: OnceLock::new(),
+            unbound_quic_server_config: OnceLock::new(),
+            client_configs: Mutex::new(HashMap::new()),
+            quic_client_configs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The chain verifier shared by every derived config (anchor set + CRLs
+    /// are material-wide invariants). Built once per material; per-CN
+    /// verifiers are this [`Arc`] plus the expected-CN string.
+    fn shared_webpki_verifier(&self) -> Result<&Arc<dyn ClientCertVerifier>> {
+        if let Some(built) = self.webpki_verifier.get() {
+            return Ok(built);
+        }
+        // Build outside the cell (a failure must not poison it), then race
+        // the insertion — concurrent first users both build a valid
+        // verifier; the loser's instance is simply dropped.
+        let mut builder = WebPkiClientVerifier::builder(Arc::new(self.roots.clone()));
+        if !self.crls.is_empty() {
+            builder = builder.with_crls(self.crls.clone());
+        }
+        let built = builder.build().map_err(|e| {
+            InterflowError::config("inner TLS verifier build failed".to_string()).with_source(e)
+        })?;
+        Ok(self.webpki_verifier.get_or_init(move || built))
+    }
+
+    /// Cached-map insertion with the shared overflow policy: at capacity the
+    /// whole map clears (bounded agent populations; a cleared entry rebuilds
+    /// on its next use).
+    fn cache_insert<T>(cache: &Mutex<HashMap<String, Arc<T>>>, cn: &str, value: Arc<T>) -> Arc<T> {
+        let mut map = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.len() >= CONFIG_CACHE_CAP {
+            map.clear();
+        }
+        let shared = Arc::clone(&value);
+        map.insert(cn.to_owned(), value);
+        shared
+    }
+
+    /// The cached per-CN TCP client config (ingress role). First use for a
+    /// CN pays one full assembly; every later use is an [`Arc`] clone.
+    pub fn client_config(&self, expected_peer_cn: &str) -> Result<Arc<ClientConfig>> {
+        {
+            let cache = self
+                .client_configs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(hit) = cache.get(expected_peer_cn) {
+                return Ok(Arc::clone(hit));
+            }
+        }
+        let verifier = Arc::new(InnerPeerVerifier::new(
+            Arc::clone(self.shared_webpki_verifier()?),
+            Some(expected_peer_cn),
+        ));
+        let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(self.cert_chain.clone(), self.key.clone_key())
+            .map_err(|e| {
+                InterflowError::config("inner TLS client config error".to_string()).with_source(e)
+            })?;
+        // Placeholder server name is shared across all peers: a resumed session
+        // would skip certificate verification. Disable resumption outright
+        // (listed as future work in the RFC §10.8).
+        config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
+        Ok(Self::cache_insert(
+            &self.client_configs,
+            expected_peer_cn,
+            Arc::new(config),
+        ))
+    }
+
+    /// The cached per-CN QUIC client config (inner UDP association role).
+    /// The per-CN session store rides inside the shared config [`Arc`], so
+    /// association rebuilds resume while CN isolation is preserved.
+    pub fn quic_client_config(&self, expected_peer_cn: &str) -> Result<Arc<ClientConfig>> {
+        {
+            let cache = self
+                .quic_client_configs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(hit) = cache.get(expected_peer_cn) {
+                return Ok(Arc::clone(hit));
+            }
+        }
+        let verifier = Arc::new(InnerPeerVerifier::new(
+            Arc::clone(self.shared_webpki_verifier()?),
+            Some(expected_peer_cn),
+        ));
+        let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(self.cert_chain.clone(), self.key.clone_key())
+            .map_err(|e| {
+                InterflowError::config("inner QUIC client config error".to_string()).with_source(e)
+            })?;
+        config.alpn_protocols = vec![INNER_QUIC_ALPN.as_bytes().to_vec()];
+        config.resumption = tokio_rustls::rustls::client::Resumption::in_memory_sessions(64);
+        config.enable_early_data = false;
+        Ok(Self::cache_insert(
+            &self.quic_client_configs,
+            expected_peer_cn,
+            Arc::new(config),
+        ))
+    }
+
+    /// One-shot server-config assembly over the shared verifier (both unbound
+    /// cache variants and the test-facing bound builder).
+    fn build_server_config(&self, verifier: InnerPeerVerifier) -> Result<ServerConfig> {
+        ServerConfig::builder_with_protocol_versions(&[&TLS13])
+            .with_client_cert_verifier(Arc::new(verifier))
+            .with_single_cert(self.cert_chain.clone(), self.key.clone_key())
+            .map_err(|e| {
+                InterflowError::config("inner TLS server config error".to_string()).with_source(e)
+            })
+    }
+
+    /// The cached CN-agnostic server acceptor (TCP shape, no ALPN) — the
+    /// egress role's per-stream acceptor is an [`Arc`] clone.
+    pub fn unbound_server_config(&self) -> Result<&Arc<ServerConfig>> {
+        if let Some(built) = self.unbound_server_config.get() {
+            return Ok(built);
+        }
+        let verifier = InnerPeerVerifier::new(Arc::clone(self.shared_webpki_verifier()?), None);
+        let built = Arc::new(self.build_server_config(verifier)?);
+        Ok(self.unbound_server_config.get_or_init(move || built))
+    }
+
+    /// The cached CN-agnostic server config carrying the inner-QUIC ALPN —
+    /// the inner UDP association acceptor.
+    pub fn unbound_quic_server_config(&self) -> Result<&Arc<ServerConfig>> {
+        if let Some(built) = self.unbound_quic_server_config.get() {
+            return Ok(built);
+        }
+        let verifier = InnerPeerVerifier::new(Arc::clone(self.shared_webpki_verifier()?), None);
+        let mut config = self.build_server_config(verifier)?;
+        config.alpn_protocols = vec![INNER_QUIC_ALPN.as_bytes().to_vec()];
+        let built = Arc::new(config);
+        Ok(self.unbound_quic_server_config.get_or_init(move || built))
     }
 
     /// SHA-256 fingerprint of the leaf certificate presented by this side.
@@ -154,28 +377,14 @@ impl InnerPeerVerifier {
         }
     }
 
-    /// Builds the verifier for an expected peer CN over an anchor set.
-    #[cfg(test)]
-    fn new(roots: &RootCertStore, expected_cn: Option<&str>) -> Result<Self> {
-        Self::new_with_crls(roots, expected_cn, &[])
-    }
-
-    fn new_with_crls(
-        roots: &RootCertStore,
-        expected_cn: Option<&str>,
-        crls: &[CertificateRevocationListDer<'static>],
-    ) -> Result<Self> {
-        let mut builder = WebPkiClientVerifier::builder(Arc::new(roots.clone()));
-        if !crls.is_empty() {
-            builder = builder.with_crls(crls.to_vec());
-        }
-        let webpki = builder.build().map_err(|e| {
-            InterflowError::config("inner TLS verifier build failed".to_string()).with_source(e)
-        })?;
-        Ok(Self {
+    /// Builds the verifier for an expected peer CN over a shared chain
+    /// verifier (the material's prebuilt [`Arc`] — constructing this type
+    /// no longer clones the anchor store or rebuilds webpki).
+    fn new(webpki: Arc<dyn ClientCertVerifier>, expected_cn: Option<&str>) -> Self {
+        Self {
             webpki,
             expected_cn: expected_cn.map(str::to_string),
-        })
+        }
     }
 }
 
@@ -273,30 +482,18 @@ impl tokio_rustls::rustls::server::danger::ClientCertVerifier for InnerPeerVerif
 
 /// Derives the inner TLS **client** config (ingress side) for one stream:
 /// the expected peer is the Open frame's target agent.
+///
+/// Cached per expected CN on the material (see [`InnerTlsMaterial`]): steady
+/// state is an [`Arc`] clone, not a rebuild.
 pub fn inner_client_config(
     material: &InnerTlsMaterial,
     expected_peer_cn: &str,
-) -> Result<ClientConfig> {
-    let verifier = Arc::new(InnerPeerVerifier::new_with_crls(
-        &material.roots,
-        Some(expected_peer_cn),
-        &material.crls,
-    )?);
-    let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
-        .map_err(|e| {
-            InterflowError::config("inner TLS client config error".to_string()).with_source(e)
-        })?;
-    // Placeholder server name is shared across all peers: a resumed session
-    // would skip certificate verification. Disable resumption outright
-    // (listed as future work in the RFC §10.8).
-    config.resumption = tokio_rustls::rustls::client::Resumption::disabled();
-    Ok(config)
+) -> Result<Arc<ClientConfig>> {
+    material.client_config(expected_peer_cn)
 }
 
-/// Derives the inner **QUIC** client config for one expected peer.
+/// Derives the inner **QUIC** client config for one expected peer (cached
+/// per CN, see [`InnerTlsMaterial`]).
 ///
 /// The inner peer verifier still checks the full certificate chain and leaf CN
 /// on every full handshake. Resumption is keyed by a 128-bit deterministic SNI
@@ -305,36 +502,23 @@ pub fn inner_client_config(
 pub fn inner_quic_client_config(
     material: &InnerTlsMaterial,
     expected_peer_cn: &str,
-) -> Result<ClientConfig> {
-    let verifier = Arc::new(InnerPeerVerifier::new_with_crls(
-        &material.roots,
-        Some(expected_peer_cn),
-        &material.crls,
-    )?);
-    let mut config = ClientConfig::builder_with_protocol_versions(&[&TLS13])
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_client_auth_cert(material.cert_chain.clone(), material.key.clone_key())
-        .map_err(|e| {
-            InterflowError::config("inner QUIC client config error".to_string()).with_source(e)
-        })?;
-    config.alpn_protocols = vec![INNER_QUIC_ALPN.as_bytes().to_vec()];
-    config.resumption = tokio_rustls::rustls::client::Resumption::in_memory_sessions(64);
-    config.enable_early_data = false;
-    Ok(config)
+) -> Result<Arc<ClientConfig>> {
+    material.quic_client_config(expected_peer_cn)
 }
 
-/// Derives the inner TLS **server** config (egress side) for one stream:
-/// the expected peer is the Open frame's declared source agent.
+/// Derives the inner TLS **server** config (egress side) for one stream.
+///
+/// The expected peer is the Open frame's declared source agent. Test-facing
+/// shape (production accepts any CN and binds identity in the encrypted
+/// inner hello); uncached by design.
 pub fn inner_server_config(
     material: &InnerTlsMaterial,
     expected_client_cn: &str,
 ) -> Result<ServerConfig> {
-    let verifier = Arc::new(InnerPeerVerifier::new_with_crls(
-        &material.roots,
+    let verifier = Arc::new(InnerPeerVerifier::new(
+        Arc::clone(material.shared_webpki_verifier()?),
         Some(expected_client_cn),
-        &material.crls,
-    )?);
+    ));
     ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_client_cert_verifier(verifier)
         .with_single_cert(material.cert_chain.clone(), material.key.clone_key())
@@ -356,18 +540,17 @@ pub fn inner_quic_server_name(expected_peer_cn: &str) -> String {
 /// egress cannot pre-bind the expected CN. Chain validation is still mandatory
 /// at handshake time; the encrypted inner hello then requires the claimed
 /// principal and fingerprint to match the certificate that was just verified.
-pub fn inner_server_config_unbound(material: &InnerTlsMaterial) -> Result<ServerConfig> {
-    let verifier = Arc::new(InnerPeerVerifier::new_with_crls(
-        &material.roots,
-        None,
-        &material.crls,
-    )?);
-    ServerConfig::builder_with_protocol_versions(&[&TLS13])
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(material.cert_chain.clone(), material.key.clone_key())
-        .map_err(|e| {
-            InterflowError::config("inner TLS server config error".to_string()).with_source(e)
-        })
+///
+/// Cached on the material (see [`InnerTlsMaterial`]): the egress's per-stream
+/// acceptor is an [`Arc`] clone.
+pub fn inner_server_config_unbound(material: &InnerTlsMaterial) -> Result<Arc<ServerConfig>> {
+    Ok(Arc::clone(material.unbound_server_config()?))
+}
+
+/// [`inner_server_config_unbound`] with the inner-QUIC ALPN attached — the
+/// inner UDP association acceptor's config (cached on the material).
+pub fn inner_quic_server_config_unbound(material: &InnerTlsMaterial) -> Result<Arc<ServerConfig>> {
+    Ok(Arc::clone(material.unbound_quic_server_config()?))
 }
 
 /// Buckets an inner-handshake failure into a metrics reason label.
@@ -458,12 +641,7 @@ mod tests {
         {
             let _ = roots.add(cert);
         }
-        InnerTlsMaterial {
-            crls: Vec::new(),
-            roots,
-            cert_chain: fx.cert_a.clone(),
-            key: fx.key_a.clone_key(),
-        }
+        InnerTlsMaterial::from_parts(roots, Vec::new(), fx.cert_a.clone(), fx.key_a.clone_key())
     }
 
     fn expired_material(fx: &Fixture) -> InnerTlsMaterial {
@@ -492,7 +670,10 @@ mod tests {
         expected_cn: &str,
         chain: &[CertificateDer<'static>],
     ) -> std::result::Result<(), tokio_rustls::rustls::Error> {
-        let verifier = InnerPeerVerifier::new(&mat.roots, Some(expected_cn)).unwrap();
+        let verifier = InnerPeerVerifier::new(
+            Arc::clone(mat.shared_webpki_verifier().unwrap()),
+            Some(expected_cn),
+        );
         let (leaf, intermediates) = chain.split_first().unwrap();
         verifier.verify_chain_and_cn(leaf, intermediates)
     }
@@ -583,17 +764,13 @@ mod tests {
             &format!("{}{}", leaf2.cert_pem, fx.ca_a.cert_pem()),
             &leaf2.key_pem,
         );
-        let mat_2 = InnerTlsMaterial {
-            crls: Vec::new(),
-            roots: mat.roots.clone(), // same tenant anchor set
-            cert_chain: cert_2,
-            key: key_2,
-        };
+        // same tenant anchor set
+        let mat_2 = InnerTlsMaterial::from_parts(mat.roots.clone(), Vec::new(), cert_2, key_2);
 
         let (client_side, server_side) = tokio::io::duplex(4096);
         let client = tokio::spawn(async move {
             let name = ServerName::try_from(INNER_SERVER_NAME.to_string()).unwrap();
-            TlsConnector::from(Arc::new(inner_client_config(&mat, "agent-2").unwrap()))
+            TlsConnector::from(inner_client_config(&mat, "agent-2").unwrap())
                 .connect(name, client_side)
                 .await
         });
@@ -611,7 +788,7 @@ mod tests {
         let (client_side, server_side) = tokio::io::duplex(4096);
         let client = tokio::spawn(async move {
             let name = ServerName::try_from(INNER_SERVER_NAME.to_string()).unwrap();
-            TlsConnector::from(Arc::new(inner_client_config(&mat3, "agent-2").unwrap()))
+            TlsConnector::from(inner_client_config(&mat3, "agent-2").unwrap())
                 .connect(name, client_side)
                 .await
         });
@@ -626,6 +803,89 @@ mod tests {
         assert!(
             c.is_err() || s.is_err(),
             "CN mismatch must fail the handshake"
+        );
+    }
+
+    /// §2.1 cache semantics: same expected CN serves the same `Arc`
+    /// (no rebuild); different CNs get distinct configs; the unbound
+    /// server configs build once and share; the QUIC variants keep their
+    /// resumption/ALPN posture.
+    #[test]
+    fn derived_configs_are_cached_per_cn() {
+        let fx = fixture();
+        let mat = material(&fx);
+
+        let a1 = inner_client_config(&mat, "agent-2").unwrap();
+        let a2 = inner_client_config(&mat, "agent-2").unwrap();
+        assert!(Arc::ptr_eq(&a1, &a2), "same CN must hit the cache");
+
+        let b = inner_client_config(&mat, "agent-3").unwrap();
+        assert!(!Arc::ptr_eq(&a1, &b), "different CNs are distinct configs");
+
+        let q1 = inner_quic_client_config(&mat, "agent-2").unwrap();
+        let q2 = inner_quic_client_config(&mat, "agent-2").unwrap();
+        assert!(Arc::ptr_eq(&q1, &q2));
+        assert!(!q1.enable_early_data, "0-RTT stays disabled");
+        assert!(
+            q1.alpn_protocols
+                .iter()
+                .any(|p| p == INNER_QUIC_ALPN.as_bytes()),
+            "QUIC client config carries the inner QUIC ALPN"
+        );
+
+        let s1 = inner_server_config_unbound(&mat).unwrap();
+        let s2 = inner_server_config_unbound(&mat).unwrap();
+        assert!(Arc::ptr_eq(&s1, &s2), "the unbound acceptor builds once");
+
+        let qs = inner_quic_server_config_unbound(&mat).unwrap();
+        assert!(
+            !Arc::ptr_eq(&s1, &qs),
+            "TCP and QUIC-ALPN variants are separate caches"
+        );
+        assert!(
+            qs.alpn_protocols
+                .iter()
+                .any(|p| p == INNER_QUIC_ALPN.as_bytes()),
+            "the QUIC server variant carries the ALPN"
+        );
+    }
+
+    /// The per-CN cache clears wholesale at [`CONFIG_CACHE_CAP`]: the 129th
+    /// distinct CN evicts everything (bounded memory; a cleared entry
+    /// rebuilds on its next use).
+    #[test]
+    fn config_cache_clears_at_capacity() {
+        let fx = fixture();
+        let mat = material(&fx);
+        for i in 0..CONFIG_CACHE_CAP {
+            inner_client_config(&mat, &format!("agent-{i}")).unwrap();
+        }
+        {
+            let cache = mat
+                .client_configs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(cache.len(), CONFIG_CACHE_CAP);
+        }
+        let overflow = inner_client_config(&mat, "agent-overflow").unwrap();
+        {
+            let cache = mat
+                .client_configs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                cache.len() <= CONFIG_CACHE_CAP,
+                "overflow must clear the map, not grow past the cap"
+            );
+            assert!(
+                cache.contains_key("agent-overflow"),
+                "the inserting caller always lands its entry"
+            );
+        }
+        let again = inner_client_config(&mat, "agent-overflow").unwrap();
+        assert!(
+            Arc::ptr_eq(&overflow, &again),
+            "re-hit after clear is stable"
         );
     }
 }

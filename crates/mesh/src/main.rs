@@ -5,14 +5,15 @@
 //!   Credential Pack (`interflow-cli plan apply` renders the pack)
 //! - `interflow-mesh agent --pack <dir>` — start a LAN agent from a
 //!   Credential Pack (can carry both ingress + egress)
-//! - `interflow-mesh version` — version information
+//! - `interflow-mesh --version` / `-V` — version information (the
+//!   `interflow-mesh version` subcommand prints the identical line)
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Top-level CLI arguments.
 #[derive(Parser)]
-#[command(name = env!("CARGO_PKG_NAME"))]
+#[command(name = env!("CARGO_PKG_NAME"), version = interflow_buildinfo::VERSION_WITH_TAG)]
 #[command(about = "Site-to-site TCP tunnel (public hub + LAN agents)", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -49,7 +50,10 @@ async fn main() -> interflow_core::error::Result<()> {
             // Full identity: name anchors the binary, the shared const pins
             // the release line and exact code (`-dirty` = uncommitted
             // changes) — the same const `interflow-cli --version` prints, so
-            // the two CLIs cannot drift apart.
+            // the two CLIs cannot drift apart. The `--version`/`-V` flag
+            // prints this identical line (clap: "{name} {version}"); the
+            // subcommand stays as the pre-flag spelling
+            // (tests/version_face.rs holds the byte-for-byte parity).
             println!(
                 "{} {}",
                 env!("CARGO_PKG_NAME"),

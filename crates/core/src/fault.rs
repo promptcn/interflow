@@ -52,14 +52,24 @@ pub enum FaultPoint {
     /// Wedge (park forever) the QUIC control-stream write forwarder after
     /// registration (Pong path dead while the connection stays healthy).
     QuicControlWriteStall,
+    /// Panic in the agent's policy-watch loop at its first armed tick —
+    /// the task dies under the agent's `TaskTracker` with no supervisor
+    /// restart, modeling the SILENT watcher death (watermark frozen, node
+    /// otherwise healthy): the failure class the policy watermark face's
+    /// recency dimension exists to expose
+    AgentPolicyWatchTick,
     /// Drop every QUIC liveness-probe roundtrip stream without answering
-    /// while armed (the hub's answer arm stays up, the connection and the
-    /// heartbeat Ping both keep flowing) — the "session object alive,
+    /// while armed (the hub's answer arm stays up, the connection and
+    /// the heartbeat Ping both keep flowing) — the "session object alive,
     /// answers never arrive" one-way-blackhole form of 2026-10-09. Unlike
     /// the stall-class points this one is **re-consulted per probe** and
     /// never parks the handler task, so disarming restores service on the
     /// next roundtrip.
     HubQuicSwallowLivenessProbe,
+    /// Wedge (park forever) the hub's signed-policy reload watcher at its
+    /// loop pass — the resident task stays alive but stops ticking, the
+    /// silent-watcher shape the armed-assertion face exists to expose
+    HubPolicyReloadWatchTick,
 }
 
 impl FaultPoint {
@@ -78,7 +88,9 @@ impl FaultPoint {
             "quicacceptloop" => Self::QuicAcceptLoop,
             "quicclosedwatcher" => Self::QuicClosedWatcher,
             "quiccontrolwritestall" => Self::QuicControlWriteStall,
+            "agentpolicywatchtick" => Self::AgentPolicyWatchTick,
             "hubquicswallowlivenessprobe" => Self::HubQuicSwallowLivenessProbe,
+            "hubpolicyreloadwatchtick" => Self::HubPolicyReloadWatchTick,
             _ => return None,
         })
     }

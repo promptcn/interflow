@@ -249,6 +249,13 @@ impl AsyncWrite for E2eTunnelIo {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
+            // §3.5 audit conclusion (2026-11-04): this copy is inherent —
+            // rustls hands poll_write a &[u8] TLS record it owns; ownership
+            // for the async sink requires one copy (~16 KiB per record at the
+            // TLS maximum). The boxed write future below allocates once per
+            // record and its slot is reused across polls — proportionate to
+            // the copy itself; no further reduction without a poll-based
+            // sink-trait redesign whose cost exceeds its benefit.
             let n = buf.len().min(MAX_FRAME_PAYLOAD);
             let chunk = Bytes::copy_from_slice(&buf[..n]);
             let sink = Arc::clone(&this.sink);
@@ -684,12 +691,12 @@ mod tests {
                 .next()
                 .unwrap()
                 .unwrap();
-            InnerTlsMaterial {
-                crls: Vec::new(),
-                roots: roots.clone(),
-                cert_chain: chain,
-                key: tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(key),
-            }
+            InnerTlsMaterial::from_parts(
+                roots.clone(),
+                Vec::new(),
+                chain,
+                tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(key),
+            )
         };
         (mk(cn), mk("agent-2"))
     }
@@ -722,9 +729,7 @@ mod tests {
         let deadline = Duration::from_secs(10);
         let client = inner_tls_connect(
             client_adapter,
-            tokio_rustls::TlsConnector::from(Arc::new(
-                inner_client_config(&mat_1, "agent-2").unwrap(),
-            )),
+            tokio_rustls::TlsConnector::from(inner_client_config(&mat_1, "agent-2").unwrap()),
             deadline,
         );
         let server = inner_tls_accept(
@@ -803,9 +808,7 @@ mod tests {
         );
         let client = inner_tls_connect(
             client_adapter,
-            tokio_rustls::TlsConnector::from(Arc::new(
-                inner_client_config(&mat_1, "agent-2").unwrap(),
-            )),
+            tokio_rustls::TlsConnector::from(inner_client_config(&mat_1, "agent-2").unwrap()),
             Duration::from_secs(10),
         );
         let (server, client) = tokio::join!(server, client);
@@ -852,9 +855,7 @@ mod tests {
         let started = std::time::Instant::now();
         let outcome = inner_tls_connect(
             adapter,
-            tokio_rustls::TlsConnector::from(Arc::new(
-                inner_client_config(&mat_1, "agent-2").unwrap(),
-            )),
+            tokio_rustls::TlsConnector::from(inner_client_config(&mat_1, "agent-2").unwrap()),
             Duration::from_millis(300),
         )
         .await;

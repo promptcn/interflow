@@ -453,7 +453,7 @@ service = "main/desktop/asr"
             format!("{}{}", "re", "vision"),
         ];
         for retired_field in retired_fields {
-            let metadata = original.replace("format_version = 1", &format!("{retired_field} = 2"));
+            let metadata = original.replace("format_version = 3", &format!("{retired_field} = 4"));
             std::fs::write(&metadata_path, metadata).unwrap();
 
             let err = CredentialPack::load(&out).unwrap_err();
@@ -465,12 +465,12 @@ service = "main/desktop/asr"
         }
         std::fs::write(
             &metadata_path,
-            original.replace("format_version = 1", "format_version = 2"),
+            original.replace("format_version = 3", "format_version = 4"),
         )
         .unwrap();
         let err = CredentialPack::load(&out).unwrap_err();
         assert!(
-            err.to_string().contains("pack format_version must be 1"),
+            err.to_string().contains("pack format_version must be 3"),
             "expected format-version fail-closed rejection: {err}"
         );
     }
@@ -824,6 +824,7 @@ target_addr = "127.0.0.1:3000"
                 target_cidr: None,
                 udp_idle_timeout_secs: None,
             }],
+            nodes: vec![],
         }
     }
 

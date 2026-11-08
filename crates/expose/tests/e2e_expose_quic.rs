@@ -60,8 +60,9 @@ async fn wait_for_session(handle: &mut interflow_mesh::agent::AgentHandle) {
 async fn run_quic_round_trip(derived_addr: bool) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,interflow=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug".into()
+            }),
         )
         .try_init();
 
@@ -133,6 +134,7 @@ async fn run_quic_round_trip(derived_addr: bool) {
         },
 
         identity_offline: false,
+        renewal_face: None,
     };
     let mut client_handle = interflow_expose::client::start(&client_args).expect("client start");
     wait_for_session(&mut client_handle).await;
@@ -155,9 +157,11 @@ async fn run_quic_round_trip(derived_addr: bool) {
     read_result
         .expect("read should not timeout")
         .expect("read_exact should succeed");
+    // `&request[..]`, not `as_ref()`: array AsRef went inference-ambiguous
+    // under hybrid-array's impls (transitive via age 0.12's ml-kem).
     assert_eq!(
         response.as_slice(),
-        request.as_ref(),
+        &request[..],
         "response should equal echoed request (full QUIC round trip)"
     );
 }

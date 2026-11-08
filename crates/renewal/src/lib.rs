@@ -37,6 +37,145 @@ pub struct RenewalReport {
     pub renewed: Vec<String>,
 }
 
+/// The CRL poll cadence the scheduler enforces even while renewal is
+/// backing off (the loop's sleep cap) — the pacing fact the liveness
+/// face's silent threshold derives from.
+pub const CRL_POLL: Duration = Duration::from_secs(60);
+
+/// How long without a successful CRL poll a node's liveness face reads
+/// "silent".
+///
+/// The single source for the hub-side recency sweeper, the CLI doctor,
+/// and the GUI fleet face (mirroring
+/// `interflow_mesh::agent::policy_watch::POLICY_SILENT_AFTER_SECS`: three
+/// missed polls plus one sweep interval of slack. 1–2 missed polls are
+/// ordinary transient fetch failures, not the silent class).
+pub const CRL_SILENT_AFTER_SECS: u64 = CRL_POLL.as_secs() * 3 + 20;
+
+/// The renewal loop's CRL-poll liveness face — the level material behind
+/// the fleet faces' `crl_last_success_unix` + `crl_failures_total`
+///
+/// Before this face the loop's `last_crl_success` was a loop-local
+/// variable feeding only the 1h fail-closed bound: between CRL changes a
+/// silently-hung poll loop (the task wedges without erroring — the bound
+/// is checked BY the loop, so it never fires) was invisible on every read
+/// face, indistinguishable from a long legitimate quiet period. The
+/// correct material is the level itself: the confirmation instant of the
+/// last successful poll — a no-change `Ok(false)` IS a success ("polled,
+/// nothing moved") — refreshed on every poll and published here as plain
+/// atomics for whoever assembled the scheduler to report or display.
+///
+/// Unix wall seconds, not the loop's monotonic clock: the value crosses
+/// process boundaries (agent → hub → operator), where only wall time is
+/// comparable. The 1h staleness bound below stays monotonic on purpose —
+/// it must not see wall-clock jumps; this face must.
+#[derive(Debug)]
+pub struct CrlPollFace {
+    last_success_unix: std::sync::atomic::AtomicU64,
+    failures_total: std::sync::atomic::AtomicU64,
+    backoff_failures: std::sync::atomic::AtomicU32,
+}
+
+/// The read-side snapshot of [`CrlPollFace`] — value plus confirmation
+/// instant, the level-face shape the read-face family standardizes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CrlPollSnapshot {
+    /// Unix seconds of the last successful CRL poll (no-change included).
+    pub last_success_unix: u64,
+    /// Cumulative failed polls since process start. Monotonic within a
+    /// process; a restart resets it — this is the node's current level,
+    /// not an audit ledger.
+    pub failures_total: u64,
+    /// Consecutive failed renewal attempts at this moment (the backoff
+    /// ladder's current stage, 0 = none) — the connection-quality
+    /// face's `backoff stage N/5` level.
+    pub backoff_failures: u32,
+}
+
+impl CrlPollFace {
+    /// A fresh face asserts one optimistically-fresh poll (mirroring the
+    /// loop's `last_crl_success = clock.monotonic()` init): the first real
+    /// poll lands within one [`CRL_POLL`], well inside the silent
+    /// threshold, so a starting node never reads as silent before it had
+    /// a chance to poll.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::new_at(unix_now())
+    }
+
+    /// [`Self::new`] anchored at a chosen instant — the test seam (and the
+    /// shape an assembler would use to seed from persisted state, should
+    /// that ever become worth its IO).
+    #[must_use]
+    pub const fn new_at(last_success_unix: u64) -> Self {
+        Self {
+            last_success_unix: std::sync::atomic::AtomicU64::new(last_success_unix),
+            failures_total: std::sync::atomic::AtomicU64::new(0),
+            backoff_failures: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// The current level.
+    #[must_use]
+    pub fn snapshot(&self) -> CrlPollSnapshot {
+        CrlPollSnapshot {
+            last_success_unix: self
+                .last_success_unix
+                .load(std::sync::atomic::Ordering::Relaxed),
+            failures_total: self
+                .failures_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            backoff_failures: self
+                .backoff_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// One successful poll (change and no-change alike) — the confirmation
+    /// instant advances. The failure counter deliberately does not reset:
+    /// recovery after failures is exactly the history the counter should
+    /// keep showing; the fresh↔silent class transition is the hub-side
+    /// sweeper's to detect, not this side's to erase. `fetch_max` keeps a
+    /// wall-clock jump back from regressing the face.
+    pub fn note_success(&self, unix: u64) {
+        self.last_success_unix
+            .fetch_max(unix, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One failed poll.
+    pub fn note_failure(&self) {
+        self.failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The renewal backoff ladder's current stage (consecutive failed
+    /// attempts; 0 = none). Written by the scheduler at each failure and
+    /// reset by its process-ending success — the face mirrors the loop's
+    /// own `failures` variable, the level doctrine.
+    pub fn note_backoff(&self, failures: u32) {
+        self.backoff_failures
+            .store(failures, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Default for CrlPollFace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wall-clock unix seconds off a [`Clock`] (pre-epoch reads as 0, which
+/// every consumer treats as "long ago").
+fn unix_secs(clock: &dyn Clock) -> u64 {
+    u64::try_from(clock.now_utc().unix_timestamp()).unwrap_or(0)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Pack load/validation failures are configuration-class (unrecoverable at
 /// boot); keep the identity error as the source-chain root.
 pub fn pack_error(e: interflow_identity::Error) -> InterflowError {
@@ -369,8 +508,13 @@ async fn renew_all_at(
 }
 
 /// Single-node-process default: attribution is the pack's node name.
-pub async fn renewal_scheduler(pack_dir: &Path) -> Result<()> {
-    renewal_scheduler_with_log_name(pack_dir, None).await
+///
+/// `face` is the CRL-poll liveness face this scheduler keeps fresh (see
+/// [`CrlPollFace`]); callers that have no use for it construct a throwaway
+/// one, but it is not `Option` — a scheduler whose loop cannot be observed
+/// is exactly the blind spot the face exists to close.
+pub async fn renewal_scheduler(pack_dir: &Path, face: Arc<CrlPollFace>) -> Result<()> {
+    renewal_scheduler_with_log_name(pack_dir, None, face).await
 }
 
 /// The CRL-change hook: invoked (and awaited) instead of the default
@@ -383,6 +527,16 @@ pub async fn renewal_scheduler(pack_dir: &Path) -> Result<()> {
 pub type CrlChangeHook = std::sync::Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
 >;
+
+/// Per-pass progress notice for the renewal loop.
+///
+/// The hub-process watchdog's touch callback
+/// (`interflow_mesh::hub::watchdog`): the loop owns its own liveness
+/// level — an external poller would only re-report a frozen face,
+/// transport not truth — so the assembler that wants a watchdog row
+/// hands the touch in here. `None` on embedders without a watchdog
+/// (agents, edges, tests); the notice is then simply absent.
+pub type TickWatch = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// Time source for the renewal scheduler: the wall clock drives the
 /// threshold/warning/expiry math, the monotonic clock drives the CRL
@@ -429,8 +583,40 @@ pub async fn renewal_scheduler_with_crl_reload(
     pack_dir: &Path,
     log_name: Option<String>,
     on_crl_change: Option<CrlChangeHook>,
+    face: Arc<CrlPollFace>,
 ) -> Result<()> {
-    renewal_scheduler_with_clock(pack_dir, log_name, on_crl_change, Arc::new(SystemClock)).await
+    renewal_scheduler_with_clock(
+        pack_dir,
+        log_name,
+        on_crl_change,
+        Arc::new(SystemClock),
+        face,
+        None,
+    )
+    .await
+}
+
+/// [`renewal_scheduler_with_crl_reload`] plus a per-pass progress notice
+/// (see [`TickWatch`]).
+///
+/// The hub-process assembly's entry: it registers a watchdog row beside
+/// the engine and needs the loop to attest its own passes.
+pub async fn renewal_scheduler_with_watch(
+    pack_dir: &Path,
+    log_name: Option<String>,
+    on_crl_change: Option<CrlChangeHook>,
+    face: Arc<CrlPollFace>,
+    watch: Option<TickWatch>,
+) -> Result<()> {
+    renewal_scheduler_with_clock(
+        pack_dir,
+        log_name,
+        on_crl_change,
+        Arc::new(SystemClock),
+        face,
+        watch,
+    )
+    .await
 }
 
 /// The scheduler core over an injected [`Clock`] — the seam the scheduler
@@ -441,6 +627,8 @@ pub async fn renewal_scheduler_with_clock(
     log_name: Option<String>,
     on_crl_change: Option<CrlChangeHook>,
     clock: Arc<dyn Clock>,
+    face: Arc<CrlPollFace>,
+    watch: Option<TickWatch>,
 ) -> Result<()> {
     // Offline deployments (pack metadata decides — GUI/CLI wiring stays
     // identical): no registrar to renew against and no freshness bound to
@@ -448,7 +636,7 @@ pub async fn renewal_scheduler_with_clock(
     {
         let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
         if pack.metadata.identity_mode == interflow_identity::manifest::IdentityMode::Offline {
-            return offline_watch(pack_dir, log_name, clock).await;
+            return offline_watch(pack_dir, log_name, clock, watch).await;
         }
     }
     const BACKOFF: [Duration; 5] = [
@@ -458,7 +646,6 @@ pub async fn renewal_scheduler_with_clock(
         Duration::from_mins(8),
         Duration::from_mins(15),
     ];
-    const CRL_POLL: Duration = Duration::from_secs(60);
     const CRL_STALENESS_BOUND: Duration = Duration::from_hours(1);
     let mut failures = 0usize;
     // When set (after a failed renewal attempt), the earliest wall-clock
@@ -467,6 +654,13 @@ pub async fn renewal_scheduler_with_clock(
     let mut next_renewal_at: Option<time::OffsetDateTime> = None;
     let mut last_crl_success = clock.monotonic();
     loop {
+        // Each pass attests progress to the watchdog FIRST (if the
+        // assembler attached one): everything below — the pack load, the
+        // poll, the renewal attempt — is the pass whose wedge this notice
+        // exists to expose.
+        if let Some(watch) = &watch {
+            watch();
+        }
         let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
         // Node name for log attribution (see the fn docs above).
         let node = log_name.as_deref().unwrap_or(pack.metadata.node.as_str());
@@ -492,6 +686,7 @@ pub async fn renewal_scheduler_with_clock(
                     // on watching the next interval.
                     hook().await;
                     last_crl_success = clock.monotonic();
+                    face.note_success(unix_secs(clock.as_ref()));
                     continue;
                 }
                 tracing::info!(
@@ -502,9 +697,11 @@ pub async fn renewal_scheduler_with_clock(
             }
             Ok(false) => {
                 last_crl_success = clock.monotonic();
+                face.note_success(unix_secs(clock.as_ref()));
             }
             Err(e) => {
                 tracing::warn!(node, "crl_stale: {e}");
+                face.note_failure();
                 if clock.monotonic().saturating_sub(last_crl_success) >= CRL_STALENESS_BOUND {
                     return Err(InterflowError::connection(
                         "CRL freshness bound exceeded — refusing unrevocable credentials",
@@ -547,6 +744,7 @@ pub async fn renewal_scheduler_with_clock(
             Err(e) => {
                 failures += 1;
                 tracing::error!(node, "rotation_failed: {e}");
+                face.note_backoff(u32::try_from(failures).unwrap_or(u32::MAX));
                 let backoff = BACKOFF[(failures - 1).min(BACKOFF.len() - 1)];
                 next_renewal_at =
                     Some(now + time::Duration::try_from(backoff).unwrap_or(time::Duration::MAX));
@@ -564,8 +762,9 @@ pub async fn renewal_scheduler_with_clock(
 pub async fn renewal_scheduler_with_log_name(
     pack_dir: &Path,
     log_name: Option<String>,
+    face: Arc<CrlPollFace>,
 ) -> Result<()> {
-    renewal_scheduler_with_crl_reload(pack_dir, log_name, None).await
+    renewal_scheduler_with_crl_reload(pack_dir, log_name, None, face).await
 }
 
 /// The offline twin of the renewal scheduler: nothing renews, nothing is
@@ -575,10 +774,15 @@ async fn offline_watch(
     pack_dir: &Path,
     log_name: Option<String>,
     clock: Arc<dyn Clock>,
+    watch: Option<TickWatch>,
 ) -> Result<()> {
     const CHECK: Duration = Duration::from_secs(3600);
     let mut warned = false;
     loop {
+        // Same first-thing attestation as the registrar loop above.
+        if let Some(watch) = &watch {
+            watch();
+        }
         let pack = CredentialPack::load_runtime(pack_dir).map_err(pack_error)?;
         let node = log_name.as_deref().unwrap_or(pack.metadata.node.as_str());
         let active = ActiveCredentialSet::load_or_bootstrap(&pack).map_err(pack_error)?;

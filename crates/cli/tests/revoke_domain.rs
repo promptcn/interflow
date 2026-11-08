@@ -6,15 +6,11 @@
 //! default revoke never touches the ledger; `--include-active-credentials`
 //! is the operator's statement that the node's runtime credential must die.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+mod common;
+use common::bin;
 
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop();
-    p.pop();
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
+use std::path::Path;
+use std::process::Command;
 
 struct Run {
     success: bool,

@@ -7,16 +7,12 @@
 //! effects of a multi-step command. These drills close the pipe after the
 //! first line and assert the command still runs to completion.
 
-use std::io::{BufRead as _, BufReader};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+mod common;
+use common::bin;
 
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop(); // deps/
-    p.pop(); // tests/
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
+use std::io::{BufRead as _, BufReader};
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 /// Spawns the CLI, consumes exactly one stdout line, then closes the pipe:
 /// the child's next write gets EPIPE, exactly like `| head -1`.

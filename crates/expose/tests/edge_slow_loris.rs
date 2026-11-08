@@ -94,6 +94,7 @@ async fn spawn_stack(
         hub_quic_addr: None,
 
         identity_offline: false,
+        renewal_face: None,
     };
     let handle = interflow_expose::client::start(&client_args).expect("start expose client");
     let mut state = handle.subscribe_state();

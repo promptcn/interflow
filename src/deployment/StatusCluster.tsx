@@ -32,7 +32,8 @@ export default function StatusCluster({ onJumpProposals }: { onJumpProposals: ()
       {unpublished ? (
         <Hint
           text={
-            changeState?.kind === "policy_edits_pending"
+            changeState?.kind === "policy_edits_pending" ||
+            changeState?.kind === "watermarks_diverged"
               ? t("dep.status.unpublishedHot")
               : t("dep.status.unpublishedRestart")
           }

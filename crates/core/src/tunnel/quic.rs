@@ -52,6 +52,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -192,7 +193,12 @@ pub const DATAGRAM_FRAME_BUDGET: usize =
 
 /// Write command: an ordinary frame, or a Close frame (FIN closes out after the write).
 enum WriteCmd {
-    Frame(Bytes),
+    /// One frame as two segments (the 41-byte header plus the payload
+    /// `Bytes`): the write task issues two `write_all`s — the payload rides
+    /// zero-copy from the tunnel data path instead of being memcpy'd into a
+    /// combined buffer (§3.1; the same two-chunk shape as the h2 upstream).
+    Frame(Bytes, Bytes),
+    /// Close frame (header + 1-byte reason, combined — tiny).
     CloseFrame(Bytes),
 }
 
@@ -200,6 +206,10 @@ enum WriteCmd {
 #[derive(Clone)]
 struct StreamHandle {
     tx: mpsc::Sender<WriteCmd>,
+    /// DATAGRAM fast-path eligibility for this stream: set when the hub's
+    /// OpenAck arrives (§3.1: a per-handle flag instead of a parallel
+    /// shared set — one table, one lock on the send path).
+    datagram_ok: bool,
 }
 
 /// The QUIC tunnel backend.
@@ -220,8 +230,6 @@ pub struct QuicTunnel {
     streams: Arc<StdMutex<HashMap<StreamId, StreamHandle>>>,
     /// The negotiated DATAGRAM capability (true only if both this end and the hub support it).
     datagram_ok: bool,
-    /// Streams whose OpenAck has been received (small Data packets on these streams take the DATAGRAM fast path).
-    datagram_streams: Arc<StdMutex<std::collections::HashSet<StreamId>>>,
     /// The effective critical-task stall timeout (negotiated or pinned at
     /// connect) — session-level consumers (e.g. the agent's closed watcher)
     /// read it so every critical task in the session shares one budget.
@@ -261,8 +269,12 @@ fn encode_frame_bytes(
 async fn stream_write_loop(mut send: quinn::SendStream, mut rx: mpsc::Receiver<WriteCmd>) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            WriteCmd::Frame(buf) => {
-                if let Err(e) = send.write_all(&buf).await {
+            WriteCmd::Frame(header, payload) => {
+                if let Err(e) = send.write_all(&header).await {
+                    debug!("QUIC stream write failed (peer already closed): {e}");
+                    break;
+                }
+                if let Err(e) = send.write_all(&payload).await {
                     debug!("QUIC stream write failed (peer already closed): {e}");
                     break;
                 }
@@ -290,15 +302,16 @@ async fn control_read_loop(
     beat_every: Duration,
 ) {
     let mut buf = BytesMut::with_capacity(256);
-    let mut chunk = [0u8; 1024];
     loop {
         beat.beat();
-        let n = match beat.during(beat_every, rx.read(&mut chunk)).await {
-            Ok(Some(n)) => n,
-            Ok(None) | Err(_) => break,
-        };
+        if buf.capacity() < 256 {
+            buf.reserve(1024);
+        }
+        match beat.during(beat_every, rx.read_buf(&mut buf)).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
         last_rx.store(unix_millis_now(), Ordering::Relaxed);
-        buf.extend_from_slice(&chunk[..n]);
         while let Some(frame) = TunnelDispatch::decode_tunnel_data(&mut buf) {
             if matches!(frame.stream_type, FrameType::Ping) {
                 // The Pong carries this agent's own circuit (Ping is
@@ -307,7 +320,7 @@ async fn control_read_loop(
                 else {
                     return;
                 };
-                if tx.send(WriteCmd::Frame(pong)).await.is_err() {
+                if tx.send(WriteCmd::Frame(pong, Bytes::new())).await.is_err() {
                     return;
                 }
             }
@@ -325,7 +338,6 @@ async fn accept_loop(
     conn: quinn::Connection,
     dispatch: Arc<TunnelDispatch>,
     streams: Arc<StdMutex<HashMap<StreamId, StreamHandle>>>,
-    datagram_streams: Arc<StdMutex<std::collections::HashSet<StreamId>>>,
     last_rx: Arc<AtomicU64>,
     shutdown: CancellationToken,
     beat: Beat,
@@ -346,21 +358,23 @@ async fn accept_loop(
         last_rx.store(unix_millis_now(), Ordering::Relaxed);
         let dispatch = dispatch.clone();
         let streams = streams.clone();
-        let datagram_streams = datagram_streams.clone();
         let stream_last_rx = last_rx.clone();
         let token = shutdown.clone();
         tokio::spawn(async move {
             // Read the first frame (Open) to obtain the stream_id, then
             // register the write handle and enter the regular read loop.
             let mut rx = rx;
+            // read_buf grows the decode buffer in place (§3.6): no 16 KiB
+            // intermediate chunk, no second memcpy.
             let mut buf = BytesMut::with_capacity(512);
-            let mut chunk = vec![0u8; 16 * 1024];
             let opened = loop {
-                let n = match rx.read(&mut chunk).await {
-                    Ok(Some(n)) => n,
-                    Ok(None) | Err(_) => return,
-                };
-                buf.extend_from_slice(&chunk[..n]);
+                if buf.capacity() < 256 {
+                    buf.reserve(16 * 1024);
+                }
+                match rx.read_buf(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
                 match wire::decode_frame(&mut buf) {
                     wire::DecodeOutcome::Ok(f) => break f,
                     wire::DecodeOutcome::Error => {
@@ -373,7 +387,10 @@ async fn accept_loop(
             };
             let (wtx, wrx) = mpsc::channel(WRITE_CHANNEL_CAP);
             tokio::spawn(stream_write_loop(tx, wrx));
-            let handle = StreamHandle { tx: wtx };
+            let handle = StreamHandle {
+                tx: wtx,
+                datagram_ok: false,
+            };
             let td = TunnelData {
                 stream_id: opened.stream_id,
                 origin: FrameOrigin::from_parts(opened.flags, opened.circuit),
@@ -391,7 +408,7 @@ async fn accept_loop(
             // read loop exits in place (not left hanging on a blocking read)
             tokio::select! {
                 () = token.cancelled() => {}
-                () = stream_read_loop(rx, buf, dispatch, Some(datagram_streams), stream_last_rx) => {}
+                () = stream_read_loop(rx, buf, dispatch, streams, stream_last_rx) => {}
             }
         });
     }
@@ -407,20 +424,23 @@ async fn stream_read_loop(
     mut rx: quinn::RecvStream,
     mut buf: BytesMut,
     dispatch: Arc<TunnelDispatch>,
-    datagram_streams: Option<Arc<StdMutex<std::collections::HashSet<StreamId>>>>,
+    streams: Arc<StdMutex<HashMap<StreamId, StreamHandle>>>,
     last_rx: Arc<AtomicU64>,
 ) {
-    let mut chunk = vec![0u8; 16 * 1024];
-    // Intercept OpenAck (the hub confirming this stream may take the DATAGRAM fast path); other frames dispatch as usual
+    // Intercept OpenAck (the hub confirming this stream may take the
+    // DATAGRAM fast path — flips the handle's flag); other frames dispatch
+    // as usual.
     let process = |buf: &mut BytesMut| {
         let mut deferred: Vec<TunnelData> = Vec::new();
         while let Some(td) = TunnelDispatch::decode_tunnel_data(buf) {
-            if matches!(td.stream_type, FrameType::OpenAck)
-                && let Some(set) = &datagram_streams
-            {
-                set.lock()
+            if matches!(td.stream_type, FrameType::OpenAck) {
+                if let Some(handle) = streams
+                    .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(td.stream_id);
+                    .get_mut(&td.stream_id)
+                {
+                    handle.datagram_ok = true;
+                }
                 continue;
             }
             deferred.push(td);
@@ -431,12 +451,16 @@ async fn stream_read_loop(
         dispatch.dispatch(td).await;
     }
     loop {
-        let n = match rx.read(&mut chunk).await {
-            Ok(Some(n)) => n,
-            Ok(None) | Err(_) => break,
-        };
+        // read_buf grows the decode buffer in place (§3.6): no 16 KiB
+        // intermediate chunk, no second memcpy via extend_from_slice.
+        if buf.capacity() < 4096 {
+            buf.reserve(16 * 1024);
+        }
+        match rx.read_buf(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
         last_rx.store(unix_millis_now(), Ordering::Relaxed);
-        buf.extend_from_slice(&chunk[..n]);
         for td in process(&mut buf) {
             dispatch.dispatch(td).await;
         }
@@ -569,7 +593,7 @@ impl QuicTunnel {
         agent_id: String,
         server_addr: SocketAddr,
         server_name: &str,
-        tls: rustls::ClientConfig,
+        tls: Arc<rustls::ClientConfig>,
         tasks: SessionTasks,
         params: QuicSessionParams,
     ) -> Result<Self> {
@@ -580,11 +604,10 @@ impl QuicTunnel {
             params.transport.max_idle_timeout_ms,
         ))));
 
-        let quic_tls =
-            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls)).map_err(|e| {
-                InterflowError::config("invalid QUIC client TLS configuration".to_string())
-                    .with_source(e)
-            })?;
+        let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls).map_err(|e| {
+            InterflowError::config("invalid QUIC client TLS configuration".to_string())
+                .with_source(e)
+        })?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
         client_config.transport_config(Arc::new(transport));
 
@@ -740,8 +763,6 @@ impl QuicTunnel {
         ));
         let streams: Arc<StdMutex<HashMap<StreamId, StreamHandle>>> =
             Arc::new(StdMutex::new(HashMap::new()));
-        let datagram_streams: Arc<StdMutex<std::collections::HashSet<StreamId>>> =
-            Arc::new(StdMutex::new(std::collections::HashSet::new()));
 
         // Control-stream read loop: Ping → Pong (the Pong goes through the
         // wtx forwarding write task). Critical under the death contract:
@@ -772,7 +793,6 @@ impl QuicTunnel {
             let accept_conn = conn.clone();
             let accept_dispatch = dispatch.clone();
             let accept_streams = streams.clone();
-            let accept_datagrams = datagram_streams.clone();
             let accept_last_rx = last_rx.clone();
             let accept_shutdown = shutdown.clone();
             tasks.spawn_critical("quic-accept", Some(task_stall_timeout), move |beat| {
@@ -780,7 +800,6 @@ impl QuicTunnel {
                     accept_conn,
                     accept_dispatch,
                     accept_streams,
-                    accept_datagrams,
                     accept_last_rx,
                     accept_shutdown,
                     beat,
@@ -809,7 +828,8 @@ impl QuicTunnel {
         }
 
         // Transport-stats sampler (see STATS_SAMPLE_INTERVAL) — auxiliary:
-        // forensics only, its death degrades nothing.
+        // forensics only, its death degrades nothing. Own target so it can be
+        // enabled with `transport_stats=debug` without crate-wide debug.
         {
             let conn_stats = conn.clone();
             let shutdown_stats = shutdown.clone();
@@ -824,6 +844,7 @@ impl QuicTunnel {
                     let s = conn_stats.stats();
                     let p = &s.path;
                     debug!(
+                        target: crate::telemetry::TARGET_TRANSPORT_STATS,
                         cwnd = p.cwnd,
                         rtt_us = p.rtt.as_micros(),
                         sent_packets = p.sent_packets,
@@ -845,7 +866,6 @@ impl QuicTunnel {
             dispatch,
             streams,
             datagram_ok,
-            datagram_streams,
             stall_timeout: task_stall_timeout,
             routes: StdMutex::new(HashMap::new()),
             last_rx,
@@ -895,13 +915,50 @@ impl QuicTunnel {
         flags: u8,
         payload: &[u8],
     ) -> Result<()> {
+        self.send_frame_on_bytes(
+            stream_id,
+            frame_type,
+            flags,
+            Bytes::copy_from_slice(payload),
+        )
+        .await
+    }
+
+    /// Two-segment send (§3.1): the 41-byte header is encoded alone; the
+    /// payload `Bytes` moves through the write channel untouched (no
+    /// whole-frame memcpy). Frame boundaries stay atomic — one channel
+    /// element per frame, single writer task per stream.
+    async fn send_frame_on_bytes(
+        &self,
+        stream_id: StreamId,
+        frame_type: FrameType,
+        flags: u8,
+        payload: Bytes,
+    ) -> Result<()> {
         let handle = self
             .lookup_handle(stream_id)
             .ok_or_else(|| InterflowError::stream(format!("QUIC stream not found: {stream_id}")))?;
-        let buf = encode_frame_bytes(frame_type, flags, stream_id, self.circuit, payload)?;
-        handle.tx.send(WriteCmd::Frame(buf)).await.map_err(|_| {
-            InterflowError::stream(format!("QUIC stream write task exited: {stream_id}"))
+        let mut header = BytesMut::with_capacity(wire::FRAME_HEADER_LEN);
+        wire::encode_frame_header(
+            frame_type,
+            flags,
+            stream_id,
+            self.circuit,
+            payload.len(),
+            &mut header,
+        )
+        .ok_or_else(|| {
+            InterflowError::protocol(format!(
+                "QUIC frame encoding failed (contract violation): {stream_id}"
+            ))
         })?;
+        handle
+            .tx
+            .send(WriteCmd::Frame(header.freeze(), payload))
+            .await
+            .map_err(|_| {
+                InterflowError::stream(format!("QUIC stream write task exited: {stream_id}"))
+            })?;
         Ok(())
     }
 }
@@ -923,12 +980,23 @@ async fn control_write_forward(
         let Some(cmd) = beat.during(beat_every, rx.recv()).await else {
             return;
         };
-        let buf = match cmd {
-            WriteCmd::Frame(b) | WriteCmd::CloseFrame(b) => b,
-        };
-        if let Err(e) = tx.write_all(&buf).await {
-            debug!("QUIC control stream write failed: {e}");
-            return;
+        match cmd {
+            WriteCmd::Frame(header, payload) => {
+                if let Err(e) = tx.write_all(&header).await {
+                    debug!("QUIC control stream write failed: {e}");
+                    return;
+                }
+                if let Err(e) = tx.write_all(&payload).await {
+                    debug!("QUIC control stream write failed: {e}");
+                    return;
+                }
+            }
+            WriteCmd::CloseFrame(b) => {
+                if let Err(e) = tx.write_all(&b).await {
+                    debug!("QUIC control stream write failed: {e}");
+                    return;
+                }
+            }
         }
         // Fault injection: wedge after the first forwarded frame (the first
         // Pong) — the Pong path dies post-registration while the connection
@@ -960,22 +1028,24 @@ impl TunnelTransport for QuicTunnel {
         self.streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(stream_id, StreamHandle { tx: wtx });
+            .insert(
+                stream_id,
+                StreamHandle {
+                    tx: wtx,
+                    datagram_ok: false,
+                },
+            );
 
         // Read loop (return-path frames on this stream → dispatch; the
         // ingress role hits via the response-direction dedicated channel)
         let dispatch = self.dispatch.clone();
-        let datagram_set = if self.datagram_ok {
-            Some(self.datagram_streams.clone())
-        } else {
-            None
-        };
+        let streams_for_read = self.streams.clone();
         let token = self.token.clone();
         let open_last_rx = self.last_rx.clone();
         tokio::spawn(async move {
             tokio::select! {
                 () = token.cancelled() => {}
-                () = stream_read_loop(rx, BytesMut::new(), dispatch, datagram_set, open_last_rx) => {}
+                () = stream_read_loop(rx, BytesMut::new(), dispatch, streams_for_read, open_last_rx) => {}
             }
         });
 
@@ -1006,11 +1076,11 @@ impl TunnelTransport for QuicTunnel {
     }
 
     async fn register_stream(&self, stream_id: StreamId) -> mpsc::Receiver<TunnelData> {
-        self.dispatch.register_stream(stream_id).await
+        self.dispatch.register_stream(stream_id)
     }
 
     async fn unregister_stream(&self, stream_id: StreamId) {
-        self.dispatch.unregister_stream(stream_id).await;
+        self.dispatch.unregister_stream(stream_id);
     }
 
     async fn take_incoming_streams(
@@ -1020,7 +1090,7 @@ impl TunnelTransport for QuicTunnel {
     }
 
     async fn unregister_incoming_stream(&self, stream_id: StreamId) {
-        self.dispatch.unregister_incoming_stream(stream_id).await;
+        self.dispatch.unregister_incoming_stream(stream_id);
         // Request-direction forwarder exiting: synchronously release the
         // stream's QUIC write resources — remove the streams table entry
         // (drop the write handle → the write loop gets recv None → SendStream
@@ -1029,10 +1099,6 @@ impl TunnelTransport for QuicTunnel {
         // egress finish()'s echo_close; this path only does resource release
         // (idempotent).
         self.streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&stream_id);
-        self.datagram_streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&stream_id);
@@ -1048,18 +1114,14 @@ impl TunnelTransport for QuicTunnel {
         // 0x0 = NO_ERROR (normal session termination, not a protocol fault)
         self.conn
             .close(quinn::VarInt::from_u32(0), b"session shutdown");
-        let req = self.dispatch.close_all_request_streams().await;
-        let resp = self.dispatch.close_all_response_streams().await;
+        let req = self.dispatch.close_all_request_streams();
+        let resp = self.dispatch.close_all_response_streams();
         let handles = self
             .streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain()
             .count();
-        self.datagram_streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
         // Release the local endpoint (UDP socket) — no longer relying on all
         // Arc clones dropping to zero
         self.endpoint
@@ -1146,6 +1208,30 @@ impl TunnelTransport for QuicTunnel {
         })
     }
 
+    /// The QUIC face of the stream-intent exchange: same short-bi-stream
+    /// carriage, the JSON report of this node's paused names in, the
+    /// pending ops out.
+    async fn exchange_stream_intents(
+        &self,
+        report: &crate::tunnel::transport::StreamIntentReport,
+    ) -> Result<crate::tunnel::transport::StreamIntentOps> {
+        let payload = serde_json::to_vec(report).map_err(|e| {
+            InterflowError::protocol("QUIC stream-intent report encode failed".to_string())
+                .with_source(e)
+        })?;
+        let response = self
+            .control_roundtrip(
+                FrameType::StreamIntentRequest,
+                FrameType::StreamIntentResponse,
+                &payload,
+            )
+            .await?;
+        serde_json::from_slice(&response.payload).map_err(|e| {
+            InterflowError::protocol("QUIC stream-intent ops payload is malformed".to_string())
+                .with_source(e)
+        })
+    }
+
     /// The QUIC face of the demanding liveness roundtrip: a
     /// [`FrameType::LivenessPing`] on the shared control-roundtrip
     /// carriage, a [`FrameType::LivenessPong`] on the same stream. The
@@ -1158,6 +1244,74 @@ impl TunnelTransport for QuicTunnel {
         self.control_roundtrip(FrameType::LivenessPing, FrameType::LivenessPong, &[])
             .await
             .map(|_| ())
+    }
+
+    /// The QUIC face of the out-of-band recovery notice: the prober's
+    /// report on the shared control-roundtrip carriage, the hub's ack on
+    /// the same stream. An old hub skips the unknown frame type
+    /// (no MUST_UNDERSTAND) and the roundtrip surfaces the timeout — the
+    /// caller logs-and-moves-on, cooldown recovery remains the fallback.
+    async fn report_target_recovered(
+        &self,
+        notice: &crate::tunnel::transport::TargetRecoveredNotice,
+    ) -> Result<crate::tunnel::transport::TargetRecoveredAck> {
+        let payload = serde_json::to_vec(notice).map_err(|e| {
+            InterflowError::protocol("QUIC target-recovery notice encode failed".to_string())
+                .with_source(e)
+        })?;
+        let response = self
+            .control_roundtrip(
+                FrameType::TargetRecoveredRequest,
+                FrameType::TargetRecoveredResponse,
+                &payload,
+            )
+            .await?;
+        serde_json::from_slice(&response.payload).map_err(|e| {
+            InterflowError::protocol("QUIC target-recovery ack is malformed".to_string())
+                .with_source(e)
+        })
+    }
+
+    /// The QUIC face of the CRL-poll liveness report: the renewal
+    /// reporter's level on the shared control-roundtrip carriage, the
+    /// hub's empty ack on the same stream. An old hub skips the unknown
+    /// frame type (no MUST_UNDERSTAND) and the roundtrip surfaces the
+    /// timeout — one dropped sample, the level re-arrives next report.
+    async fn report_crl_liveness(
+        &self,
+        report: &crate::tunnel::transport::CrlLivenessReport,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(report).map_err(|e| {
+            InterflowError::protocol("QUIC CRL-liveness report encode failed".to_string())
+                .with_source(e)
+        })?;
+        self.control_roundtrip(
+            FrameType::CrlLivenessRequest,
+            FrameType::CrlLivenessResponse,
+            &payload,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The QUIC face of the node-status report: same carriage and ack
+    /// discipline as the CRL-liveness report (an old hub's skip surfaces
+    /// as the roundtrip timeout — one dropped sample).
+    async fn report_node_status(
+        &self,
+        report: &crate::tunnel::transport::NodeStatusReport,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(report).map_err(|e| {
+            InterflowError::protocol("QUIC node-status report encode failed".to_string())
+                .with_source(e)
+        })?;
+        self.control_roundtrip(
+            FrameType::NodeStatusRequest,
+            FrameType::NodeStatusResponse,
+            &payload,
+        )
+        .await
+        .map(|_| ())
     }
 
     fn steady_state_liveness(&self) -> Option<SteadyStateLiveness> {
@@ -1261,20 +1415,30 @@ impl QuicTunnel {
     /// Open/Close always ride a stream (reliable ordering is a hard
     /// prerequisite for session establishment).
     async fn send_data_smart(&self, stream_id: StreamId, data: Bytes) -> Result<()> {
-        if self.datagram_ok
-            && data.len() <= DATAGRAM_FRAME_BUDGET
-            && self
-                .datagram_streams
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&stream_id)
-        {
-            let frame = encode_frame_bytes(FrameType::Data, 0, stream_id, self.circuit, &data)?;
-            return self.conn.send_datagram(frame).map_err(|e| {
-                InterflowError::connection("QUIC DATAGRAM send failed".to_string()).with_source(e)
-            });
+        // DATAGRAM eligibility rides the stream handle (§3.1): one table
+        // lock decides the plane, same as the stream fallback.
+        if self.datagram_ok && data.len() <= DATAGRAM_FRAME_BUDGET {
+            let eligible = {
+                let streams = self
+                    .streams
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                streams
+                    .get(&stream_id)
+                    .is_some_and(|handle| handle.datagram_ok)
+            };
+            if eligible {
+                // quinn's send_datagram takes one contiguous buffer — the
+                // header+payload copy here is inherent to RFC 9221 on this
+                // API (bounded by DATAGRAM_FRAME_BUDGET ≈ 1 KiB).
+                let frame = encode_frame_bytes(FrameType::Data, 0, stream_id, self.circuit, &data)?;
+                return self.conn.send_datagram(frame).map_err(|e| {
+                    InterflowError::connection("QUIC DATAGRAM send failed".to_string())
+                        .with_source(e)
+                });
+            }
         }
-        self.send_frame_on(stream_id, FrameType::Data, 0, &data)
+        self.send_frame_on_bytes(stream_id, FrameType::Data, 0, data)
             .await
     }
 
@@ -1289,10 +1453,6 @@ impl QuicTunnel {
         else {
             return Ok(());
         };
-        self.datagram_streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&stream_id);
         let buf = encode_frame_bytes(
             FrameType::Close,
             0,

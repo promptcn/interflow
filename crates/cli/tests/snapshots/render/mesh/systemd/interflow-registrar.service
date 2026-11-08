@@ -1,3 +1,4 @@
+# rendered by interflow-cli 2026-11-04_594ce6e-dirty from manifest sha256:e6f5ad76e79f661204c1cfdb6385a393bcf8187b646ab1cc3172d3203b8c1b6f
 # One-time bootstrap (operator, on the registrar server):
 #   0. install -m 0644 interflow-registrar.service /etc/systemd/system/ \
 #      && systemctl daemon-reload

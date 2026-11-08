@@ -169,6 +169,10 @@ export function changeStateLabel(state: ChangeStateDto | null, t: Translate): st
       return t("overview.changePolicy");
     case "identity_edits_pending":
       return t("overview.changeIdentity");
+    case "pack_tree_stale":
+      return t("overview.changePackTreeStale");
+    case "watermarks_diverged":
+      return t("overview.changeWatermarksDiverged");
   }
 }
 

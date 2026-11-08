@@ -2,6 +2,7 @@ import { Plus } from "lucide-react";
 import {
   api,
   effectiveTransport,
+  formatAgeSecs,
   formatAgoSecs,
   formatRemainingSecs,
   isRunning,
@@ -10,6 +11,7 @@ import {
   stateText,
   type NodeInfo,
 } from "../api";
+import { CRL_SILENT_AFTER_SECS } from "../lib/fleetRows";
 import { localeOf, useT } from "../i18n";
 import { cn } from "../lib/utils";
 import { Button, Hint, InfoRow, SectionPanel } from "./ui";
@@ -52,6 +54,16 @@ export default function NodeStatusView({
   const reconnecting =
     typeof node.state === "object" && node.state !== null && "Reconnecting" in node.state;
   const stale = policyInverted(node.policy);
+  // The CRL-poll level's silent classification, judged against the render
+  // clock (the local face has no capture anchor — the renewal loop's own
+  // atomics ARE the truth here, and the panel degrades honestly when the
+  // level ages past the silent threshold).
+  const crlSilent = (() => {
+    if (!node.crl) return null;
+    if (node.crl.last_success_unix === 0) return null;
+    const age = Math.max(0, Math.floor(Date.now() / 1000) - node.crl.last_success_unix);
+    return age > CRL_SILENT_AFTER_SECS ? age : null;
+  })();
 
   const start = async () => {
     try {
@@ -172,6 +184,24 @@ export default function NodeStatusView({
               </Hint>
             </InfoRow>
           )}
+          {node.crl && (
+            <InfoRow label={t("nodeDetail.crlPoll")}>
+              <Hint text={t("nodeDetail.crlPollTitle")}>
+                <span
+                  className={cn(
+                    "text-small",
+                    crlSilent ? "text-warn" : "text-fg-3",
+                  )}
+                >
+                  {t("nodeDetail.crlPollOk", {
+                    ago: formatAgoSecs(node.crl.last_success_unix),
+                    fails: String(node.crl.failures_total),
+                  })}
+                  {crlSilent ? ` · ${t("fleet.crlSilent", { ago: formatAgeSecs(crlSilent) })} ⚠` : ""}
+                </span>
+              </Hint>
+            </InfoRow>
+          )}
           {node.credential && (
             <InfoRow label={t("nodeDetail.credentialsExpire")}>
               <Hint text={t("nodeDetail.credentialsExpireTitle")}>
@@ -188,6 +218,34 @@ export default function NodeStatusView({
                 </span>
               </Hint>
             </InfoRow>
+          )}
+        </SectionPanel>
+      )}
+
+      {/* The egress breaker table's open set (mesh agents, running,
+          breaker enabled — 2026-10-19): stuck-OPEN targets and the
+          recovery prober's own liveness, both legible from the row
+          instants without pulling the metrics face. */}
+      {node.kind === "mesh_agent" && running && node.breakers != null && (
+        <SectionPanel title={t("nodeDetail.egressBreakers")}>
+          {node.breakers.length === 0 ? (
+            <span className="text-small text-fg-3">{t("nodeDetail.egressBreakersNone")}</span>
+          ) : (
+            node.breakers.map((b) => (
+              <InfoRow key={b.target} label={b.target}>
+                <Hint text={t("nodeDetail.egressBreakersHint")}>
+                  <span className="text-small text-warn">
+                    {t("nodeDetail.breakerOpen", {
+                      ago: formatAgeSecs(Math.max(0, Math.floor(Date.now() / 1000) - b.opened_unix)),
+                    })}
+                    {" · "}
+                    {t("nodeDetail.breakerProbe", {
+                      ago: formatAgeSecs(Math.max(0, Math.floor(Date.now() / 1000) - b.last_probe_unix)),
+                    })}
+                  </span>
+                </Hint>
+              </InfoRow>
+            ))
           )}
         </SectionPanel>
       )}

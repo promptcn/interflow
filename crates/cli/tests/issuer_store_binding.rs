@@ -4,33 +4,10 @@
 //! silently; the only way through is the explicit `--issuer-allow-shared`
 //! rebind (same deployment after a move), and realm changes never pass.
 
+mod common;
+
+use common::{RunOutcome, run};
 use std::path::PathBuf;
-use std::process::Command;
-
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop(); // deps/
-    p.pop(); // tests/
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
-
-struct RunOutcome {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
-fn run(args: &[&str]) -> RunOutcome {
-    let output = Command::new(bin())
-        .args(args)
-        .output()
-        .expect("spawn interflow");
-    RunOutcome {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
-}
 
 /// A minimal valid manifest; `realm`, `host` and the service port vary per
 /// scenario so different files are genuinely different manifests.
@@ -115,7 +92,7 @@ fn first_apply_binds_then_stays_silent_across_reruns_and_edits() {
     // not the path it happens to sit at.
     assert!(first.stdout.contains("issuer store "), "{}", first.stdout);
     // The binding and applied accounting live in the store's bookkeeping
-    // db; the legacy JSON pair never appears.
+    // db — the only bookkeeping shape there is.
     assert!(env.dir.join("issuer/store.db").exists());
     assert!(!env.dir.join("issuer/binding.json").exists());
     assert!(!env.dir.join("issuer/applied.json").exists());

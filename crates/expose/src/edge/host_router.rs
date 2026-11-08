@@ -78,11 +78,44 @@ impl HostRouter {
     /// unparseable Host header simply never routes (fail closed).
     pub fn lookup(&self, host: &str) -> Option<Route> {
         let key = normalize_host(host)?;
+        self.lookup_normalized(&key)
+    }
+
+    /// Lookup by an ALREADY-normalized key ([`HostRouter::normalize`]'s
+    /// canonical form): the per-request hot path normalizes once (the
+    /// listener's peek already produced the normalized host — §4: the old
+    /// path parsed the authority a second time inside `lookup`, one String
+    /// allocation + authority parse per request).
+    pub fn lookup_normalized(&self, key: &str) -> Option<Route> {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
+            .get(key)
             .cloned()
+    }
+
+    /// Snapshot of every registered route (canonical-key order not
+    /// guaranteed). The target-recovery sink's reverse-mapping face: it
+    /// filters by (workspace, agent_id, service_id) to find the hosts a
+    /// recovery notice authorizes closing.
+    pub fn routes(&self) -> Vec<Route> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// The canonical key form of a host: lowercase, port-stripped, IPv6
+    /// brackets removed (`[::1]:8443` → `::1`). `None` when the value is
+    /// not a valid authority — the old `rsplit_once(':')` mangling turned
+    /// `[::1]` into `"[:",` which could never match a configured host.
+    /// The route breaker keys its entries by exactly this form (the
+    /// listener normalizes once after the Host peek), so every consumer —
+    /// gate, sink, metrics — agrees on one spelling per host.
+    pub fn normalize(host: &str) -> Option<String> {
+        normalize_host(host)
     }
 
     /// Number of registered hosts.

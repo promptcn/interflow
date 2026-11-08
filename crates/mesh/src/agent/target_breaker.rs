@@ -44,13 +44,21 @@
 //!   fails every other attempt still trips — successes while CLOSED do not
 //!   erase failure history (the breaker's job is budget isolation: what
 //!   matters is the failure *rate*, and a flapping target drains the shared
-//!   open budget exactly like a dead one). Only a successful *probe* of a
-//!   tripped target removes the entry (full recovery).
+//!   open budget exactly like a dead one). A tripped entry is removed only by
+//!   a **successful probe** — a real Open admitted post-cooldown, or the
+//!   background bare-TCP recovery prober
+//!   ([`super::breaker_probe`], 2026-10-18) whose success calls the same
+//!   `note_success` without consuming any stream budget.
 //! - **Probe throttling instead of in-flight tracking**: after the cooldown
 //!   elapses, at most one Open per `PROBE_INTERVAL` is admitted as a probe.
 //!   A lost probe (a stream that never reports back) self-corrects after one
 //!   interval — no permanently stuck HALF_OPEN state — and the effective
 //!   probe rate toward a dead target is bounded at 1/cooldown.
+//! - **Egress keys are transport-namespaced** ([`dial_key`]): the same
+//!   `host:port` dialed over TCP and over UDP keeps two independent entries —
+//!   a TCP connect failure says nothing about UDP health (and vice versa),
+//!   so evidence must not pool across transports. The route kind (keyed by
+//!   host) has no transport dimension and uses the bare key.
 //! - **Only connect-phase failures count** (resolve / TCP connect / UDP
 //!   connect). Post-connection pathologies (`BackendWriteTimeout` etc.) are
 //!   a different disease; the breaker's semantics is strictly
@@ -60,11 +68,13 @@
 //!   closed-first, least-recently-touched eviction.
 
 use interflow_core::config::params::BreakerPolicy;
+use interflow_core::protocol::StreamProto;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -111,6 +121,115 @@ impl BreakerKind {
             Self::Route => "interflow_edge_route_breaker_transitions_total",
         }
     }
+
+    /// The "entries currently OPEN" gauge name, set at every trip/recovery
+    /// transition (2026-10-18: wired for real — the field comment had
+    /// promised this gauge since the 2026-09-16 origin without any emitter
+    /// existing).
+    const fn open_gauge(self) -> &'static str {
+        match self {
+            Self::Egress => "interflow_egress_target_breakers_open",
+            Self::Route => "interflow_edge_route_breakers_open",
+        }
+    }
+}
+
+/// Namespaces an egress dial target by transport.
+///
+/// The breaker key for a TCP-path dial is `tcp:host:port`, for a UDP-path
+/// dial `udp:host:port`. All egress `check`/`note_*` call sites and the
+/// recovery prober go through this one constructor, so the two failure
+/// populations can never pool (the 2026-10-18 active-recovery
+/// prerequisite: a bare-TCP probe must not "heal" a UDP-tripped entry,
+/// and a UDP resolve failure must not count against TCP routing).
+#[must_use]
+pub fn dial_key(proto: StreamProto, target: &str) -> String {
+    match proto {
+        StreamProto::Tcp => format!("tcp:{target}"),
+        StreamProto::Udp => format!("udp:{target}"),
+    }
+}
+
+/// One OPEN breaker entry as the read face carries it — the level's row
+/// material (2026-10-19 open-set face).
+///
+/// WHICH target, WHEN it tripped, WHEN the recovery machinery last
+/// touched it. The set + these instants are the whole face: a stuck-OPEN
+/// entry reads as an old `opened_unix`, a dead recovery prober as a
+/// `last_probe_unix` that stops advancing while the entry stays open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakerOpenRow {
+    /// The breaker key: agent egress dial keys (`tcp:host:port` /
+    /// `udp:host:port`, see [`dial_key`]); edge route hosts bare.
+    pub target: String,
+    /// Unix seconds of the trip (the entry's last closed→open
+    /// transition).
+    pub opened_unix: u64,
+    /// Unix seconds of the last admitted recovery probe (egress kind) /
+    /// last touch (route kind). `0` = never.
+    pub last_probe_unix: u64,
+}
+
+/// Live open-set telemetry for one breaker table.
+///
+/// The authoritative latest snapshot lives in the watch channel itself
+/// (rows are a `Vec`, not copy atomics); `snapshot()` borrows-and-clones
+/// it. Same birth-receiver and subscription contracts as
+/// [`super::peer_watch::PeerWatchState`]: the table publishes on every
+/// open-set change (trip / recovery removal / cap eviction), sorted by
+/// target — an unchanged set never re-sends.
+#[derive(Debug)]
+pub struct BreakerWatchState {
+    tx: watch::Sender<Vec<BreakerOpenRow>>,
+    #[allow(dead_code)] // alive for the channel's lifetime, not read here
+    rx: watch::Receiver<Vec<BreakerOpenRow>>,
+    /// Publishes that actually landed (change-guarded sends only) — the
+    /// no-chatter assertion's test seam.
+    sends: AtomicUsize,
+}
+
+impl Default for BreakerWatchState {
+    fn default() -> Self {
+        let (tx, rx) = watch::channel(Vec::new());
+        Self {
+            tx,
+            rx,
+            sends: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl BreakerWatchState {
+    /// Reads the latest open set (empty = every tracked target healthy).
+    pub fn snapshot(&self) -> Vec<BreakerOpenRow> {
+        self.tx.borrow().clone()
+    }
+
+    /// Subscribes to open-set changes from here on; errors once the
+    /// table — and every handle to this state — is gone.
+    pub fn subscribe(&self) -> watch::Receiver<Vec<BreakerOpenRow>> {
+        self.rx.clone()
+    }
+
+    /// One change-guarded publish: an unchanged set never wakes the
+    /// watchers (a quiet table must not degenerate its subscribers into
+    /// polling).
+    fn publish(&self, rows: Vec<BreakerOpenRow>) {
+        if self.tx.borrow().as_slice() != rows.as_slice() {
+            let _ = self.tx.send(rows);
+            self.sends.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The count of change-guarded publishes that landed (tests only).
+    #[cfg(test)]
+    fn send_count(&self) -> usize {
+        self.sends.load(Ordering::Relaxed)
+    }
+}
+
+fn unix_now() -> u64 {
+    u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0)
 }
 
 /// Verdict for one Open against a target.
@@ -137,9 +256,14 @@ pub struct TargetBreakers {
     node: String,
     cfg: BreakerPolicy,
     inner: Mutex<HashMap<String, BreakerEntry>>,
-    /// Number of entries currently tripped (OPEN); feeds the
-    /// `interflow_egress_target_breakers_open` gauge.
+    /// Number of entries currently tripped (OPEN); every transition point
+    /// publishes it to the kind's `open_gauge` (see [`BreakerKind::open_gauge`]).
     tripped: AtomicUsize,
+    /// The open-set read face (2026-10-19): present exactly when an
+    /// owner wanted the set observable (the agent's egress runtime, the
+    /// edge's route table feeding the hub row); `None` keeps the table
+    /// metrics-only, the pre-face behavior.
+    face: Option<std::sync::Arc<BreakerWatchState>>,
 }
 
 #[derive(Debug)]
@@ -157,6 +281,12 @@ struct BreakerEntry {
     last_probe: Instant,
     /// LRU touch for the hard-cap eviction.
     last_touch: Instant,
+    /// Unix seconds of the trip (0 = never tripped / CLOSED); the open
+    /// face's "最近转变时刻".
+    opened_unix: u64,
+    /// Unix seconds of the last admitted probe / touch; the dead-prober
+    /// signature when it stops advancing on a still-open entry.
+    last_probe_unix: u64,
 }
 
 impl TargetBreakers {
@@ -168,14 +298,43 @@ impl TargetBreakers {
             cfg,
             inner: Mutex::new(HashMap::new()),
             tripped: AtomicUsize::new(0),
+            face: None,
         }
     }
 
-    /// Current number of tripped targets (test-only accessor; no gauge is
-    /// wired to it).
+    /// [`Self::new`] with the open-set read face attached — the table
+    /// publishes the currently-OPEN rows (plus their transition and
+    /// probe instants) on every open-set change.
+    #[must_use]
+    pub fn with_face(
+        kind: BreakerKind,
+        node: String,
+        cfg: BreakerPolicy,
+        face: std::sync::Arc<BreakerWatchState>,
+    ) -> Self {
+        Self {
+            face: Some(face),
+            ..Self::new(kind, node, cfg)
+        }
+    }
+
+    /// Current number of tripped targets (test-only accessor; production
+    /// readers use the `open_gauge` metric or [`Self::open_targets`]).
     #[cfg(test)]
     fn tripped_count(&self) -> usize {
         self.tripped.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot of the currently OPEN (tripped) keys, unordered. The
+    /// recovery prober's scan face: one lock, one collect; empty result =
+    /// nothing to probe this tick (the prober's idle exit — no separate
+    /// gauge poll needed).
+    pub fn open_targets(&self) -> Vec<String> {
+        self.lock()
+            .iter()
+            .filter(|(_, entry)| entry.open)
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     /// Gate one Open. Cheap (one lock + arithmetic); called before the
@@ -199,6 +358,8 @@ impl TargetBreakers {
         // the full cooldown.
         if now >= entry.last_probe + PROBE_INTERVAL {
             entry.last_probe = now;
+            let unix = unix_now();
+            entry.last_probe_unix = unix;
             debug!(node = %self.node, "{} admitting recovery probe: {target}", self.kind.label());
             BreakerDecision::Probe
         } else {
@@ -230,6 +391,11 @@ impl TargetBreakers {
     fn record_failure(&self, target: &str, soft: bool) {
         let now = Instant::now();
         let mut inner = self.lock();
+        // Whether the OPEN count moved this call — the face/gauge publish
+        // happens ONCE at the end, with the guard still held but no
+        // outstanding entry borrow (re-locking here would self-deadlock:
+        // the std Mutex is not reentrant).
+        let mut open_count_moved = false;
 
         if let Some(entry) = inner.get_mut(target) {
             entry.last_touch = now;
@@ -245,58 +411,68 @@ impl TargetBreakers {
             entry.failures.push_back(now);
             Self::prune_window(entry, now, self.cfg.failure_window);
             if entry.failures.len() >= self.cfg.failure_threshold as usize {
-                self.trip(entry, target, now);
+                self.trip_entry(entry, target, now);
+                open_count_moved = true;
             }
-            return;
+        } else {
+            // Unseen target: enforce the hard cap, then insert with one
+            // failure.
+            if inner.len() >= MAX_TRACKED_TARGETS
+                && let Some(victim) = eviction_candidate(&inner)
+                && let Some(removed) = inner.remove(&victim)
+                && removed.open
+            {
+                // Evicting a tripped entry: it simply stops being tracked;
+                // fresh failures will re-trip it.
+                self.tripped.fetch_sub(1, Ordering::Relaxed);
+                open_count_moved = true;
+                debug!(node = %self.node, "{} table full, evicting {}", self.kind.label(), victim);
+            }
+            let mut entry = BreakerEntry {
+                open: false,
+                failures: VecDeque::from([now]),
+                deadline: now,
+                last_probe: now,
+                last_touch: now,
+                opened_unix: 0,
+                last_probe_unix: unix_now(),
+            };
+            if self.cfg.failure_threshold <= 1 {
+                self.trip_entry(&mut entry, target, now);
+                open_count_moved = true;
+            }
+            inner.insert(target.to_string(), entry);
         }
-
-        // Unseen target: enforce the hard cap, then insert with one failure.
-        if inner.len() >= MAX_TRACKED_TARGETS
-            && let Some(victim) = eviction_candidate(&inner)
-            && let Some(removed) = inner.remove(&victim)
-            && removed.open
-        {
-            // Evicting a tripped entry: it simply stops being tracked;
-            // fresh failures will re-trip it.
-            self.tripped.fetch_sub(1, Ordering::Relaxed);
-            debug!(node = %self.node, "{} table full, evicting {}", self.kind.label(), victim);
+        if open_count_moved {
+            self.publish_open_gauge(&inner);
         }
-        let mut entry = BreakerEntry {
-            open: false,
-            failures: VecDeque::from([now]),
-            deadline: now,
-            last_probe: now,
-            last_touch: now,
-        };
-        if self.cfg.failure_threshold <= 1 {
-            self.trip(&mut entry, target, now);
-        }
-        inner.insert(target.to_string(), entry);
     }
 
     /// Report a successful backend connection. For a **tripped** target this
     /// is the recovery probe succeeding — the entry is removed and the
-    /// target fully re-admitted. For a CLOSED entry it is a no-op: failure
-    /// history lives out its window (windowed failure-rate semantics — a
-    /// flapping target must not dodge the threshold via interleaved
-    /// successes).
-    pub fn note_success(&self, target: &str) {
+    /// target fully re-admitted; returns `true`. For a CLOSED entry it is a
+    /// no-op (returns `false`): failure history lives out its window
+    /// (windowed failure-rate semantics — a flapping target must not dodge
+    /// the threshold via interleaved successes).
+    pub fn note_success(&self, target: &str) -> bool {
         let mut inner = self.lock();
         let Some(entry) = inner.get_mut(target) else {
-            return; // common case: healthy target never tracked
+            return false; // common case: healthy target never tracked
         };
         entry.last_touch = Instant::now();
         if !entry.open {
-            return;
+            return false;
         }
         inner.remove(target);
         self.tripped.fetch_sub(1, Ordering::Relaxed);
+        self.publish_open_gauge(&inner);
         metrics::counter!(self.kind.transitions_metric(), "state" => "closed").increment(1);
         info!(
             node = %self.node,
             "{} recovered: {target} (probe succeeded)",
             self.kind.label()
         );
+        true
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, BreakerEntry>> {
@@ -305,12 +481,44 @@ impl TargetBreakers {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Trip a CLOSED entry OPEN. Warn once per trip — the per-stream
+    /// Publishes the OPEN-entry count after every transition (trip, recovery
+    /// removal, cap eviction) — the gauge is level-triggered, so a missed
+    /// publisher would only be visible as a stale value until the next
+    /// transition of the same table. The 2026-10-19 open-set face rides
+    /// the same single publication point: the currently-OPEN rows (with
+    /// their transition and probe instants), re-sent only when the set
+    /// actually changed (a quiet table never wakes its watchers).
+    fn publish_open_gauge(&self, inner: &HashMap<String, BreakerEntry>) {
+        metrics::gauge!(self.kind.open_gauge()).set(crate::hub::state::count_as_f64(
+            self.tripped.load(Ordering::Relaxed),
+        ));
+        if let Some(face) = &self.face {
+            let mut rows: Vec<BreakerOpenRow> = inner
+                .iter()
+                .filter(|(_, entry)| entry.open)
+                .map(|(target, entry)| BreakerOpenRow {
+                    target: target.clone(),
+                    opened_unix: entry.opened_unix,
+                    last_probe_unix: entry.last_probe_unix,
+                })
+                .collect();
+            rows.sort_by(|a, b| a.target.cmp(&b.target));
+            face.publish(rows);
+        }
+    }
+
+    /// Trip a CLOSED entry OPEN — the entry mutation + counter + log half
+    /// only. The gauge/face publish is the CALLER's (it holds the table
+    /// guard; see [`Self::record_failure`]'s publish note and
+    /// [`Self::note_success`]). Warn once per trip — the per-stream
     /// rejections stay at debug so a retry storm does not flood the log.
-    fn trip(&self, entry: &mut BreakerEntry, target: &str, now: Instant) {
+    fn trip_entry(&self, entry: &mut BreakerEntry, target: &str, now: Instant) {
         entry.open = true;
         entry.deadline = now + self.cfg.cooldown;
         entry.last_probe = now;
+        let unix = unix_now();
+        entry.opened_unix = unix;
+        entry.last_probe_unix = unix;
         self.tripped.fetch_add(1, Ordering::Relaxed);
         metrics::counter!(self.kind.transitions_metric(), "state" => "open").increment(1);
         warn!(
@@ -513,6 +721,8 @@ mod tests {
             deadline: now,
             last_probe: now,
             last_touch: now - age_ago,
+            opened_unix: 0,
+            last_probe_unix: 0,
         };
         let mut inner = HashMap::new();
         inner.insert("open-new".to_string(), entry(true, Duration::from_secs(1)));
@@ -533,5 +743,106 @@ mod tests {
 
         inner.remove("closed-new");
         assert_eq!(eviction_candidate(&inner).as_deref(), Some("open-new"));
+    }
+
+    /// Transport-namespaced dial keys keep the TCP and UDP populations of
+    /// the same `host:port` fully independent: TCP failures trip only the
+    /// TCP entry, and a TCP recovery (the bare-TCP prober) cannot "heal" a
+    /// UDP-tripped entry — the correctness prerequisite of the 2026-10-18
+    /// active recovery.
+    #[tokio::test(start_paused = true)]
+    async fn dial_keys_split_transports() {
+        use interflow_core::protocol::StreamProto;
+        let t = table(2, Duration::from_secs(10), Duration::from_secs(30));
+        let tcp = dial_key(StreamProto::Tcp, "127.0.0.1:5174");
+        let udp = dial_key(StreamProto::Udp, "127.0.0.1:5174");
+        assert_ne!(tcp, udp);
+
+        // TCP-side failures trip the TCP entry only.
+        t.note_failure(&tcp);
+        t.note_failure(&tcp);
+        assert_eq!(t.check(&tcp), BreakerDecision::Reject);
+        assert_eq!(t.check(&udp), BreakerDecision::Allow);
+        assert_eq!(t.tripped_count(), 1);
+
+        // A bare-TCP probe success (the prober's note_success) removes the
+        // TCP entry without touching a UDP entry tripped independently.
+        t.note_failure(&udp);
+        t.note_failure(&udp);
+        t.note_success(&tcp);
+        assert_eq!(t.check(&tcp), BreakerDecision::Allow);
+        assert_eq!(t.check(&udp), BreakerDecision::Reject);
+    }
+
+    /// The open-set face (2026-10-19): trips publish rows with their
+    /// transition and probe instants, recovery removes them, and an
+    /// unchanged set never re-sends.
+    #[tokio::test(start_paused = true)]
+    async fn open_set_face_publishes_rows_on_changes_only() {
+        let face = std::sync::Arc::new(BreakerWatchState::default());
+        let t = TargetBreakers::with_face(
+            BreakerKind::Egress,
+            "test-node".to_owned(),
+            BreakerPolicy {
+                failure_threshold: 1,
+                failure_window: Duration::from_secs(10),
+                cooldown: Duration::from_secs(30),
+            },
+            std::sync::Arc::clone(&face),
+        );
+        assert!(
+            face.snapshot().is_empty(),
+            "a healthy table publishes nothing"
+        );
+
+        // Trip one: the row carries the target and a real transition
+        // instant (the "最近转变时刻" the face promises).
+        t.note_failure("tcp:a:1");
+        let rows = face.snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target, "tcp:a:1");
+        assert!(rows[0].opened_unix > 0, "the trip instant is populated");
+        assert!(rows[0].last_probe_unix > 0);
+
+        // A no-transition touch (another failure while OPEN re-arms the
+        // cooldown but the SET is unchanged... which does change the row
+        // only via re-arm — the set SHAPE is what the face keys on; the
+        // re-arm does not alter the row material, so no re-send).
+        let before = face.send_count();
+        t.note_failure("tcp:a:1");
+        assert_eq!(
+            face.send_count(),
+            before,
+            "an unchanged open set never re-sends"
+        );
+
+        // A second trip adds its row (deterministically ordered).
+        t.note_failure("tcp:b:2");
+        let rows = face.snapshot();
+        assert_eq!(
+            rows.iter().map(|r| r.target.as_str()).collect::<Vec<_>>(),
+            ["tcp:a:1", "tcp:b:2"],
+            "rows are sorted by target"
+        );
+
+        // Recovery removes exactly that row.
+        t.note_success("tcp:a:1");
+        let rows = face.snapshot();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].target, "tcp:b:2");
+    }
+
+    /// `open_targets` lists exactly the tripped keys — the prober's scan
+    /// face (and its idle-exit signal when empty).
+    #[tokio::test(start_paused = true)]
+    async fn open_targets_lists_only_tripped() {
+        let t = table(1, Duration::from_secs(10), Duration::from_secs(30));
+        assert_eq!(t.open_targets(), Vec::<String>::new());
+        t.note_failure("a");
+        t.note_failure("b");
+        t.note_success("b");
+        let mut open = t.open_targets();
+        open.sort();
+        assert_eq!(open, ["a".to_string()]);
     }
 }

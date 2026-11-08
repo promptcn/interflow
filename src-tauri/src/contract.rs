@@ -332,6 +332,92 @@ pub struct PeersPlaneDto {
     pub failures_total: u32,
 }
 
+/// The CRL-poll liveness plane for one running node — the renewal loop's
+/// level (value + confirmation instant), the local half of the 2026-10-19
+/// liveness face. The panel judges `last_success_unix` against its own
+/// clock: a level that stopped advancing is a wedged poll loop, exactly
+/// the reading this face exists to make visible.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
+pub struct CrlPollPlaneDto {
+    /// Unix seconds of the last successful CRL poll; `0` = never.
+    pub last_success_unix: u32,
+    /// Failed polls since the node's process started.
+    pub failures_total: u32,
+}
+
+impl From<crate::node::CrlPollPlane> for CrlPollPlaneDto {
+    fn from(p: crate::node::CrlPollPlane) -> Self {
+        Self {
+            last_success_unix: u32::try_from(p.last_success_unix).unwrap_or(u32::MAX),
+            failures_total: u32::try_from(p.failures_total).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// One OPEN breaker entry (agent egress dial keys locally, route hosts
+/// on the hub face) — the open-set face's row material (2026-10-19).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct BreakerOpenRowDto {
+    /// The breaker key: `tcp:host:port` / `udp:host:port` (agent egress)
+    /// or the bare public host (edge routes).
+    pub target: String,
+    /// Unix seconds of the trip.
+    pub opened_unix: u32,
+    /// Unix seconds of the last admitted recovery probe; `0` = never.
+    pub last_probe_unix: u32,
+}
+
+impl From<crate::node::BreakerOpenFace> for BreakerOpenRowDto {
+    fn from(r: crate::node::BreakerOpenFace) -> Self {
+        Self {
+            target: r.target,
+            opened_unix: u32::try_from(r.opened_unix).unwrap_or(u32::MAX),
+            last_probe_unix: u32::try_from(r.last_probe_unix).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// One OPEN route breaker on the answering hub, as the overview parses
+/// it off the floor payload.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct RouteBreakerOpenRowDto {
+    /// The public host whose route breaker is OPEN.
+    pub host: String,
+    /// Unix seconds of the trip.
+    pub opened_unix: u32,
+    /// Unix seconds of the last admitted probe/touch.
+    pub last_probe_unix: u32,
+}
+
+/// The proposals queue's watermark face: pending count plus the oldest
+/// submission's instant (ages are consumer-side, judged against the
+/// overview's `captured_at_unix`).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct ProposalsPendingDto {
+    /// Proposals awaiting an operator decision.
+    pub pending_count: u32,
+    /// Unix seconds of the oldest pending submission.
+    pub oldest_submitted_unix: u32,
+}
+
+/// One resident hub task as the watchdog face carries it (the
+/// armed-assertion face): a row whose `last_tick_unix` went quiet past
+/// `watcher_silent_factor` multiples of its OWN `interval_secs` (judged
+/// against the overview's `captured_at_unix`) is a task wedged while the
+/// hub keeps serving.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct WatcherFaceRowDto {
+    /// The task's registry name (stable across restarts).
+    pub name: String,
+    /// The task's own loop cadence, seconds — the silence judgment's
+    /// anchor.
+    pub interval_secs: u32,
+    /// Unix seconds of this row's (re-)registration.
+    pub started_unix: u32,
+    /// Unix seconds of the last loop pass.
+    pub last_tick_unix: u32,
+}
+
 /// One peer as the node's peer watcher reads it.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct PeerStatusDto {
@@ -373,6 +459,10 @@ pub struct ListenerStatusDto {
     pub bound_addr: Option<String>,
     /// The last bind failure (`null` = healthy).
     pub last_error: Option<String>,
+    /// The stream is paused by intent (planned unavailability): no
+    /// listener should be up and the port is deliberately free — its own
+    /// face, not a bind failure.
+    pub paused: bool,
 }
 
 impl From<crate::node::ListenerStatusFace> for ListenerStatusDto {
@@ -381,6 +471,7 @@ impl From<crate::node::ListenerStatusFace> for ListenerStatusDto {
             rule: f.rule,
             bound_addr: f.bound_addr,
             last_error: f.last_error,
+            paused: f.paused,
         }
     }
 }
@@ -473,6 +564,13 @@ pub struct NodeInfo {
     /// other kinds or a stopped node — presence has no meaningful stale
     /// display.
     pub peers: Option<PeersPlaneDto>,
+    /// The renewal loop's CRL-poll liveness plane (agent/edge kinds,
+    /// running). `None` for other kinds or a stopped node — a stale
+    /// reading must come from a running loop or not at all.
+    pub crl: Option<CrlPollPlaneDto>,
+    /// The egress-breaker open set (mesh agents, running, breaker
+    /// enabled). `None` for other kinds or a stopped node.
+    pub breakers: Option<Vec<BreakerOpenRowDto>>,
     /// This node's stream-proposal receipts (mesh agents only, running) —
     /// `None` for other kinds or a stopped node.
     pub proposals: Option<Vec<ProposalReceiptDto>>,
@@ -554,6 +652,8 @@ impl From<NodeSnapshot> for NodeInfo {
             // Merged by the command layer from the manager's peers-plane
             // view (live watcher state; stopped nodes carry no reading).
             peers: None,
+            crl: None,
+            breakers: None,
             // Merged by the command layer from the manager's proposal
             // receipts view (same contract).
             proposals: None,
@@ -725,6 +825,17 @@ pub enum ChangeStateDto {
     /// The identity/trust/dial face changed — the next apply re-renders
     /// every pack.
     IdentityEditsPending,
+    /// The declaration is unchanged but the rendered pack tree is not
+    /// "applied" — a retired pack format, or an embedded CRL snapshot
+    /// predating the issuer's deny list. The next apply re-renders every
+    /// pack and publishes a new generation above the watermarks; local
+    /// nodes restart per their captured intent.
+    PackTreeStale,
+    /// The declaration is unchanged but the dist tree's signed artifacts
+    /// sit above the issuer bookkeeping — the next apply re-publishes the
+    /// same policy above the watermarks (hot, like policy edits; no pack
+    /// re-renders).
+    WatermarksDiverged,
 }
 
 /// The running hub's operator overview: watermarks plus the fleet's
@@ -739,6 +850,82 @@ pub struct HubOverviewDto {
     pub floor: u32,
     /// What the hub actually serves; `None` = this hub cannot report it.
     pub serving: Option<u32>,
+    /// The hub-side capture instant (unix seconds) — the anchor every
+    /// per-leg recency judgment reads against; `None` = an older hub
+    /// (recency then stays unjudgeable, never guessed).
+    #[serde(default)]
+    pub captured_at_unix: Option<u32>,
+    /// The policy-watch silent threshold in seconds (3× the engine's
+    /// watch interval), self-reported so clients never hardcode a
+    /// cadence they do not own.
+    #[serde(default)]
+    pub policy_silent_after_secs: u32,
+    /// The CRL-poll silent threshold in seconds (3× the renewal loop's
+    /// poll cadence), self-reported so clients never hardcode a cadence
+    /// they do not own (same discipline as
+    /// [`Self::policy_silent_after_secs`]).
+    #[serde(default)]
+    pub crl_silent_after_secs: u32,
+    /// Unix seconds of THIS hub's own last successful CRL poll (its
+    /// renewal loop's liveness face, self slot); `None` = an older hub
+    /// or no renewal loop.
+    #[serde(default)]
+    pub crl_last_success_unix: Option<u32>,
+    /// Failed CRL polls since this hub process started.
+    #[serde(default)]
+    pub crl_failures_total: Option<u32>,
+    /// The currently-OPEN route breakers (edge gateways; empty on plain
+    /// mesh hubs) — the hub card's ⚠ chips and the doctor line read this.
+    #[serde(default)]
+    pub route_breakers_open: Vec<RouteBreakerOpenRowDto>,
+    /// The resident-task watchdog's rows (the armed-assertion face): every
+    /// long-lived hub task with its cadence anchor and last tick. Empty on
+    /// older hubs — the assertion is then unjudgeable, never passed.
+    #[serde(default)]
+    pub watchers: Vec<WatcherFaceRowDto>,
+    /// The silence judgment factor (a row is silent strictly past this
+    /// multiple of its own interval), self-reported so clients never
+    /// hardcode a threshold they do not own.
+    #[serde(default)]
+    pub watcher_silent_factor: u32,
+    /// The proposals queue's watermark face (`None` when nothing is
+    /// pending or the hub carries no store).
+    #[serde(default)]
+    pub proposals_pending: Option<ProposalsPendingDto>,
+    /// The hub's currently-admitted streams across all agents (`None` on
+    /// older hubs).
+    #[serde(default)]
+    pub streams_in_flight_total: Option<u32>,
+    /// The admission caps the headroom judgments read against (`None` on
+    /// older hubs).
+    #[serde(default)]
+    pub stream_limits: Option<StreamLimitsDto>,
+    /// The fossil-judgment anchors, self-reported so clients never
+    /// hardcode thresholds they do not own: a budgeted stream reads
+    /// fossil quiet past this multiple of its own budget.
+    #[serde(default)]
+    pub fossil_idle_multiple: u32,
+    /// The fossil line for streams with NO idle budget (days).
+    #[serde(default)]
+    pub fossil_unbudgeted_days: u32,
+    /// The headroom warn ratio (percent; a scope under this remaining
+    /// capacity reads tight).
+    #[serde(default)]
+    pub headroom_warn_pct: u32,
+    /// The credential-expiry face's thresholds, self-reported so clients
+    /// never hardcode lines they do not own: the offline tier's yellow
+    /// line (days remaining).
+    #[serde(default)]
+    pub offline_warn_days: i32,
+    /// The offline tier's red line (days).
+    #[serde(default)]
+    pub offline_critical_days: i32,
+    /// The registrar tier's yellow line (percent of the span remaining).
+    #[serde(default)]
+    pub registrar_warn_pct: u32,
+    /// The registrar tier's red line (percent of the span).
+    #[serde(default)]
+    pub registrar_critical_pct: u32,
     /// Every registered fleet member with presence and last-pulled
     /// watermark.
     pub agents: Vec<HubAgentRowDto>,
@@ -809,6 +996,62 @@ pub struct RemoteFaceDto {
     pub online: bool,
     /// The generation this agent last pulled; `None` = no completed pull.
     pub seen_generation: Option<u32>,
+    /// Unix seconds of the agent's last completed pull; `None` = no
+    /// completed pull, or an older hub without the field (recency then
+    /// stays unjudgeable, never guessed).
+    pub policy_last_pull_unix: Option<u32>,
+    /// The overview's hub-side capture instant — the recency anchor (a
+    /// face older than the silent threshold cannot support a per-leg
+    /// silent verdict; the view degrades to "data age", not a guess).
+    pub face_captured_at_unix: Option<u32>,
+    /// The stream names this member last reported paused (planned
+    /// unavailability, stream-level); `None` = never reported.
+    #[serde(default)]
+    pub paused_streams: Option<Vec<String>>,
+    /// The member is declared under maintenance (planned unavailability,
+    /// node-level — its absence is expected, not an accident).
+    #[serde(default)]
+    pub maintenance: bool,
+    /// Unix seconds of the member's last successful CRL poll (its
+    /// renewal reporter's level); `None` = never reported / an older
+    /// hub.
+    #[serde(default)]
+    pub crl_last_success_unix: Option<u32>,
+    /// Failed CRL polls since the member's process started.
+    #[serde(default)]
+    pub crl_failures_total: Option<u32>,
+    /// The operator's queued stream ops waiting on this leg (the mailbox
+    /// watermark face); `None` = nothing waiting / an older hub.
+    #[serde(default)]
+    pub pending_ops: Option<MailboxFaceDto>,
+    /// This agent's currently-admitted hub streams (`None` on older
+    /// hubs / legs with no live count).
+    #[serde(default)]
+    pub streams_in_flight: Option<u32>,
+    /// The agent's per-stream byte-activity levels (the fossil face).
+    #[serde(default)]
+    pub streams: Vec<NodeStreamActivityDto>,
+    /// The last-seen leaf validity window (the credential-expiry face).
+    #[serde(default)]
+    pub leaf_not_before_unix: Option<u32>,
+    /// See [`Self::leaf_not_before_unix`].
+    #[serde(default)]
+    pub leaf_not_after_unix: Option<u32>,
+    /// The tier the span implies (`registrar` / `offline`).
+    #[serde(default)]
+    pub credential_mode: Option<String>,
+    /// Unix seconds of the registration that last presented the window.
+    #[serde(default)]
+    pub credential_last_seen_unix: Option<u32>,
+    /// The connection-quality window stats (`None` on older agents).
+    #[serde(default)]
+    pub connection: Option<ConnectionQualityDto>,
+    /// The renewal backoff ladder's current stage.
+    #[serde(default)]
+    pub renewal_backoff_failures: Option<u32>,
+    /// The stage's observed maximum today.
+    #[serde(default)]
+    pub renewal_backoff_max_today: Option<u32>,
 }
 
 /// A stream row's live status. Local bind state is definitive when the
@@ -823,6 +1066,11 @@ pub enum StreamStatusDto {
     /// The local listener exists but its bind failed (down; the error
     /// rides the listener face).
     Down,
+    /// The stream is paused by intent (planned unavailability): no
+    /// listener should be up, the port is deliberately free (e.g. lent
+    /// to a local process). Yellow, not red — and resumable in one
+    /// action.
+    Paused,
     /// The policy generation is still propagating (hub serving above the
     /// source node's seen/applied generation).
     CatchingUp,
@@ -925,6 +1173,119 @@ pub struct HubAgentRowDto {
     /// The generation this agent last pulled; `None` = no completed pull
     /// since the hub process started.
     pub seen: Option<u32>,
+    /// Unix seconds of the agent's last completed pull (`None` = an older
+    /// hub, or no completed pull) — the LEVEL face's confirmation instant.
+    #[serde(default)]
+    pub policy_last_pull_unix: Option<u32>,
+    /// The stream names this member last reported paused (planned
+    /// unavailability, stream-level); `None` = never reported.
+    #[serde(default)]
+    pub paused_streams: Option<Vec<String>>,
+    /// The member is declared under maintenance (planned unavailability,
+    /// node-level — its absence is expected, not an accident).
+    #[serde(default)]
+    pub maintenance: bool,
+    /// Unix seconds of the member's last successful CRL poll (its renewal
+    /// reporter's level); `None` = never reported / an older hub.
+    #[serde(default)]
+    pub crl_last_success_unix: Option<u32>,
+    /// Failed CRL polls since the member's process started.
+    #[serde(default)]
+    pub crl_failures_total: Option<u32>,
+    /// The operator's queued stream ops waiting on this leg (the mailbox
+    /// watermark face); `None` = nothing waiting and nothing ever
+    /// dropped, or an older hub.
+    #[serde(default)]
+    pub pending_ops: Option<MailboxFaceDto>,
+    /// This agent's currently-admitted hub streams (`None` on older
+    /// hubs / legs with no live count).
+    #[serde(default)]
+    pub streams_in_flight: Option<u32>,
+    /// The agent's per-stream byte-activity levels (the fossil face;
+    /// empty on older agents / agents without mesh stream rules).
+    #[serde(default)]
+    pub streams: Vec<NodeStreamActivityDto>,
+    /// The last-seen leaf validity window (the credential-expiry face).
+    #[serde(default)]
+    pub leaf_not_before_unix: Option<u32>,
+    /// See [`Self::leaf_not_before_unix`].
+    #[serde(default)]
+    pub leaf_not_after_unix: Option<u32>,
+    /// The tier the span implies (`registrar` / `offline`).
+    #[serde(default)]
+    pub credential_mode: Option<String>,
+    /// Unix seconds of the registration that last presented the window.
+    #[serde(default)]
+    pub credential_last_seen_unix: Option<u32>,
+    /// The connection-quality window stats (`None` on older agents).
+    #[serde(default)]
+    pub connection: Option<ConnectionQualityDto>,
+    /// The renewal backoff ladder's current stage.
+    #[serde(default)]
+    pub renewal_backoff_failures: Option<u32>,
+    /// The stage's observed maximum today.
+    #[serde(default)]
+    pub renewal_backoff_max_today: Option<u32>,
+}
+
+/// One stream's byte-activity level (the fossil face's row material).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct NodeStreamActivityDto {
+    /// The stream rule's name (policy vocabulary).
+    pub name: String,
+    /// Unix seconds of the last byte (arm-time baseline before the
+    /// first byte ever crosses).
+    pub last_byte_unix: u32,
+    /// The rule's own idle budget, when it sets one — the fossil
+    /// judgment's per-row anchor.
+    #[serde(default)]
+    pub idle_budget_secs: Option<u32>,
+}
+
+/// The connection-quality window stats (the supervisor domain's
+/// levels): reconnect rate, liveness RTT percentiles, probe timeouts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
+pub struct ConnectionQualityDto {
+    /// Session establishments inside the reconnect window (one hour).
+    pub reconnects_last_hour: u32,
+    /// Median answered roundtrip, millis (`None` = no answered sample).
+    #[serde(default)]
+    pub rtt_p50_ms: Option<u32>,
+    /// 99th-percentile answered roundtrip, millis.
+    #[serde(default)]
+    pub rtt_p99_ms: Option<u32>,
+    /// Unanswered demanding roundtrips in the window.
+    pub rtt_timeouts: u32,
+    /// Total roundtrip samples in the window.
+    pub rtt_samples: u32,
+}
+
+/// The admission caps the headroom judgments read against.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
+pub struct StreamLimitsDto {
+    /// `max_streams_total` (0 = unlimited).
+    pub total: u32,
+    /// `max_streams_per_agent` (0 = unlimited).
+    pub per_agent: u32,
+}
+
+/// The mailbox watermark face for one member: queued stream ops waiting
+/// on the leg, plus the capacity-drop history
+///. Ages judge
+/// against the overview's `captured_at_unix`.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
+pub struct MailboxFaceDto {
+    /// Ops occupying the mailbox (undelivered AND delivered-unacked).
+    pub pending_count: u32,
+    /// Unix seconds of the oldest queued op.
+    #[serde(default)]
+    pub oldest_queued_unix: Option<u32>,
+    /// The oldest op, rendered (`"pause ollama"`).
+    #[serde(default)]
+    pub oldest_op: Option<String>,
+    /// Ops dropped by the capacity guard, cumulative for this hub
+    /// process.
+    pub dropped_total: u32,
 }
 
 /// One stream-proposal request (the requester's form = the validator's
@@ -1106,6 +1467,8 @@ impl From<interflow_cli::plan::ChangeState> for ChangeStateDto {
             },
             interflow_cli::plan::ChangeState::PolicyEditsPending => Self::PolicyEditsPending,
             interflow_cli::plan::ChangeState::IdentityEditsPending => Self::IdentityEditsPending,
+            interflow_cli::plan::ChangeState::PackTreeStale => Self::PackTreeStale,
+            interflow_cli::plan::ChangeState::WatermarksDiverged => Self::WatermarksDiverged,
         }
     }
 }
@@ -1116,6 +1479,65 @@ impl From<interflow_mesh::hub::policy::HubOverview> for HubOverviewDto {
             hub: o.hub,
             floor: u32::try_from(o.floor).unwrap_or(u32::MAX),
             serving: o.serving.and_then(|g| u32::try_from(g).ok()),
+            captured_at_unix: o.captured_at_unix.and_then(|t| u32::try_from(t).ok()),
+            policy_silent_after_secs: u32::try_from(
+                interflow_mesh::agent::policy_watch::POLICY_SILENT_AFTER_SECS,
+            )
+            .unwrap_or(u32::MAX),
+            crl_silent_after_secs: u32::try_from(interflow_renewal::CRL_SILENT_AFTER_SECS)
+                .unwrap_or(u32::MAX),
+            crl_last_success_unix: o.crl_last_success_unix.and_then(|t| u32::try_from(t).ok()),
+            crl_failures_total: o.crl_failures_total.and_then(|t| u32::try_from(t).ok()),
+            route_breakers_open: o
+                .route_breakers_open
+                .into_iter()
+                .map(|row| RouteBreakerOpenRowDto {
+                    host: row.host,
+                    opened_unix: u32::try_from(row.opened_unix).unwrap_or(u32::MAX),
+                    last_probe_unix: u32::try_from(row.last_probe_unix).unwrap_or(u32::MAX),
+                })
+                .collect(),
+            watchers: o
+                .watchers
+                .into_iter()
+                .map(|row| WatcherFaceRowDto {
+                    name: row.name,
+                    interval_secs: u32::try_from(row.interval_secs).unwrap_or(u32::MAX),
+                    started_unix: u32::try_from(row.started_unix).unwrap_or(u32::MAX),
+                    last_tick_unix: u32::try_from(row.last_tick_unix).unwrap_or(u32::MAX),
+                })
+                .collect(),
+            watcher_silent_factor: u32::try_from(
+                interflow_mesh::hub::watchdog::WATCHER_SILENT_FACTOR,
+            )
+            .unwrap_or(u32::MAX),
+            proposals_pending: o.proposals_pending.map(|face| ProposalsPendingDto {
+                pending_count: face.pending_count,
+                oldest_submitted_unix: u32::try_from(face.oldest_submitted_unix)
+                    .unwrap_or(u32::MAX),
+            }),
+            streams_in_flight_total: o
+                .streams_in_flight_total
+                .and_then(|v| u32::try_from(v).ok()),
+            stream_limits: o.stream_limits.map(|limits| StreamLimitsDto {
+                total: u32::try_from(limits.total).unwrap_or(u32::MAX),
+                per_agent: u32::try_from(limits.per_agent).unwrap_or(u32::MAX),
+            }),
+            fossil_idle_multiple: u32::try_from(
+                interflow_mesh::agent::stream_activity::FOSSIL_IDLE_MULTIPLE,
+            )
+            .unwrap_or(u32::MAX),
+            fossil_unbudgeted_days: u32::try_from(
+                interflow_mesh::agent::stream_activity::FOSSIL_UNBUDGETED_DAYS_SECS / 86_400,
+            )
+            .unwrap_or(u32::MAX),
+            headroom_warn_pct: ratio_as_pct(interflow_mesh::hub::routing::HEADROOM_WARN_RATIO),
+            offline_warn_days: i32::try_from(interflow_identity::expiry::OFFLINE_WARN_DAYS)
+                .unwrap_or(i32::MAX),
+            offline_critical_days: i32::try_from(interflow_identity::expiry::OFFLINE_CRITICAL_DAYS)
+                .unwrap_or(i32::MAX),
+            registrar_warn_pct: ratio_as_pct(interflow_identity::expiry::WARN_RATIO),
+            registrar_critical_pct: ratio_as_pct(interflow_identity::expiry::CRITICAL_RATIO),
             agents: o
                 .agents
                 .into_iter()
@@ -1123,10 +1545,62 @@ impl From<interflow_mesh::hub::policy::HubOverview> for HubOverviewDto {
                     agent: row.agent,
                     online: row.online,
                     seen: row.seen.and_then(|g| u32::try_from(g).ok()),
+                    policy_last_pull_unix: row.last_pull_unix.and_then(|t| u32::try_from(t).ok()),
+                    paused_streams: row.paused_streams,
+                    maintenance: row.maintenance,
+                    crl_last_success_unix: row
+                        .crl_last_success_unix
+                        .and_then(|t| u32::try_from(t).ok()),
+                    crl_failures_total: row.crl_failures_total.and_then(|t| u32::try_from(t).ok()),
+                    pending_ops: row.pending_ops.map(|face| MailboxFaceDto {
+                        pending_count: face.pending_count,
+                        oldest_queued_unix: face
+                            .oldest_queued_unix
+                            .and_then(|t| u32::try_from(t).ok()),
+                        oldest_op: face.oldest_op,
+                        dropped_total: u32::try_from(face.dropped_total).unwrap_or(u32::MAX),
+                    }),
+                    streams_in_flight: row.streams_in_flight.and_then(|t| u32::try_from(t).ok()),
+                    streams: row
+                        .streams
+                        .into_iter()
+                        .map(|s| NodeStreamActivityDto {
+                            name: s.name,
+                            last_byte_unix: u32::try_from(s.last_byte_unix).unwrap_or(u32::MAX),
+                            idle_budget_secs: s.idle_budget_secs,
+                        })
+                        .collect(),
+                    leaf_not_before_unix: row
+                        .leaf_not_before_unix
+                        .and_then(|t| u32::try_from(t).ok()),
+                    leaf_not_after_unix: row
+                        .leaf_not_after_unix
+                        .and_then(|t| u32::try_from(t).ok()),
+                    credential_mode: row.credential_mode,
+                    credential_last_seen_unix: row
+                        .credential_last_seen_unix
+                        .and_then(|t| u32::try_from(t).ok()),
+                    connection: row.connection.map(|c| ConnectionQualityDto {
+                        reconnects_last_hour: c.reconnects_last_hour,
+                        rtt_p50_ms: c.rtt_p50_ms.and_then(|v| u32::try_from(v).ok()),
+                        rtt_p99_ms: c.rtt_p99_ms.and_then(|v| u32::try_from(v).ok()),
+                        rtt_timeouts: c.rtt_timeouts,
+                        rtt_samples: c.rtt_samples,
+                    }),
+                    renewal_backoff_failures: row.renewal_backoff_failures,
+                    renewal_backoff_max_today: row.renewal_backoff_max_today,
                 })
                 .collect(),
         }
     }
+}
+
+/// A threshold ratio in `[0, 1]` as the whole percent the chips print.
+// Nothing to truncate, no sign to lose on a const ratio in [0, 1] — the
+// cast lints cannot see the range.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn ratio_as_pct(ratio: f64) -> u32 {
+    (ratio * 100.0).round() as u32
 }
 
 /// One rendered pack in a `plan apply` output tree (deploy page cards).
@@ -1209,6 +1683,30 @@ pub struct ManifestTemplateParams {
     pub agent: String,
     pub service: String,
     pub service_address: String,
+}
+
+/// Which known retirement a startup notice narrates. The wire tags are the
+/// contract (the shell maps them to localized text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupNoticeKindDto {
+    /// Stored preferences exist but this build cannot read them — they were
+    /// retired by the upgrade; removing prefs.db starts fresh.
+    PrefsRetired,
+    /// The remembered deployment folder no longer opens as a deployment —
+    /// retired by an upgrade or moved; open a current one or import a node
+    /// pack.
+    DeploymentGone,
+}
+
+/// One startup notice: a known retirement this build narrates instead of
+/// silently absorbing. `id` is the stable dismissal key — tied to the
+/// format epoch whose retirement produced the notice, so each era
+/// notifies exactly once per machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
+pub struct StartupNoticeDto {
+    pub id: String,
+    pub kind: StartupNoticeKindDto,
 }
 
 /// `deploy_install_sealed` result: ready to "add as node".
@@ -2132,6 +2630,30 @@ pub struct MeshProposalsEvent {
     pub proposals: Vec<ProposalReceiptDto>,
 }
 
+/// `mesh-crl` event payload: a running node's CRL-poll liveness level
+/// moved (renewal loop atomics → ticking forwarder → here). The node
+/// detail's "CRL polling" panel patches its node's `crl` field from
+/// these — same push-not-poll contract as [`MeshPeersEvent`]; the local
+/// half of the 2026-10-19 liveness face (fleet rows come from the hub's
+/// floor face instead).
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "mesh-crl")]
+pub struct MeshCrlEvent {
+    pub id: String,
+    pub crl: CrlPollPlaneDto,
+}
+
+/// `mesh-breakers` event payload: a running mesh agent's egress-breaker
+/// open set moved (table publish → manager forwarder → here). The node
+/// detail's "Egress breakers" panel patches its node's `breakers` from
+/// these.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "mesh-breakers")]
+pub struct MeshBreakersEvent {
+    pub id: String,
+    pub breakers: Vec<BreakerOpenRowDto>,
+}
+
 /// `mesh-listeners` event payload: a running mesh agent's ingress-listener
 /// actual state moved (engine reconciler → manager forwarder → here). The
 /// node card's listener badge and the detail's Health section patch their
@@ -2143,6 +2665,22 @@ pub struct MeshProposalsEvent {
 pub struct MeshListenersEvent {
     pub id: String,
     pub listeners: Vec<ListenerStatusDto>,
+}
+
+/// `hub-floor` event payload: the deployment's hub floor version advanced
+/// (hub floor watcher → here). The composed fleet read model is a pull
+/// over `/policy/floor`; this event is its invalidation signal — the
+/// deployment scope re-pulls on receipt, so external writers (a CLI
+/// pause/resume, a maintenance declaration, another operator's publish,
+/// an agent's re-report) reach every fleet-reading view the moment the
+/// hub's face moves, not at the next manual refresh
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type, tauri_specta::Event)]
+#[tauri_specta(event_name = "hub-floor")]
+pub struct HubFloorEvent {
+    /// The hub's floor version at the advance (diagnostics; the payload
+    /// stays with the floor endpoint — narrowed u64 → u32 per the
+    /// BigInt-ban contract rule).
+    pub version: u32,
 }
 
 /// `log` event payload (tracing capture pump → frontend log panel).
@@ -2227,5 +2765,121 @@ mod tests {
             .unwrap(),
             r#"{"Connected":{"agent_id":"expose-mac","hub_receipt":{"egress_ip":"203.0.113.7","registered_at_unix":1759171200}}}"#
         );
+    }
+
+    /// Every `ChangeState` variant maps through the `From` layer to its
+    /// exact wire tag — the three faces' anchor: the CLI enum
+    /// (`interflow_cli::plan::ChangeState`, classified by the SAME fork
+    /// decision apply executes), this DTO's wire form (what the frontend
+    /// receives), and the TS union (held fresh by `bindings_ts_is_fresh`,
+    /// exhaustively switched by `changeStateLabel`). A new CLI variant
+    /// fails to compile here until the whole chain carries it.
+    #[test]
+    fn change_state_dto_wire_tags_are_exhaustive_and_stable() {
+        let wire = |s: interflow_cli::plan::ChangeState| {
+            serde_json::to_string(&ChangeStateDto::from(s)).unwrap()
+        };
+        assert_eq!(
+            wire(interflow_cli::plan::ChangeState::NeverApplied),
+            r#"{"kind":"never_applied"}"#
+        );
+        assert_eq!(
+            wire(interflow_cli::plan::ChangeState::Applied { generation: 7 }),
+            r#"{"kind":"applied","generation":7}"#
+        );
+        assert_eq!(
+            wire(interflow_cli::plan::ChangeState::PolicyEditsPending),
+            r#"{"kind":"policy_edits_pending"}"#
+        );
+        assert_eq!(
+            wire(interflow_cli::plan::ChangeState::IdentityEditsPending),
+            r#"{"kind":"identity_edits_pending"}"#
+        );
+        assert_eq!(
+            wire(interflow_cli::plan::ChangeState::PackTreeStale),
+            r#"{"kind":"pack_tree_stale"}"#
+        );
+        assert_eq!(
+            wire(interflow_cli::plan::ChangeState::WatermarksDiverged),
+            r#"{"kind":"watermarks_diverged"}"#
+        );
+    }
+
+    /// The startup-notice wire shape is the shell's dismissal contract: the
+    /// `kind` tags are stable spellings, and the epoch-suffixed `id` is
+    /// what the localStorage dismissal keys on — a re-spelled tag or a
+    /// missing field would silently re-notify (or never notify) every
+    /// machine that lived through a retirement.
+    #[test]
+    fn startup_notice_wire_tags_are_exhaustive_and_stable() {
+        let prefs_retired = StartupNoticeDto {
+            id: "prefs-retired@3".to_owned(),
+            kind: StartupNoticeKindDto::PrefsRetired,
+        };
+        assert_eq!(
+            serde_json::to_string(&prefs_retired).unwrap(),
+            r#"{"id":"prefs-retired@3","kind":"prefs_retired"}"#
+        );
+        let deployment_gone = StartupNoticeDto {
+            id: "deployment-gone@3".to_owned(),
+            kind: StartupNoticeKindDto::DeploymentGone,
+        };
+        assert_eq!(
+            serde_json::to_string(&deployment_gone).unwrap(),
+            r#"{"id":"deployment-gone@3","kind":"deployment_gone"}"#
+        );
+    }
+
+    /// The GUI face classifies the SHARED corpus (the same bytes the CLI's
+    /// released-binary contract test drives) and lands on the same forks:
+    /// a retired pack format is a full re-render, a node state mirror above
+    /// the bookkeeping is a re-publish.
+    #[test]
+    fn gui_face_classifies_the_shared_corpus() {
+        use interflow_testkit::plan_corpus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("interflow.toml");
+        let issuer = dir.path().join("issuer");
+        let out = dir.path().join("dist");
+        let classify = || {
+            serde_json::to_string(&ChangeStateDto::from(
+                interflow_cli::plan::change_state(&manifest_path, &issuer, &out).unwrap(),
+            ))
+            .unwrap()
+        };
+
+        std::fs::write(
+            &manifest_path,
+            plan_corpus::mesh_manifest_text("gui-corpus", 11434, 8080),
+        )
+        .unwrap();
+        interflow_cli::plan::apply(
+            &manifest_path,
+            &issuer,
+            &out,
+            false,
+            &interflow_cli::plan::BackupInitOptions::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(classify(), r#"{"kind":"applied","generation":1}"#);
+
+        plan_corpus::deprecate_pack_format(&out.join("packs/agent-svc-host"));
+        assert_eq!(classify(), r#"{"kind":"pack_tree_stale"}"#);
+
+        // Restore a current-format pack.toml by re-rendering, then plant a
+        // node state mirror above the bookkeeping.
+        interflow_cli::plan::apply(
+            &manifest_path,
+            &issuer,
+            &out,
+            false,
+            &interflow_cli::plan::BackupInitOptions::default(),
+            false,
+        )
+        .unwrap();
+        plan_corpus::write_state_policy_mirror(&out, "home-win", 6);
+        assert_eq!(classify(), r#"{"kind":"watermarks_diverged"}"#);
     }
 }

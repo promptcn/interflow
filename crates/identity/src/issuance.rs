@@ -326,13 +326,18 @@ fn err(context: &'static str) -> impl Fn(rcgen::Error) -> Error {
 
 /// How one recorded applied state came about — the applied history's kind
 /// column (`plan apply` full render, the policy-only fast path, a node
-/// `rotate`, or the one-time absorb of the legacy `applied.json`).
+/// `rotate`, or a bookkeeping-only refresh of the baseline cache).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppliedKind {
     FullRender,
     PolicyOnly,
     Rotate,
-    AbsorbedLegacy,
+    /// Nothing rendered, nothing published: `plan apply` found the recorded
+    /// digest disagreeing with the live declaration, the snapshot
+    /// arbitration proved the identity face unchanged (the digest was a
+    /// stale cache), and the write re-recorded digest and snapshot
+    /// alongside.
+    BaselineRestamp,
 }
 
 impl AppliedKind {
@@ -341,22 +346,28 @@ impl AppliedKind {
             Self::FullRender => "full-render",
             Self::PolicyOnly => "policy-only",
             Self::Rotate => "rotate",
-            Self::AbsorbedLegacy => "absorbed-legacy",
+            Self::BaselineRestamp => "baseline-restamp",
         }
     }
 }
 
 /// What `plan apply` last put into the world — the diff base that lets the
 /// next apply distinguish "the manifest's identity face changed" (re-render
-/// packs) from "only the mesh rule face changed" (sign + publish a policy
+/// packs) from "only the policy face changed" (sign + publish a policy
 /// update; no identity is re-signed). Stored in the issuer store's
 /// bookkeeping db ([`crate::state_db`]) next to the binding contract, with
 /// the applied declaration text snapshotted alongside (the `plan diff`
 /// baseline).
+///
+/// The snapshot is the truth; `stripped_manifest_digest` is an unlabelled
+/// cache of it. A digest that compares equal settles the identity-face
+/// question; one that compares unequal is settled against the snapshot —
+/// both texts under the same rule ([`crate::applied_digest`]) — before
+/// anyone calls it an identity edit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppliedState {
-    /// sha256 of the manifest with every agent's mesh rule lists emptied —
-    /// the identity/trust/dial face. Unchanged + policy changed = the
+    /// sha256 of the manifest with its policy face emptied — the
+    /// identity/trust/dial face. Unchanged + policy changed = the
     /// policy-only fast path.
     pub stripped_manifest_digest: String,
     /// The live policy generation — CONTINUED at full render (minted above
@@ -621,13 +632,15 @@ impl IssuerStore {
         )
     }
 
-    /// The store's stable id (minted when its db was created; `None`
-    /// before the first write created one). Identifies the store in
-    /// operator output regardless of where the directory sits or moves.
-    pub fn store_uuid(&self) -> Result<Option<String>> {
+    /// The store's stable id (minted when its db was created). Identifies
+    /// the store in operator output regardless of where the directory sits
+    /// or moves.
+    pub fn store_uuid(&self) -> Result<String> {
         match crate::state_db::StateDb::open_existing(&self.root)? {
-            Some(db) => db.store_uuid().map(Some),
-            None => Ok(None),
+            Some(db) => db.store_uuid(),
+            None => Err(Error::issuance(
+                "the store has no bookkeeping db yet — its id is minted by the first write",
+            )),
         }
     }
 
@@ -663,8 +676,7 @@ impl IssuerStore {
 
     /// The declaration text as it stood at the last recorded applied
     /// state — the baseline `plan diff` compares the live manifest
-    /// against. `None` before the first apply, or for a state absorbed
-    /// from the legacy `applied.json` (no snapshot existed to keep).
+    /// against. `None` before the first apply.
     pub fn applied_manifest_text(&self) -> Result<Option<String>> {
         match crate::state_db::StateDb::open_existing(&self.root)? {
             Some(db) => db.applied_manifest_text(),

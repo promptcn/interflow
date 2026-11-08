@@ -2,8 +2,9 @@
 //! identity gating, request routing.
 //!
 //! Every HTTP/2 request first goes through [`Service::call`]:
-//! 1. per-IP token-bucket rate limiting ([`AuthRateLimiter`], keyed on the
-//!    PROXY-protocol effective IP); over the limit returns 429
+//! 1. per-client token-bucket rate limiting ([`AuthRateLimiter`], keyed on
+//!    the PROXY-protocol effective IP — one client is one IPv4 address or
+//!    one IPv6 /64); over the limit returns 429
 //! 2. mTLS identity gate: the connection must carry a derived
 //!    [`PeerIdentity`] (tenant from the chain's anchoring root, agent from
 //!    the leaf CN); registration binds the CN while data-plane handlers bind
@@ -201,10 +202,43 @@ impl Service<Request<Incoming>> for HubService {
                 (&Method::PUT, "/crls") => svc.handle_crl_publish(req).await,
                 (&Method::GET, "/policy") => svc.handle_policy_pull(req).await,
                 (&Method::GET, "/policy/floor") => svc.handle_policy_floor().await,
+                (&Method::GET, "/policy/floor/version") => {
+                    svc.handle_policy_floor_version(req).await
+                }
                 (&Method::GET, "/snapshot") => svc.handle_fleet_snapshot().await,
+                (&Method::GET, "/audit/biography") => svc.handle_audit_biography(req).await,
+                (&Method::POST, "/streams/intent") => svc.handle_stream_intent_exchange(req).await,
+                (&Method::POST, "/breakers/recovered") => svc.handle_target_recovered(req).await,
+                (&Method::POST, "/crls/liveness") => svc.handle_crl_liveness(req).await,
+                (&Method::POST, "/node/status") => svc.handle_node_status(req).await,
                 (&Method::POST, "/proposals") => svc.handle_proposal_submit(req).await,
                 (&Method::GET, "/proposals/mine") => svc.handle_proposals_mine().await,
                 (&Method::GET, "/proposals") => svc.handle_proposals_list().await,
+                (&Method::POST, path) if path.starts_with("/streams/") => {
+                    // `/streams/{agent}/pause|resume` — the operator's
+                    // stream-intent verbs (control-principal gated inside).
+                    let rest = path.trim_start_matches("/streams/");
+                    match (rest.rsplit_once('/'), rest.ends_with("/pause")) {
+                        (Some((agent, "pause")), true) => {
+                            svc.handle_stream_op(req, agent, true).await
+                        }
+                        (Some((agent, "resume")), false) => {
+                            svc.handle_stream_op(req, agent, false).await
+                        }
+                        _ => Ok(text_response(StatusCode::NOT_FOUND, "Not Found")),
+                    }
+                }
+                (&Method::POST, path) if path.starts_with("/maintenance/") => {
+                    // `/maintenance/{agent}/on|off` — the node-level
+                    // maintenance declaration verbs (control-principal
+                    // gated inside).
+                    let rest = path.trim_start_matches("/maintenance/");
+                    match (rest.rsplit_once('/'), rest.ends_with("/on")) {
+                        (Some((agent, "on")), true) => svc.handle_maintenance(agent, true).await,
+                        (Some((agent, "off")), false) => svc.handle_maintenance(agent, false).await,
+                        _ => Ok(text_response(StatusCode::NOT_FOUND, "Not Found")),
+                    }
+                }
                 (&Method::POST, path) if path.starts_with("/proposals/") => {
                     // `/proposals/{id}/approve|reject` — the operator's
                     // decision endpoints (control-principal gated inside).

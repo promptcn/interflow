@@ -158,6 +158,7 @@ mod setup {
             hub_quic_addr: None,
 
             identity_offline: false,
+            renewal_face: None,
         };
         let client_handle = tokio::task::spawn(async move {
             interflow_expose::client::start(&client_args)?.join().await

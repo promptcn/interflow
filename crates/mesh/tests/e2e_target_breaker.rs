@@ -15,12 +15,18 @@
 //!   open-rate budget** — a healthy stream succeeds immediately afterwards
 //!   with a budget too small to survive even one wasted token, and zero
 //!   rate_limited drops occur in the whole test.
-//! - B2 (self-healing): the backend comes up mid-test; after the cooldown
-//!   one recovery probe is admitted, round-trips, and the target is fully
-//!   re-admitted.
+//! - B2 (self-healing via the cooldown path, prober disabled): the backend
+//!   comes up mid-test; after the cooldown one recovery probe is admitted,
+//!   round-trips, and the target is fully re-admitted. The passive path
+//!   must stay covered — it is the fallback when the prober is off.
 //! - B3 (opt-out): with the breaker disabled the old behavior returns —
 //!   the storm dials on every Open and a healthy stream is rate-limited
 //!   (the original starvation, now by choice).
+//! - B4 (active recovery, 2026-10-18): with the prober on its default
+//!   cadence and **zero inbound Opens after the trip**, a revived backend
+//!   is re-admitted within the probe period — strictly before the cooldown
+//!   could have elapsed. Pre-fix this cannot pass: passive recovery
+//!   requires cooldown + an admitted probe stream.
 //!
 //! The metrics recorder is shared in-process and counters accumulate
 //! monotonically; assertions use before/after deltas and tests serialize on
@@ -43,7 +49,7 @@ use interflow_core::tunnel::{InnerStreamHello, TargetSelector};
 use interflow_mesh::agent::AgentClient;
 use interflow_testkit::{
     agent_config, echo_server, hub_config, metrics_harness::counter_value,
-    metrics_harness::init_tracing, metrics_harness::metrics_handle,
+    metrics_harness::gauge_value, metrics_harness::init_tracing, metrics_harness::metrics_handle,
     metrics_harness::wait_counter_at_least, spawn_hub,
 };
 use std::net::SocketAddr;
@@ -74,6 +80,7 @@ const CLOSED_CONNECT_FAILED: &str =
 const BREAKER_OPENED: &str = "interflow_egress_target_breaker_transitions_total{state=\"open\"}";
 const BREAKER_RECOVERED: &str =
     "interflow_egress_target_breaker_transitions_total{state=\"closed\"}";
+const BREAKERS_OPEN: &str = "interflow_egress_target_breakers_open";
 
 // ---------------------------------------------------------------------------
 // scaffolding (same bare-tunnel injection pattern as e2e_open_flood.rs)
@@ -119,9 +126,9 @@ async fn open_inner_tls(
         &key.display().to_string(),
     )
     .expect("inner material");
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+    let connector = tokio_rustls::TlsConnector::from(
         inner_client_config(&material, "eg").expect("inner connector"),
-    ));
+    );
     let adapter = E2eTunnelIo::ingress(rx, inj.clone(), sid);
     let mut tls = match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
         E2eHandshakeOutcome::Established(tls, _) => tls,
@@ -373,10 +380,14 @@ async fn b1_dead_target_storm_does_not_starve_healthy() {
 // ---------------------------------------------------------------------------
 
 /// Threshold 2, cooldown 2s; the rate limiter is disabled to isolate the
-/// breaker dimension. The target starts dead (storm trips it), the backend
-/// binds the port mid-test, and after the cooldown exactly one recovery
-/// probe is admitted — it round-trips, the breaker recovers, and the target
-/// is fully re-admitted.
+/// breaker dimension. **The recovery prober is disabled** — this scenario
+/// owns the passive cooldown path (still the fallback when the prober is
+/// off or its transport is unsupported); with the prober on, its 1s
+/// loopback dial would close the entry before this test's own phases run
+/// (that behavior is B4's to assert). The target starts dead (storm trips
+/// it), the backend binds the port mid-test, and after the cooldown
+/// exactly one recovery probe is admitted — it round-trips, the breaker
+/// recovers, and the target is fully re-admitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn b2_recovery_after_backend_starts() {
     let _serial = serial_lock().await;
@@ -393,6 +404,7 @@ async fn b2_recovery_after_backend_starts() {
     eg.egress_target_breaker_failure_threshold = 2;
     eg.egress_target_breaker_window_secs = 10;
     eg.egress_target_breaker_cooldown_secs = 2;
+    eg.egress_recovery_probe_enabled = false;
     interflow_testkit::spawn_agent_registered(eg).await;
 
     let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
@@ -443,6 +455,104 @@ async fn b2_recovery_after_backend_starts() {
     )
     .await;
     assert_eq!(got, b"again");
+}
+
+// ---------------------------------------------------------------------------
+// B4: active recovery — the 2026-10-18 prober beats the cooldown
+// ---------------------------------------------------------------------------
+
+/// Threshold 2, cooldown 10s (deliberately long — it must NOT elapse
+/// inside this test), prober on its default loopback cadence (1s). The
+/// backend revives right after the trip; from that moment the test sends
+/// **zero Opens toward the target** — yet the entry must recover within
+/// the probe period and strictly before the cooldown. Passive recovery
+/// cannot pass this: with no inbound Open there is no probe stream, and
+/// the cooldown alone admits nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b4_active_recovery_beats_the_cooldown() {
+    let _serial = serial_lock().await;
+    let _ = metrics_handle();
+    init_tracing();
+    let hub = spawn_hub(hub_config(0, certs(), vec![])).await;
+    let hub_port = hub.local_addr().expect("hub bound").port();
+    let (echo_addr, _echo) = echo_server().await;
+    let dead = dead_target().await;
+    const COOLDOWN: Duration = Duration::from_secs(10);
+
+    let mut eg = agent_config("eg", hub_port, certs());
+    eg.max_stream_opens_per_sec = 0;
+    eg.max_incoming_streams = 0;
+    eg.egress_target_breaker_failure_threshold = 2;
+    eg.egress_target_breaker_window_secs = 10;
+    eg.egress_target_breaker_cooldown_secs = COOLDOWN.as_secs();
+    interflow_testkit::spawn_agent_registered(eg).await;
+
+    let (inj, _conn) = connect_tunnel(hub_port, "inj").await;
+    wait_egress_ready(&inj, echo_addr).await;
+
+    let gauge_before = gauge_value(BREAKERS_OPEN).unwrap_or(0.0);
+    for i in 0..5 {
+        open_until_rejected(
+            &inj,
+            interflow_testkit::opaque_stream_id(&format!("b4-storm-{i}")),
+            &dead,
+        )
+        .await;
+    }
+    wait_counter_at_least(BREAKER_OPENED, 1, Duration::from_secs(5)).await;
+    // The wired-open gauge (2026-10-18): the trip must publish the level.
+    // Baseline-relative (a serialized sibling test may leave its own entry
+    // OPEN in the process-global recorder — B1's dead target never
+    // recovers).
+    wait_gauge_at_least(BREAKERS_OPEN, gauge_before + 1.0, Duration::from_secs(5)).await;
+
+    // The backend revives; the clock starts. No Open is sent toward the
+    // target from here until recovery has been asserted.
+    let revived = echo_on_port(dead.rsplit(':').next().unwrap().parse().unwrap()).await;
+    let recovery_started = std::time::Instant::now();
+    wait_counter_at_least(BREAKER_RECOVERED, 1, Duration::from_secs(5)).await;
+    let elapsed = recovery_started.elapsed();
+    assert!(
+        elapsed < COOLDOWN,
+        "active recovery must beat the {COOLDOWN:?} cooldown, took {elapsed:?} \
+         (passive recovery would still be OPEN — no probe stream was ever sent)"
+    );
+    // …and the gauge came back down to the pre-trip level.
+    wait_gauge_at_most(BREAKERS_OPEN, gauge_before, Duration::from_secs(5)).await;
+
+    // Fully re-admitted: the first Open after recovery succeeds outright.
+    let got = round_trip_closing(
+        &inj,
+        interflow_testkit::opaque_stream_id("b4-after"),
+        &revived.to_string(),
+        b"alive",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(got, b"alive");
+}
+
+/// Polls until the gauge reads ≥ `min` (level-triggered face of
+/// [`wait_counter_at_least`]; the snapshot is the post-mortem).
+async fn wait_gauge_at_least(metric: &str, min: f64, timeout: Duration) {
+    interflow_testkit::wait::eventually(&format!("gauge {metric} >= {min}"), timeout, || {
+        let v = gauge_value(metric).unwrap_or(f64::MIN);
+        (v >= min)
+            .then_some(v)
+            .ok_or_else(|| format!("current {v} (snapshot:\n{})", metrics_handle().render()))
+    })
+    .await;
+}
+
+/// Polls until the gauge reads ≤ `max`.
+async fn wait_gauge_at_most(metric: &str, max: f64, timeout: Duration) {
+    interflow_testkit::wait::eventually(&format!("gauge {metric} <= {max}"), timeout, || {
+        let v = gauge_value(metric).unwrap_or(f64::MAX);
+        (v <= max)
+            .then_some(v)
+            .ok_or_else(|| format!("current {v} (snapshot:\n{})", metrics_handle().render()))
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------

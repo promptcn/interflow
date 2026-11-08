@@ -64,8 +64,9 @@ async fn full_edge_expose_round_trip() {
     // Enable logging (visible only for this test)
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,interflow=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug".into()
+            }),
         )
         .try_init();
 
@@ -126,6 +127,7 @@ async fn full_edge_expose_round_trip() {
         hub_quic_addr: None,
 
         identity_offline: false,
+        renewal_face: None,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(
@@ -155,10 +157,13 @@ async fn full_edge_expose_round_trip() {
         .expect("read_exact should succeed");
 
     // Expected: the echo reflects the request bytes verbatim (proving the data
-    // fully traverses edge→hub→expose→echo→expose→hub→edge)
+    // fully traverses edge→hub→expose→echo→expose→hub→edge). The slice is
+    // spelled `&request[..]` — `as_ref()` on an array became
+    // inference-ambiguous once hybrid-array (transitive via age 0.12's
+    // ml-kem) added its own AsRef impls for arrays.
     assert_eq!(
         response.as_slice(),
-        request.as_ref(),
+        &request[..],
         "response should equal echoed request"
     );
 }
@@ -189,8 +194,9 @@ async fn marker_backend(marker: &'static str) -> SocketAddr {
 async fn two_services_route_by_id_not_position() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,interflow=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug".into()
+            }),
         )
         .try_init();
 
@@ -260,6 +266,7 @@ async fn two_services_route_by_id_not_position() {
         hub_quic_addr: None,
 
         identity_offline: false,
+        renewal_face: None,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(

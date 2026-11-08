@@ -262,7 +262,7 @@ async fn peek_exact(
 /// Discards a PROXY protocol (v1 or v2) preamble from the front of the
 /// stream when the loopback front (nginx stream SNI dispatch, which emits
 /// the preamble on every map target) sent one. Framing only: the source
-/// address is dropped — the registrar makes no per-IP decisions, so a
+/// address is dropped — the registrar makes no per-client decisions, so a
 /// `PROXY UNKNOWN` line carries exactly as much information as a real one.
 ///
 /// Discrimination is by first byte: `0x0D` starts the v2 signature, `P`

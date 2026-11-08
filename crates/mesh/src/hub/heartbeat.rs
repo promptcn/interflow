@@ -56,7 +56,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 // Poll interval while heartbeats are disabled and the summary-log period
 // are single-sourced in core `config::params::liveness`
@@ -136,6 +136,14 @@ pub(crate) async fn remove_agent_if_current(
                 match armed.equal_epoch(&current) {
                     Verdict::Current => {
                         agents.remove(agent_id);
+                        // The data-plane projection moves with the registry
+                        // row (same critical section): post-eviction
+                        // resolutions miss → NoTarget fast-fail.
+                        h.remove_data_tx(agent_id);
+                        // The row leaves the floor (presence → gone; a
+                        // watermark-only row may remain via the pull
+                        // ledger, now offline).
+                        h.floor_clock.bump();
                         metrics::gauge!("interflow_hub_agents_registered")
                             .set(crate::hub::state::count_as_f64(agents.len()));
                         Internal::Evict
@@ -148,8 +156,10 @@ pub(crate) async fn remove_agent_if_current(
     };
     match outcome {
         Internal::Evict => {
-            // 1. Sever the session entry (see [`AgentSession::terminate`]).
-            witness.session.write().await.terminate();
+            // 1. Sever the session entry (see [`AgentSession::terminate`]) —
+            //    the h2 pipes and, on a QUIC registration, the relay
+            //    connection itself.
+            witness.session.write().await.terminate(reason);
 
             // 2. Sweep orphan streams + notify peers + reset the per-agent
             //    count (reuses the register sweep).
@@ -161,6 +171,48 @@ pub(crate) async fn remove_agent_if_current(
             )
             .await;
 
+            // A revoked circuit never comes back — every registration arm
+            // refuses it at the core's gate — so its route leases die with
+            // the eviction instead of the connection's eventual death (the
+            // close above races the watcher's own by-circuit clear; belt
+            // and braces). Other eviction reasons KEEP the leases: the
+            // same circuit may implicitly re-register (h2) and the agent's
+            // session-scoped route cache expects them.
+            if reason == "credential_revoked" {
+                h.route_leases
+                    .write()
+                    .await
+                    .retain(|_, (lease_circuit, _, _)| *lease_circuit != witness.circuit);
+            }
+
+            // Planned unavailability: a node declared under maintenance
+            // is EXPECTED to be down. The
+            // registry cleanup is identical (the offline fact stands) but
+            // the accounting is not an accident: no eviction metric, no
+            // `evicted_total` move, its own audit kind — the
+            // voided-eviction discipline applied to planned absence. A
+            // credential revocation is a security event and outranks the
+            // ops window (never exempted).
+            let under_maintenance =
+                h.maintenance.is_under(agent_id) && reason != "credential_revoked";
+            if under_maintenance {
+                metrics::counter!("interflow_hub_agent_maintenance_departed", "reason" => reason)
+                    .increment(1);
+                h.audit.record(
+                    AuditKind::MaintenanceDeparture {
+                        agent: agent_id.to_string(),
+                        reason: reason.to_string(),
+                    },
+                    Some(witness.circuit.to_hex()),
+                    None,
+                );
+                info!(
+                    "agent circuit={} departed under declared maintenance (reason={reason}), \
+                     orphan streams cleaned, eviction accounting exempted",
+                    witness.circuit
+                );
+                return;
+            }
             metrics::counter!("interflow_hub_agent_evicted", "reason" => reason).increment(1);
             // The domain-counter twin of the metric above: the steady-state
             // face (`GET /snapshot`) reports it without a Prometheus scrape,
@@ -171,6 +223,7 @@ pub(crate) async fn remove_agent_if_current(
             h.audit.record(
                 AuditKind::AgentEvicted {
                     circuit: witness.circuit.to_hex(),
+                    agent: agent_id.to_string(),
                     reason: reason.to_string(),
                 },
                 Some(witness.circuit.to_hex()),
@@ -198,8 +251,10 @@ pub(crate) async fn remove_agent_if_current(
         Internal::VoidedByTakeover => {
             // The captured Arc is no longer the registry entry: severing it
             // only cleans up the dead registration's residual channels (its
-            // poll streams end via the generation self-check).
-            witness.session.write().await.terminate();
+            // poll streams end via the generation self-check; its QUIC
+            // connection — superseded, never the current entry's — closes
+            // with the same reason).
+            witness.session.write().await.terminate(reason);
             metrics::counter!("interflow_hub_agent_eviction_voided", "reason" => reason)
                 .increment(1);
             debug!(
@@ -224,6 +279,20 @@ pub fn spawn_heartbeat_supervisor(
     shutdown: CancellationToken,
 ) {
     tasks.spawn(async move {
+        // The watchdog row registers at SPAWN (not at the first tick, up
+        // to one interval later): every registration bump completes
+        // before the hub answers its first request, so a version read
+        // after readiness attributes cleanly. The per-pass tick below
+        // re-anchors the cadence if a config reload moves it.
+        let initial_interval = {
+            let cfg = h.config.read().await;
+            tick_sleep(cadence_snapshot(&cfg)).as_secs().max(1)
+        };
+        h.watchdog.register(
+            "heartbeat",
+            initial_interval,
+            u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0),
+        );
         loop {
             let inner = tokio::spawn(run_heartbeat_supervisor(h.clone(), shutdown.clone()));
             match inner.await {
@@ -273,6 +342,12 @@ async fn run_heartbeat_supervisor(h: std::sync::Arc<HubState>, shutdown: Cancell
             () = shutdown.cancelled() => break,
             () = tokio::time::sleep(sleep_for) => {}
         }
+        // The watchdog row: the cadence anchor follows the config snapshot
+        // (a reload that moves the interval re-anchors the silence
+        // judgment on the next pass).
+        h.watchdog.tick("heartbeat", sleep_for.as_secs().max(1), {
+            u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0)
+        });
         let Some(cadence) = cadence else { continue };
         let deadline = cadence.dead_line();
         let summary_every = cadence.summary_ticks();
@@ -396,7 +471,7 @@ async fn run_heartbeat_supervisor(h: std::sync::Arc<HubState>, shutdown: Cancell
                     pings += 1;
                     metrics::counter!("interflow_hub_heartbeat_pings_sent").increment(1);
                     full_streaks.remove(agent_id);
-                    debug!("agent circuit={circuit} heartbeat Ping enqueued");
+                    trace!("agent circuit={circuit} heartbeat Ping enqueued");
                 }
                 Err(e) => {
                     full += 1;
@@ -411,7 +486,7 @@ async fn run_heartbeat_supervisor(h: std::sync::Arc<HubState>, shutdown: Cancell
                              (poll channel full, consumer most likely stalled)"
                         );
                     }
-                    debug!("agent circuit={circuit} heartbeat Ping enqueue failed: {e}");
+                    trace!("agent circuit={circuit} heartbeat Ping enqueue failed: {e}");
                 }
             }
         }

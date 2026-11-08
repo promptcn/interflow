@@ -29,8 +29,11 @@ async fn acme_issues_serves_and_routes() {
     };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,interflow=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(
+                    "info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug",
+                )
+            }),
         )
         .try_init();
 
@@ -95,6 +98,7 @@ async fn acme_issues_serves_and_routes() {
         hub_quic_addr: None,
 
         identity_offline: false,
+        renewal_face: None,
     };
     let client = interflow_expose::client::start(&args).expect("agent start");
     assert!(

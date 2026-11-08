@@ -26,10 +26,9 @@ use interflow_identity::{PackTreeStale, pack_digest_of, pack_generation_of, prob
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// sha256 of the manifest with every agent's policy-carried lists emptied
-/// (mesh rules, services, routes) — the identity/trust/dial face. `plan
-/// apply` diffs this against the applied state: unchanged face + moved
-/// policy content = the policy-only fast path (no re-render, no re-sign).
+pub mod narration;
+pub mod stage;
+
 /// Writes a PEM private key with owner-only permissions (the ephemeral
 /// publish credential).
 fn write_private_key_file(path: &Path, pem: &str) -> interflow_core::error::Result<()> {
@@ -46,26 +45,29 @@ fn write_private_key_file(path: &Path, pem: &str) -> interflow_core::error::Resu
     Ok(())
 }
 
-fn stripped_manifest_digest(manifest: &Manifest) -> interflow_core::error::Result<String> {
-    let mut stripped = manifest.clone();
-    for agent in stripped.agent.values_mut() {
-        agent.mesh_ingress.clear();
-        agent.mesh_egress.clear();
-        // Services are policy material too (the signed default address
-        // rides the policy since 2026-10-10), and so are routes: both
-        // hot-apply on every node kind, so they belong to the policy-only
-        // face. A stale pack node.toml default is shadowed by the signed
-        // default in the resolve ladder until the next full render.
-        agent.services.clear();
-    }
-    stripped.route.clear();
-    let text = serde_json::to_string(&stripped).map_err(|e| {
-        interflow_core::error::InterflowError::config("manifest serialization".to_string())
-            .with_source(e)
-    })?;
+/// The identity/trust/dial face digest (mesh rules, services, routes
+/// emptied — the strip rule lives in `interflow_identity::applied_digest`).
+/// `plan apply` verifies it against the applied state: unchanged face +
+/// moved policy content = the policy-only fast path (no re-render, no
+/// re-sign). A recorded digest that disagrees is settled against the
+/// declaration snapshot — never trusted or condemned on its own — see
+/// [`verify_baseline`].
+fn identity_face_digest(manifest: &Manifest) -> interflow_core::error::Result<String> {
+    interflow_identity::identity_face_digest(manifest).map_err(crate::runtime::pack_error)
+}
+
+/// sha256 of the manifest's policy at `generation` (canonical bytes) — the
+/// applied state's `policy_digest`, and what the gate compares the live
+/// declaration's policy against (built at the SAME generation, so only
+/// content differences surface).
+fn policy_digest_at(manifest: &Manifest, generation: u64) -> interflow_core::error::Result<String> {
     Ok(format!(
         "sha256:{}",
-        interflow_util::sha256_hex(text.as_bytes())
+        interflow_util::sha256_hex(
+            &RuntimePolicy::from_manifest(manifest, generation)
+                .to_bytes()
+                .map_err(crate::runtime::pack_error)?
+        )
     ))
 }
 
@@ -79,17 +81,11 @@ fn pack_dir_digest(dir: &Path) -> interflow_core::error::Result<String> {
     ))
 }
 
-/// The policy-only fast path: the identity face is unchanged, only mesh
-/// rules moved. Signs the next policy generation, writes the bundle for
-/// manual distribution, and publishes to the mesh hub when it is reachable
-/// (the hub cascades to online agents; offline agents catch up on
-/// reconnect). No pack is re-rendered and no identity is re-signed — the
-/// whole point of the policy-identity separation.
 /// The first hub's endpoint — the control-plane dial target for the policy
 /// floor query and the publish (empty when the manifest declares no hub;
 /// every control-plane call degrades to local watermarks / manual
 /// distribution).
-fn manifest_hub_endpoint(manifest: &Manifest) -> String {
+pub(crate) fn manifest_hub_endpoint(manifest: &Manifest) -> String {
     if let Some(hub) = manifest.mesh.hub.values().next() {
         return hub.endpoint.clone();
     }
@@ -106,6 +102,17 @@ fn manifest_hub_endpoint(manifest: &Manifest) -> String {
         .unwrap_or_default()
 }
 
+/// The policy-only fast path: the identity face is verified unchanged,
+/// only policy content moved. Signs the next policy generation, writes the
+/// bundle for manual distribution, and publishes to the mesh hub when it
+/// is reachable (the hub cascades to online agents; offline agents catch
+/// up on reconnect). No pack is re-rendered and no identity is re-signed —
+/// the whole point of the policy-identity separation.
+///
+/// The recorded baseline is the live declaration's face digest (not
+/// `prev`'s digest carried forward): the gate proved the face unchanged,
+/// so the freshly computed digest describes the same face and a stale
+/// cache heals here as a matter of course.
 fn apply_policy_only(
     issuer: &IssuerStore,
     manifest: &Manifest,
@@ -143,10 +150,7 @@ fn apply_policy_only(
             .map_err(interflow_core::error::InterflowError::Io)?;
         std::fs::write(bundle_dir.join("policy.sig"), &signature)
             .map_err(interflow_core::error::InterflowError::Io)?;
-        pushln!(
-            lines,
-            "✔ policy-only change: rules / services / routes moved, identity face unchanged — signed              policy generation {generation} (no pack re-rendered, no identity re-signed)"
-        );
+        pushln!(lines, "{}", narration::policy_only_signed(generation));
         match publish_with_ephemeral_credential(
             issuer,
             &manifest.realm.id,
@@ -163,7 +167,8 @@ fn apply_policy_only(
             PublishResult::Conflict(hub_floor) if attempt == 0 => {
                 pushln!(
                     lines,
-                    "  hub floor is generation {hub_floor} (advanced since the pre-flight query) —                      re-signing at {} and retrying",
+                    "  hub floor is generation {hub_floor} (advanced since the pre-flight query) — \
+                     re-signing at {} and retrying",
                     hub_floor + 1
                 );
                 generation = hub_floor + 1;
@@ -174,27 +179,15 @@ fn apply_policy_only(
         }
     }
     if !published {
-        pushln!(
-            lines,
-            "  manual distribution: copy {}/policy.toml + policy.sig into every node's              <pack>/state/policy/ (the reload watcher applies them, ≤10s)",
-            bundle_dir.display()
-        );
+        pushln!(lines, "{}", narration::manual_distribution(&bundle_dir));
     }
 
-    let digest = format!(
-        "sha256:{}",
-        interflow_util::sha256_hex(
-            &RuntimePolicy::from_manifest(manifest, generation)
-                .to_bytes()
-                .map_err(crate::runtime::pack_error)?
-        )
-    );
     issuer
         .record_applied(
             &AppliedState {
-                stripped_manifest_digest: prev.stripped_manifest_digest.clone(),
+                stripped_manifest_digest: identity_face_digest(manifest)?,
                 policy_generation: generation,
-                policy_digest: digest,
+                policy_digest: policy_digest_at(manifest, generation)?,
                 packs: prev.packs.clone(),
             },
             Some(manifest_text),
@@ -223,7 +216,7 @@ enum PublishResult {
 /// A short-lived control credential (realm-anchored hub member principal)
 /// materialized into a private temp dir — one minting serves the whole
 /// apply round (the hub floor query and the publish), the Drop cleans up.
-struct ControlCredential {
+pub(crate) struct ControlCredential {
     dir: std::path::PathBuf,
     ca: std::path::PathBuf,
     cert: std::path::PathBuf,
@@ -231,7 +224,7 @@ struct ControlCredential {
 }
 
 impl ControlCredential {
-    fn mint(issuer: &IssuerStore, realm: &str) -> interflow_core::error::Result<Self> {
+    pub(crate) fn mint(issuer: &IssuerStore, realm: &str) -> interflow_core::error::Result<Self> {
         let ttl = interflow_identity::issuance::LeafTtl::new(time::Duration::hours(1));
         let material = issuer
             .issue_hub_member_with_ttl(realm, "plan-apply", ttl)
@@ -267,7 +260,7 @@ impl ControlCredential {
     /// Runs one control-plane call on a dedicated thread with its own
     /// runtime so both the CLI (async main) and the GUI (blocking pool)
     /// can drive it synchronously.
-    fn call<T, F, Fut>(&self, endpoint: &str, f: F) -> interflow_core::error::Result<T>
+    pub(crate) fn call<T, F, Fut>(&self, endpoint: &str, f: F) -> interflow_core::error::Result<T>
     where
         F: FnOnce(String, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) -> Fut
             + Send
@@ -361,7 +354,8 @@ fn publish_with_ephemeral_credential(
         Ok(interflow_mesh::hub::policy::PublishOutcome::Published { generation }) => {
             pushln!(
                 lines,
-                "  published to hub {endpoint} → generation {generation}; online agents hot-apply"
+                "{}",
+                narration::published_to_hub(endpoint, generation)
             );
             PublishResult::Published(generation)
         }
@@ -604,6 +598,7 @@ fn policy_mint_floor(
 /// numbers masked the fourth — the hub's actual serving generation):
 /// adding a dimension without comparing it is now a structural decision,
 /// not a discipline matter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PolicyWatermarks {
     /// The issuer store's bookkeeping generation.
     bookkeeping: u64,
@@ -617,6 +612,7 @@ struct PolicyWatermarks {
 
 /// Why a digest match is NOT a no-op — every divergence shape has a name
 /// and its own narration (the re-publish line names what it reconciles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Divergence {
     /// Dist artifacts sit above the bookkeeping: a split the ledger can no
     /// longer see — a node state mirror is the surviving watermark of
@@ -663,6 +659,7 @@ impl Divergence {
 }
 
 /// The gate's verdict on one watermark picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateVerdict {
     /// Every observable watermark agrees with the bookkeeping — the digest
     /// match is a genuine no-op.
@@ -854,6 +851,67 @@ fn stale_trust_snapshot_in_tree(
     Ok(None)
 }
 
+/// Why the rendered pack tree is not "applied" in any useful sense — the
+/// two freshness probes' findings under one name, so the fork decision
+/// ([`classify_fork`]) and both faces' narration consume ONE value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreeStale {
+    /// A pack is not in the current pack format (retired vintage, damaged
+    /// or missing pack.toml, a wiped dist).
+    Format { dir: String, reason: PackTreeStale },
+    /// A pack's embedded CRL snapshot predates the issuer's deny list.
+    Trust {
+        dir: String,
+        reason: TrustSnapshotStale,
+    },
+}
+
+impl TreeStale {
+    /// The finding, as both faces embed it verbatim: `plan diff` inside its
+    /// prediction, `plan apply` inside the ✔ line that acts on it. One
+    /// string, two tenses around it — the facts cannot disagree.
+    fn fact(&self) -> String {
+        match self {
+            Self::Format { dir, reason } => {
+                format!("packs/{dir} is stale — {}", reason.narrate())
+            }
+            Self::Trust { dir, reason } => {
+                format!(
+                    "packs/{dir} carries a stale trust snapshot — {}",
+                    reason.narrate()
+                )
+            }
+        }
+    }
+
+    /// What the full re-render restores for this kind of staleness.
+    const fn consequence(&self) -> &'static str {
+        match self {
+            Self::Format { .. } => "the tree returns to the current format",
+            Self::Trust { .. } => "trust/crls/ picks up the issuer's current deny list",
+        }
+    }
+}
+
+/// The gate's pack-tree freshness probe — format first (a pack the strict
+/// loader refuses has no trust face to inspect), then trust. Pure reads of
+/// the dist tree and the issuer's deny list: the read face runs it at zero
+/// cost, which is the whole point — a probe only the write face runs is a
+/// prediction the read face cannot make.
+fn probe_pack_tree(
+    issuer_dir: &Path,
+    out_root: &Path,
+    manifest: &Manifest,
+) -> interflow_core::error::Result<Option<TreeStale>> {
+    if let Some((dir, reason)) = stale_pack_in_tree(out_root, manifest) {
+        return Ok(Some(TreeStale::Format { dir, reason }));
+    }
+    Ok(
+        stale_trust_snapshot_in_tree(issuer_dir, out_root, manifest)?
+            .map(|(dir, reason)| TreeStale::Trust { dir, reason }),
+    )
+}
+
 /// Enforces the issuer store's trust-root isolation contract at every entry
 /// point that mints material (`plan apply`, `plan rotate`; the GUI deploy
 /// page rides the same functions):
@@ -884,10 +942,7 @@ fn enforce_store_binding(
             issuer
                 .record_binding(&next)
                 .map_err(crate::runtime::pack_error)?;
-            let store_id = issuer
-                .store_uuid()
-                .map_err(crate::runtime::pack_error)?
-                .unwrap_or_default();
+            let store_id = issuer.store_uuid().map_err(crate::runtime::pack_error)?;
             pushln!(
                 lines,
                 "  issuer store {} bound to realm {} (manifest {})",
@@ -1128,9 +1183,12 @@ pub struct ApplyReport {
 /// The bookkeeping-level pre-check behind the GUI's "unapplied changes"
 /// face.
 ///
-/// Compare the manifest against the issuer store's applied state, WITHOUT
-/// minting or dialing anything (apply re-runs the full watermark-aware
-/// funnel; this answers only "would apply do anything, and which kind").
+/// Compare the manifest against the issuer store's applied state and the
+/// locally observable output tree, WITHOUT minting or dialing anything
+/// (apply re-runs the full watermark-aware funnel; this answers only "would
+/// apply do anything, and which kind"). Every variant is one fork of
+/// [`classify_fork`] — the SAME decision apply executes — so the pre-check
+/// cannot promise a fork the gate would not take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeState {
     /// No applied state in this issuer store — the first apply performs a
@@ -1146,86 +1204,402 @@ pub enum ChangeState {
     /// The identity/trust/dial face changed — the next apply re-renders
     /// every pack.
     IdentityEditsPending,
+    /// The declaration is unchanged but the rendered pack tree is not
+    /// "applied": a pack in a retired format, or an embedded CRL snapshot
+    /// that predates the issuer's deny list. The next apply re-renders
+    /// every pack and publishes above the watermarks (a new generation) —
+    /// whatever else is pending rides that render.
+    PackTreeStale,
+    /// The declaration is unchanged but the dist tree's signed artifacts
+    /// sit above the issuer bookkeeping (a node state mirror is the
+    /// surviving watermark of record). The next apply re-publishes the same
+    /// policy above the watermarks to reconcile — no pack re-renders.
+    WatermarksDiverged,
 }
 
-/// Computes [`ChangeState`] for one manifest against one issuer store.
+/// What the recorded baseline says about the live declaration, once
+/// verified — the one judgment both [`change_state`] (the pre-check) and
+/// [`apply`] (the gate) act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaselineVerdict {
+    /// The identity/trust/dial face is unchanged. `cache_stale` is `true`
+    /// when the recorded digest disagreed and the snapshot had to settle
+    /// it: the next write refreshes the digest in place — nothing renders
+    /// or publishes for that alone.
+    FaceUnchanged {
+        cache_stale: bool,
+        policy_moved: bool,
+    },
+    /// The identity/trust/dial face changed — settled against the snapshot,
+    /// never on the digest's disagreement alone.
+    FaceChanged,
+}
+
+/// Verifies the recorded baseline against the live declaration.
+///
+/// The recorded digest is a cache of the applied declaration snapshot; the
+/// snapshot is the truth. Hence: a digest that agrees settles the face
+/// question outright; one that disagrees is checked against the snapshot —
+/// both texts under the same rule, so the answer is exact whatever produced
+/// the recorded digest (a serialized-representation drift heals as a cache
+/// refresh, a real edit reads as one). A digest that disagrees while no
+/// snapshot exists cannot be settled at all: every record writes its
+/// snapshot, so that store's bookkeeping is damaged — fail closed and say
+/// so.
+///
+/// `face_now` is the digest of `manifest` (the caller has it anyway — it
+/// is what gets recorded).
+fn verify_baseline(
+    prev: &AppliedState,
+    snapshot: Option<&str>,
+    manifest: &Manifest,
+    face_now: &str,
+) -> interflow_core::error::Result<BaselineVerdict> {
+    let policy_moved = || {
+        Ok::<_, interflow_core::error::InterflowError>(
+            policy_digest_at(manifest, prev.policy_generation)? != prev.policy_digest,
+        )
+    };
+    // 1. The cache agrees: the face is unchanged, the cache is fresh.
+    if prev.stripped_manifest_digest == face_now {
+        return Ok(BaselineVerdict::FaceUnchanged {
+            cache_stale: false,
+            policy_moved: policy_moved()?,
+        });
+    }
+    // 2. The cache disagrees: the snapshot settles it, exactly.
+    let Some(text) = snapshot else {
+        return Err(interflow_core::error::InterflowError::config(
+            "the recorded baseline digest disagrees with the declaration and the store \
+             carries no declaration snapshot to settle it — the bookkeeping is damaged; \
+             re-run apply with --force-rerender to record a fresh baseline",
+        ));
+    };
+    let applied = Manifest::parse(text).map_err(|e| {
+        interflow_core::error::InterflowError::config(
+            "the applied declaration snapshot in the issuer store does not parse — the \
+             bookkeeping is damaged; re-run apply with --force-rerender to record a fresh \
+             baseline",
+        )
+        .with_source(e)
+    })?;
+    Ok(if identity_face_digest(&applied)? == face_now {
+        BaselineVerdict::FaceUnchanged {
+            cache_stale: true,
+            policy_moved: policy_moved()?,
+        }
+    } else {
+        BaselineVerdict::FaceChanged
+    })
+}
+
+/// Why the next apply walks the full-render fork — each reason carries the
+/// material its narration needs, so both faces say the same thing about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FullRenderReason {
+    /// No applied state in the issuer store.
+    FirstRender,
+    /// The identity/trust/dial face changed (settled against the snapshot).
+    IdentityEdit,
+    /// The rendered tree is not applied (see [`TreeStale`]).
+    StaleTree(TreeStale),
+}
+
+/// The fork the next `plan apply` takes — the ONE decision both faces
+/// consume: `plan diff`/[`change_state`] narrate and classify it, [`apply`]
+/// executes it. Until this type existed the write face decided inline and
+/// the read face re-derived the decision by hand, which is exactly how the
+/// read face came to promise "no render and no publish" for a tree the
+/// write face would re-render and publish.
+///
+/// The non-render forks carry the applied baseline they were derived from:
+/// the evidence the write face records against, by construction present
+/// wherever it is needed.
+#[derive(Debug)]
+enum ApplyFork<'a> {
+    /// Every pack re-renders; the policy generation mints above every
+    /// watermark and publishes.
+    FullRender(FullRenderReason),
+    /// Policy content moved under an unchanged face: sign and publish the
+    /// next generation, re-render nothing.
+    PolicyOnly {
+        prev: &'a AppliedState,
+        cache_stale: bool,
+    },
+    /// Every observable watermark agrees with the bookkeeping: nothing to
+    /// mint. `cache_stale` = a bookkeeping-only refresh of the baseline
+    /// digest is pending.
+    NoOp {
+        prev: &'a AppliedState,
+        cache_stale: bool,
+        watermarks: PolicyWatermarks,
+    },
+    /// The face is unchanged but a watermark diverged: re-publish the same
+    /// policy above the watermarks to reconcile.
+    Republish {
+        prev: &'a AppliedState,
+        cache_stale: bool,
+        watermarks: PolicyWatermarks,
+        divergence: Divergence,
+    },
+}
+
+impl ApplyFork<'_> {
+    /// The pre-check classification of this fork — the single mapping the
+    /// GUI badge and the CLI headline share.
+    const fn change_state(&self) -> ChangeState {
+        match self {
+            Self::FullRender(FullRenderReason::FirstRender) => ChangeState::NeverApplied,
+            Self::FullRender(FullRenderReason::IdentityEdit) => ChangeState::IdentityEditsPending,
+            Self::FullRender(FullRenderReason::StaleTree(_)) => ChangeState::PackTreeStale,
+            Self::PolicyOnly { .. } => ChangeState::PolicyEditsPending,
+            Self::NoOp { prev, .. } => ChangeState::Applied {
+                generation: prev.policy_generation,
+            },
+            Self::Republish { .. } => ChangeState::WatermarksDiverged,
+        }
+    }
+}
+
+/// Everything the fork decision reads — gathered by the caller (the read
+/// face loads it from paths, apply has it in hand), so the decision itself
+/// touches nothing the two faces could supply differently.
+struct ForkInputs<'a> {
+    issuer_dir: &'a Path,
+    out_root: &'a Path,
+    manifest: &'a Manifest,
+    /// The applied baseline and its declaration snapshot; `None` = never
+    /// applied.
+    baseline: Option<(&'a AppliedState, Option<&'a str>)>,
+    /// The current-rule digest of `manifest`.
+    face_now: &'a str,
+}
+
+/// Decides the fork the next `plan apply` takes. The order IS the gate:
+///
+/// 1. no baseline → first render;
+/// 2. [`verify_baseline`]: a changed face → full render (a digest
+///    disagreement the snapshot cannot settle is a damaged store — a loud
+///    error, not a fork);
+/// 3. an unchanged face is still not "applied" if the pack tree is stale
+///    ([`probe_pack_tree`]) → full render, whatever else is pending;
+/// 4. moved policy content → the policy-only fast path;
+/// 5. the watermark gate ([`policy_no_op_verdict`]) over the bookkeeping,
+///    the dist tree and — `hub_watermarks`, queried lazily right here, only
+///    when this step is reached — the running hub: agreement is the no-op,
+///    a divergence the re-publish.
+///
+/// `hub_watermarks` is the one input the faces supply differently: apply
+/// dials the hub, the read face returns `None` (no dial; the hub's own
+/// watermarks are re-queried at apply time, which `plan diff` says in as
+/// many words). Everything else is the same read for both.
+fn classify_fork<'a>(
+    inputs: &ForkInputs<'a>,
+    hub_watermarks: impl FnOnce() -> Option<interflow_mesh::hub::policy::PolicyFloorQuery>,
+) -> interflow_core::error::Result<(ApplyFork<'a>, Option<BaselineVerdict>)> {
+    let Some((prev, snapshot)) = inputs.baseline else {
+        return Ok((ApplyFork::FullRender(FullRenderReason::FirstRender), None));
+    };
+    let verdict = verify_baseline(prev, snapshot, inputs.manifest, inputs.face_now)?;
+    let fork = match verdict {
+        BaselineVerdict::FaceChanged => ApplyFork::FullRender(FullRenderReason::IdentityEdit),
+        BaselineVerdict::FaceUnchanged {
+            cache_stale,
+            policy_moved,
+        } => {
+            if let Some(stale) =
+                probe_pack_tree(inputs.issuer_dir, inputs.out_root, inputs.manifest)?
+            {
+                ApplyFork::FullRender(FullRenderReason::StaleTree(stale))
+            } else if policy_moved {
+                ApplyFork::PolicyOnly { prev, cache_stale }
+            } else {
+                let watermarks = PolicyWatermarks {
+                    bookkeeping: prev.policy_generation,
+                    dist: dist_policy_floor(inputs.out_root),
+                    hub: hub_watermarks(),
+                };
+                match policy_no_op_verdict(&watermarks) {
+                    GateVerdict::NoOp => ApplyFork::NoOp {
+                        prev,
+                        cache_stale,
+                        watermarks,
+                    },
+                    GateVerdict::Republish(divergence) => ApplyFork::Republish {
+                        prev,
+                        cache_stale,
+                        watermarks,
+                        divergence,
+                    },
+                }
+            }
+        }
+    };
+    Ok((fork, Some(verdict)))
+}
+
+/// The read face's loaded inputs — one manifest, one issuer store's applied
+/// baseline — owned so the fork can borrow them.
+struct ReadFace {
+    manifest: Manifest,
+    /// The manifest file's exact bytes as read (the vintage digest's
+    /// input — read once, shared by every consumer on this face).
+    manifest_text: String,
+    prev: Option<AppliedState>,
+    snapshot: Option<String>,
+    face_now: String,
+}
+
+impl ReadFace {
+    /// Pure reads: no store is materialized, no file renamed (a legacy JSON
+    /// pair stays a legacy JSON pair until the first write).
+    fn load(manifest_path: &Path, issuer_dir: &Path) -> interflow_core::error::Result<Self> {
+        let manifest_text = std::fs::read_to_string(manifest_path)?;
+        let manifest = Manifest::parse(&manifest_text).map_err(crate::runtime::pack_error)?;
+        let issuer = IssuerStore::open(issuer_dir);
+        let prev = issuer.applied_state().map_err(crate::runtime::pack_error)?;
+        let snapshot = if prev.is_some() {
+            issuer
+                .applied_manifest_text()
+                .map_err(crate::runtime::pack_error)?
+        } else {
+            None
+        };
+        let face_now = identity_face_digest(&manifest)?;
+        Ok(Self {
+            manifest,
+            manifest_text,
+            prev,
+            snapshot,
+            face_now,
+        })
+    }
+
+    /// The sha256 of the manifest file's exact bytes — the digest the
+    /// rendered artifacts' vintage lines carry. One read feeds the parsed
+    /// struct and this digest; the two cannot diverge mid-command.
+    fn manifest_sha256(&self) -> String {
+        interflow_util::sha256_hex(self.manifest_text.as_bytes())
+    }
+
+    fn inputs<'a>(&'a self, issuer_dir: &'a Path, out_root: &'a Path) -> ForkInputs<'a> {
+        ForkInputs {
+            issuer_dir,
+            out_root,
+            manifest: &self.manifest,
+            baseline: self
+                .prev
+                .as_ref()
+                .map(|prev| (prev, self.snapshot.as_deref())),
+            face_now: &self.face_now,
+        }
+    }
+}
+
+/// Computes [`ChangeState`] for one manifest against one issuer store and
+/// one output tree — the fork [`apply`] would take, read-only (no mint, no
+/// hub dial; the dist tree and the deny list are local reads).
 pub fn change_state(
     manifest_path: &Path,
     issuer_dir: &Path,
+    out_root: &Path,
 ) -> interflow_core::error::Result<ChangeState> {
-    let manifest = Manifest::load(manifest_path).map_err(crate::runtime::pack_error)?;
-    let issuer = IssuerStore::open(issuer_dir);
-    let Some(prev) = issuer.applied_state().map_err(crate::runtime::pack_error)? else {
-        return Ok(ChangeState::NeverApplied);
-    };
-    let stripped_now = stripped_manifest_digest(&manifest)?;
-    if prev.stripped_manifest_digest != stripped_now {
-        return Ok(ChangeState::IdentityEditsPending);
-    }
-    let candidate = RuntimePolicy::from_manifest(&manifest, prev.policy_generation);
-    let candidate_digest = format!(
-        "sha256:{}",
-        interflow_util::sha256_hex(&candidate.to_bytes().map_err(crate::runtime::pack_error)?)
-    );
-    if candidate_digest == prev.policy_digest {
-        Ok(ChangeState::Applied {
-            generation: prev.policy_generation,
-        })
-    } else {
-        Ok(ChangeState::PolicyEditsPending)
-    }
+    let face = ReadFace::load(manifest_path, issuer_dir)?;
+    let (fork, _) = classify_fork(&face.inputs(issuer_dir, out_root), || None)?;
+    Ok(fork.change_state())
 }
 
 /// The drift view — `plan diff`, the declaration-vs-applied review face
 /// (the same shape `kubectl diff` answers for submitted-vs-live).
 ///
-/// The classification ([`change_state`]) headlines; the body is a line
-/// diff of the declaration against the exact text the last apply
+/// The fork headlines ([`classify_fork`] — the decision apply executes,
+/// narrated in the future tense from the same evidence); the body is a
+/// line diff of the declaration against the exact text the last apply
 /// snapshotted, so what the next `plan apply` would change reads line by
-/// line before anything is minted. Stores whose applied state predates
-/// snapshots (absorbed from the legacy `applied.json`) classify but carry
-/// no text to diff — one apply records the baseline.
-pub fn diff(manifest_path: &Path, issuer_dir: &Path) -> interflow_core::error::Result<Vec<String>> {
+/// line before anything is minted. Every promise-bearing phrase comes from
+/// [`narration`]: the preview-honorability contract test parses the same
+/// constants.
+pub fn diff(
+    manifest_path: &Path,
+    issuer_dir: &Path,
+    out_root: &Path,
+) -> interflow_core::error::Result<Vec<String>> {
     let mut lines = Vec::new();
-    let state = change_state(manifest_path, issuer_dir)?;
-    match state {
-        ChangeState::NeverApplied => {
-            pushln!(
-                lines,
-                "never applied — the next `plan apply` performs the full first render"
-            );
+    let face = ReadFace::load(manifest_path, issuer_dir)?;
+    let (fork, verdict) = classify_fork(&face.inputs(issuer_dir, out_root), || None)?;
+    let policy_moved = matches!(
+        verdict,
+        Some(BaselineVerdict::FaceUnchanged {
+            policy_moved: true,
+            ..
+        })
+    );
+    match &fork {
+        ApplyFork::FullRender(FullRenderReason::FirstRender) => {
+            pushln!(lines, "{}", narration::never_applied());
             return Ok(lines);
         }
-        ChangeState::Applied { generation } => pushln!(
-            lines,
-            "the declaration matches the applied state (policy generation {generation}) — \
-             nothing to apply"
-        ),
-        ChangeState::PolicyEditsPending => pushln!(
-            lines,
-            "policy-face edits pending — the next `plan apply` takes the policy-only fast \
-             path (no pack re-rendered, no identity re-signed)"
-        ),
-        ChangeState::IdentityEditsPending => pushln!(
-            lines,
-            "identity-face edits pending — the next `plan apply` re-renders every pack"
-        ),
+        ApplyFork::FullRender(FullRenderReason::IdentityEdit) => {
+            pushln!(lines, "{}", narration::identity_edits_pending());
+        }
+        ApplyFork::FullRender(FullRenderReason::StaleTree(stale)) => {
+            pushln!(lines, "{}", narration::pack_tree_stale_preview(stale));
+            if policy_moved {
+                pushln!(lines, "{}", narration::fast_path_superseded());
+            }
+        }
+        ApplyFork::PolicyOnly { cache_stale, .. } => {
+            pushln!(lines, "{}", narration::policy_edits_pending());
+            if *cache_stale {
+                pushln!(lines, "{}", narration::baseline_cache_refresh_preview());
+            }
+        }
+        ApplyFork::NoOp {
+            prev, cache_stale, ..
+        } => {
+            pushln!(
+                lines,
+                "{}",
+                narration::applied_matches(prev.policy_generation)
+            );
+            if *cache_stale {
+                pushln!(lines, "{}", narration::baseline_cache_refresh_preview());
+            }
+            if !manifest_hub_endpoint(&face.manifest).is_empty() {
+                pushln!(lines, "{}", narration::hub_watermarks_caveat());
+            }
+        }
+        ApplyFork::Republish {
+            prev,
+            cache_stale,
+            watermarks,
+            divergence,
+        } => {
+            pushln!(
+                lines,
+                "{}",
+                narration::watermarks_diverged_preview(
+                    prev.policy_generation,
+                    watermarks.dist,
+                    divergence
+                )
+            );
+            if *cache_stale {
+                pushln!(lines, "{}", narration::baseline_cache_refresh_preview());
+            }
+        }
     }
-    let issuer = IssuerStore::open(issuer_dir);
-    let Some(applied_text) = issuer
-        .applied_manifest_text()
-        .map_err(crate::runtime::pack_error)?
-    else {
+    let Some(applied_text) = face.snapshot.as_deref() else {
         pushln!(
             lines,
-            "no declaration snapshot exists for the applied state (it predates snapshots) — \
-             apply once to record the drift baseline"
+            "no declaration snapshot exists for the applied state — the bookkeeping is \
+             damaged; apply with --force-rerender to record a fresh baseline"
         );
         return Ok(lines);
     };
     let current = std::fs::read_to_string(manifest_path)
         .map_err(interflow_core::error::InterflowError::Io)?;
-    let text_diff = similar::TextDiff::from_lines(&applied_text, &current);
+    let text_diff = similar::TextDiff::from_lines(applied_text, &current);
     let mut buf = Vec::new();
     {
         let mut unified = text_diff.unified_diff();
@@ -1464,6 +1838,32 @@ pub fn hub_overview(
     )
 }
 
+/// One blocking-watch cycle of the hub's floor version clock with a
+/// freshly minted control credential.
+///
+/// The GUI's hub floor watcher drives this (its loop owns the
+/// backoff/reconnect cadence; this is one cycle: dial, hold up to
+/// `wait_secs`, answer with the current version). `None` = the manifest
+/// names no hub endpoint (nothing to watch).
+pub fn hub_floor_watch_cycle(
+    manifest_path: &Path,
+    issuer_dir: &Path,
+    since: u64,
+    wait_secs: u64,
+) -> interflow_core::error::Result<Option<u64>> {
+    Ok(with_hub_control_credential(
+        manifest_path,
+        issuer_dir,
+        move |ep, ca, cert, key| async move {
+            interflow_mesh::hub::policy::watch_floor_version(
+                &ep, &ca, &cert, &key, since, wait_secs,
+            )
+            .await
+        },
+    )?
+    .map(|(_, version)| version))
+}
+
 /// The shared plumbing behind every CLI operator query against a running
 /// hub.
 ///
@@ -1559,8 +1959,8 @@ fn ensure_backup_configured(
     };
     pushln!(
         lines,
-        "✔ issuer store backup configured — every change now checkpoints an encrypted, \
-         versioned copy to {}",
+        "{} — every change now checkpoints an encrypted, versioned copy to {}",
+        narration::action::BACKUP_CONFIGURED,
         cfg.backup_dir.display()
     );
     if let Some(identity) = generated {
@@ -1633,146 +2033,167 @@ pub fn apply(
             .map_err(crate::runtime::pack_error)?;
     }
 
-    // The policy-only fast path: the identity/trust/dial face is unchanged
-    // and only mesh rules moved → sign the next policy generation and
-    // publish; no pack is re-rendered, no identity is re-signed, no
-    // endpoint is touched.
-    let stripped_now = stripped_manifest_digest(&manifest)?;
+    // The policy-only fast path: the identity/trust/dial face is verified
+    // unchanged and only policy content moved → sign the next policy
+    // generation and publish; no pack is re-rendered, no identity is
+    // re-signed, no endpoint is touched.
+    // The gate below is ONE decision ([`classify_fork`]) — the same
+    // function `plan diff` narrates from, so the preview and the gate
+    // cannot disagree about which fork apply takes.
+    let face_now = identity_face_digest(&manifest)?;
+    // The control-plane dial target — the gate's hub query and every
+    // publish below share it.
+    let endpoint = manifest_hub_endpoint(&manifest);
     if force_rerender {
-        pushln!(
-            lines,
-            "⚠ --force-rerender: the no-op gate is skipped — every pack re-renders above the \
-             watermarks (generation continuity preserved)"
+        // The operator's explicit exit from the gate — not a fork the gate
+        // decided, which is why the read face has no equivalent: diff never
+        // bypasses anything.
+        pushln!(lines, "{}", narration::force_rerender_notice());
+    } else {
+        // Read the baseline only when the gate runs: --force-rerender must
+        // succeed past a damaged baseline (it is the documented recovery).
+        let prev = issuer.applied_state().map_err(crate::runtime::pack_error)?;
+        let snapshot = issuer
+            .applied_manifest_text()
+            .map_err(crate::runtime::pack_error)?;
+        let inputs = ForkInputs {
+            issuer_dir,
+            out_root,
+            manifest: &manifest,
+            baseline: prev.as_ref().map(|prev| (prev, snapshot.as_deref())),
+            face_now: &face_now,
+        };
+        // The hub dial is the gate's own, queried only when the decision
+        // reaches the watermark step (the same laziness the inline gate
+        // had: a policy-only or full render never dials for the gate).
+        let (fork, verdict) = classify_fork(&inputs, || {
+            hub_watermarks_with_ephemeral_credential(&issuer, &manifest.realm.id, &endpoint)
+        })?;
+        let policy_moved = matches!(
+            verdict,
+            Some(BaselineVerdict::FaceUnchanged {
+                policy_moved: true,
+                ..
+            })
         );
-    } else if let Some(prev) = issuer.applied_state().map_err(crate::runtime::pack_error)?
-        && prev.stripped_manifest_digest == stripped_now
-    {
-        // Pack-tree freshness (2026-10-12 fix): a digest match plus agreeing
-        // watermarks still says nothing about the PACK format vintage. A
-        // stale pack tree (retired format, missing pack.toml) is not
-        // "applied" in any useful sense — and the policy-only path would
-        // leave it stale forever. Fall through to the full render, which
-        // re-renders every pack above the watermarks; the fresh tree then
-        // converges back to no-ops.
-        if let Some((pack_dir, reason)) = stale_pack_in_tree(out_root, &manifest) {
-            pushln!(
-                lines,
-                "✔ manifest unchanged, but packs/{pack_dir} is stale — {} — re-rendering every \
-                 pack above the watermarks to the current format",
-                reason.narrate()
-            );
-        } else if let Some((pack_dir, reason)) =
-            stale_trust_snapshot_in_tree(issuer_dir, out_root, &manifest)?
-        {
-            // The trust twin of the format probe above: a revoke that moved
-            // the deny list since the packs rendered means the tree is not
-            // "applied" in any security sense — fall through to the full
-            // render so every pack re-embeds the current CRL snapshot (the
-            // hub, if reachable, additionally receives the push below).
-            pushln!(
-                lines,
-                "✔ manifest unchanged, but packs/{pack_dir} carries a stale trust snapshot — \
-                 {} — re-rendering every pack so trust/crls/ picks up the issuer's current \
-                 deny list",
-                reason.narrate()
-            );
-        } else {
-            let candidate = RuntimePolicy::from_manifest(&manifest, prev.policy_generation);
-            let candidate_digest = format!(
-                "sha256:{}",
-                interflow_util::sha256_hex(
-                    &candidate.to_bytes().map_err(crate::runtime::pack_error)?
-                )
-            );
-            if candidate_digest == prev.policy_digest {
-                // Watermark-aware no-op gate (2026-10-06 fix): a digest match
-                // alone no longer proves "applied" — the bookkeeping may sit
-                // below a split it cannot see (node state mirrors, a
-                // reinstalled hub, another operator's higher publish). Only
-                // when EVERY observable watermark — including, since the
-                // 2026-10-07 fix, what the hub actually SERVES — agrees with
-                // the bookkeeping is this a true no-op; otherwise the same
-                // manifest is re-published ABOVE the watermarks — exactly what
-                // the hub's inverted-watermark WARN tells the operator to do
-                let endpoint = manifest_hub_endpoint(&manifest);
-                let watermarks = PolicyWatermarks {
-                    bookkeeping: prev.policy_generation,
-                    dist: dist_policy_floor(out_root),
-                    hub: hub_watermarks_with_ephemeral_credential(
-                        &issuer,
-                        &manifest.realm.id,
-                        &endpoint,
-                    ),
-                };
-                match policy_no_op_verdict(&watermarks) {
-                    GateVerdict::NoOp => {
-                        pushln!(
-                            lines,
-                            "✔ manifest already applied — policy generation {} is live, nothing to do",
-                            prev.policy_generation
-                        );
-                        if !endpoint.is_empty() && watermarks.hub.is_none() {
-                            pushln!(
-                                lines,
-                                "  hub {endpoint} unreachable — its serving generation was not \
-                                 verified; re-run apply once the hub is reachable"
-                            );
-                        } else if watermarks.hub.is_some_and(|hub| hub.serving.is_none()) {
-                            pushln!(
-                                lines,
-                                "  hub {endpoint} did not report its serving generation (an older \
-                                 hub build) — serving was not verified; upgrade the hub to close \
-                                 the gap"
-                            );
-                        }
-                        return Ok(ApplyReport {
-                            lines,
-                            generation: prev.policy_generation,
-                        });
-                    }
-                    GateVerdict::Republish(divergence) => {
-                        pushln!(
-                            lines,
-                            "✔ manifest unchanged, but the watermarks diverge from the issuer \
-                             bookkeeping (bookkeeping {}, dist artifacts {}, hub floor {}, hub \
-                             serving {}) — {} — re-publishing above the watermarks to reconcile",
-                            watermarks.bookkeeping,
-                            watermarks.dist,
-                            watermarks.hub.map_or_else(
-                                || "unreachable".to_string(),
-                                |hub| hub.floor.to_string()
-                            ),
-                            watermarks.hub.map_or_else(
-                                || "unreachable".to_string(),
-                                |hub| hub
-                                    .serving
-                                    .map_or_else(|| "not reported".to_string(), |s| s.to_string())
-                            ),
-                            divergence.narrate()
-                        );
-                        let generation = apply_policy_only(
-                            &issuer,
-                            &manifest,
-                            &manifest_text,
-                            &prev,
-                            out_root,
-                            watermarks.hub,
-                            &mut lines,
-                        )?;
-                        return Ok(ApplyReport { lines, generation });
+        match fork {
+            ApplyFork::FullRender(reason) => match reason {
+                // A stale tree outranks everything else the unchanged-face
+                // branch might have done (the policy-only fast path would
+                // leave it stale forever); the render below fixes the tree
+                // and carries whatever else is pending.
+                FullRenderReason::StaleTree(stale) => {
+                    pushln!(lines, "{}", narration::pack_tree_stale_action(&stale));
+                    if policy_moved {
+                        pushln!(lines, "{}", narration::fast_path_superseded());
                     }
                 }
+                // First render and identity edits narrate through the
+                // render itself below.
+                FullRenderReason::FirstRender | FullRenderReason::IdentityEdit => {}
+            },
+            ApplyFork::PolicyOnly { prev, cache_stale } => {
+                // Every path below records the digest freshly computed from
+                // the declaration: the policy-only record does so by
+                // construction.
+                if cache_stale {
+                    pushln!(lines, "{}", narration::baseline_cache_refresh_action());
+                }
+                let generation = apply_policy_only(
+                    &issuer,
+                    &manifest,
+                    &manifest_text,
+                    prev,
+                    out_root,
+                    None,
+                    &mut lines,
+                )?;
+                return Ok(ApplyReport { lines, generation });
             }
-            let generation = apply_policy_only(
-                &issuer,
-                &manifest,
-                &manifest_text,
-                &prev,
-                out_root,
-                None,
-                &mut lines,
-            )?;
-            return Ok(ApplyReport { lines, generation });
+            ApplyFork::NoOp {
+                prev,
+                cache_stale,
+                watermarks,
+            } => {
+                // Watermark-aware no-op gate (2026-10-06 fix): a digest
+                // match alone no longer proves "applied" — the bookkeeping
+                // may sit below a split it cannot see (node state mirrors,
+                // a reinstalled hub, another operator's higher publish).
+                // Only when EVERY observable watermark — including, since
+                // the 2026-10-07 fix, what the hub actually SERVES —
+                // agrees with the bookkeeping is this a true no-op.
+                if cache_stale {
+                    // Bookkeeping only: same generation, same policy, same
+                    // packs — the digest cache refreshed from the
+                    // declaration the snapshot already proved unchanged.
+                    pushln!(lines, "{}", narration::baseline_cache_refresh_action());
+                    issuer
+                        .record_applied(
+                            &AppliedState {
+                                stripped_manifest_digest: face_now.clone(),
+                                policy_generation: prev.policy_generation,
+                                policy_digest: prev.policy_digest.clone(),
+                                packs: prev.packs.clone(),
+                            },
+                            Some(&manifest_text),
+                            AppliedKind::BaselineRestamp,
+                        )
+                        .map_err(crate::runtime::pack_error)?;
+                    pushln!(
+                        lines,
+                        "{}",
+                        narration::already_applied_restamped(prev.policy_generation)
+                    );
+                } else {
+                    pushln!(
+                        lines,
+                        "{}",
+                        narration::already_applied_nothing_to_do(prev.policy_generation)
+                    );
+                }
+                if !endpoint.is_empty() && watermarks.hub.is_none() {
+                    pushln!(
+                        lines,
+                        "  hub {endpoint} unreachable — its serving generation was not \
+                         verified; re-run apply once the hub is reachable"
+                    );
+                } else if watermarks.hub.is_some_and(|hub| hub.serving.is_none()) {
+                    pushln!(
+                        lines,
+                        "  hub {endpoint} did not report its serving generation (an older hub \
+                         build) — serving was not verified; upgrade the hub to close the gap"
+                    );
+                }
+                return Ok(ApplyReport {
+                    lines,
+                    generation: prev.policy_generation,
+                });
+            }
+            ApplyFork::Republish {
+                prev,
+                cache_stale,
+                watermarks,
+                divergence,
+            } => {
+                if cache_stale {
+                    pushln!(lines, "{}", narration::baseline_cache_refresh_action());
+                }
+                pushln!(
+                    lines,
+                    "{}",
+                    narration::watermarks_diverged_action(&watermarks, &divergence)
+                );
+                let generation = apply_policy_only(
+                    &issuer,
+                    &manifest,
+                    &manifest_text,
+                    prev,
+                    out_root,
+                    watermarks.hub,
+                    &mut lines,
+                )?;
+                return Ok(ApplyReport { lines, generation });
+            }
         }
     }
 
@@ -1783,7 +2204,6 @@ pub fn apply(
     // hub's floor). The former hard reset to 1 froze every online agent
     // holding a higher watermark: anti-rollback refused all subsequent
     // policies, silently.
-    let endpoint = manifest_hub_endpoint(&manifest);
     let (floor, _) = policy_mint_floor(
         &issuer,
         out_root,
@@ -1821,6 +2241,9 @@ pub fn apply(
         // deployments), frontend-proxy nginx fragments and the bootstrap
         // script — all derived from the manifest (render.rs owns the layout
         // convention). Idempotent writes: a conflict re-render rewrites them.
+        // The vintage digest is the manifest's exact bytes — the same read
+        // the parsed struct came from.
+        let manifest_sha = interflow_util::sha256_hex(manifest_text.as_bytes());
         for pack in &rendered_packs {
             let mesh_role = pack.metadata.kind == interflow_identity::pack::PackKind::Hub
                 || manifest.agent_has_mesh_role(&pack.metadata.node);
@@ -1833,10 +2256,15 @@ pub fn apply(
             )?;
         }
         if render::has_registrar(&manifest) {
-            render::write_registrar_unit(out_root, &manifest, render::DEFAULT_INSTALL_ROOT)?;
+            render::write_registrar_unit(
+                out_root,
+                &manifest,
+                render::DEFAULT_INSTALL_ROOT,
+                &manifest_sha,
+            )?;
         }
-        render::write_nginx_fragments(out_root, &manifest)?;
-        render::write_install_sh(out_root, &manifest)?;
+        render::write_nginx_fragments(out_root, &manifest, &manifest_sha)?;
+        render::write_install_sh(out_root, &manifest, &manifest_sha)?;
 
         // Mirror the render-generation bundle into dist/policy: the manual
         // distribution channel must never trail what the packs embed.
@@ -1871,7 +2299,8 @@ pub fn apply(
             PublishResult::Conflict(hub_floor) if attempt == 0 => {
                 pushln!(
                     lines,
-                    "  hub floor is generation {hub_floor} (advanced since the pre-flight                      query) — re-rendering packs at {} and retrying",
+                    "  hub floor is generation {hub_floor} (advanced since the pre-flight query) — \
+                     re-rendering packs at {} and retrying",
                     hub_floor + 1
                 );
                 render_generation = hub_floor + 1;
@@ -1887,8 +2316,8 @@ pub fn apply(
     if !published {
         pushln!(
             lines,
-            "  manual distribution: copy {}/policy.toml + policy.sig into every node's              <pack>/state/policy/ (the reload watcher applies them, ≤10s)",
-            out_root.join("policy").display()
+            "{}",
+            narration::manual_distribution(&out_root.join("policy"))
         );
     }
     // Close the staging windows this render supersedes: the bases now sit at
@@ -1925,10 +2354,7 @@ pub fn apply(
                 pack.metadata.leaf_ttl_secs,
             )?;
         }
-        pushln!(
-            lines,
-            "  embedded revocation snapshot in trust/crls/ of every pack (covers every issuer)"
-        );
+        pushln!(lines, "{}", narration::embedded_revocation_snapshot());
         // Deliver the same deny list to the running hub over the control
         // plane — the offline tier has no pull lane of its own, so the
         // render pushes: the hub hot-swaps onto the fresh CRLs without a
@@ -1962,20 +2388,12 @@ pub fn apply(
             packs.insert(pack.metadata.node.clone(), digest);
         }
     }
-    let embedded_policy = RuntimePolicy::from_manifest(&manifest, render_generation);
     issuer
         .record_applied(
             &AppliedState {
-                stripped_manifest_digest: stripped_now,
+                stripped_manifest_digest: face_now,
                 policy_generation: render_generation,
-                policy_digest: format!(
-                    "sha256:{}",
-                    interflow_util::sha256_hex(
-                        &embedded_policy
-                            .to_bytes()
-                            .map_err(crate::runtime::pack_error)?
-                    )
-                ),
+                policy_digest: policy_digest_at(&manifest, render_generation)?,
                 packs,
             },
             Some(&manifest_text),
@@ -1983,12 +2401,7 @@ pub fn apply(
         )
         .map_err(crate::runtime::pack_error)?;
 
-    pushln!(
-        lines,
-        "✔ applied {} → {}",
-        manifest_path.display(),
-        out_root.display()
-    );
+    pushln!(lines, "{}", narration::applied(manifest_path, out_root));
     pushln!(
         lines,
         "  issuer store: {} (keep secret — never distribute)",
@@ -2025,15 +2438,23 @@ pub fn apply(
         pushln!(lines, "deploy, per server:");
         pushln!(
             lines,
-            "  1. copy this dist tree to the server (or just its node's pack + install.sh)"
+            "  1. interflow-cli plan stage --host <kind>/<node>   # minimal verified tree: bin/ + pack + tar"
         );
         pushln!(
             lines,
-            "  2. sudo bash install.sh   # once per server: user, dirs, bin/ (no units)"
+            "     (one machine, several nodes: add --with <kind>/<node> per extra node — one tree, one install)"
         );
         pushln!(
             lines,
-            "  3. per node:  sudo interflow-cli node install --pack packs/<kind>-<node>   # pack + unit + enable"
+            "  2. scp stage/<kind>-<node>.tar (+ .sha256) to the server, sha256sum -c, untar"
+        );
+        pushln!(
+            lines,
+            "  3. bash install.sh --verify-staging && sudo bash install.sh   # user, dirs, bin/ (no units)"
+        );
+        pushln!(
+            lines,
+            "  4. per node:  sudo interflow-cli node install --pack packs/<kind>-<node>   # pack + unit + enable"
         );
         pushln!(
             lines,
@@ -2167,20 +2588,16 @@ pub fn rotate(
     // Refresh the applied state's policy bookkeeping: the rotated pack
     // embeds the manifest's policy at the new generation (nodes may still
     // serve a higher generation from their state channel — the publish
-    // path's floor-retry reconciles).
+    // path's floor-retry reconciles). The face digest rides along
+    // untouched: rotate re-renders one node, it does not verify the
+    // declaration's face against the baseline — that is apply's job.
     if let Some(applied) = issuer.applied_state().map_err(crate::runtime::pack_error)? {
-        let policy = RuntimePolicy::from_manifest(&manifest, next_generation);
         issuer
             .record_applied(
                 &AppliedState {
                     stripped_manifest_digest: applied.stripped_manifest_digest,
                     policy_generation: next_generation,
-                    policy_digest: format!(
-                        "sha256:{}",
-                        interflow_util::sha256_hex(
-                            &policy.to_bytes().map_err(crate::runtime::pack_error)?
-                        )
-                    ),
+                    policy_digest: policy_digest_at(&manifest, next_generation)?,
                     packs: applied.packs,
                 },
                 Some(&manifest_text),
@@ -2988,7 +3405,7 @@ target_cidr = "127.0.0.0/8"
 
     std::fs::write(&manifest, mesh_text(11434, "cs-test")).unwrap();
     assert!(matches!(
-        change_state(&manifest, &issuer).unwrap(),
+        change_state(&manifest, &issuer, &out).unwrap(),
         ChangeState::NeverApplied
     ));
 
@@ -3007,12 +3424,12 @@ target_cidr = "127.0.0.0/8"
         "{:?}",
         report.lines
     );
-    match change_state(&manifest, &issuer).unwrap() {
+    match change_state(&manifest, &issuer, &out).unwrap() {
         ChangeState::Applied { generation } => assert_eq!(generation, 1),
         other => panic!("expected Applied(1), got {other:?}"),
     }
     // The drift view agrees with the bookkeeping: applied, no drift.
-    let drift = diff(&manifest, &issuer).unwrap();
+    let drift = diff(&manifest, &issuer, &out).unwrap();
     assert!(
         drift
             .iter()
@@ -3027,11 +3444,11 @@ target_cidr = "127.0.0.0/8"
     // A stream-face edit (the remote port moved): policy-pending.
     std::fs::write(&manifest, mesh_text(11435, "cs-test")).unwrap();
     assert!(matches!(
-        change_state(&manifest, &issuer).unwrap(),
+        change_state(&manifest, &issuer, &out).unwrap(),
         ChangeState::PolicyEditsPending
     ));
     // The drift view headlines the classification and shows the line move.
-    let drift = diff(&manifest, &issuer).unwrap();
+    let drift = diff(&manifest, &issuer, &out).unwrap();
     assert!(
         drift
             .iter()
@@ -3066,14 +3483,631 @@ target_cidr = "127.0.0.0/8"
     .unwrap();
     assert_eq!(report.generation, 2, "policy-only apply mints gen 2");
     assert!(matches!(
-        change_state(&manifest, &issuer).unwrap(),
+        change_state(&manifest, &issuer, &out).unwrap(),
         ChangeState::Applied { generation: 2 }
     ));
 
     // An identity-face edit (the realm id moved): identity-pending.
     std::fs::write(&manifest, mesh_text(11435, "cs-test-2")).unwrap();
     assert!(matches!(
-        change_state(&manifest, &issuer).unwrap(),
+        change_state(&manifest, &issuer, &out).unwrap(),
         ChangeState::IdentityEditsPending
+    ));
+}
+
+/// Renders the declaration at `manifest` into `out` once — a real apply, a
+/// real pack tree — and then strips the issuer store back to the bare
+/// directory the hand-crafted baselines below are written into. The read
+/// face classifies against the OUTPUT TREE too (a missing or retired pack
+/// is a stale tree the gate would re-render), so a baseline fixture without
+/// a tree would honestly classify as [`ChangeState::PackTreeStale`].
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+fn render_tree_then_forget_the_bookkeeping(manifest: &Path, issuer: &Path, out: &Path) {
+    apply(
+        manifest,
+        issuer,
+        out,
+        false,
+        &BackupInitOptions::default(),
+        false,
+    )
+    .unwrap();
+    for file in ["store.db", "store.db-wal", "store.db-shm"] {
+        let path = issuer.join(file);
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+}
+
+/// A mesh declaration plus one service-only agent — material the current
+/// strip rule empties and the v1 rule kept, so the two rules disagree on
+/// it (a mesh-only declaration would make them coincide and hide the
+/// vintage; one agent cannot carry both roles, so the service rides its
+/// own node). `remote_port` moves the mesh rule face (invisible to every
+/// rule); `service_port` moves the service (invisible to the current rule,
+/// visible to v1); `realm` moves the identity face (visible to every rule).
+#[cfg(test)]
+fn vintage_fixture(realm: &str, remote_port: u16, service_port: u16) -> String {
+    format!(
+        r#"
+[realm]
+id = "{realm}"
+[identity]
+mode = "offline"
+leaf_ttl = "7d"
+[mesh.hub.promptcn]
+listen = "127.0.0.1:16666"
+endpoint = "127.0.0.1:1"
+[workspace.main]
+[agent.svc-host]
+workspace = "main"
+[[agent.svc-host.services]]
+id = "asr"
+address = "127.0.0.1:{service_port}"
+[agent.leo-mesh]
+workspace = "main"
+[[agent.leo-mesh.mesh_ingress]]
+name = "ollama"
+listen = "127.0.0.1:24001"
+target_agent = "home-win"
+remote_addr = "127.0.0.1:{remote_port}"
+[agent.home-win]
+workspace = "main"
+[[agent.home-win.mesh_egress]]
+name = "loopback"
+target_cidr = "127.0.0.0/8"
+"#
+    )
+}
+
+/// [`verify_baseline`] — the judgment `plan diff` and `plan apply` share.
+/// The digest is a cache; the snapshot is the truth: agreement settles the
+/// face outright, a disagreement is settled against the snapshot (exact —
+/// the same rule over both texts, whatever produced the recorded digest),
+/// and a disagreement nothing can settle is a damaged store, refused
+/// loudly.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines
+)]
+fn verify_baseline_settles_digest_disagreements_against_the_snapshot() {
+    use BaselineVerdict::{FaceChanged, FaceUnchanged};
+
+    let base_text = vintage_fixture("cache", 11434, 8080);
+    let base = Manifest::parse(&base_text).unwrap();
+    let mesh_edit = Manifest::parse(&vintage_fixture("cache", 11435, 8080)).unwrap();
+    let service_edit = Manifest::parse(&vintage_fixture("cache", 11434, 8081)).unwrap();
+    let realm_edit = Manifest::parse(&vintage_fixture("cache-2", 11434, 8080)).unwrap();
+    let recorded = |digest: &str| AppliedState {
+        stripped_manifest_digest: digest.to_owned(),
+        policy_generation: 3,
+        policy_digest: policy_digest_at(&base, 3).unwrap(),
+        packs: BTreeMap::new(),
+    };
+    let verify = |prev: &AppliedState, snapshot: Option<&str>, manifest: &Manifest| {
+        verify_baseline(
+            prev,
+            snapshot,
+            manifest,
+            &identity_face_digest(manifest).unwrap(),
+        )
+    };
+
+    // 1. The cache agrees: the face is unchanged and the cache is fresh —
+    //    whatever else the declaration does is policy material or nothing.
+    let fresh = recorded(&identity_face_digest(&base).unwrap());
+    assert_eq!(
+        verify(&fresh, Some(&base_text), &base).unwrap(),
+        FaceUnchanged {
+            cache_stale: false,
+            policy_moved: false
+        }
+    );
+    assert_eq!(
+        verify(&fresh, Some(&base_text), &mesh_edit).unwrap(),
+        FaceUnchanged {
+            cache_stale: false,
+            policy_moved: true
+        },
+        "a mesh-rule edit is policy material"
+    );
+    assert_eq!(
+        verify(&fresh, Some(&base_text), &service_edit).unwrap(),
+        FaceUnchanged {
+            cache_stale: false,
+            policy_moved: true
+        },
+        "a service edit is policy material"
+    );
+
+    // 2. The cache disagrees (a stale cache, however it got that way); the
+    //    snapshot settles every edit exactly: zero drift or a policy-only
+    //    edit proves the face unchanged (the cache heals on the next
+    //    write), an identity edit reads as one.
+    let stale = recorded("sha256:a-stale-cache");
+    assert_eq!(
+        verify(&stale, Some(&base_text), &base).unwrap(),
+        FaceUnchanged {
+            cache_stale: true,
+            policy_moved: false
+        },
+        "zero drift: only the cache is stale"
+    );
+    assert_eq!(
+        verify(&stale, Some(&base_text), &service_edit).unwrap(),
+        FaceUnchanged {
+            cache_stale: true,
+            policy_moved: true
+        }
+    );
+    assert_eq!(
+        verify(&stale, Some(&base_text), &realm_edit).unwrap(),
+        FaceChanged,
+        "an identity edit is settled against the snapshot, never the stale cache"
+    );
+
+    // 3. A disagreement nothing can settle: every record writes its
+    //    snapshot, so a digest without one is damaged bookkeeping — a loud
+    //    error, not a verdict.
+    let err = verify(&stale, None, &base).unwrap_err();
+    assert!(
+        err.to_string().contains("no declaration snapshot"),
+        "wrong error: {err}"
+    );
+
+    // 4. A damaged snapshot is a loud error, never a verdict.
+    let err = verify(&stale, Some("not = [toml"), &base).unwrap_err();
+    assert!(
+        err.to_string().contains("does not parse"),
+        "wrong error: {err}"
+    );
+}
+
+/// [`change_state`] / [`diff`] through the issuer store, over the baseline
+/// states a real store presents: a stale cache the snapshot proves
+/// unchanged (applied, with the refresh announced), the policy and
+/// identity edits on it, and a fresh cache (nothing to refresh).
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+fn change_state_and_diff_narrate_the_baseline_cache_states() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("interflow.toml");
+    let issuer = dir.path().join("issuer");
+    let out = dir.path().join("dist");
+    std::fs::create_dir_all(&issuer).unwrap();
+    let base_text = vintage_fixture("narrate", 11434, 8080);
+    std::fs::write(&manifest, &base_text).unwrap();
+    // A real tree under every baseline below (the field's shape).
+    render_tree_then_forget_the_bookkeeping(&manifest, &issuer, &out);
+    let base = Manifest::parse(&base_text).unwrap();
+    let recorded = |digest: &str| AppliedState {
+        stripped_manifest_digest: digest.to_owned(),
+        policy_generation: 3,
+        policy_digest: policy_digest_at(&base, 3).unwrap(),
+        packs: BTreeMap::new(),
+    };
+    let has = |lines: &[String], needle: &str| lines.iter().any(|l| l.contains(needle));
+
+    // A stale cache, zero drift: applied, refresh announced.
+    let store = IssuerStore::open(&issuer);
+    store
+        .record_applied(
+            &recorded("sha256:stale-cache"),
+            Some(&base_text),
+            AppliedKind::FullRender,
+        )
+        .unwrap();
+    assert!(matches!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::Applied { generation: 3 }
+    ));
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(&drift, "matches the applied state (policy generation 3)")
+            && has(&drift, "stale cache of the unchanged declaration")
+            && has(&drift, "refreshes the baseline digest in the bookkeeping"),
+        "{drift:?}"
+    );
+
+    // A policy-face edit on the stale cache: still policy-only; the
+    // refresh rides the fast path's own record (no lane ceremony).
+    std::fs::write(&manifest, vintage_fixture("narrate", 11434, 8081)).unwrap();
+    assert_eq!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::PolicyEditsPending
+    );
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(&drift, "policy-face edits pending")
+            && has(&drift, "-address = \"127.0.0.1:8080\"")
+            && has(&drift, "+address = \"127.0.0.1:8081\""),
+        "{drift:?}"
+    );
+
+    // An identity edit on the stale cache: the snapshot settles it as one.
+    std::fs::write(&manifest, vintage_fixture("narrate-2", 11434, 8080)).unwrap();
+    assert_eq!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::IdentityEditsPending
+    );
+
+    // A fresh cache: unchanged behavior, nothing to refresh.
+    std::fs::write(&manifest, &base_text).unwrap();
+    store
+        .record_applied(
+            &recorded(&identity_face_digest(&base).unwrap()),
+            Some(&base_text),
+            AppliedKind::FullRender,
+        )
+        .unwrap();
+    assert!(matches!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::Applied { generation: 3 }
+    ));
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(&drift, "matches the applied state") && has(&drift, "no textual drift"),
+        "{drift:?}"
+    );
+    assert!(!has(&drift, "refreshes the baseline digest"), "{drift:?}");
+}
+
+/// The read face runs the SAME fork decision as apply — including the two
+/// tree probes and the local watermark gate that used to live only on the
+/// apply path, where diff could promise "no render and no publish" for a
+/// tree the gate would re-render and publish
+/// Corpus: trust-stale × (zero drift, policy edits), format-stale × (zero
+/// drift, policy edits), watermark divergence, and the converged no-op's
+/// hub caveat. The same-source assertion extracts the probe's fact from
+/// diff's line and requires apply's ✔ line to embed it verbatim.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines
+)]
+fn diff_names_the_stale_tree_and_the_watermark_fork_apply_takes() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("interflow.toml");
+    let issuer = dir.path().join("issuer");
+    let out = dir.path().join("dist");
+    let has = |lines: &[String], needle: &str| lines.iter().any(|l| l.contains(needle));
+    let write = |text: &str| std::fs::write(&manifest, text).unwrap();
+    let run_apply = || {
+        apply(
+            &manifest,
+            &issuer,
+            &out,
+            false,
+            &BackupInitOptions::default(),
+            false,
+        )
+        .unwrap()
+    };
+    // The fact diff printed, extracted from its stale-tree line — apply's
+    // ✔ line must embed exactly this.
+    let stale_fact = |drift: &[String]| -> String {
+        drift
+            .iter()
+            .find(|l| l.starts_with("pack tree is stale"))
+            .unwrap()
+            .strip_prefix("pack tree is stale — ")
+            .unwrap()
+            .split_once(" — the next")
+            .unwrap()
+            .0
+            .to_owned()
+    };
+
+    write(&vintage_fixture("stale-forks", 11434, 8080));
+    assert_eq!(run_apply().generation, 1);
+
+    // Trust staleness, zero drift: a revoke moved the deny list past the
+    // tree's embedded snapshots. (The probe walks the pack dirs in order —
+    // agent-home-win is the first to report.)
+    let pack = out.join("packs/agent-home-win");
+    revoke(&issuer, &pack, "superseded", None, false).unwrap();
+    assert_eq!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::PackTreeStale
+    );
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(&drift, "carries a stale trust snapshot") && has(&drift, "workspace/main"),
+        "{drift:?}"
+    );
+    assert!(
+        has(
+            &drift,
+            "re-renders every pack and publishes above the watermarks"
+        ),
+        "the mint-and-publish is part of the prediction: {drift:?}"
+    );
+    assert!(
+        !has(&drift, "with no render and no publish"),
+        "a stale tree prediction cannot promise a no-op: {drift:?}"
+    );
+    let applied = run_apply();
+    let fact = stale_fact(&drift);
+    assert!(
+        has(&applied.lines, &fact),
+        "apply's ✔ line embeds diff's fact verbatim: {fact} not in {:?}",
+        applied.lines
+    );
+    assert!(
+        has(
+            &applied.lines,
+            "re-rendering every pack and publishing above the watermarks"
+        ),
+        "{:?}",
+        applied.lines
+    );
+    assert_eq!(
+        applied.generation, 2,
+        "the re-render mints above the watermark"
+    );
+    assert!(matches!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::Applied { generation: 2 }
+    ));
+
+    // Trust staleness, policy edits pending: the full render carries them;
+    // the fast path is not taken and diff says so.
+    revoke(&issuer, &pack, "superseded", None, false).unwrap();
+    write(&vintage_fixture("stale-forks", 11435, 8080));
+    assert_eq!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::PackTreeStale
+    );
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(&drift, "the policy-only fast path does not apply"),
+        "the superseded fast path is named: {drift:?}"
+    );
+    let applied = run_apply();
+    assert!(
+        has(&applied.lines, &stale_fact(&drift)),
+        "{:?}",
+        applied.lines
+    );
+    assert!(has(
+        &applied.lines,
+        "the policy-only fast path does not apply"
+    ));
+    assert!(
+        !has(&applied.lines, "policy-only change"),
+        "{:?}",
+        applied.lines
+    );
+
+    // Format staleness: a retired pack.toml vintage, zero drift.
+    let pack_toml = out.join("packs/agent-leo-mesh/pack.toml");
+    let text = std::fs::read_to_string(&pack_toml).unwrap();
+    let legacy = text
+        .lines()
+        .filter(|line| !line.starts_with("workspace"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&pack_toml, format!("{legacy}\n")).unwrap();
+    assert!(interflow_identity::CredentialPack::load(&out.join("packs/agent-leo-mesh")).is_err());
+    assert_eq!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::PackTreeStale
+    );
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(
+            &drift,
+            "is stale — pack.toml does not parse as the current pack format"
+        ),
+        "{drift:?}"
+    );
+    let applied = run_apply();
+    assert!(
+        has(&applied.lines, &stale_fact(&drift)),
+        "{:?}",
+        applied.lines
+    );
+    assert!(
+        interflow_identity::CredentialPack::load(&out.join("packs/agent-leo-mesh")).is_ok(),
+        "the re-render restored the current format"
+    );
+    let generation = applied.generation;
+
+    // Watermark divergence under zero drift: a node state mirror above the
+    // bookkeeping — the fork re-publishes the same policy above it.
+    let mirror = out.join("packs/agent-home-win/state/policy");
+    std::fs::create_dir_all(&mirror).unwrap();
+    std::fs::write(
+        mirror.join("policy.toml"),
+        format!("generation = {}\n", generation + 5),
+    )
+    .unwrap();
+    assert_eq!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::WatermarksDiverged
+    );
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(&drift, "the watermarks diverge from the issuer bookkeeping")
+            && has(&drift, "sit above the issuer bookkeeping")
+            && has(&drift, "re-publishes above the watermarks"),
+        "{drift:?}"
+    );
+    assert!(
+        !has(&drift, "nothing to apply"),
+        "a diverged watermark is not a no-op: {drift:?}"
+    );
+    let applied = run_apply();
+    assert!(
+        has(
+            &applied.lines,
+            "re-publishing above the watermarks to reconcile"
+        ),
+        "{:?}",
+        applied.lines
+    );
+    assert!(
+        has(&applied.lines, "policy-only change"),
+        "the re-publish rides the policy-only path: {:?}",
+        applied.lines
+    );
+    assert_eq!(
+        applied.generation,
+        generation + 6,
+        "minted above the dist floor, not merely the bookkeeping"
+    );
+
+    // Converged: the no-op again, with its hub caveat stated where it
+    // applies (the hub's own watermarks are live state, read at apply).
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(&drift, "matches the applied state") && has(&drift, "re-queried at apply time"),
+        "{drift:?}"
+    );
+}
+
+/// The NoOp fork's bookkeeping-only refresh: a recorded digest the
+/// snapshot proves stale heals in one apply — nothing mints, nothing
+/// renders, nothing publishes — and the next apply is a plain no-op. An
+/// identity edit on a stale cache still reads as one (the snapshot settles
+/// it) and re-renders with the generation continued.
+#[test]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines
+)]
+fn apply_refreshes_a_stale_baseline_cache_without_rendering() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("interflow.toml");
+    let issuer = dir.path().join("issuer");
+    let out = dir.path().join("dist");
+    let base_text = vintage_fixture("refresh", 11434, 8080);
+    std::fs::write(&manifest, &base_text).unwrap();
+    let has = |lines: &[String], needle: &str| lines.iter().any(|l| l.contains(needle));
+    let run_apply = || {
+        apply(
+            &manifest,
+            &issuer,
+            &out,
+            false,
+            &BackupInitOptions::default(),
+            false,
+        )
+        .unwrap()
+    };
+    // Rewrites the recorded digest into a stale cache while the record
+    // keeps the live declaration as its snapshot — a digest that
+    // disagrees with a snapshot that is still the truth.
+    let age_the_cache = |stale: &str| {
+        let store = IssuerStore::open(&issuer);
+        let mut applied = store.applied_state().unwrap().expect("a state is recorded");
+        applied.stripped_manifest_digest = stale.to_owned();
+        let packs = applied.packs.clone();
+        store
+            .record_applied(&applied, Some(&base_text), AppliedKind::FullRender)
+            .unwrap();
+        packs
+    };
+
+    let first = run_apply();
+    assert_eq!(first.generation, 1);
+    assert!(has(&first.lines, "✔ applied"), "{:?}", first.lines);
+    let base = Manifest::parse(&base_text).unwrap();
+    let packs = age_the_cache("sha256:a-stale-cache");
+    assert!(!packs.is_empty(), "the full render recorded its packs");
+
+    // Zero drift on the stale cache: applied, refresh pending.
+    assert!(matches!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::Applied { generation: 1 }
+    ));
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(&drift, "stale cache of the unchanged declaration")
+            && has(&drift, "refreshes the baseline digest in the bookkeeping"),
+        "{drift:?}"
+    );
+
+    let refresh = run_apply();
+    assert_eq!(refresh.generation, 1, "nothing minted");
+    assert!(
+        has(&refresh.lines, "stale cache of the unchanged declaration")
+            && has(
+                &refresh.lines,
+                "baseline digest cache refreshed (no render, no publish)"
+            ),
+        "{:?}",
+        refresh.lines
+    );
+    assert!(
+        !has(&refresh.lines, "✔ applied") && !has(&refresh.lines, "policy-only change"),
+        "a refresh renders and publishes nothing: {:?}",
+        refresh.lines
+    );
+    let store = IssuerStore::open(&issuer);
+    let state = store.applied_state().unwrap().unwrap();
+    assert_eq!(
+        state.stripped_manifest_digest,
+        identity_face_digest(&base).unwrap()
+    );
+    assert_eq!(state.policy_generation, 1);
+    assert_eq!(state.packs, packs, "the pack bookkeeping rides along");
+    assert_eq!(
+        store.applied_manifest_text().unwrap().as_deref(),
+        Some(base_text.as_str())
+    );
+    let drift = diff(&manifest, &issuer, &out).unwrap();
+    assert!(
+        has(&drift, "matches the applied state (policy generation 1)")
+            && has(&drift, "no textual drift")
+            && !has(&drift, "refreshes the baseline digest"),
+        "{drift:?}"
+    );
+    // The cache is fresh again: a second apply is a plain no-op.
+    let again = run_apply();
+    assert!(
+        has(&again.lines, "nothing to do") && !has(&again.lines, "refreshed"),
+        "{:?}",
+        again.lines
+    );
+
+    // An identity edit on a stale cache: the snapshot settles it as one —
+    // a full render, generation continued. The hub's listen address is the
+    // edit: an identity-face move that keeps the realm (one store still
+    // signs one realm).
+    age_the_cache("sha256:another-stale-cache");
+    let edited = vintage_fixture("refresh", 11434, 8080).replace(
+        "listen = \"127.0.0.1:16666\"",
+        "listen = \"127.0.0.1:16677\"",
+    );
+    std::fs::write(&manifest, &edited).unwrap();
+    assert_eq!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::IdentityEditsPending
+    );
+    let rerender = run_apply();
+    assert_eq!(
+        rerender.generation, 2,
+        "the full render continues the generation"
+    );
+    assert!(has(&rerender.lines, "✔ applied"), "{:?}", rerender.lines);
+    let state = IssuerStore::open(&issuer).applied_state().unwrap().unwrap();
+    assert_eq!(state.policy_generation, 2);
+    assert_eq!(
+        state.stripped_manifest_digest,
+        identity_face_digest(&Manifest::parse(&edited).unwrap()).unwrap()
+    );
+    assert!(matches!(
+        change_state(&manifest, &issuer, &out).unwrap(),
+        ChangeState::Applied { generation: 2 }
     ));
 }

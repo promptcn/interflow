@@ -57,7 +57,7 @@ fn certs() -> &'static interflow_testkit::certs::TestCerts {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_tcp_round_trip() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,interflow=debug")
+        .with_env_filter("info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug")
         .try_init();
     let (echo_addr, _echo) = echo_server().await;
     let _hub = spawn_hub(hub_quic_config(0, certs(), Vec::new())).await;
@@ -136,7 +136,7 @@ async fn quic_udp_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cross_transport_h2_ingress_quic_egress() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,interflow=debug")
+        .with_env_filter("info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug")
         .try_init();
     let (echo_addr, _echo) = echo_server().await;
     let _hub = spawn_hub(hub_quic_config(0, certs(), Vec::new())).await;
@@ -235,12 +235,13 @@ async fn quic_udp_datagram_mixed_sizes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_mtls_valid_client_cert() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,interflow=debug")
+        .with_env_filter("info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug")
         .try_init();
     let (echo_addr, _echo) = echo_server().await;
     let mut hub_cfg = hub_quic_config(0, certs(), Vec::new());
     hub_cfg.auth = AuthConfig {
         rate_limit_per_minute: 0,
+        max_tracked_clients: interflow_core::security::MAX_TRACKED_CLIENTS,
         tenants: vec![TenantConfig {
             name: interflow_testkit::TEST_TENANT.to_string(),
             ca_path: certs().ca_path().display().to_string(),
@@ -317,6 +318,7 @@ async fn quic_mtls_cn_mismatch_rejected() {
     let mut hub_cfg = hub_quic_config(0, certs(), vec![]);
     hub_cfg.auth = AuthConfig {
         rate_limit_per_minute: 0,
+        max_tracked_clients: interflow_core::security::MAX_TRACKED_CLIENTS,
         tenants: vec![TenantConfig {
             name: interflow_testkit::TEST_TENANT.to_string(),
             ca_path: certs().ca_path().display().to_string(),

@@ -4,10 +4,8 @@
 //! else is persisted.
 //!
 //! Storage is the GUI's prefs db (one process-owned SQLite, [`crate::prefs`]):
-//! the `nodes` table with the `ord` column preserving profile order. The
-//! legacy `profile.toml` shape (`[[nodes]]`, unknown fields rejected) still
-//! exists as the one-time import format; a `pack_dir` that was relative in
-//! it anchored to the config directory, and still does on load.
+//! the `nodes` table with the `ord` column preserving profile order. A
+//! relative `pack_dir` anchors to the config directory on load.
 
 use interflow_core::error::Result;
 use interflow_mesh::config::TransportKind;
@@ -50,7 +48,6 @@ pub struct NodeEntry {
 
 /// Persisted GUI profile (the node list, in order).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
 pub struct Profile {
     /// The managed nodes, in profile order.
     pub nodes: Vec<NodeEntry>,

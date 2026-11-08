@@ -203,9 +203,9 @@ async fn open_inner_tls(
         &key.display().to_string(),
     )
     .expect("inner material");
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+    let connector = tokio_rustls::TlsConnector::from(
         inner_client_config(&material, "eg").expect("inner connector"),
-    ));
+    );
 
     for attempt in 0..3 {
         let rx = inj.register_stream(sid).await;

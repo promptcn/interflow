@@ -58,10 +58,11 @@
 //! means reject + Close — never fall through to the first rule (the old
 //! `.or_else(rules.first())` would send bytes to an unrelated backend).
 
+use crate::agent::backend_dial;
 use crate::agent::control::{ControlOpError, EgressCommand};
 use crate::agent::ingress_udp::UDP_RECV_BUF;
 use crate::agent::rules::RuleStore;
-use crate::agent::target_breaker::{BreakerDecision, BreakerKind, TargetBreakers};
+use crate::agent::target_breaker::{self, BreakerDecision, BreakerKind, TargetBreakers};
 use crate::config::{AgentConfig, EgressRule, EgressTarget, SecurityConfig};
 use bytes::Bytes;
 use interflow_core::config::params::BreakerPolicy;
@@ -161,15 +162,24 @@ pub struct EgressRuntime {
     /// without consuming the shared open-rate budget above, so healthy
     /// targets keep their full budget (2026-09-16 starvation case file).
     breakers: Option<Arc<TargetBreakers>>,
+    /// The breaker table's open-set read face (present exactly when the
+    /// table exists — 2026-10-19): the GUI node detail's "Egress
+    /// breakers" panel subscribes; the table publishes on every open-set
+    /// change.
+    breaker_face: Option<Arc<crate::agent::target_breaker::BreakerWatchState>>,
 }
 
 impl EgressRuntime {
     pub fn from_config(config: &AgentConfig) -> Self {
-        let breakers = config.egress_target_breaker_enabled.then(|| {
-            Arc::new(TargetBreakers::new(
+        let breaker_face = config.egress_target_breaker_enabled.then(|| {
+            std::sync::Arc::new(crate::agent::target_breaker::BreakerWatchState::default())
+        });
+        let breakers = breaker_face.clone().map(|face| {
+            Arc::new(TargetBreakers::with_face(
                 BreakerKind::Egress,
                 config.agent.effective_log_name().to_string(),
                 BreakerPolicy::from(config),
+                face,
             ))
         });
         Self {
@@ -180,7 +190,22 @@ impl EgressRuntime {
                 config.stream_open_burst,
             ),
             breakers,
+            breaker_face,
         }
+    }
+
+    /// The agent-level breaker table (None = breaker disabled). The
+    /// recovery prober's scan surface.
+    pub const fn breakers(&self) -> Option<&Arc<TargetBreakers>> {
+        self.breakers.as_ref()
+    }
+
+    /// The breaker table's open-set read face (None = breaker disabled) —
+    /// the local observability surface (handle → GUI forwarder).
+    pub const fn breaker_face(
+        &self,
+    ) -> Option<&Arc<crate::agent::target_breaker::BreakerWatchState>> {
+        self.breaker_face.as_ref()
     }
 }
 
@@ -293,7 +318,7 @@ impl EgressHandler {
     /// malformed, wrong-CN, foreign-anchor, or revoked peer.
     async fn run_udp_inner_quic_association(
         stream_id: interflow_core::protocol::StreamId,
-        rules: Vec<EgressRule>,
+        rules: std::sync::Arc<[EgressRule]>,
         frames: mpsc::Receiver<TunnelData>,
         sess: EgressSession,
         idle_timeout: Duration,
@@ -652,13 +677,13 @@ impl EgressHandler {
 
         // Snapshot the live allowlist for this Open (see the TCP path note).
         let security_now = security.borrow().clone();
+        let target_breaker_key = target_breaker::dial_key(StreamProto::Udp, &target);
         let reject = if target.is_empty() {
             Some(SessionReject::NoTarget)
         } else if !Self::is_target_allowed(&target, &security_now)
-            || runtime
-                .breakers
-                .as_ref()
-                .is_some_and(|breaker| breaker.check(&target) == BreakerDecision::Reject)
+            || runtime.breakers.as_ref().is_some_and(|breaker| {
+                breaker.check(&target_breaker_key) == BreakerDecision::Reject
+            })
         {
             Some(SessionReject::SecurityDenied)
         } else if runtime
@@ -795,38 +820,35 @@ impl EgressHandler {
     ) {
         let resolve_timeout = policy.resolve_timeout;
         tokio::spawn(async move {
-            let resolved =
-                match tokio::time::timeout(resolve_timeout, tokio::net::lookup_host(&target_addr))
-                    .await
-                {
-                    Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
-                    Ok(Err(e)) => {
+            let breaker_key = target_breaker::dial_key(StreamProto::Udp, &target_addr);
+            let address = match crate::agent::backend_dial::resolve_first_allowed(
+                &target_addr,
+                resolve_timeout,
+            )
+            .await
+            {
+                Ok(address) => address,
+                Err(e) => {
+                    // Only true resolve failures are backend-health
+                    // evidence; an SSRF block is policy, not pathology.
+                    if matches!(
+                        e,
+                        backend_dial::BackendResolveError::Failed(_)
+                            | backend_dial::BackendResolveError::TimedOut
+                    ) {
                         error!(node = %node, "Failed to resolve UDP target {target_addr}: {e}");
                         if let Some(breakers) = &breakers {
-                            breakers.note_failure(&target_addr);
+                            breakers.note_failure(&breaker_key);
                         }
-                        let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
-                        return;
+                    } else {
+                        error!(
+                            node = %node,
+                            "Security block: all resolved IPs for UDP target {target_addr} hit the SSRF blocklist"
+                        );
                     }
-                    Err(_) => {
-                        error!(node = %node, "UDP target resolve timed out: {target_addr}");
-                        if let Some(breakers) = &breakers {
-                            breakers.note_failure(&target_addr);
-                        }
-                        let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
-                        return;
-                    }
-                };
-            let safe_address = resolved
-                .into_iter()
-                .find(|sa| !crate::agent::ssrf_deny::is_ip_ssrf_blocked(sa.ip()));
-            let Some(address) = safe_address else {
-                error!(
-                    node = %node,
-                    "Security block: all resolved IPs for UDP target {target_addr} hit the SSRF blocklist"
-                );
-                let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
-                return;
+                    let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
+                    return;
+                }
             };
             let bind_addr = if address.is_ipv4() {
                 "0.0.0.0:0"
@@ -843,13 +865,13 @@ impl EgressHandler {
             if socket.connect(address).await.is_err() {
                 error!(node = %node, "UDP connect failed {target_addr}");
                 if let Some(breakers) = &breakers {
-                    breakers.note_failure(&target_addr);
+                    breakers.note_failure(&breaker_key);
                 }
                 let _ = command_tx.send(UdpAssociationCommand::Close(session)).await;
                 return;
             }
             if let Some(breakers) = &breakers {
-                breakers.note_success(&target_addr);
+                breakers.note_success(&breaker_key);
             }
             let socket = Arc::new(socket);
             let last_active = Arc::new(std::sync::Mutex::new(Instant::now()));
@@ -953,14 +975,14 @@ impl EgressHandler {
         // catch-all tick — per-stream matching stays lock-free, and the
         // snapshot is always re-derived from the store (level-triggered),
         // never from a pushed payload.
-        let mut rules = self.store.egress_snapshot().await;
+        let mut rules: std::sync::Arc<[EgressRule]> = self.store.egress_snapshot().await.into();
         let store = self.store;
         let mut version = store.version_rx();
         let mut tick = tokio::time::interval(REFRESH_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let sess = self.sess;
 
-        for rule in &rules {
+        for rule in rules.iter() {
             info!(node = %sess.node, "Configured egress rule: {} -> {}", rule.name, rule.target);
         }
 
@@ -982,14 +1004,14 @@ impl EgressHandler {
                             info!(node = %sess.node, "Added egress rule: {}", rule.name);
                             let res = store.add_egress(rule).await
                                 .map_err(ControlOpError::from);
-                            rules = store.egress_snapshot().await;
+                            rules = store.egress_snapshot().await.into();
                             let _ = resp_tx.send(res);
                         }
                         Some(EgressCommand::Remove(name, resp_tx)) => {
                             info!(node = %sess.node, "Removed egress rule: {}", name);
                             let res = store.remove_egress(&name).await
                                 .map_err(ControlOpError::from);
-                            rules = store.egress_snapshot().await;
+                            rules = store.egress_snapshot().await.into();
                             let _ = resp_tx.send(res);
                         }
                         Some(EgressCommand::List(resp_tx)) => {
@@ -1016,14 +1038,14 @@ impl EgressHandler {
                             rules.len(),
                             fresh.len()
                         );
-                        rules = fresh;
+                        rules = fresh.into();
                     }
                 }
 
                 // Catch-all refresh: heals any state a missed wake-up could
                 // have left behind (mirrors the ingress reconciler's tick).
                 _ = tick.tick() => {
-                    rules = store.egress_snapshot().await;
+                    rules = store.egress_snapshot().await.into();
                 }
 
                 // Handle a request-direction new stream: rate/concurrency
@@ -1070,7 +1092,7 @@ impl EgressHandler {
     async fn handle_incoming_stream(
         stream: IncomingStream,
         sess: &EgressSession,
-        rules: &[EgressRule],
+        rules: &std::sync::Arc<[EgressRule]>,
     ) {
         let EgressSession {
             tunnel,
@@ -1151,7 +1173,7 @@ impl EgressHandler {
             // handshake and encrypted selector have been validated.
             tracker.spawn(Self::run_tcp_forwarder(
                 stream_id,
-                rules.to_vec(),
+                Arc::clone(rules),
                 frames,
                 src_agent.clone(),
                 sess.clone(),
@@ -1166,7 +1188,7 @@ impl EgressHandler {
             );
             tracker.spawn(Self::run_udp_inner_quic_association(
                 stream_id,
-                rules.to_vec(),
+                Arc::clone(rules),
                 frames,
                 sess.clone(),
                 idle_timeout,
@@ -1192,7 +1214,7 @@ impl EgressHandler {
     ///   drops. This is the structural fix for the fd-leak root cause.
     async fn run_tcp_forwarder(
         stream_id: interflow_core::protocol::StreamId,
-        rules: Vec<EgressRule>,
+        rules: std::sync::Arc<[EgressRule]>,
         mut frames: mpsc::Receiver<TunnelData>,
         src_agent: String,
         sess: EgressSession,
@@ -1362,12 +1384,13 @@ impl EgressHandler {
                 // between two Opens is picked up here (established streams
                 // keep their fate — new flows judge by the current policy).
                 let security_now = security.borrow().clone();
+                let breaker_key = target_breaker::dial_key(StreamProto::Tcp, &target_addr_selected);
                 if target_addr_selected.is_empty()
                     || !Self::is_target_allowed(&target_addr_selected, &security_now)
                     || runtime
                         .breakers
                         .as_ref()
-                        .is_some_and(|b| b.check(&target_addr_selected) == BreakerDecision::Reject)
+                        .is_some_and(|b| b.check(&breaker_key) == BreakerDecision::Reject)
                 {
                     let close_reason = if target_addr_selected.is_empty() {
                         CloseReason::NoTarget
@@ -1436,73 +1459,48 @@ impl EgressHandler {
             }
         };
 
-        // 1. Resolve-then-check-then-connect: tokio::net::lookup_host
-        //    resolves (IP literals trigger no DNS) -> filter out
-        //    SSRF-blocklist IPs -> connect to the already-resolved address
-        //    (the checked IP = the connected IP).
-        let resolved = match tokio::time::timeout(
+        // 1. Resolve-then-check-then-connect via the shared backend-dial
+        //    constructor (resolve bounded -> first SSRF-passing address ->
+        //    connect to the already-resolved address; the checked IP = the
+        //    connected IP). Breaker evidence keys are transport-namespaced.
+        let breaker_key = target_breaker::dial_key(StreamProto::Tcp, &target_addr);
+        let target_socket_addr = match crate::agent::backend_dial::resolve_first_allowed(
+            &target_addr,
             resolve_timeout,
-            tokio::net::lookup_host(&target_addr),
         )
         .await
         {
-            Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
-            Ok(Err(e)) => {
-                error!(node = %node, "Failed to resolve target address {}: {}", target_addr, e);
-                if let Some(b) = &runtime.breakers {
-                    b.note_failure(&target_addr);
+            Ok(addr) => addr,
+            Err(e) => {
+                // True resolve failures are backend-health evidence (breaker
+                // + ConnectFailed); an SSRF block is policy, not pathology
+                // (SecurityDenied, no breaker note).
+                let (reason, breaker_evidence) = match &e {
+                    backend_dial::BackendResolveError::Failed(_) => {
+                        error!(node = %node, "Failed to resolve target address {target_addr}: {e}");
+                        (CloseReason::ConnectFailed, true)
+                    }
+                    backend_dial::BackendResolveError::TimedOut => {
+                        error!(
+                            node = %node,
+                            "Target address resolution timed out {target_addr}: exceeded {resolve_timeout:?}, killing stream"
+                        );
+                        (CloseReason::ConnectFailed, true)
+                    }
+                    backend_dial::BackendResolveError::SsrfBlocked => {
+                        error!(
+                            node = %node,
+                            "Security block: all resolved IPs for target {target_addr} hit the SSRF blocklist"
+                        );
+                        (CloseReason::SecurityDenied, false)
+                    }
+                };
+                if breaker_evidence && let Some(b) = &runtime.breakers {
+                    b.note_failure(&breaker_key);
                 }
-                Self::finish(
-                    &node,
-                    &tunnel,
-                    stream_id,
-                    CloseReason::ConnectFailed,
-                    true,
-                    &runtime.active,
-                )
-                .await;
+                Self::finish(&node, &tunnel, stream_id, reason, true, &runtime.active).await;
                 return;
             }
-            Err(_) => {
-                error!(
-                    node = %node,
-                    "Target address resolution timed out {}: exceeded {:?}, killing stream",
-                    target_addr, resolve_timeout
-                );
-                if let Some(b) = &runtime.breakers {
-                    b.note_failure(&target_addr);
-                }
-                Self::finish(
-                    &node,
-                    &tunnel,
-                    stream_id,
-                    CloseReason::ConnectFailed,
-                    true,
-                    &runtime.active,
-                )
-                .await;
-                return;
-            }
-        };
-        let safe_addr = resolved
-            .into_iter()
-            .find(|sa| !crate::agent::ssrf_deny::is_ip_ssrf_blocked(sa.ip()));
-        let Some(target_socket_addr) = safe_addr else {
-            error!(
-                node = %node,
-                "Security block: all resolved IPs for target {} hit the SSRF blocklist",
-                target_addr
-            );
-            Self::finish(
-                &node,
-                &tunnel,
-                stream_id,
-                CloseReason::SecurityDenied,
-                true,
-                &runtime.active,
-            )
-            .await;
-            return;
         };
 
         let stream = match tokio::time::timeout(
@@ -1515,7 +1513,7 @@ impl EgressHandler {
             Ok(Err(e)) => {
                 error!(node = %node, "Failed to connect to target {}: {}", target_addr, e);
                 if let Some(b) = &runtime.breakers {
-                    b.note_failure(&target_addr);
+                    b.note_failure(&breaker_key);
                 }
                 Self::finish(
                     &node,
@@ -1531,11 +1529,11 @@ impl EgressHandler {
             Err(_) => {
                 error!(
                     node = %node,
-                    "Connect to target timed out {}: exceeded {:?} (black-hole address?), killing stream and releasing slot",
-                    target_addr, connect_timeout
+                    "Connect to target timed out {target_addr}: exceeded {:?} (black-hole address?), killing stream and releasing slot",
+                    connect_timeout
                 );
                 if let Some(b) = &runtime.breakers {
-                    b.note_failure(&target_addr);
+                    b.note_failure(&breaker_key);
                 }
                 Self::finish(
                     &node,
@@ -1550,12 +1548,14 @@ impl EgressHandler {
             }
         };
         if let Some(b) = &runtime.breakers {
-            b.note_success(&target_addr);
+            b.note_success(&breaker_key);
         }
         info!(
             node = %node,
-            "Backend connection established: {} -> {}",
-            stream_id, target_addr
+            "Backend connection established: {} -> {} ({})",
+            stream_id,
+            target_addr,
+            crate::agent::correlation::stream_note(&stream_id)
         );
 
         // 1b. Established streams pump through the inner TLS layer: all tunnel
@@ -1576,6 +1576,7 @@ impl EgressHandler {
                 idle_timeout_counter: "interflow_agent_e2e_egress_stream_idle_timeout",
                 write_stall_counter: "interflow_agent_e2e_egress_backend_write_stall",
                 log_label: "egress-e2e",
+                activity: None,
             },
             CloseReason::BackendClosed,
             interflow_core::tunnel::pump::DUPLEX_LOCAL_EOF_DRAIN,
@@ -1709,37 +1710,7 @@ impl EgressHandler {
     }
 
     fn is_loopback(target: &str) -> bool {
-        // Parse strictly to avoid prefix spoofing (e.g. "127.0.0.1.evil.com" / "localhostx" / "localhost:65535.evil")
-        // Accepts "host:port" / "[::1]:port" / "host" / "::1" forms
-
-        // 1) Whole-string SocketAddr parse (covers "127.0.0.1:80" and "[::1]:80")
-        if let Ok(sa) = target.parse::<std::net::SocketAddr>() {
-            return sa.ip().is_loopback();
-        }
-        // 2) Whole-string IpAddr parse (covers "127.0.0.1" / "::1")
-        if let Ok(ip) = target.parse::<std::net::IpAddr>() {
-            return ip.is_loopback();
-        }
-        // 3) Split as host[:port] (only when the target has no extra colons)
-        if !target.starts_with('[')
-            && let Some((host, _port)) = target.rsplit_once(':')
-        {
-            if host.eq_ignore_ascii_case("localhost") {
-                return true;
-            }
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                return ip.is_loopback();
-            }
-        }
-        // 4) Bracket-stripped IPv6 forms
-        let stripped = target.trim_start_matches('[').trim_end_matches(']');
-        if stripped.eq_ignore_ascii_case("localhost") {
-            return true;
-        }
-        if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
-            return ip.is_loopback();
-        }
-        false
+        backend_dial::is_loopback_target(target)
     }
 }
 

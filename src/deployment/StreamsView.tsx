@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { MoreVertical } from "lucide-react";
 import type { StreamDto } from "../api";
+import { api } from "../api";
 import { useT } from "../i18n";
 import StreamDialog, { type StreamFields } from "../components/StreamDialog";
 import StreamDrawer from "../components/StreamDrawer";
@@ -49,7 +50,7 @@ interface Props {
 /// RenameMeshIngress edit; delete confirms.
 export default function StreamsView({ onOpenNode }: Props) {
   const { t } = useT();
-  const { fleet, text, busy, applyEdit, refresh } = useDeployment();
+  const { fleet, text, busy, applyEdit, refresh, say, deployment } = useDeployment();
   const [adjust, setAdjust] = useState<{ agent: string; ruleName: string } | undefined>();
   const [adding, setAdding] = useState(false);
   const [renaming, setRenaming] = useState<{ agent: string; from: string } | null>(null);
@@ -71,6 +72,35 @@ export default function StreamsView({ onOpenNode }: Props) {
     detail === null
       ? undefined
       : streams.find((s) => s.agent === detail.agent && s.name === detail.name);
+
+  /// Pause/resume (planned unavailability, stream level): the local
+  /// source node takes the in-process path; a remote source goes through
+  /// the hub's control plane (qualified id resolved against the hub's
+  /// rows). Idempotent both ways — the verb is anxiety-free by design,
+  /// and the face converges within one watch interval.
+  const pauseResume = async (s: StreamDto) => {
+    const pause = s.status !== "paused";
+    try {
+      if (s.source_node_id !== null) {
+        await api.streamPauseLocal(s.source_node_id, s.name, pause);
+      } else if (deployment !== null) {
+        const qualified =
+          fleet?.hub?.agents.find((row) => row.agent.endsWith("/" + s.agent))?.agent ?? s.agent;
+        await api.streamPauseHub(
+          deployment.manifest_path,
+          deployment.issuer_path,
+          qualified,
+          s.name,
+          pause,
+        );
+      } else {
+        return;
+      }
+      void refresh(true);
+    } catch (e) {
+      say([`✘ ${String(e)}`]);
+    }
+  };
 
   /// Adjust = the shared wizard (paired fields + live dry-run validation);
   /// its submit path in this IA saves the document and leaves publishing
@@ -188,6 +218,11 @@ export default function StreamsView({ onOpenNode }: Props) {
                             </Button>
                           </MenuTrigger>
                           <MenuContent>
+                            <MenuItem onSelect={() => void pauseResume(s)}>
+                              {s.status === "paused"
+                                ? t("dep.streams.resume")
+                                : t("dep.streams.pause")}
+                            </MenuItem>
                             <MenuItem
                               onSelect={() => setRenaming({ agent: s.agent, from: s.name })}
                             >

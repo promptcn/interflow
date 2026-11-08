@@ -16,6 +16,7 @@
 //! public API here speaks in CNs or file paths; everything speaks in Realm /
 //! Workspace / Node / Principal / Service / Route.
 
+pub mod applied_digest;
 pub mod backup;
 pub mod credentials;
 pub mod expiry;
@@ -28,11 +29,12 @@ mod state_db;
 pub mod timestamp;
 pub mod trust;
 
+pub use applied_digest::identity_face_digest;
 pub use manifest::{Manifest, RouteConfig, ServiceConfig};
 pub use pack::load::{
     PackSummary, PackTreeStale, RevocationIdentity, pack_digest_of, pack_generation_of,
-    pack_node_and_generation_of, probe_pack_format, scan_active_credentials,
-    scan_revocation_identities,
+    pack_kind_node_realm_of, pack_node_and_generation_of, pack_roster_of, probe_pack_format,
+    scan_active_credentials, scan_revocation_identities,
 };
 pub use pack::render::{AgentCredentialPack, HubCredentialPack, IngressCredentialPack};
 pub use pack::{CredentialPack, IdentityEntry, PackKind, PackMetadata};

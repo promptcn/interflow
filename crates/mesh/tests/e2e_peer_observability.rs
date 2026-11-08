@@ -55,7 +55,7 @@ fn sees_peer(handle: &interflow_mesh::agent::AgentHandle, peer_short: &str, onli
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quic_fleet_peer_presence_full_cycle() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,interflow=debug")
+        .with_env_filter("info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug")
         .try_init();
     let hub = spawn_hub(hub_quic_config(0, certs(), Vec::new())).await;
     let port = hub.local_addr().expect("hub bound").port();
@@ -113,7 +113,7 @@ async fn quic_fleet_peer_presence_full_cycle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn h2_fleet_peer_presence() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,interflow=debug")
+        .with_env_filter("info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug")
         .try_init();
     let hub = spawn_hub(interflow_testkit::hub_config(0, certs(), Vec::new())).await;
     let port = hub.local_addr().expect("hub bound").port();
@@ -152,7 +152,7 @@ async fn h2_fleet_peer_presence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agents_listing_carries_online_presence() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,interflow=debug")
+        .with_env_filter("info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug")
         .try_init();
     let hub = spawn_hub(hub_quic_config(0, certs(), Vec::new())).await;
     let port = hub.local_addr().expect("hub bound").port();
@@ -200,7 +200,7 @@ async fn agents_listing_carries_online_presence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_port_agents_proxy_works_over_quic_session() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("info,interflow=debug")
+        .with_env_filter("info,interflow_core=debug,interflow_mesh=debug,interflow_expose=debug")
         .try_init();
     let hub = spawn_hub(hub_quic_config(0, certs(), Vec::new())).await;
     let port = hub.local_addr().expect("hub bound").port();

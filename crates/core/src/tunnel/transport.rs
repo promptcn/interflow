@@ -44,8 +44,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, RwLock, mpsc};
-use tracing::{debug, warn};
+use tokio::sync::{Notify, mpsc};
+use tracing::{debug, trace, warn};
 
 /// Tunnel data
 #[derive(Debug, Clone)]
@@ -205,6 +205,80 @@ pub trait TunnelTransport: Send + Sync + 'static {
     async fn my_proposals(&self) -> Result<Vec<ProposalReceipt>> {
         Err(InterflowError::protocol(
             "this transport has no proposals control plane".to_string(),
+        ))
+    }
+
+    /// One stream-intent exchange over this session's control plane
+    /// (`POST /streams/intent` on h2; the [`StreamIntentRequest`
+    /// frame](crate::protocol::FrameType::StreamIntentRequest) on QUIC):
+    /// reports this node's actually-paused stream names and receives the
+    /// operator's pending pause/resume ops. The requester is this
+    /// session's identity; the report lands under that identity only.
+    async fn exchange_stream_intents(
+        &self,
+        _report: &StreamIntentReport,
+    ) -> Result<StreamIntentOps> {
+        Err(InterflowError::protocol(
+            "this transport has no stream-intent control plane".to_string(),
+        ))
+    }
+
+    /// One out-of-band target-recovery notice over this session's control
+    /// plane (`POST /breakers/recovered` on h2; the [`TargetRecoveredRequest`
+    /// frame](crate::protocol::FrameType::TargetRecoveredRequest) on QUIC):
+    /// the background recovery prober's report that a backend this agent's
+    /// egress breaker had tripped is answering bare-TCP dials again. The
+    /// requester is this session's identity — an edge-hub on the receiving
+    /// side closes the matching route-breaker entries ahead of their
+    /// cooldown; every other hub acks without acting. Informational by
+    /// design: a lost or unsupported notice only means the receiver keeps
+    /// its cooldown-based recovery.
+    async fn report_target_recovered(
+        &self,
+        _notice: &TargetRecoveredNotice,
+    ) -> Result<TargetRecoveredAck> {
+        Err(InterflowError::protocol(
+            "this transport has no target-recovery control plane".to_string(),
+        ))
+    }
+
+    /// One CRL-poll liveness report over this session's control plane
+    /// (`POST /crls/liveness` on h2; the [`CrlLivenessRequest`
+    /// frame](crate::protocol::FrameType::CrlLivenessRequest) on QUIC):
+    /// this node's renewal loop publishing its current level — the
+    /// confirmation instant of the last successful registrar CRL poll (a
+    /// no-change poll IS a success) plus the cumulative failure count.
+    /// The requester is this session's identity; the report lands under
+    /// that identity only.
+    ///
+    /// The report is the level itself, not a heartbeat: the reporting
+    /// task reads the renewal loop's shared face at send time, so a hung
+    /// loop keeps producing reports whose confirmation instant stays
+    /// frozen — exactly the silence the hub-side recency sweeper exists
+    /// to classify.
+    async fn report_crl_liveness(&self, _report: &CrlLivenessReport) -> Result<()> {
+        Err(InterflowError::protocol(
+            "this transport has no CRL-liveness control plane".to_string(),
+        ))
+    }
+
+    /// One node-status report over this session's control plane
+    /// (`POST /node/status` on h2; the [`NodeStatusRequest`
+    /// frame](crate::protocol::FrameType::NodeStatusRequest) on QUIC):
+    /// this node's engine-level levels (per-stream byte activity; later
+    /// the connection-quality window stats) — the things only the node
+    /// itself can observe, published so the hub's fleet faces can carry
+    /// them. The requester is this session's identity; the report lands
+    /// under that identity only.
+    ///
+    /// Same level-not-heartbeat doctrine as
+    /// [`Self::report_crl_liveness`]: the reporter reads shared state at
+    /// send time, so a wedged engine's frozen levels arrive verbatim —
+    /// which is exactly the silence the consumers' recency judgments
+    /// classify.
+    async fn report_node_status(&self, _report: &NodeStatusReport) -> Result<()> {
+        Err(InterflowError::protocol(
+            "this transport has no node-status control plane".to_string(),
         ))
     }
 
@@ -454,6 +528,156 @@ pub enum ProposalStatusWire {
     Rejected { reason: String },
 }
 
+/// The agent's stream-intent report: what this node's persisted pause
+/// set actually holds right now (the names of its paused ingress
+/// streams).
+///
+/// Sent with every intent exchange; the hub reconciles its
+/// operator-issued pending ops against this face and clears each op the
+/// report reflects (set membership IS the ack — no sequence numbers).
+/// Planned unavailability
+/// a
+/// paused stream's listener is deliberately down and its port
+/// deliberately free; this report is how the hub's observability faces
+/// tell that state apart from an unexpected death.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StreamIntentReport {
+    /// The paused stream names, sorted (the wire form of a `BTreeSet`).
+    pub paused: Vec<String>,
+}
+
+/// The hub's answer to one intent exchange: the pending pause/resume
+/// ops the operator queued for THIS agent, oldest first.
+///
+/// Applying them is idempotent (set add/remove), so a re-delivered op
+/// after a restart is harmless; the agent's next report acks them
+/// implicitly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct StreamIntentOps {
+    /// Pending ops for the reporting agent (empty = nothing queued).
+    #[serde(default)]
+    pub ops: Vec<StreamIntentOp>,
+}
+
+/// One operator-issued stream-intent op.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum StreamIntentOp {
+    /// Pause the named ingress stream (stop its listener, release the
+    /// port; persists across agent restarts).
+    Pause { name: String },
+    /// Resume the named ingress stream (explicitly the only unpause).
+    Resume { name: String },
+}
+
+/// The recovery prober's out-of-band notice: a backend this agent's egress
+/// breaker had tripped is answering bare-TCP dials again
+///
+/// `service_ids` are the agent's own egress-rule names offering the
+/// recovered dial target over TCP — the same ids an expose edge's routes
+/// select by (`Route::service_id`), which is how the receiving hub maps
+/// the notice onto hosts. An empty list (a dynamically-addressed target no
+/// named rule offers) is skipped by the sender.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TargetRecoveredNotice {
+    /// The recovered dial target, agent vocabulary (`host:port`).
+    pub target_addr: String,
+    /// The egress-rule (service) ids whose TCP dial target this is.
+    pub service_ids: Vec<String>,
+}
+
+/// The hub's acknowledgement of one [`TargetRecoveredNotice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct TargetRecoveredAck {
+    /// How many route-breaker entries the hub actually closed on the strength
+    /// of this notice (0 on hubs with no edge face — acknowledged, no-op).
+    pub closed_routes: u32,
+}
+
+/// One node's CRL-poll liveness level, as the control plane carries it.
+///
+/// The wire shape of the renewal loop's face snapshot
+/// (`interflow_renewal::CrlPollSnapshot`; kept as a core-local struct so
+/// this crate's serde stays independent, exactly like [`PeerInfo`]). The
+/// hub stores this verbatim under the reporting identity and judges
+/// recency against ITS OWN clock: the age that matters is
+/// `hub_now - last_success_unix`, never the report's arrival instant —
+/// a hung loop with a healthy reporter must still read silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct CrlLivenessReport {
+    /// Unix seconds of the last successful CRL poll (no-change included).
+    pub last_success_unix: u64,
+    /// Cumulative failed polls since the reporting process started.
+    pub failures_total: u64,
+    /// The renewal backoff ladder's current stage (consecutive failed
+    /// renewal attempts, 0 = none) — additive (2026-10-20
+    /// connection-quality face; an older hub reads it as absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewal_backoff_failures: Option<u32>,
+}
+
+/// One stream's byte-activity level, as the node-status report carries
+/// it (the fossil face's row material).
+///
+/// The last instant any byte crossed this stream's pump in either
+/// direction, plus the rule's idle budget (the silence-judgment anchor;
+/// absent when the rule sets none).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodeStreamActivity {
+    /// The stream rule's name (policy vocabulary).
+    pub name: String,
+    /// Unix seconds of the last byte (open/listen-time baseline before
+    /// the first byte ever crosses).
+    pub last_byte_unix: u64,
+    /// The rule's `idle_timeout_secs`, when it sets one — the fossil
+    /// judgment's per-row cadence anchor (a multiple of the budget), so
+    /// consumers never hardcode a rhythm they do not own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_budget_secs: Option<u32>,
+}
+
+/// One node's engine-level status report, as the control plane carries
+/// it (`POST /node/status` on h2; the [`NodeStatusRequest`
+/// frame](crate::protocol::FrameType::NodeStatusRequest) on QUIC).
+///
+/// The report is a LEVEL, not a heartbeat (the CRL-liveness doctrine):
+/// the reporter reads the engine's shared state at send time, so a
+/// wedged engine keeps producing reports whose levels stay frozen —
+/// consumers judge recency against the levels' own instants. Sections
+/// are additive-optional so the shape grows without an epoch bump (the
+/// connection-quality window stats ride this report later, 2026-10-20
+/// backlog family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct ConnectionQualityWire {
+    /// Session establishments inside the reconnect window (one hour).
+    pub reconnects_last_hour: u32,
+    /// Median answered demanding-roundtrip, millis (`None` = no
+    /// answered sample in the window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_p50_ms: Option<u64>,
+    /// 99th-percentile answered roundtrip, millis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_p99_ms: Option<u64>,
+    /// Unanswered demanding roundtrips in the window — the
+    /// one-way-blackhole leading signal.
+    pub rtt_timeouts: u32,
+    /// Total roundtrip samples in the window (the confidence
+    /// denominator).
+    pub rtt_samples: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct NodeStatusReport {
+    /// The connection-quality window stats (the engine's supervisor
+    /// domain). Absent on older agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ConnectionQualityWire>,
+    /// Per-stream byte activity, sorted by name (the wire form of a
+    /// `BTreeMap`). Absent/empty on nodes without mesh stream rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<NodeStreamActivity>,
+}
+
 /// Capacity (in frames) of the per-stream dedicated channel. A healthy
 /// consumer's steady-state backlog stays far below this; a full channel means
 /// the consumer has stalled, handled by poisoning via [`DISPATCH_SEND_TIMEOUT`]
@@ -535,11 +759,110 @@ impl AttachGate {
 /// circuit == own) → request direction. The request/response channels for the
 /// same sid live in two separate tables, so one agent playing both roles
 /// (loopback) does not conflict.
-pub(crate) struct TunnelDispatch {
+/// Sharded stream-channel table (2026-11-04 audit §2.2/§2.4): per-frame
+/// delivery resolves ONE shard read; registration/unregistration write only
+/// their own shard. Std locks — every critical section is a clone-out, never
+/// held across an await.
+struct StreamChannels {
+    shards: [std::sync::RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>; 16],
+}
+
+impl StreamChannels {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn shard(
+        &self,
+        id: &StreamId,
+    ) -> &std::sync::RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut hasher);
+        let idx = hasher.finish() % self.shards.len() as u64;
+        &self.shards[usize::try_from(idx).unwrap_or(0)]
+    }
+
+    /// Inserts, reporting whether a previous channel existed (duplicate Open).
+    fn insert(&self, id: StreamId, tx: mpsc::Sender<TunnelData>) -> bool {
+        self.shard(&id)
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, tx)
+            .is_some()
+    }
+
+    /// Removes the entry only while it is still the given channel (a
+    /// duplicate Open's rollback must not delete its successor's channel).
+    fn remove_if(&self, id: &StreamId, tx: &mpsc::Sender<TunnelData>) {
+        let mut guard = self
+            .shard(id)
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.get(id).is_some_and(|cur| cur.same_channel(tx)) {
+            guard.remove(id);
+        }
+    }
+
+    /// Removes, reporting whether an entry was there.
+    fn remove(&self, id: &StreamId) -> bool {
+        self.shard(id)
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id)
+            .is_some()
+    }
+
+    /// Clones out one stream's sender.
+    fn get(&self, id: &StreamId) -> Option<mpsc::Sender<TunnelData>> {
+        self.shard(id)
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+    }
+
+    fn contains(&self, id: &StreamId) -> bool {
+        self.shard(id)
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(id)
+    }
+
+    /// Total entries across shards (tests + diagnostics).
+    #[cfg(test)]
+    fn total(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| {
+                s.read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            })
+            .sum()
+    }
+
+    /// Clears every shard, returning the released entry count.
+    fn clear(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| {
+                let mut guard = s.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let n = guard.len();
+                guard.clear();
+                n
+            })
+            .sum()
+    }
+}
+
+pub struct TunnelDispatch {
     /// Response-direction stream channels (registered by ingress/edge via register_stream).
-    resp_streams: Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
+    resp_streams: Arc<StreamChannels>,
     /// Request-direction stream channels (created by dispatch on Open).
-    req_streams: Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
+    req_streams: Arc<StreamChannels>,
     /// New-stream event sender (delivery only begins after the receiver is taken by egress; see open_request_stream).
     incoming_tx: mpsc::Sender<IncomingStream>,
     /// New-stream event receiver (take-once; still `Some` means egress has not taken over).
@@ -552,22 +875,46 @@ pub(crate) struct TunnelDispatch {
     pending_attach_cap: usize,
 }
 
+/// Outcome of the non-blocking delivery pass.
+#[derive(Debug)]
+pub enum DeliverOutcome {
+    /// Handed to the stream channel (or handled inline: Open routed to
+    /// the request-stream machinery, which is queue-based, never
+    /// blocking on a full stream channel).
+    Delivered,
+    /// The stream's channel is full: per-stream ordering requires the
+    /// caller to park this frame (and any further frames of the same
+    /// stream this batch) and resolve it with the timed discipline
+    /// ([`TunnelDispatch::deliver_parked`]).
+    Parked(TunnelData),
+    /// No such stream / consumer gone: dropped (already accounted).
+    Gone,
+}
+
 impl TunnelDispatch {
     /// Builds with the default event-channel budget (the shared floor) —
     /// for tests and callers without a stream limit.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::with_stream_limit(0)
     }
+}
 
+impl Default for TunnelDispatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TunnelDispatch {
     /// Builds with the event-channel budget derived from the agent's local
     /// concurrent-stream limit: `max_incoming_streams` legitimate Opens must
     /// pass in one go; 0 (unlimited) falls back to the floor.
-    pub(crate) fn with_stream_limit(max_incoming_streams: usize) -> Self {
+    pub fn with_stream_limit(max_incoming_streams: usize) -> Self {
         let cap = crate::config::params::transport::incoming_channel_cap(max_incoming_streams);
         let (incoming_tx, incoming_rx) = mpsc::channel(cap);
         Self {
-            resp_streams: Arc::new(RwLock::new(HashMap::new())),
-            req_streams: Arc::new(RwLock::new(HashMap::new())),
+            resp_streams: Arc::new(StreamChannels::new()),
+            req_streams: Arc::new(StreamChannels::new()),
             incoming_tx,
             incoming_rx: std::sync::Mutex::new(Some(incoming_rx)),
             attach_gate: Arc::new(AttachGate::default()),
@@ -579,17 +926,15 @@ impl TunnelDispatch {
     /// Registers a dedicated response-direction stream channel (capacity [`STREAM_CHANNEL_CAP`]: under congestion the sender
     /// applies a bounded wait + poisoning fallback, so a single stream's
     /// backlog cannot blow up memory).
-    pub(crate) async fn register_stream(&self, stream_id: StreamId) -> mpsc::Receiver<TunnelData> {
+    pub fn register_stream(&self, stream_id: StreamId) -> mpsc::Receiver<TunnelData> {
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAP);
-        let mut map = self.resp_streams.write().await;
-        map.insert(stream_id, tx);
+        self.resp_streams.insert(stream_id, tx);
         rx
     }
 
     /// Unregisters the dedicated response-direction stream channel.
-    pub(crate) async fn unregister_stream(&self, stream_id: StreamId) {
-        let mut map = self.resp_streams.write().await;
-        map.remove(&stream_id);
+    pub fn unregister_stream(&self, stream_id: StreamId) {
+        self.resp_streams.remove(&stream_id);
     }
 
     /// Takes the request-direction new-stream event receiver (take-once) and wakes parked Open hand-offs.
@@ -606,9 +951,8 @@ impl TunnelDispatch {
     }
 
     /// Unregisters the request-direction stream channel (called when a forwarder exits; idempotent).
-    pub(crate) async fn unregister_incoming_stream(&self, stream_id: StreamId) {
-        let mut map = self.req_streams.write().await;
-        map.remove(&stream_id);
+    pub(crate) fn unregister_incoming_stream(&self, stream_id: StreamId) {
+        self.req_streams.remove(&stream_id);
     }
 
     /// Session termination: clears the request-direction stream table, returning the number of entries released (idempotent; a second call returns 0).
@@ -621,11 +965,8 @@ impl TunnelDispatch {
     /// poisoning path never triggers, so table entries must be released
     /// uniformly by the termination contract
     /// ([`TunnelTransport::shutdown`])
-    pub(crate) async fn close_all_request_streams(&self) -> usize {
-        let mut map = self.req_streams.write().await;
-        let n = map.len();
-        map.clear();
-        n
+    pub(crate) fn close_all_request_streams(&self) -> usize {
+        self.req_streams.clear()
     }
 
     /// Session termination: clears the response-direction stream table, returning the number of entries released (idempotent).
@@ -633,11 +974,8 @@ impl TunnelDispatch {
     /// Dropping all senders → the write half of the ingress/edge pump sees
     /// `recv()` return `None` and closes out → the client socket is closed
     /// with it (no longer relying on the idle timeout to expire on its own).
-    pub(crate) async fn close_all_response_streams(&self) -> usize {
-        let mut map = self.resp_streams.write().await;
-        let n = map.len();
-        map.clear();
-        n
+    pub(crate) fn close_all_response_streams(&self) -> usize {
+        self.resp_streams.clear()
     }
 
     /// Dispatches a `TunnelData` frame to the corresponding stream channel based on direction.
@@ -656,56 +994,114 @@ impl TunnelDispatch {
     /// - Request-direction Data/Close: delivered on a req-table hit, dropped
     ///   on a miss (late frame, or a QUIC DATAGRAM arriving before the Open —
     ///   legitimate loss under UDP semantics).
-    pub(crate) async fn dispatch(&self, tunnel_data: TunnelData) {
+    pub async fn dispatch(&self, tunnel_data: TunnelData) {
+        // Open builds stream state (channel creation + hand-off) and awaits
+        // its own bounded machinery — never a full stream channel.
+        if !matches!(tunnel_data.origin, FrameOrigin::Response)
+            && !matches!(tunnel_data.origin, FrameOrigin::Hub)
+            && matches!(tunnel_data.stream_type, FrameType::Open)
+        {
+            self.open_request_stream(tunnel_data).await;
+            return;
+        }
+        // Non-blocking first: only a backpressured (Full) channel falls to
+        // the timed wait — the h2/QUIC read loops' common path never arms a
+        // timer (§2.3/§2.4).
+        if let DeliverOutcome::Parked(tunnel_data) = self.try_deliver(tunnel_data) {
+            self.deliver_parked(tunnel_data).await;
+        }
+    }
+
+    /// The non-blocking delivery pass (§2.4): routes exactly like
+    /// [`Self::dispatch`] but never waits — `try_send` semantics. Open
+    /// frames are NOT handled here (they build stream state through async
+    /// machinery — the caller awaits [`Self::dispatch`] for them).
+    pub fn try_deliver(&self, tunnel_data: TunnelData) -> DeliverOutcome {
         let is_response = matches!(tunnel_data.origin, FrameOrigin::Response);
         let is_close_notification = matches!(tunnel_data.origin, FrameOrigin::Hub)
             && tunnel_data.stream_type == FrameType::Close;
 
         if is_response {
-            Self::deliver(tunnel_data, &self.resp_streams, "response").await;
+            Self::try_deliver_into(tunnel_data, &self.resp_streams, "response")
         } else if is_close_notification {
             // Deliver to the req table first (the egress forwarder reclaims
             // the slot/connection as soon as it receives it — otherwise
             // streams closed by the origin linger indefinitely on the agent
             // side); with no req-table entry go to the resp table
             // (ingress/edge stream teardown).
-            let has_req = self
-                .req_streams
-                .read()
-                .await
-                .contains_key(&tunnel_data.stream_id);
-            if has_req {
-                Self::deliver(tunnel_data, &self.req_streams, "request").await;
+            if self.req_streams.contains(&tunnel_data.stream_id) {
+                Self::try_deliver_into(tunnel_data, &self.req_streams, "request")
             } else {
-                Self::deliver(tunnel_data, &self.resp_streams, "response").await;
+                Self::try_deliver_into(tunnel_data, &self.resp_streams, "response")
             }
-        } else if matches!(tunnel_data.stream_type, FrameType::Open) {
-            self.open_request_stream(tunnel_data).await;
         } else {
-            Self::deliver(tunnel_data, &self.req_streams, "request").await;
+            Self::try_deliver_into(tunnel_data, &self.req_streams, "request")
         }
     }
 
-    /// Bounded delivery: clone the sender outside the lock, then `timeout(DISPATCH_SEND_TIMEOUT, send())`.
+    /// Non-blocking send into one table (the shared fast path).
+    fn try_deliver_into(
+        tunnel_data: TunnelData,
+        table: &StreamChannels,
+        direction: &'static str,
+    ) -> DeliverOutcome {
+        let stream_id = tunnel_data.stream_id;
+        let Some(tx) = table.get(&stream_id) else {
+            // Frames keep arriving for a stream after its channel is gone
+            // until the peer learns of the close — a steady-state signal for
+            // the counter, trace-only per frame.
+            metrics::counter!("interflow_dispatch_frames_dropped_total", "reason" => "late_frame", "direction" => direction)
+                .increment(1);
+            trace!(
+                "no channel for stream {} in {direction} direction (late frame), dropping",
+                stream_id
+            );
+            return DeliverOutcome::Gone;
+        };
+        match tx.try_send(tunnel_data) {
+            Ok(()) => DeliverOutcome::Delivered,
+            Err(mpsc::error::TrySendError::Full(tunnel_data)) => {
+                DeliverOutcome::Parked(tunnel_data)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::counter!("interflow_dispatch_frames_dropped_total", "reason" => "consumer_exited", "direction" => direction)
+                    .increment(1);
+                trace!(
+                    "stream {} channel closed (consumer exited), dropping further frames",
+                    stream_id
+                );
+                DeliverOutcome::Gone
+            }
+        }
+    }
+
+    /// Resolution of a parked frame (§2.4): re-derives the routing table,
+    /// then the timed bounded wait + poisoning discipline. Only
+    /// backpressured frames reach here — the fast path never arms a timer.
     ///
     /// Timeout = consumer stalled → poison (remove the table entry; once all
     /// senders are dropped the channel closes, and the consumer exits itself
     /// on `recv() == None` and notifies the peer). Channel already closed =
     /// consumer has exited; drop this frame.
-    async fn deliver(
-        tunnel_data: TunnelData,
-        map: &Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
-        direction: &'static str,
-    ) {
+    pub async fn deliver_parked(&self, tunnel_data: TunnelData) {
         let stream_id = tunnel_data.stream_id;
-        // Release the read lock right after cloning the sender, so send().await does not block register/unregister
-        let tx = {
-            let map = map.read().await;
-            map.get(&stream_id).cloned()
+        let is_response = matches!(tunnel_data.origin, FrameOrigin::Response);
+        let is_close_notification = matches!(tunnel_data.origin, FrameOrigin::Hub)
+            && tunnel_data.stream_type == FrameType::Close;
+        let (table, direction) = if is_response {
+            (&self.resp_streams, "response")
+        } else if is_close_notification && self.req_streams.contains(&stream_id) {
+            (&self.req_streams, "request")
+        } else if is_close_notification {
+            (&self.resp_streams, "response")
+        } else {
+            (&self.req_streams, "request")
         };
-        let Some(tx) = tx else {
-            debug!(
-                "no channel for stream {} in {direction} direction (late frame), dropping",
+        let Some(tx) = table.get(&stream_id) else {
+            // The stream left the table between park and resolution (peer
+            // closed / poison raced): drop, already accounted at park time.
+            trace!(
+                "parked stream {} left the table before resolution, dropping",
                 stream_id
             );
             return;
@@ -713,7 +1109,9 @@ impl TunnelDispatch {
         match tokio::time::timeout(DISPATCH_SEND_TIMEOUT, tx.send(tunnel_data)).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
-                debug!(
+                metrics::counter!("interflow_dispatch_frames_dropped_total", "reason" => "consumer_exited", "direction" => direction)
+                    .increment(1);
+                trace!(
                     "stream {} channel closed (consumer exited), dropping further frames",
                     stream_id
                 );
@@ -725,7 +1123,7 @@ impl TunnelDispatch {
                     "stream {} consumer stalled for over {DISPATCH_SEND_TIMEOUT:?}, poisoning the stream (direction={direction})",
                     stream_id
                 );
-                map.write().await.remove(&stream_id);
+                table.remove(&stream_id);
             }
         }
     }
@@ -736,13 +1134,10 @@ impl TunnelDispatch {
     async fn open_request_stream(&self, open: TunnelData) {
         let stream_id = open.stream_id;
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAP);
-        {
-            let mut map = self.req_streams.write().await;
-            if map.insert(stream_id, tx.clone()).is_some() {
-                warn!(
-                    "duplicate Open for request-direction stream {stream_id}, overwriting old channel (old forwarder will exit)"
-                );
-            }
+        if self.req_streams.insert(stream_id, tx.clone()) {
+            warn!(
+                "duplicate Open for request-direction stream {stream_id}, overwriting old channel (old forwarder will exit)"
+            );
         }
 
         // Egress has taken over: direct bounded hand-off.
@@ -773,7 +1168,7 @@ impl TunnelDispatch {
                 "pending-attach budget full ({}), dropping Open: {stream_id}",
                 self.pending_attach_cap
             );
-            Self::remove_req_stream(&self.req_streams, stream_id, &tx).await;
+            Self::remove_req_stream(&self.req_streams, stream_id, &tx);
             return;
         }
         let gate = Arc::clone(&self.attach_gate);
@@ -806,7 +1201,7 @@ impl TunnelDispatch {
                 warn!(
                     "egress did not attach within {ATTACH_GRACE:?} (misrouted or handler not started), dropping Open and rolling back table entry: {stream_id}"
                 );
-                Self::remove_req_stream(&req_streams, stream_id, &tx).await;
+                Self::remove_req_stream(&req_streams, stream_id, &tx);
                 return;
             }
             Self::hand_off_incoming(&incoming_tx, &req_streams, open, rx, stream_id, &tx).await;
@@ -822,7 +1217,7 @@ impl TunnelDispatch {
     /// JoinError fallback.
     async fn hand_off_incoming(
         incoming_tx: &mpsc::Sender<IncomingStream>,
-        req_streams: &Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
+        req_streams: &Arc<StreamChannels>,
         open: TunnelData,
         frames: mpsc::Receiver<TunnelData>,
         stream_id: StreamId,
@@ -837,7 +1232,7 @@ impl TunnelDispatch {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 debug!("new-stream event has no consumer (egress exited): {stream_id}");
-                Self::remove_req_stream(req_streams, stream_id, tx).await;
+                Self::remove_req_stream(req_streams, stream_id, tx);
             }
             Err(_) => {
                 metrics::counter!(
@@ -848,7 +1243,7 @@ impl TunnelDispatch {
                 warn!(
                     "new-stream event channel backlog exceeded {INCOMING_SEND_TIMEOUT:?}, dropping Open and rolling back table entry: {stream_id}"
                 );
-                Self::remove_req_stream(req_streams, stream_id, tx).await;
+                Self::remove_req_stream(req_streams, stream_id, tx);
             }
         }
     }
@@ -859,15 +1254,12 @@ impl TunnelDispatch {
     /// concurrently: after a duplicate Open for the same sid overwrites the
     /// entry, the old Open's timeout rollback must not delete the new Open's
     /// channel (otherwise the new forwarder would be poisoned for no reason).
-    async fn remove_req_stream(
-        map: &Arc<RwLock<HashMap<StreamId, mpsc::Sender<TunnelData>>>>,
+    fn remove_req_stream(
+        map: &Arc<StreamChannels>,
         stream_id: StreamId,
         tx: &mpsc::Sender<TunnelData>,
     ) {
-        let mut map = map.write().await;
-        if map.get(&stream_id).is_some_and(|cur| cur.same_channel(tx)) {
-            map.remove(&stream_id);
-        }
+        map.remove_if(&stream_id, tx);
     }
 
     /// Decodes tunnel data (binary length-prefixed frames, supports fragmentation).
@@ -966,8 +1358,8 @@ mod tests {
         }
     }
 
-    async fn req_stream_count(dispatch: &TunnelDispatch) -> usize {
-        dispatch.req_streams.read().await.len()
+    fn req_stream_count(dispatch: &TunnelDispatch) -> usize {
+        dispatch.req_streams.total()
     }
 
     /// F1 (main regression, unit form): Open hand-off is bounded when the event channel is backlogged —
@@ -984,7 +1376,7 @@ mod tests {
             dispatch.dispatch(open_td(i as u64 + 1)).await;
         }
         assert_eq!(
-            req_stream_count(&dispatch).await,
+            req_stream_count(&dispatch),
             crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR
         );
 
@@ -995,7 +1387,7 @@ mod tests {
 
         // Table entry rolled back (dropped stream leaves no channel), counter +1
         assert!(
-            dispatch.req_streams.read().await.get(&sid(9_001)).is_none(),
+            dispatch.req_streams.get(&sid(9_001)).is_none(),
             "the over-budget Open's table entry must be rolled back"
         );
         let dropped = metrics_handle()
@@ -1024,7 +1416,7 @@ mod tests {
             .await
             .expect("Open event should be handed off immediately (channel far from full)");
         assert_eq!(ev.open.stream_id, sid(1));
-        assert!(dispatch.req_streams.read().await.contains_key(&sid(1)));
+        assert!(dispatch.req_streams.contains(&sid(1)));
     }
 
     /// Main regression (the timing race reproduced in the soak guardrail on 2026-09-13; fails before the fix):
@@ -1037,7 +1429,7 @@ mod tests {
         // Not yet taken over: the Open parks (table entry retained, not dropped)
         dispatch.dispatch(open_td(2)).await;
         assert!(
-            dispatch.req_streams.read().await.contains_key(&sid(2)),
+            dispatch.req_streams.contains(&sid(2)),
             "the table entry must be retained while parked (later Data frames must hit the channel)"
         );
 
@@ -1076,14 +1468,14 @@ mod tests {
         let dispatch = TunnelDispatch::new();
         dispatch.dispatch(open_td(3)).await;
         assert_eq!(
-            req_stream_count(&dispatch).await,
+            req_stream_count(&dispatch),
             1,
             "parked within the grace period"
         );
 
         // Must converge after the test-profile ATTACH_GRACE (200ms)
         let deadline = Instant::now() + Duration::from_secs(5);
-        while req_stream_count(&dispatch).await > 0 {
+        while req_stream_count(&dispatch) > 0 {
             assert!(
                 Instant::now() < deadline,
                 "the table entry must be rolled back after the grace period"
@@ -1110,13 +1502,13 @@ mod tests {
             dispatch.dispatch(open_td(i as u64 + 1)).await;
         }
         assert_eq!(
-            req_stream_count(&dispatch).await,
+            req_stream_count(&dispatch),
             crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR
         );
 
         dispatch.dispatch(open_td(9_001)).await;
         assert_eq!(
-            req_stream_count(&dispatch).await,
+            req_stream_count(&dispatch),
             crate::config::params::transport::INCOMING_CHANNEL_CAP_FLOOR,
             "the over-budget Open must not park (entry count unchanged)"
         );
@@ -1176,7 +1568,7 @@ mod tests {
         assert_eq!(td.stream_type, FrameType::Close);
 
         // _close_ with no req-table entry → resp table (received by the ingress registrant)
-        let mut resp = dispatch.register_stream(sid(5)).await;
+        let mut resp = dispatch.register_stream(sid(5));
         dispatch
             .dispatch(TunnelData {
                 stream_id: sid(5),
@@ -1205,7 +1597,7 @@ mod tests {
             started.elapsed() < INCOMING_SEND_TIMEOUT,
             "a closed channel should fail immediately instead of waiting out the full timeout"
         );
-        assert_eq!(req_stream_count(&dispatch).await, 0);
+        assert_eq!(req_stream_count(&dispatch), 0);
     }
 
     /// Termination contract (main regression, 2026-09-14 fd leak): `close_all_request_streams`
@@ -1222,11 +1614,11 @@ mod tests {
         dispatch.dispatch(open_td(8)).await;
         let ev1 = rx.recv().await.expect("Open handed off");
         let ev2 = rx.recv().await.expect("Open handed off");
-        assert_eq!(req_stream_count(&dispatch).await, 2);
+        assert_eq!(req_stream_count(&dispatch), 2);
 
-        let n = dispatch.close_all_request_streams().await;
+        let n = dispatch.close_all_request_streams();
         assert_eq!(n, 2, "returns the number of cleared entries");
-        assert_eq!(req_stream_count(&dispatch).await, 0);
+        assert_eq!(req_stream_count(&dispatch), 0);
 
         // From the forwarder's perspective: channel closure is visible immediately, and it is idempotent (a second call returns 0)
         for mut frames in [ev1.frames, ev2.frames] {
@@ -1236,7 +1628,7 @@ mod tests {
                 "recv must return None immediately after close_all"
             );
         }
-        assert_eq!(dispatch.close_all_request_streams().await, 0);
+        assert_eq!(dispatch.close_all_request_streams(), 0);
     }
 
     /// Termination contract (response direction): `close_all_response_streams` clears the resp table —
@@ -1245,8 +1637,8 @@ mod tests {
     #[tokio::test]
     async fn close_all_response_streams_releases_pump_channels() {
         let dispatch = TunnelDispatch::new();
-        let mut pump_rx = dispatch.register_stream(sid(9)).await;
-        assert_eq!(dispatch.close_all_response_streams().await, 1);
+        let mut pump_rx = dispatch.register_stream(sid(9));
+        assert_eq!(dispatch.close_all_response_streams(), 1);
 
         let r = tokio::time::timeout(Duration::from_secs(1), pump_rx.recv()).await;
         assert!(
@@ -1263,7 +1655,7 @@ mod tests {
                 flags: 0,
             })
             .await;
-        assert_eq!(dispatch.close_all_response_streams().await, 0);
+        assert_eq!(dispatch.close_all_response_streams(), 0);
     }
 
     /// Duplicate-Open overwrite + timeout-rollback same_channel guard: the old Open's rollback
@@ -1286,13 +1678,131 @@ mod tests {
         tokio::task::yield_now().await;
         {
             let (tx2, _rx2) = mpsc::channel(STREAM_CHANNEL_CAP);
-            dispatch.req_streams.write().await.insert(sid(10), tx2);
+            dispatch.req_streams.insert(sid(10), tx2);
         }
         first.await.unwrap();
         // The old Open's timeout rollback is stopped by the same_channel guard: the new channel stays in the table
         assert!(
-            dispatch.req_streams.read().await.contains_key(&sid(10)),
+            dispatch.req_streams.contains(&sid(10)),
             "the timeout rollback must not mis-delete the new channel installed by the duplicate Open"
+        );
+    }
+
+    /// §2.4 non-blocking delivery: a backpressured (full) stream parks its
+    /// frame while other streams in the same batch keep flowing — one
+    /// stalled consumer cannot head-of-line-block the poll loop.
+    #[tokio::test]
+    async fn try_deliver_parks_full_stream_without_blocking_others() {
+        let dispatch = TunnelDispatch::new();
+        let stalled = sid(1);
+        let healthy = sid(2);
+        let mut stalled_rx = dispatch.register_stream(stalled);
+        let mut healthy_rx = dispatch.register_stream(healthy);
+
+        // Fill the stalled stream's channel to capacity (no consumer).
+        for i in 0..STREAM_CHANNEL_CAP {
+            let frame = TunnelData {
+                stream_id: stalled,
+                origin: FrameOrigin::Response,
+                data: Bytes::from(vec![0u8; 8]),
+                stream_type: FrameType::Data,
+                flags: 0,
+            };
+            let _ = &i;
+            assert!(
+                matches!(dispatch.try_deliver(frame), DeliverOutcome::Delivered),
+                "fill below capacity delivers without parking"
+            );
+        }
+
+        // Capacity exhausted: the next frame parks instead of waiting.
+        let overflow = TunnelData {
+            stream_id: stalled,
+            origin: FrameOrigin::Response,
+            data: Bytes::from_static(b"overflow"),
+            stream_type: FrameType::Data,
+            flags: 0,
+        };
+        let parked_frame = match dispatch.try_deliver(overflow) {
+            DeliverOutcome::Parked(td) => td,
+            other => panic!("expected Parked, got {other:?}"),
+        };
+
+        // The healthy stream flows in the same batch (no waiting on the
+        // stalled one).
+        let flows = TunnelData {
+            stream_id: healthy,
+            origin: FrameOrigin::Response,
+            data: Bytes::from_static(b"healthy"),
+            stream_type: FrameType::Data,
+            flags: 0,
+        };
+        assert!(matches!(
+            dispatch.try_deliver(flows),
+            DeliverOutcome::Delivered
+        ));
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), healthy_rx.recv())
+            .await
+            .expect("healthy stream delivered immediately")
+            .expect("frame");
+        assert_eq!(received.data.as_ref(), b"healthy");
+
+        // Parked resolution: after the consumer drains, the parked frame
+        // lands (order preserved behind the queued backlog).
+        let drained = stalled_rx.recv().await.expect("backlog frame");
+        assert_eq!(drained.data.len(), 8);
+        dispatch.deliver_parked(parked_frame).await;
+        for _ in 0..(STREAM_CHANNEL_CAP - 1) {
+            stalled_rx.recv().await.expect("backlog frame");
+        }
+        let last = tokio::time::timeout(std::time::Duration::from_secs(1), stalled_rx.recv())
+            .await
+            .expect("parked frame resolved")
+            .expect("frame");
+        assert_eq!(last.data.as_ref(), b"overflow");
+    }
+
+    /// A poisoned stream (consumer stalled past the deadline) is removed
+    /// from the table by the parked-resolution path — the existing
+    /// discipline carried over the §2.4 restructure.
+    #[tokio::test(start_paused = true)]
+    async fn deliver_parked_poisons_stalled_consumer() {
+        let dispatch = TunnelDispatch::new();
+        let stream = sid(3);
+        let _never_drained = dispatch.register_stream(stream);
+
+        for _ in 0..STREAM_CHANNEL_CAP {
+            let frame = TunnelData {
+                stream_id: stream,
+                origin: FrameOrigin::Response,
+                data: Bytes::from(vec![0u8; 4]),
+                stream_type: FrameType::Data,
+                flags: 0,
+            };
+            assert!(matches!(
+                dispatch.try_deliver(frame),
+                DeliverOutcome::Delivered
+            ));
+        }
+        let overflow = TunnelData {
+            stream_id: stream,
+            origin: FrameOrigin::Response,
+            data: Bytes::from_static(b"x"),
+            stream_type: FrameType::Data,
+            flags: 0,
+        };
+        let parked = match dispatch.try_deliver(overflow) {
+            DeliverOutcome::Parked(td) => td,
+            other => panic!("expected Parked, got {other:?}"),
+        };
+
+        // Advance past DISPATCH_SEND_TIMEOUT with no consumer: the
+        // resolution poisons the stream (table entry removed).
+        tokio::time::advance(DISPATCH_SEND_TIMEOUT + std::time::Duration::from_millis(50)).await;
+        dispatch.deliver_parked(parked).await;
+        assert!(
+            !dispatch.resp_streams.contains(&stream),
+            "a stalled consumer must be poisoned out of the table"
         );
     }
 }

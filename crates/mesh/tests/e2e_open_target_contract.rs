@@ -92,14 +92,16 @@ async fn quic_empty_target_route_lease_rejected() {
         .port();
 
     let (cert, key) = certs().named_client_cert("quic-src");
-    let tls = build_client_config(
-        None,
-        certs().ca_path().to_str(),
-        cert.to_str(),
-        key.to_str(),
-        &[QUIC_ALPN],
-    )
-    .expect("client tls config");
+    let tls = std::sync::Arc::new(
+        build_client_config(
+            None,
+            certs().ca_path().to_str(),
+            cert.to_str(),
+            key.to_str(),
+            &[QUIC_ALPN],
+        )
+        .expect("client tls config"),
+    );
     let server_addr: SocketAddr = format!("127.0.0.1:{hub_port}").parse().unwrap();
 
     // Direct QuicTunnel (the production QUIC client): register, then open a

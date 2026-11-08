@@ -5,22 +5,14 @@
 //! (`quic_listen`) so the agent-side probe's UDP layer has a real listener
 //! to answer its version-negotiation trigger.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod common;
+use common::run;
 
 use interflow_core::security::AuditSink;
 use interflow_identity::credentials::ActiveCredentialSet;
 use interflow_identity::pack::CredentialPack;
 use interflow_mesh::hub::HubServer;
 use interflow_mesh::pack::build_hub_config;
-use std::path::PathBuf;
-use std::process::Command;
-
-fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test bin path");
-    p.pop(); // deps/
-    p.pop(); // tests/
-    p.join(format!("interflow-cli{}", std::env::consts::EXE_SUFFIX))
-}
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -57,24 +49,6 @@ name = "loopback"
 target_cidr = "127.0.0.0/8"
 "#
     )
-}
-
-struct RunOutcome {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
-fn run(args: &[&str]) -> RunOutcome {
-    let output = Command::new(bin())
-        .args(args)
-        .output()
-        .expect("spawn interflow");
-    RunOutcome {
-        success: output.status.success(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    }
 }
 
 /// The full tool chain against a live hub: capture → persist → diff →

@@ -42,7 +42,7 @@ use interflow_core::security::ProxyProtocolConfig;
 use interflow_core::security::ProxyProtocolPolicy;
 use interflow_core::security::XffMode;
 use interflow_core::security::XffPolicy;
-use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker};
+use interflow_core::security::{AuditSink, AuthRateLimiter, ConnTracker, RateLimitScope};
 use interflow_core::tls::TenantTrustRoot;
 use interflow_mesh::agent::client::AgentClient;
 use interflow_mesh::config::{
@@ -141,6 +141,12 @@ pub struct EdgeListenerPolicy {
     pub x_forwarded_for: XffMode,
     /// Per-IP new-connection limit per minute; 0 = unlimited.
     pub new_conn_rate_per_ip_per_minute: u32,
+    /// The most distinct clients the new-connection limiter tracks at once
+    /// — its memory bound. Beyond it the limiter forgets the debt of
+    /// clients idle for a whole generation first (counted in
+    /// `interflow_rate_limit_capacity_evictions`, warned about), never
+    /// refusing a new client. Rounds down to multiples of 32.
+    pub max_tracked_clients: usize,
     /// Public-stream idle timeout. The pump's read/write halves share one
     /// budget: "an upper bound on surviving without bytes in either
     /// direction"; must be ≤ the front proxy's `proxy_read_timeout`.
@@ -158,6 +164,7 @@ impl Default for EdgeListenerPolicy {
             proxy_protocol: ProxyProtocolConfig::default(),
             x_forwarded_for: XffMode::Off,
             new_conn_rate_per_ip_per_minute: DEFAULT_NEW_CONN_RATE_PER_IP_PER_MINUTE,
+            max_tracked_clients: interflow_core::security::MAX_TRACKED_CLIENTS,
             stream_idle_timeout: Duration::from_secs(DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
             route_breaker: RouteBreakerPolicy::default(),
         }
@@ -286,6 +293,12 @@ pub struct EdgeConfig {
     /// deliberately does not depend on the identity crate, so the pack
     /// loader fills this from `pack.metadata.identity_mode`).
     pub identity_offline: bool,
+    /// The renewal loop's CRL-poll liveness face, when this edge runs one
+    /// beside the engine (the CLI's ingress path hands the SAME `Arc` to
+    /// the scheduler spawn; the edge feeds it into the embedded hub's
+    /// self slot). `None` = no reporter (in-memory embedders,
+    /// offline-identity edges).
+    pub renewal_face: Option<std::sync::Arc<interflow_renewal::CrlPollFace>>,
 }
 
 impl EdgeConfig {
@@ -324,6 +337,7 @@ impl Default for EdgeConfig {
             log_name: None,
             policy: None,
             identity_offline: false,
+            renewal_face: None,
         }
     }
 }
@@ -346,6 +360,76 @@ fn agent_recovery_timeout(config: &EdgeConfig) -> Duration {
         );
     }
     timeout
+}
+
+/// The edge's target-recovery sink (2026-10-18 active recovery): receives
+/// an agent's out-of-band "backend recovered" notice on the embedded hub's
+/// control plane and closes the matching route-breaker entries ahead of
+/// their cooldown — the root cure for the outage-shorter-than-cooldown
+/// residual window (the agent's own entry recovers in ~one probe interval;
+/// without this sink the public face would still wait out the route
+/// breaker's remaining cooldown).
+///
+/// Authorization shape: a notice acts only on routes resolving to the
+/// SENDING agent (`{workspace}/{agent_id}` equality) that select one of
+/// the notice's service ids — a compromised agent can at worst
+/// prematurely re-admit its own routes, never a peer's. Closing is
+/// fail-safe anyway (`note_success` on a CLOSED entry is a no-op).
+struct EdgeTargetRecovery {
+    /// The live host table (hot-swapped by the policy watcher): the
+    /// reverse index is derived per notice, so a swap needs no extra
+    /// plumbing here.
+    router: Arc<HostRouter>,
+    /// The route breaker shared with the public listener's gate.
+    breaker: Option<Arc<interflow_mesh::agent::target_breaker::TargetBreakers>>,
+    /// Log attribution.
+    node: String,
+}
+
+impl interflow_mesh::hub::target_recovery::TargetRecoverySink for EdgeTargetRecovery {
+    fn target_recovered(
+        &self,
+        agent: &str,
+        notice: &interflow_core::tunnel::transport::TargetRecoveredNotice,
+    ) -> u32 {
+        let Some(breaker) = &self.breaker else {
+            return 0;
+        };
+        let mut closed = 0u32;
+        for route in self.router.routes() {
+            // Registry-key equality: the notice sender must BE the route's
+            // agent (workspace + agent id), and the notice must name the
+            // route's service.
+            if route.workspace + "/" + &route.agent_id != agent
+                || !notice.service_ids.contains(&route.service_id)
+            {
+                continue;
+            }
+            let Some(host) = HostRouter::normalize(&route.host) else {
+                continue;
+            };
+            if breaker.note_success(&host) {
+                closed += 1;
+            }
+        }
+        if closed > 0 {
+            tracing::info!(
+                node = %self.node,
+                agent = %agent,
+                target = %notice.target_addr,
+                routes = closed,
+                "route breaker closed ahead of cooldown by agent recovery notice"
+            );
+        } else {
+            tracing::debug!(
+                node = %self.node,
+                agent = %agent,
+                target = %notice.target_addr,
+                "agent recovery notice matched no OPEN route (idle or foreign)"
+            );
+        }
+        closed
+    }
 }
 
 /// Start Edge: spawn control endpoint + one session per workspace + run the
@@ -469,7 +553,7 @@ async fn run_until_inner(
         ));
     }
     for route in &config.routes {
-        identity.material_for(&route.workspace)?;
+        identity.material_for(&route.workspace).await?;
     }
     info!(
         node = %node,
@@ -507,7 +591,10 @@ async fn run_until_inner(
                         );
                         continue;
                     };
-                    if identity_for_watch.material_for(&service.workspace).is_err() {
+                    if identity_for_watch
+                        .material_for_blocking(&service.workspace)
+                        .is_err()
+                    {
                         tracing::warn!(
                             node = %watch_name,
                             "route hot-swap: workspace {ws:?} has no principal material (identity-face change; re-render the pack) — route {host:?} deferred",
@@ -569,15 +656,53 @@ async fn run_until_inner(
 
     // 3b. Per-IP new-connection rate limit (defends against connect loop
     //     attacks; checked before conn_tracker)
-    let rate_limiter =
-        AuthRateLimiter::new(config.listener.new_conn_rate_per_ip_per_minute).map(Arc::new);
-    if rate_limiter.is_some() {
+    let rate_limiter = AuthRateLimiter::with_max_tracked_clients(
+        RateLimitScope::EdgeNewConn,
+        config.listener.new_conn_rate_per_ip_per_minute,
+        config.listener.max_tracked_clients,
+    )
+    .map(Arc::new);
+    if let Some(limiter) = &rate_limiter {
         info!(
             node = %node,
-            "enabled edge per-IP new-connection rate limit: {} per minute per IP",
-            config.listener.new_conn_rate_per_ip_per_minute
+            "enabled edge per-client new-connection rate limit: {} per minute per client, \
+             tracking at most {} clients",
+            config.listener.new_conn_rate_per_ip_per_minute,
+            limiter.max_tracked_clients()
         );
     }
+
+    // 3c. The route breaker (route kind, keyed by canonical host): created
+    //     here — before the hub server — so the same instance is shared by
+    //     the public listener's gate and the hub's target-recovery sink
+    //     (one table, one truth; the sink closes entries the gate trips).
+    let route_breaker = config.listener.route_breaker.enabled.then(|| {
+        // The open-set read face (2026-10-19): the hub row below and
+        // the floor payload read the currently-OPEN route hosts
+        // through the embedded hub's registered slot.
+        let face = Arc::new(interflow_mesh::agent::target_breaker::BreakerWatchState::default());
+        let table = Arc::new(
+            interflow_mesh::agent::target_breaker::TargetBreakers::with_face(
+                interflow_mesh::agent::target_breaker::BreakerKind::Route,
+                node.clone(),
+                interflow_core::config::params::BreakerPolicy {
+                    failure_threshold: config.listener.route_breaker.failure_threshold.max(1),
+                    failure_window: Duration::from_secs(
+                        config.listener.route_breaker.failure_window_secs.max(1),
+                    ),
+                    cooldown: Duration::from_secs(
+                        config.listener.route_breaker.cooldown_secs.max(1),
+                    ),
+                },
+                Arc::clone(&face),
+            ),
+        );
+        (table, face)
+    });
+    let (route_breaker, route_breaker_face) = match route_breaker {
+        Some((table, face)) => (Some(table), Some(face)),
+        None => (None, None),
+    };
 
     // 4. Assemble the control endpoint config and spawn the HubServer. The
     //    TLS plane is built here from the in-memory trust table; the audit
@@ -595,6 +720,27 @@ async fn run_until_inner(
     let hub_plane_config = plane.config.clone();
 
     let hub_server = interflow_mesh::hub::HubServer::with_tls_plane(hub_cfg, plane, audit.clone())?;
+    // Captured before the run task consumes the server (the sink and the
+    // liveness self-reporter below act on the same Arc fields).
+    let hub_state_handle = hub_server.state_handle();
+    // Register the edge's target-recovery sink before the server task owns
+    // the HubServer: an agent's out-of-band "backend recovered" notice now
+    // closes this edge's route-breaker entries ahead of their cooldown
+    // (2026-10-18 active recovery — the outage-shorter-than-cooldown
+    // residual window's root cure). Plain mesh hubs never register; their
+    // notices take the acknowledged no-op arm.
+    hub_state_handle.register_target_recovery_sink(Arc::new(EdgeTargetRecovery {
+        router: Arc::clone(&router),
+        breaker: route_breaker.clone(),
+        node: node.clone(),
+    }));
+    // The route-breaker open-set face: the snapshot hub row, the floor
+    // payload, and (via the floor-clock bridge inside the registration)
+    // the push contract all carry the currently-OPEN hosts the moment
+    // they change (2026-10-19).
+    if let Some(face) = route_breaker_face {
+        hub_state_handle.register_route_breaker_face(face);
+    }
     // Single-public-port mode: remember the hub's TLS configuration and a
     // serve handle before the server task owns them, so the public listener
     // can dispatch control-plane SNIs into the same plane.
@@ -610,6 +756,16 @@ async fn run_until_inner(
     // Child token: the hub drains on ANY exit path of run_until (external
     // cancellation or a component failure), not just process death.
     let hub_token = tokio_util::sync::CancellationToken::new();
+    // The edge's own renewal face, fed into the embedded hub's liveness
+    // self slot (same shape as a pack-built hub's copy task — one Arc the
+    // scheduler refreshes and the fleet face reads).
+    if let Some(renewal_face) = &config.renewal_face {
+        interflow_mesh::hub::crl_liveness::spawn_self_reporter(
+            hub_state_handle,
+            Arc::clone(renewal_face),
+            hub_token.child_token(),
+        );
+    }
     let hub_run_token = hub_token.clone();
     let (hub_ready_tx, hub_ready_rx) = tokio::sync::oneshot::channel();
     let mut hub_task = tokio::spawn(async move {
@@ -684,32 +840,21 @@ async fn run_until_inner(
     );
 
     // 7. Run the public listener; if the control endpoint, the listener, or
-    //    any internal agent's recovery dies, fail as a whole — once the
-    //    control endpoint is dead every tunnel dial from the listener fails,
-    //    and continuing to serve would only produce black-hole connections.
-    //    The agents' own session deaths are NOT in this set: the supervisor
-    //    rebuilds them in process (step 6); only a supervisor that stops
-    //    making progress for a sustained stretch (watch_agent_health) is a
-    //    whole-process failure.
-    let route_breaker = config.listener.route_breaker.enabled.then(|| {
-        Arc::new(interflow_mesh::agent::target_breaker::TargetBreakers::new(
-            interflow_mesh::agent::target_breaker::BreakerKind::Route,
-            node.clone(),
-            interflow_core::config::params::BreakerPolicy {
-                failure_threshold: config.listener.route_breaker.failure_threshold.max(1),
-                failure_window: Duration::from_secs(
-                    config.listener.route_breaker.failure_window_secs.max(1),
-                ),
-                cooldown: Duration::from_secs(config.listener.route_breaker.cooldown_secs.max(1)),
-            },
-        ))
-    });
+    // any internal agent's recovery dies, fail as a whole — once the
+    // control endpoint is dead every tunnel dial from the listener fails,
+    // and continuing to serve would only produce black-hole connections.
+    // The agents' own session deaths are NOT in this set: the supervisor
+    // rebuilds them in process (step 6); only a supervisor that stops
+    // making progress for a sustained stretch (watch_agent_health) is a
+    // whole-process failure.
+    // (The route breaker itself was constructed at step 3c, before the
+    // hub — the listener and the hub's recovery sink share the instance.)
     // 7a. Public-HTTPS termination: in ACME mode the ingress terminates
     //     TLS itself (HTTP-01 + TLS-ALPN-01 + renewal); in fronted modes
     //     the listener stays plain TCP behind the proxy. The :80 face gets
     //     the SAME tracker/limiter/audit instances as the :443 listener —
     //     one shared budget across both public ports, keyed on the TCP peer
-    //     IP, so the documented per-IP/total limits keep one meaning.
+    //     IP, so the documented per-client/total limits keep one meaning.
     //     The runtime handle is kept for the teardown path (its :80
     //     listener must release the port when the edge stops).
     let mut acme_runtime: Option<acme::AcmeRuntime> = None;
@@ -1038,6 +1183,7 @@ fn build_hub_config(config: &EdgeConfig) -> HubConfig {
         // this config section carries only the rate limit.
         auth: AuthConfig {
             rate_limit_per_minute: 30,
+            max_tracked_clients: interflow_core::security::MAX_TRACKED_CLIENTS,
             tenants: Vec::new(),
         },
         tls: Some(HubTlsConfig {
@@ -1187,30 +1333,10 @@ fn build_workspace_agent_config(
 }
 
 /// Read a PEM-encoded cert file, extract the DER of the first CERTIFICATE
-/// block, and return the SHA256 hex.
+/// block, and return the SHA256 hex — the shared pinning helper in
+/// `interflow_core::tls` (verifier and fingerprint computation colocated).
 fn sha256_of_pem_cert(path: &std::path::Path) -> Result<String> {
-    use interflow_core::error::InterflowError;
-    let path_display = path.display().to_string();
-    let pem_bytes = std::fs::read(path).map_err(|e| {
-        InterflowError::config(format!(
-            "failed to read control endpoint cert {path_display}"
-        ))
-        .with_source(e)
-    })?;
-    let der = rustls_pemfile::certs(&mut &pem_bytes[..])
-        .next()
-        .ok_or_else(|| {
-            InterflowError::config(format!(
-                "control endpoint cert {path_display} has no PEM CERTIFICATE block"
-            ))
-        })?
-        .map_err(|e| {
-            InterflowError::config(format!(
-                "failed to parse control endpoint cert {path_display}"
-            ))
-            .with_source(e)
-        })?;
-    Ok(interflow_util::sha256_hex(&der))
+    interflow_core::tls::sha256_of_pem_cert(path, "control endpoint")
 }
 
 #[cfg(test)]
@@ -1296,22 +1422,7 @@ mod tests {
         );
     }
 
-    /// `sha256_of_pem_cert` should return Err for missing/invalid paths,
-    /// not panic.
-    #[test]
-    fn sha256_of_pem_cert_handles_missing_file() {
-        let result = sha256_of_pem_cert(&PathBuf::from("/nonexistent/hub.crt"));
-        assert!(result.is_err());
-    }
-
-    /// `sha256_of_pem_cert` should return Err for files without a
-    /// CERTIFICATE block.
-    #[test]
-    fn sha256_of_pem_cert_rejects_non_pem() {
-        let dir = tempfile::tempdir().unwrap();
-        let junk = dir.path().join("junk.pem");
-        std::fs::write(&junk, b"not a pem file").unwrap();
-        let result = sha256_of_pem_cert(&junk);
-        assert!(result.is_err());
-    }
+    // `sha256_of_pem_cert` error-path coverage lives with the helper in
+    // `interflow_core::tls::cert_pin`; the edge-side tests above keep the
+    // self-dial trust-model replication.
 }

@@ -45,8 +45,25 @@ pub struct RuntimePolicy {
     /// peers. Serve agents derive their engine egress rules — and the egress
     /// allowlist (`allowed_targets`) — from these entries, so adding or
     /// widening an offer is a policy change, not an identity re-sign.
-    #[serde(default)]
     pub mesh_egress: Vec<PolicyMeshEgress>,
+    /// The fleet roster: every node the manifest declares (ingress, agent,
+    /// hub), signed as the realm's desired state (format epoch 3). Membership
+    /// is a signed fact, so retirement and renaming are detectable on any
+    /// machine that carries a current pack: a unit or pack whose `(kind,
+    /// node)` is absent from the newest roster it can see is leftovers from a
+    /// retired or renamed node, not a member the signer forgot. Host-side
+    /// reconciliation (`doctor host`, `node install`'s closing sweep) and the
+    /// operator's `doctor` faces read this face; the data plane does not.
+    pub nodes: Vec<PolicyNode>,
+}
+
+/// One fleet-roster row: the kind spelling matches [`crate::pack::PackKind`]'s
+/// `as_str` (`ingress` / `agent` / `hub`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyNode {
+    pub kind: String,
+    pub node: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -72,12 +89,10 @@ pub struct PolicyService {
     pub workspace: String,
     pub agent: String,
     pub id: String,
-    /// Default dial target (`host:port`) from the manifest. Absent only on
-    /// policies signed before the field existed (schema evolution — old
-    /// readers fail-closed on the new key, per the `deny_unknown_fields`
-    /// doctrine; see documentation/versioning.md).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<String>,
+    /// Default dial target (`host:port`) from the manifest — required: the
+    /// manifest demands one for every declared service and the issuer signs
+    /// it verbatim.
+    pub address: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -154,7 +169,7 @@ impl RuntimePolicy {
                     workspace: config.workspace.clone(),
                     agent: agent.clone(),
                     id: service.id.clone(),
-                    address: Some(service.address.clone()),
+                    address: service.address.clone(),
                 });
             }
         }
@@ -210,6 +225,26 @@ impl RuntimePolicy {
             }
         }
         mesh_egress.sort();
+        let mut nodes = Vec::new();
+        for ingress in manifest.ingress.keys() {
+            nodes.push(PolicyNode {
+                kind: "ingress".to_owned(),
+                node: ingress.clone(),
+            });
+        }
+        for agent in manifest.agent.keys() {
+            nodes.push(PolicyNode {
+                kind: "agent".to_owned(),
+                node: agent.clone(),
+            });
+        }
+        for hub in manifest.mesh.hub.keys() {
+            nodes.push(PolicyNode {
+                kind: "hub".to_owned(),
+                node: hub.clone(),
+            });
+        }
+        nodes.sort();
         Self {
             generation,
             routes: manifest
@@ -224,6 +259,7 @@ impl RuntimePolicy {
             ingress_authorizations: authorizations,
             mesh,
             mesh_egress,
+            nodes,
         }
     }
 
@@ -367,6 +403,7 @@ mod tests {
             ingress_authorizations: vec![],
             mesh: vec![],
             mesh_egress: vec![],
+            nodes: vec![],
         };
         policy.check_not_rollback(2).unwrap();
         let err = policy.check_not_rollback(4).unwrap_err();
@@ -491,35 +528,52 @@ address = "127.0.0.1:3000"
         .unwrap();
         let policy = RuntimePolicy::from_manifest(&manifest, 1);
         assert_eq!(policy.services.len(), 1);
-        assert_eq!(
-            policy.services[0].address.as_deref(),
-            Some("127.0.0.1:3000")
-        );
+        assert_eq!(policy.services[0].address, "127.0.0.1:3000");
         let bytes = policy.to_bytes().unwrap();
         let parsed = RuntimePolicy::parse(&bytes).unwrap();
         assert_eq!(
-            parsed.services[0].address.as_deref(),
-            Some("127.0.0.1:3000"),
+            parsed.services[0].address, "127.0.0.1:3000",
             "the default survives the signed round trip"
         );
     }
 
-    /// Policies signed before the address field existed (the 2026-09-23
-    /// demotion era) parse with the default absent — `#[serde(default)]`
-    /// on the new field keeps legacy bytes readable node-side; the
-    /// fail-closed edge stays one-directional (old binaries reject new
-    /// policies, never the reverse).
+    /// A policy without a service address, without the mesh_egress key, or
+    /// without the fleet roster, fails closed — one policy shape per format
+    /// epoch, no absent-field vintages to tolerate (the format epoch gates
+    /// compatibility instead).
     #[test]
-    fn legacy_policy_without_address_parses() {
-        let legacy = r#"
+    fn absent_required_policy_fields_fail_closed() {
+        let no_address = r#"
 generation = 1
 routes = []
 services = [{ workspace = "a", agent = "lan-a", id = "web" }]
 ingress_authorizations = []
 mesh = []
+mesh_egress = []
+nodes = []
 "#;
-        let parsed = RuntimePolicy::parse(legacy.as_bytes()).unwrap();
-        assert_eq!(parsed.services[0].address, None);
+        assert!(RuntimePolicy::parse(no_address.as_bytes()).is_err());
+        let no_egress = r#"
+generation = 1
+routes = []
+services = [{ workspace = "a", agent = "lan-a", id = "web", address = "127.0.0.1:3000" }]
+ingress_authorizations = []
+mesh = []
+nodes = []
+"#;
+        assert!(RuntimePolicy::parse(no_egress.as_bytes()).is_err());
+        let no_roster = r#"
+generation = 1
+routes = []
+services = []
+ingress_authorizations = []
+mesh = []
+mesh_egress = []
+"#;
+        assert!(
+            RuntimePolicy::parse(no_roster.as_bytes()).is_err(),
+            "the roster is a required face since format epoch 3"
+        );
     }
 
     /// A typo'd top-level key fails loudly instead of signing past it.
@@ -532,8 +586,80 @@ services = []
 ingress_authorizations = []
 mesh = []
 mesh_egress = []
+nodes = []
 routez = []
 "#;
         assert!(RuntimePolicy::parse(shape.as_bytes()).is_err());
+    }
+
+    /// The fleet roster signs every declared node — ingress, agent, and hub
+    /// alike (hubs were nameless in every earlier signed face; the roster is
+    /// what makes a hub's retirement detectable on the host). Rows sort by
+    /// (kind, node) so the canonical bytes are stable regardless of table
+    /// order in the manifest, and the face survives the signed round trip.
+    #[test]
+    fn nodes_face_signs_the_full_fleet_roster() {
+        let manifest = crate::manifest::Manifest::parse(
+            r#"
+[realm]
+id = "promptcn"
+control_endpoint = "edge.example.com:8443"
+[registrar]
+endpoint = "https://registrar.example.com"
+[public_tls]
+mode = "frontend-proxy"
+[workspace.a]
+[ingress.edge]
+workspaces = ["a"]
+[agent.lan-a]
+workspace = "a"
+[[agent.lan-a.services]]
+id = "web"
+address = "127.0.0.1:3000"
+[agent.lan-b]
+workspace = "a"
+[[agent.lan-b.mesh_ingress]]
+name = "svc"
+listen = "127.0.0.1:3001"
+target_agent = "lan-c"
+remote_addr = "127.0.0.1:8055"
+[agent.lan-c]
+workspace = "a"
+[[agent.lan-c.mesh_egress]]
+name = "svc"
+target_addr = "127.0.0.1:8055"
+[[route]]
+host = "web.example.com"
+service = "a/lan-a/web"
+[mesh.hub.central]
+endpoint = "hub.example.com:6666"
+"#,
+        )
+        .unwrap();
+        let policy = RuntimePolicy::from_manifest(&manifest, 1);
+        let expected: Vec<(String, String)> = vec![
+            ("agent".into(), "lan-a".into()),
+            ("agent".into(), "lan-b".into()),
+            ("agent".into(), "lan-c".into()),
+            ("hub".into(), "central".into()),
+            ("ingress".into(), "edge".into()),
+        ];
+        let got: Vec<(String, String)> = policy
+            .nodes
+            .iter()
+            .map(|n| (n.kind.clone(), n.node.clone()))
+            .collect();
+        assert_eq!(got, expected, "sorted by (kind, node)");
+        let bytes = policy.to_bytes().unwrap();
+        let parsed = RuntimePolicy::parse(&bytes).unwrap();
+        assert_eq!(parsed.nodes, policy.nodes, "roster survives the round trip");
+        // The TOML face spells one [[nodes]] table per row — the shape every
+        // lenient host-side reader parses.
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("[[nodes]]"), "roster rows as tables: {text}");
+        assert!(
+            text.contains("kind = \"ingress\"") && text.contains("node = \"edge\""),
+            "roster carries the ingress row: {text}"
+        );
     }
 }

@@ -1,0 +1,7 @@
+# The release binaries — the ONE roster. scripts/build-*.sh source this
+# list; scripts/check_binary_roster.py asserts .github/workflows/release.yml
+# spells exactly the same set (CI cannot easily read files into `run:`
+# steps, so the workflow stays hand-written but guarded).
+interflow-cli
+interflow-mesh
+interflow-registrar

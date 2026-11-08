@@ -837,13 +837,17 @@ impl Manifest {
         // The control endpoint's host must never double as a route host: one
         // server name can only dispatch one way (the ingress's public-port
         // SNI mux and the front proxy's stream map share this constraint).
+        // Parsed through the shared authority parser so an IPv6 literal
+        // arrives bracket-free and whole — a hand-rolled `split_once(':')`
+        // truncated it at the first colon and gutted this very check.
         if !self.ingress.is_empty() && !self.realm.control_endpoint.trim().is_empty() {
             let trimmed = self.realm.control_endpoint.trim();
-            let control_host = trimmed
-                .split_once("://")
-                .map_or(trimmed, |(_, rest)| rest)
-                .split_once(':')
-                .map_or(trimmed, |(host, _)| host)
+            let control_host = interflow_util::parse_endpoint(trimmed)
+                .map_err(|e| {
+                    Error::manifest(format!("realm.control_endpoint {trimmed:?} does not parse"))
+                        .with_source(e)
+                })?
+                .host
                 .to_ascii_lowercase();
             if hosts.contains(&control_host) {
                 return Err(Error::manifest(format!(
@@ -1861,5 +1865,51 @@ service = "main/desktop/asr"
 "#;
         let err = Manifest::parse(base).unwrap_err();
         assert!(err.to_string().contains("tunnel.<domain>"), "{err}");
+    }
+
+    /// The conflict check parses through the shared authority parser: a
+    /// bracketed IPv6 control endpoint must arrive as the whole address
+    /// (`2001:db8::1`), never truncated at the first colon (the hand-rolled
+    /// `split_once(':')` keyed `[` and gutted the check), and a garbage
+    /// endpoint is a validation error rather than a skipped check.
+    #[test]
+    fn control_endpoint_host_extraction_handles_ipv6_and_garbage() {
+        let base = |endpoint: &str| {
+            format!(
+                r#"
+[realm]
+id = "promptcn"
+control_endpoint = "{endpoint}"
+[registrar]
+endpoint = "https://registrar.example.com"
+[public_tls]
+mode = "frontend-proxy"
+[ingress.edge]
+workspaces = ["main"]
+[workspace.main]
+[agent.desktop]
+workspace = "main"
+[[agent.desktop.services]]
+id = "asr"
+address = "127.0.0.1:8080"
+[[route]]
+host = "asr.example.com"
+service = "main/desktop/asr"
+"#
+            )
+        };
+        // The whole IPv6 address is the extracted host and does not collide
+        // with an unrelated DNS route host.
+        assert!(Manifest::parse(&base("[2001:db8::1]:443")).is_ok());
+        assert!(Manifest::parse(&base("https://[2001:db8::1]:443")).is_ok());
+        // An IPv6-address route host does collide with the control host.
+        let colliding = base("[2001:db8::1]:443")
+            .replace("host = \"asr.example.com\"", "host = \"2001:db8::1\"");
+        let err = Manifest::parse(&colliding).unwrap_err();
+        assert!(err.to_string().contains("2001:db8::1"), "{err}");
+        // A control endpoint that does not parse is a validation error in
+        // the branch that inspects it — fail closed instead of skipping.
+        let err = Manifest::parse(&base("relay.example.com:notaport")).unwrap_err();
+        assert!(err.to_string().contains("does not parse"), "{err}");
     }
 }

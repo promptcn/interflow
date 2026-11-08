@@ -1,7 +1,8 @@
 name: soak
 
-# Nightly soak long-run guardrail (backlog §1.7): real process topology + six assertions.
+# Nightly soak long-run guardrail (backlog §1.7): real process topology + assertion suite.
 # Local equivalent: `just soak`; smoke test: workflow_dispatch defaults or `just soak -- --quick`.
+# Node logs in the uploaded artifact are gzipped in place after the run (*.log.gz).
 on:
   schedule:
     - cron: "43 19 * * *" # daily 19:43 UTC (03:43 Beijing time; avoids the audit slot at 06:17)
@@ -21,9 +22,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build mesh (release)
-        run: cargo build --release -p interflow-mesh
-      - name: Run soak (15min/transport × h2+quic)
+      # The system under test is the `interflow-soak-node` dev binary (hub +
+      # agents), which `cargo run --bin soak` does not build on its own — the
+      # same build line `just soak` runs. (Until 2026-11-02 this step built
+      # `interflow-mesh`, the pre-2026-09-22 binary name: the runner then
+      # failed at startup with "interflow-soak-node binary not found".)
+      - name: Build the soak node (release)
+        run: cargo build --release -p interflow-testkit --features fault-injection --bin interflow-soak-node
+      - name: Run soak (15min/transport × h2+quic; identity-churn phase after warmup)
         run: |
           set -o pipefail
           cargo run --release -p interflow-testkit --bin soak -- \

@@ -38,48 +38,48 @@ interflow-buildinfo.workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["rt"] }
 socket2 = "0.6"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+quinn = { workspace = true }
 
 # HTTP/2 server and client
-hyper = { version = "1.10", features = ["full", "http2"] }
-hyper-util = { version = "0.1.20", features = ["tokio"] }
-http = "1.4"
+hyper = { workspace = true, features = ["full", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+http = { workspace = true }
 http-body-util = "0.1.3"
 
 # TLS support (rustls-only) — some mesh code uses rustls types directly
-rustls = "0.23"
-tokio-rustls = "0.26.4"
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 
 # Config model serialization (pack bootstrap + testkit JSON handoff)
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = { workspace = true }
 
 # Logging
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 # Metrics
 metrics = "0.24.6"
 
 # Security
-sha2 = "0.11"
-ipnetwork = { version = "0.21.1", features = ["serde"] }
+sha2 = { workspace = true }
+ipnetwork = { workspace = true, features = ["serde"] }
 subtle = "2.6"
 
 # Error handling
-thiserror = "2"
+thiserror = { workspace = true }
 # policy signature transport (hex) for the publication endpoint
 hex = { workspace = true }
 
 # Utility libraries
 bytes = "1.12"
 futures = "0.3"
-uuid = { version = "1.23", features = ["v4", "serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
 # Full-jitter backoff between reconnect attempts (rand 0.9, aligned with testkit)
 rand = "0.9"
 
 # Command-line arguments
-clap = { version = "4.6", features = ["derive"] }
+clap = { workspace = true }
 
 [dev-dependencies]
 # Shared test/bench harness (dev-dependency cycle: testkit depends on mesh,
@@ -124,6 +124,16 @@ reqwest = { version = "0.13.4", default-features = false, features = ["json", "r
 name = "e2e_throughput"
 harness = false
 path = "benches/e2e_throughput.rs"
+
+[[bench]]
+name = "hub_relay"
+harness = false
+path = "benches/hub_relay.rs"
+
+[[bench]]
+name = "quic_send"
+harness = false
+path = "benches/quic_send.rs"
 
 [[bench]]
 name = "e2e_throughput_multi"

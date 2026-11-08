@@ -13,18 +13,24 @@ path = "src/lib.rs"
 [dependencies]
 # Issuance. `Issuer::from_ca_cert_pem` (re-signing leaves from a persisted CA)
 # needs the non-default x509-parser feature; pem is default.
-rcgen = { version = "0.14", features = ["x509-parser"] }
+rcgen = { workspace = true, features = ["x509-parser"] }
 # Real chain/validity/EKU verification for the idempotency checks (same
 # versions as core's tls module).
-rustls = "0.23"
-rustls-pemfile = "2.2.0"
-x509-parser = "0.18"
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+# The key type rustls-pemfile hands back (named directly so the private-key
+# PEM forms can be matched).
+rustls-pki-types = "1"
+x509-parser = { workspace = true }
+# Structural DER walks for the read-only pairing check (traditional SEC1
+# and PKCS#1 private keys carry no crypto operation — only fields).
+der = { version = "0.7", features = ["derive"] }
 # Explicit validity windows (rcgen's default spans to year 4096).
-time = "0.3"
-thiserror = "2"
+time = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

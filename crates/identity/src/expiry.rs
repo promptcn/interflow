@@ -15,6 +15,19 @@ pub const WARN_RATIO: f64 = 0.2;
 /// credential is the deepest form of Critical (negative remaining).
 pub const CRITICAL_RATIO: f64 = 0.1;
 
+/// The OFFLINE tier's fleet-face warn line, in days: fewer than one of
+/// these remaining reads ⚠. The anchor is the offline rotate ceremony's
+/// rhythm (~45d): two weeks out is the last comfortable moment to run
+/// it — after that the operator is scheduling against the red line.
+/// The fleet faces' thresholds; the per-leaf phase math above is
+/// unaffected.
+pub const OFFLINE_WARN_DAYS: i64 = 14;
+
+/// The OFFLINE tier's fleet-face red line, in days: fewer remaining
+/// than this reads ✘ — inside the backup window, an expiry here means
+/// rotating under pressure with no margin for a failed ceremony.
+pub const OFFLINE_CRITICAL_DAYS: i64 = 7;
+
 /// The expiry phase of a leaf credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -37,6 +50,14 @@ impl LeafPhase {
             Self::Critical => "critical",
         }
     }
+}
+
+/// Parses an RFC 3339 timestamp into unix seconds (the audit ledger's
+/// `ts` format; biography's window bound reads it).
+pub fn parse_rfc3339_unix(ts: &str) -> std::result::Result<i64, String> {
+    time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+        .map(|parsed| parsed.unix_timestamp())
+        .map_err(|e| e.to_string())
 }
 
 /// A leaf's phase plus the raw remaining seconds (negative once expired).

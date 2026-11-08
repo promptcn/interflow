@@ -176,7 +176,7 @@ pub(crate) fn spawn(
     });
 
     // HTTP-01 challenge answers + permanent redirect to HTTPS. The accept
-    // loop runs the same per-IP gate as the :443 listener BEFORE spawning a
+    // loop runs the same per-client gate as the :443 listener BEFORE spawning a
     // task: a denied peer costs one accept, no task; rejections reuse the
     // shared rejection counters and audit records. The whole task — bind
     // included — is cancellation-aware: a stopped runtime must release :80.

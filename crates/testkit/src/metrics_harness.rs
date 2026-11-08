@@ -85,6 +85,19 @@ pub fn counter_value(metric: &str) -> u64 {
         .sum()
 }
 
+/// Value of the gauge `metric` (exact rendered key — bare name or full
+/// label selector). Gauges are level-triggered, so unlike
+/// [`counter_value`] deltas this reads the *current* level; an unemitted
+/// gauge reads `None` (distinct from a live `0`).
+pub fn gauge_value(metric: &str) -> Option<f64> {
+    metrics_handle()
+        .render()
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find(|(k, _)| *k == metric)
+        .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+}
+
 /// Polls until `counter_value(metric)` >= `min`; panics with the full
 /// snapshot on timeout (the snapshot is the only post-mortem a global
 /// recorder can offer). The loop itself is [`crate::wait::eventually`];

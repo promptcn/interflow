@@ -178,6 +178,46 @@ impl AgentTunnel {
         self.inner.my_proposals().await
     }
 
+    /// One stream-intent exchange over the current session's control
+    /// plane (see [`TunnelTransport::exchange_stream_intents`]) — the
+    /// intent watcher's convergence loop rides this facade.
+    pub async fn exchange_stream_intents(
+        &self,
+        report: &crate::tunnel::transport::StreamIntentReport,
+    ) -> Result<crate::tunnel::transport::StreamIntentOps> {
+        self.inner.exchange_stream_intents(report).await
+    }
+
+    /// One out-of-band target-recovery notice over the current session's
+    /// control plane (see [`TunnelTransport::report_target_recovered`]) —
+    /// the recovery prober's push rides this facade.
+    pub async fn report_target_recovered(
+        &self,
+        notice: &crate::tunnel::transport::TargetRecoveredNotice,
+    ) -> Result<crate::tunnel::transport::TargetRecoveredAck> {
+        self.inner.report_target_recovered(notice).await
+    }
+
+    /// One CRL-poll liveness report over the current session's control
+    /// plane (see [`TunnelTransport::report_crl_liveness`]) — the renewal
+    /// reporter's push rides this facade.
+    pub async fn report_crl_liveness(
+        &self,
+        report: &crate::tunnel::transport::CrlLivenessReport,
+    ) -> Result<()> {
+        self.inner.report_crl_liveness(report).await
+    }
+
+    /// One node-status report over the current session's control plane
+    /// (see [`TunnelTransport::report_node_status`]) — the node-status
+    /// reporter's push rides this facade.
+    pub async fn report_node_status(
+        &self,
+        report: &crate::tunnel::transport::NodeStatusReport,
+    ) -> Result<()> {
+        self.inner.report_node_status(report).await
+    }
+
     /// One demanding liveness roundtrip over the current session's control
     /// plane (see [`TunnelTransport::liveness_roundtrip`]) — the supervisor's
     /// out-of-tree probe rides this facade, so the probe never touches a
@@ -453,6 +493,56 @@ impl TunnelTransport for SlotBackend {
         backend.my_proposals().await
     }
 
+    /// The stream-intent exchange rides the current session backend the
+    /// same way (an empty slot retries on the next tick).
+    async fn exchange_stream_intents(
+        &self,
+        report: &crate::tunnel::transport::StreamIntentReport,
+    ) -> Result<crate::tunnel::transport::StreamIntentOps> {
+        let Some(backend) = self.backend() else {
+            return Err(slot_empty_error());
+        };
+        backend.exchange_stream_intents(report).await
+    }
+
+    /// The target-recovery notice rides the current session backend the
+    /// same way; an empty slot (mid-rebuild) is a dropped notice — the
+    /// next recovery re-detection or the receiver's cooldown covers it.
+    async fn report_target_recovered(
+        &self,
+        notice: &crate::tunnel::transport::TargetRecoveredNotice,
+    ) -> Result<crate::tunnel::transport::TargetRecoveredAck> {
+        let Some(backend) = self.backend() else {
+            return Err(slot_empty_error());
+        };
+        backend.report_target_recovered(notice).await
+    }
+
+    /// The CRL-liveness report rides the current session backend the same
+    /// way; an empty slot (mid-rebuild) is one dropped sample — the level
+    /// re-arrives on the next tick.
+    async fn report_crl_liveness(
+        &self,
+        report: &crate::tunnel::transport::CrlLivenessReport,
+    ) -> Result<()> {
+        let Some(backend) = self.backend() else {
+            return Err(slot_empty_error());
+        };
+        backend.report_crl_liveness(report).await
+    }
+
+    /// The node-status report rides the current session backend the same
+    /// way (an empty slot is one dropped sample).
+    async fn report_node_status(
+        &self,
+        report: &crate::tunnel::transport::NodeStatusReport,
+    ) -> Result<()> {
+        let Some(backend) = self.backend() else {
+            return Err(slot_empty_error());
+        };
+        backend.report_node_status(report).await
+    }
+
     /// The demanding liveness probe rides the current session backend the
     /// same way. An empty slot is NOT a strike for the caller's strike
     /// counter — the supervisor's probe parks while liveness is unreadable
@@ -478,6 +568,10 @@ impl SlotBackend {
     /// Snapshot of the current backend (Arc clone; the lock is released
     /// before any await — a std RwLockReadGuard must not cross an await
     /// point, the future would not be `Send`).
+    /// §4 audit conclusion (2026-11-04): the per-send std RwLock read is
+    /// an uncontended nanosecond-scale operation (the slot swaps only at
+    /// session rebuild); an atomic Arc-swap facility would remove it only
+    /// at the cost of a new dependency — kept as-is deliberately.
     fn backend(&self) -> Option<Arc<dyn TunnelTransport>> {
         self.current
             .read()

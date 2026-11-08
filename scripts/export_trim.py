@@ -182,8 +182,8 @@ JUSTFILE_TRIMS = [
     ),
     (
         "ci-line",
-        "ci: fmt-check lint test private-tests config-reference version-contract changelog-debt product-language doc-surfaces export-trim\n",
-        "ci: fmt-check lint test changelog-debt product-language doc-surfaces\n",
+        "ci: fmt-check lint test deny private-tests config-reference version-contract version-surface changelog-debt product-language doc-surfaces binary-roster export-trim\n",
+        "ci: fmt-check lint test deny version-surface changelog-debt product-language doc-surfaces binary-roster\n",
     ),
 ]
 

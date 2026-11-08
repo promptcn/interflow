@@ -80,6 +80,12 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: WriteMode) -> io::Result<()
 }
 
 /// Applies the [`WriteMode`] policy to the staged temp file.
+// Off unix the body is a no-op (no mode bits) — the fallible, non-const
+// shape is for the unix path.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)
+)]
 fn apply_mode(tmp: &tempfile::NamedTempFile, target: &Path, mode: WriteMode) -> io::Result<()> {
     #[cfg(unix)]
     {

@@ -73,6 +73,7 @@ pub(crate) async fn run_udp_listener(
     tunnel: AgentTunnel,
     e2e: Arc<E2eRuntime>,
     node: String,
+    activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let (listen, target, remote) = {
         let rule = serving(&cell);
@@ -83,7 +84,7 @@ pub(crate) async fn run_udp_listener(
         )
     };
     info!(node = %node, "Starting UDP ingress listener: {listen} -> {target} (target_addr={remote:?})");
-    serve(socket, cell, tunnel, e2e, node).await;
+    serve(socket, cell, tunnel, e2e, node, activity).await;
 }
 
 fn serving(cell: &ServingRule) -> std::sync::RwLockReadGuard<'_, IngressRule> {
@@ -97,6 +98,7 @@ async fn serve(
     tunnel: AgentTunnel,
     e2e: Arc<E2eRuntime>,
     node: String,
+    activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
     let socket = Arc::new(socket);
     let name = serving(&cell).name.clone();
@@ -229,6 +231,12 @@ async fn serve(
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
         metrics::counter!("interflow_udp_datagrams_rx").increment(1);
         metrics::counter!("interflow_udp_bytes_rx").increment(n as u64);
+        // The fossil face's level: a datagram IS byte activity (the same
+        // existing-counter-point discipline as the pump's touch).
+        activity.fetch_max(
+            interflow_core::tunnel::transport::unix_millis_now(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if new_session {
             metrics::counter!("interflow_udp_session_opened").increment(1);
         }

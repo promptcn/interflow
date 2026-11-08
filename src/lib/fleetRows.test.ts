@@ -5,7 +5,15 @@ import {
   hasFleetFace,
   hasServicesFace,
   hasStreamsFace,
+  crlFaceReading,
+  policyFaceReading,
+  queuedOpsFaceReading,
+  connectionFaceReading,
+  credentialFaceReading,
+  fossilStreamsFaceReading,
+  headroomFaceReading,
   realmObservers,
+  watchersFaceReading,
 } from "./fleetRows";
 import type {
   FleetDto,
@@ -23,6 +31,8 @@ function node(over: Partial<NodeInfo> & Pick<NodeInfo, "id" | "name" | "principa
     pack_dir: `/packs/${over.name}`,
     state: "Running",
     desired_running: true,
+    crl: null,
+    breakers: null,
     transport: null,
     pack_transport: null,
     hub_quic_addr: null,
@@ -87,7 +97,7 @@ function fleet(over: Partial<FleetDto> = {}): FleetDto {
         name: "leo",
         workspace: "main",
         local: { id: "n-leo", state: "Running", desired_running: true, generation: 3, policy_generation: 15, listeners: [] },
-        remote: { online: true, seen_generation: 15 },
+        remote: { online: true, seen_generation: 15, policy_last_pull_unix: null, face_captured_at_unix: null, crl_last_success_unix: null, crl_failures_total: null },
       },
       {
         kind: "hub",
@@ -391,5 +401,412 @@ describe("realmObservers — running mesh agents with a peers plane, realm-hones
     expect(realmObservers([running, stopped, foreign, hub], "mesh").map((o) => o.node.id)).toEqual(["a"]);
     // `null` is the unfiltered form (the deployment scope's degraded page).
     expect(realmObservers([running, foreign], null).map((o) => o.node.id)).toEqual(["a", "c"]);
+  });
+});
+
+describe("watchersFaceReading — the resident-task armed assertion", () => {
+  const CAPTURED = NOW;
+  const FACTOR = 3;
+  const row = (name: string, intervalSecs: number, tickAge: number) => ({
+    name,
+    interval_secs: intervalSecs,
+    last_tick_unix: CAPTURED - tickAge,
+  });
+
+  it("allArmed: every row inside its own threshold", () => {
+    expect(
+      watchersFaceReading([row("heartbeat", 15, 8), row("renewal", 60, 45)], CAPTURED, FACTOR, NOW),
+    ).toEqual({ state: "allArmed", count: 2 });
+  });
+
+  it("the boundary is per-row: exactly 3× its own interval is a slow pass, one past is silent", () => {
+    expect(watchersFaceReading([row("policy", 10, 30)], CAPTURED, FACTOR, NOW)).toEqual({
+      state: "allArmed",
+      count: 1,
+    });
+    // The SAME tick age on a slower task stays armed — the anchor is the
+    // row's own cadence, never a global threshold.
+    expect(watchersFaceReading([row("renewal", 60, 31)], CAPTURED, FACTOR, NOW)).toEqual({
+      state: "allArmed",
+      count: 1,
+    });
+    expect(watchersFaceReading([row("policy", 10, 31)], CAPTURED, FACTOR, NOW)).toEqual({
+      state: "silent",
+      armed: 0,
+      silent: [{ name: "policy", intervalSecs: 10, quietSecs: 31 }],
+    });
+  });
+
+  it("mixed: the silent row is named, the armed count keeps the rest", () => {
+    expect(
+      watchersFaceReading([row("heartbeat", 15, 3), row("policy", 10, 45)], CAPTURED, FACTOR, NOW),
+    ).toEqual({
+      state: "silent",
+      armed: 1,
+      silent: [{ name: "policy", intervalSecs: 10, quietSecs: 45 }],
+    });
+  });
+
+  it("unknown: no rows (an older hub) or missing anchor/factor never reads as passed", () => {
+    expect(watchersFaceReading([], CAPTURED, FACTOR, NOW)).toEqual({ state: "unknown" });
+    expect(watchersFaceReading([row("policy", 10, 5)], null, FACTOR, NOW)).toEqual({
+      state: "unknown",
+    });
+    expect(watchersFaceReading([row("policy", 10, 5)], CAPTURED, undefined, NOW)).toEqual({
+      state: "unknown",
+    });
+  });
+
+  it("unknown: a face staler than the largest row threshold cannot support a verdict", () => {
+    // Largest threshold here is 3×60 = 180s; the render clock 400s past
+    // capture means every verdict could have changed unseen.
+    expect(
+      watchersFaceReading([row("heartbeat", 15, 5), row("renewal", 60, 5)], CAPTURED, FACTOR, NOW + 400),
+    ).toEqual({ state: "unknown" });
+  });
+});
+
+describe("queuedOpsFaceReading — the mailbox watermark classification", () => {
+  const CAPTURED = NOW;
+  const BUDGET = 30;
+
+  it("clear: no face / nothing waiting — never a fabricated verdict", () => {
+    expect(queuedOpsFaceReading(null, null, CAPTURED, null, null, false, BUDGET)).toEqual({
+      state: "clear",
+    });
+    expect(queuedOpsFaceReading(0, null, CAPTURED, null, 0, false, BUDGET)).toEqual({
+      state: "clear",
+    });
+  });
+
+  it("waiting on an offline leg reads expected (rides the next check-in)", () => {
+    expect(
+      queuedOpsFaceReading(1, CAPTURED - 259_200, CAPTURED, "pause ollama", 0, false, BUDGET),
+    ).toEqual({
+      state: "waiting",
+      count: 1,
+      ageSecs: 259_200,
+      oldestOp: "pause ollama",
+      stuck: false,
+    });
+  });
+
+  it("the stuck boundary is online-only: exactly the budget is slow, one past is stuck", () => {
+    expect(
+      queuedOpsFaceReading(2, CAPTURED - BUDGET, CAPTURED, null, 0, true, BUDGET),
+    ).toEqual({ state: "waiting", count: 2, ageSecs: BUDGET, oldestOp: null, stuck: false });
+    expect(
+      queuedOpsFaceReading(2, CAPTURED - (BUDGET + 1), CAPTURED, null, 0, true, BUDGET),
+    ).toEqual({ state: "waiting", count: 2, ageSecs: BUDGET + 1, oldestOp: null, stuck: true });
+    // The same age on an OFFLINE leg never reads stuck.
+    expect(
+      queuedOpsFaceReading(2, CAPTURED - (BUDGET + 1), CAPTURED, null, 0, false, BUDGET),
+    ).toEqual({ state: "waiting", count: 2, ageSecs: BUDGET + 1, oldestOp: null, stuck: false });
+  });
+
+  it("dropped: nothing waiting now, but the drop history renders apart", () => {
+    expect(queuedOpsFaceReading(0, null, CAPTURED, null, 3, false, BUDGET)).toEqual({
+      state: "dropped",
+      droppedTotal: 3,
+    });
+  });
+
+  it("missing anchors degrade: no budget or capture anchor → age unknown, never stuck", () => {
+    expect(
+      queuedOpsFaceReading(1, CAPTURED - 1000, null, null, 0, true, BUDGET),
+    ).toEqual({ state: "waiting", count: 1, ageSecs: 0, oldestOp: null, stuck: false });
+    expect(
+      queuedOpsFaceReading(1, null, CAPTURED, null, 0, true, undefined),
+    ).toEqual({ state: "waiting", count: 1, ageSecs: 0, oldestOp: null, stuck: false });
+  });
+});
+
+describe("connectionFaceReading — the window-stats classification", () => {
+  const conn = (reconnects: number, timeouts: number) => ({
+    reconnects_last_hour: reconnects,
+    rtt_p50_ms: 100,
+    rtt_p99_ms: 190,
+    rtt_timeouts: timeouts,
+  });
+
+  it("unknown on absent inputs; healthy when everything countable is quiet", () => {
+    expect(connectionFaceReading(null, null)).toEqual({ state: "unknown" });
+    expect(connectionFaceReading(conn(0, 0), null)).toEqual({
+      state: "healthy",
+      reconnects: 0,
+      backoffStage: 0,
+      timeouts: 0,
+      p50Ms: 100,
+      p99Ms: 190,
+    });
+  });
+
+  it("timeouts outrank reconnects; the backoff stage clamps to the ladder depth", () => {
+    expect(connectionFaceReading(conn(6, 0), 3)).toMatchObject({
+      state: "reconnecting",
+      reconnects: 6,
+      backoffStage: 3,
+    });
+    expect(connectionFaceReading(conn(6, 3), 9)).toMatchObject({
+      state: "probesUnanswered",
+      timeouts: 3,
+      backoffStage: 5,
+    });
+  });
+});
+
+describe("credentialFaceReading — the per-tier countdown judgment", () => {
+  const CAPTURED = NOW;
+
+  it("offline tier: green at 45d, yellow strictly under 14d, red strictly under 7d", () => {
+    const offline = (remainingDays: number) => {
+      const notAfter = CAPTURED + remainingDays * 86_400;
+      const notBefore = notAfter - 90 * 86_400;
+      return credentialFaceReading(
+        notBefore,
+        notAfter,
+        CAPTURED,
+        14,
+        7,
+        20,
+        10,
+      );
+    };
+    expect(offline(45)).toEqual({ state: "green", mode: "offline", remainingSecs: 45 * 86_400 });
+    expect(offline(14)).toEqual({ state: "green", mode: "offline", remainingSecs: 14 * 86_400 });
+    expect(offline(13)).toMatchObject({ state: "yellow", mode: "offline" });
+    expect(offline(7)).toMatchObject({ state: "yellow", mode: "offline" });
+    expect(offline(6)).toMatchObject({ state: "red", mode: "offline" });
+  });
+
+  it("registrar tier: span-relative phases, and expired is the deepest red", () => {
+    const registrar = (spanSecs: number, remainingSecs: number) =>
+      credentialFaceReading(
+        CAPTURED - (spanSecs - remainingSecs),
+        CAPTURED + remainingSecs,
+        CAPTURED,
+        14,
+        7,
+        20,
+        10,
+      );
+    expect(registrar(24 * 3600, 12 * 3600)).toMatchObject({ state: "green", mode: "registrar" });
+    // 1h of 24h is 4% — already past the critical line; yellow lives in [10%, 20%).
+    expect(registrar(24 * 3600, 12_000)).toMatchObject({ state: "yellow", mode: "registrar" });
+    expect(registrar(24 * 3600, 600)).toMatchObject({ state: "red", mode: "registrar" });
+    expect(registrar(24 * 3600, -1)).toMatchObject({ state: "red", mode: "registrar" });
+  });
+
+  it("absent window or thresholds read unknown — never a fabricated green", () => {
+    expect(credentialFaceReading(null, null, CAPTURED, 14, 7, 20, 10)).toEqual({
+      state: "unknown",
+    });
+    expect(
+      credentialFaceReading(CAPTURED, CAPTURED + 86_400, null, 14, 7, 20, 10),
+    ).toEqual({ state: "unknown" });
+    expect(
+      credentialFaceReading(CAPTURED, CAPTURED + 86_400, CAPTURED, undefined, 7, 20, 10),
+    ).toEqual({ state: "unknown" });
+  });
+});
+
+describe("fossilStreamsFaceReading — the fossil face's per-row judgment", () => {
+  const CAPTURED = NOW;
+  const stream = (name: string, byteAge: number, budget?: number | null) => ({
+    name,
+    last_byte_unix: CAPTURED - byteAge,
+    idle_budget_secs: budget ?? null,
+  });
+
+  it("per-row anchors: a 300s-budget stream is fossil past 10×300, a sibling with the same age and a 3600s budget is not", () => {
+    const fossils = fossilStreamsFaceReading(
+      [stream("svc", 2_900, 300), stream("db", 2_900, 3600)],
+      CAPTURED,
+      10,
+      7,
+    );
+    // 2_900 < 3_000: neither yet.
+    expect(fossils).toEqual([]);
+    const crossed = fossilStreamsFaceReading(
+      [stream("svc", 3_001, 300), stream("db", 3_001, 3600)],
+      CAPTURED,
+      10,
+      7,
+    );
+    expect(crossed).toEqual([{ name: "svc", idleSecs: 3_001 }]);
+  });
+
+  it("unbudgeted streams use the absolute default (7d)", () => {
+    expect(
+      fossilStreamsFaceReading([stream("svc", 7 * 86_400, null)], CAPTURED, 10, 7),
+    ).toEqual([]);
+    expect(
+      fossilStreamsFaceReading([stream("svc", 7 * 86_400 + 1, undefined)], CAPTURED, 10, 7),
+    ).toEqual([{ name: "svc", idleSecs: 7 * 86_400 + 1 }]);
+  });
+
+  it("absent inputs read no fossils, never a guess", () => {
+    expect(fossilStreamsFaceReading(null, CAPTURED, 10, 7)).toEqual([]);
+    expect(fossilStreamsFaceReading([stream("svc", 9_999_999, 300)], null, 10, 7)).toEqual([]);
+    expect(fossilStreamsFaceReading([stream("svc", 9_999_999, 300)], CAPTURED, undefined, 7)).toEqual([]);
+  });
+});
+
+describe("headroomFaceReading — the admission-scope headroom", () => {
+  it("unlimited or absent scopes read null (no wall, no reading)", () => {
+    expect(headroomFaceReading(47, 0, 20)).toBeNull();
+    expect(headroomFaceReading(null, 256, 20)).toBeNull();
+    expect(headroomFaceReading(47, 256, undefined)).toBeNull();
+  });
+
+  it("tight strictly under the warn pct: 20% remaining is not yet tight, 19% is", () => {
+    expect(headroomFaceReading(200, 250, 20)).toEqual({
+      inFlight: 200,
+      cap: 250,
+      remainingPct: 20,
+      tight: false,
+    });
+    expect(headroomFaceReading(202, 250, 20)?.tight).toBe(true);
+    expect(headroomFaceReading(256, 256, 20)).toEqual({
+      inFlight: 256,
+      cap: 256,
+      remainingPct: 0,
+      tight: true,
+    });
+  });
+});
+
+describe("crlFaceReading — the CRL-poll liveness classification", () => {
+  const CAPTURED = NOW;
+  const SILENT_AFTER = 200;
+
+  it("current: polling, nothing moved (no-change polls count)", () => {
+    expect(crlFaceReading(CAPTURED - 45, CAPTURED, SILENT_AFTER, NOW, 0)).toEqual({
+      state: "current",
+      ageSecs: 45,
+      failures: 0,
+    });
+    // The failure counter rides along as diagnostic material, never as
+    // the trigger: a failing-but-polling loop still reads current.
+    expect(crlFaceReading(CAPTURED - 45, CAPTURED, SILENT_AFTER, NOW, 7)).toEqual({
+      state: "current",
+      ageSecs: 45,
+      failures: 7,
+    });
+  });
+
+  it("the boundary: exactly the threshold is still current, one past it is the wedged-loop class", () => {
+    expect(crlFaceReading(CAPTURED - SILENT_AFTER, CAPTURED, SILENT_AFTER, NOW, 0)).toEqual({
+      state: "current",
+      ageSecs: SILENT_AFTER,
+      failures: 0,
+    });
+    expect(crlFaceReading(CAPTURED - (SILENT_AFTER + 1), CAPTURED, SILENT_AFTER, NOW, 9)).toEqual({
+      state: "silent",
+      ageSecs: SILENT_AFTER + 1,
+      failures: 9,
+    });
+  });
+
+  it("never: no report landed — unknown, not silent", () => {
+    expect(crlFaceReading(null, CAPTURED, SILENT_AFTER, NOW, null)).toEqual({ state: "never" });
+  });
+
+  it("unknown: an older hub (no capture anchor / no threshold) never guesses", () => {
+    expect(crlFaceReading(CAPTURED - 8, null, SILENT_AFTER, NOW, 0)).toEqual({ state: "unknown" });
+    expect(crlFaceReading(CAPTURED - 8, CAPTURED, undefined, NOW, 0)).toEqual({ state: "unknown" });
+  });
+
+  it("unknown: a face staler than the threshold degrades, never renders a stale verdict", () => {
+    expect(crlFaceReading(CAPTURED - 8, CAPTURED, SILENT_AFTER, NOW + 400, 0)).toEqual({
+      state: "unknown",
+    });
+  });
+});
+
+describe("policyFaceReading — the level face's recency classification", () => {
+  const CAPTURED = NOW;
+  const SILENT_AFTER = 30;
+
+  it("current: a fresh confirmation instant, judged at the capture anchor", () => {
+    expect(policyFaceReading(15, CAPTURED - 8, CAPTURED, SILENT_AFTER, NOW)).toEqual({
+      state: "current",
+      ageSecs: 8,
+    });
+  });
+
+  it("the boundary: exactly the threshold is still current, one past it is silent", () => {
+    expect(policyFaceReading(15, CAPTURED - SILENT_AFTER, CAPTURED, SILENT_AFTER, NOW)).toEqual({
+      state: "current",
+      ageSecs: SILENT_AFTER,
+    });
+    expect(policyFaceReading(15, CAPTURED - (SILENT_AFTER + 1), CAPTURED, SILENT_AFTER, NOW)).toEqual({
+      state: "silent",
+      ageSecs: SILENT_AFTER + 1,
+    });
+  });
+
+  it("never: no watermark and no confirmation — the one honest meaning left", () => {
+    expect(policyFaceReading(null, null, CAPTURED, SILENT_AFTER, NOW)).toEqual({ state: "never" });
+  });
+
+  it("unknown: an older hub (a watermark without the instant) never guesses", () => {
+    expect(policyFaceReading(15, null, CAPTURED, SILENT_AFTER, NOW)).toEqual({ state: "unknown" });
+    expect(policyFaceReading(15, CAPTURED - 8, null, SILENT_AFTER, NOW)).toEqual({ state: "unknown" });
+  });
+
+  it("unknown: a face staler than the threshold cannot support a per-leg verdict", () => {
+    // The face was captured 45s ago (missed pushes, a sleeping machine):
+    // between then and now a crossing could have happened unseen —
+    // degrade, never render a possibly-stale "current".
+    expect(policyFaceReading(15, CAPTURED - 8, CAPTURED, SILENT_AFTER, NOW + 45)).toEqual({
+      state: "unknown",
+    });
+    // "never" is a value fact, not a recency one — it survives a stale face.
+    expect(policyFaceReading(null, null, CAPTURED, SILENT_AFTER, NOW + 45)).toEqual({
+      state: "never",
+    });
+  });
+
+  it("rides the composed rows: a declared mesh agent's remote face carries the reading", () => {
+    const f = fleet({
+      hub: {
+        hub: "hub",
+        floor: 15,
+        serving: 15,
+        captured_at_unix: NOW,
+        policy_silent_after_secs: 30,
+        agents: [
+          { agent: "main/leo", online: true, seen: 15, policy_last_pull_unix: NOW - 8 },
+          { agent: "main/gone", online: false, seen: 14, policy_last_pull_unix: NOW - 400 },
+        ],
+      },
+      nodes: [
+        {
+          kind: "mesh_agent",
+          name: "leo",
+          workspace: "main",
+          local: null,
+          remote: {
+            online: true,
+            seen_generation: 15,
+            policy_last_pull_unix: NOW - 8,
+            face_captured_at_unix: NOW,
+          },
+        },
+      ],
+    });
+    const { rows } = buildDeploymentRows(f, [], NOW);
+    expect(rows.find((r) => r.key === "main/leo")?.policy).toEqual({ state: "current", ageSecs: 8 });
+    // Tail 1 (the hub-registered stray) classifies from the overview's
+    // own anchor + threshold.
+    expect(rows.find((r) => r.key === "main/gone")?.policy).toEqual({
+      state: "silent",
+      ageSecs: 400,
+    });
+    // The stock fixture (no confirmation instants — an older hub's shape)
+    // never guesses: the reading reads unknown, not a fabricated current.
+    const { rows: plainRows } = buildDeploymentRows(fleet(), [], NOW);
+    expect(plainRows.find((r) => r.key === "main/leo")?.policy).toEqual({ state: "unknown" });
   });
 });

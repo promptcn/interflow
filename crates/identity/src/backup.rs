@@ -33,26 +33,14 @@ pub const DEFAULT_RETENTION: u32 = 20;
 /// Backup file name prefix; versions sort lexicographically because the
 /// embedded timestamp is fixed-width.
 const NAME_PREFIX: &str = "issuer-";
-/// backup.json format versions — a **local migration counter**, not a
-/// format epoch (documentation/versioning.md#local-migration-counters): the
-/// file lives on one operator machine, this binary is its only writer, and
-/// v1 bytes on operators' disks must keep loading, so reads normalize old
-/// shapes in memory instead of failing closed. The guard registers this
-/// counter by name in its `LOCAL_MIGRATION_COUNTERS` list; this anchor
-/// citation is the declaration's other half.
-///
-/// v1 (no `version` field on disk) is the original shape: `backup_dir`
-/// stored exactly as the configure-time caller passed it — CWD-relative
-/// when the operator ran from the deployment tree, so every later read
-/// silently depended on process CWD. v2 pins the invariant: `backup_dir`
-/// is absolute (canonicalized at configure time). See
-/// (internal design notes).
-const CONFIG_VERSION_LEGACY: u32 = 1;
+/// backup.json's format version — a **local migration counter**, not a
+/// format epoch (documentation/versioning.md#local-migration-counters),
+/// registered by name in the version-contract guard's
+/// `LOCAL_MIGRATION_COUNTERS` list. v2 is the one and only shape: the
+/// `version` field is required, and `backup_dir` is absolute
+/// (canonicalized at configure time — the v1 CWD-relative quirk retired
+/// with the breaking-refactor batch, which re-provisions every store).
 const CONFIG_VERSION: u32 = 2;
-
-fn legacy_config_version() -> u32 {
-    CONFIG_VERSION_LEGACY
-}
 
 // ---------------------------------------------------------------------------
 // Identity (offline) and configuration
@@ -104,10 +92,8 @@ pub fn recipient_of(identity_secret: &str) -> Result<String> {
 /// The persisted backup configuration (`<store>/backup.json`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackupConfig {
-    /// Format version; absent in old files means v1 (see
-    /// [`CONFIG_VERSION_LEGACY`]). Reads normalize v1 shapes in memory and
-    /// stamp v2 on the next write.
-    #[serde(default = "legacy_config_version")]
+    /// Format version ([`CONFIG_VERSION`]); every file this binary writes
+    /// carries it.
     pub version: u32,
     /// age X25519 recipient (`age1...`) backups encrypt to.
     pub recipient: String,
@@ -121,27 +107,10 @@ pub struct BackupConfig {
     pub initialized_at: String,
 }
 
-/// Reads the store's backup configuration, normalized: v1 shapes are
-/// resolved in memory (see [`load_config`]), so every consumer is
-/// CWD-independent. `Ok(None)` = not configured (checkpoints are no-ops); a
-/// malformed file is an error, never a silent backup disable.
+/// Reads the store's backup configuration. `Ok(None)` = not configured
+/// (checkpoints are no-ops); a malformed file is an error, never a silent
+/// backup disable.
 pub fn config(store_root: &Path) -> Result<Option<BackupConfig>> {
-    Ok(load_config(store_root)?.map(|(cfg, _)| cfg))
-}
-
-/// [`config`] plus the "on-disk file differs from the normalized shape"
-/// flag. The writing paths ([`checkpoint`], [`rekey`]) use it to persist
-/// the normalization; readers never write.
-///
-/// The one v1 quirk worth an invariant: a v1 relative `backup_dir` is
-/// anchored to the store root's PARENT — the sibling layout of
-/// [`default_backup_dir`], which is the only shape that ever produced a
-/// relative value (`plan apply` / default `init` run from the deployment
-/// tree, where store and backups sit as siblings). That frozen v1 meaning
-/// is applied here so reads never depend on process CWD; the bytes on disk
-/// stay untouched, so the currency hash cannot drift from the newest
-/// version just because someone ran `status` from `~`.
-fn load_config(store_root: &Path) -> Result<Option<(BackupConfig, bool)>> {
     let path = store_root.join(BACKUP_FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -153,44 +122,24 @@ fn load_config(store_root: &Path) -> Result<Option<(BackupConfig, bool)>> {
             });
         }
     };
-    let mut cfg: BackupConfig = serde_json::from_str(&text).map_err(|e| {
+    let cfg: BackupConfig = serde_json::from_str(&text).map_err(|e| {
         Error::issuance(format!(
             "issuer store has a malformed {BACKUP_FILE} — backups are NOT running; fix \
                  or remove the file and re-run `interflow-cli issuer backup init`"
         ))
         .with_source(e)
     })?;
-    let mut migrated = false;
-    if cfg.version < CONFIG_VERSION {
-        if cfg.backup_dir.is_relative() {
-            let anchor = store_root
-                .canonicalize()
-                .unwrap_or_else(|_| store_root.to_owned());
-            let Some(parent) = anchor.parent() else {
-                return Err(Error::issuance(format!(
-                    "backup_dir \"{}\" is relative and the store root {} has no parent to anchor \
-                     it against — fix the file and re-run `interflow-cli issuer backup init`",
-                    cfg.backup_dir.display(),
-                    store_root.display()
-                )));
-            };
-            cfg.backup_dir = parent.join(&cfg.backup_dir);
-        }
-        cfg.version = CONFIG_VERSION;
-        migrated = true;
-    } else if cfg.backup_dir.is_relative() {
-        // The v2 invariant is broken — a hand-edit, not a legacy shape.
-        // Fail closed rather than guess an anchor for a file that promised
-        // not to need one.
+    if cfg.backup_dir.is_relative() {
+        // The v2 invariant is broken — a hand-edit. Fail closed rather
+        // than guess an anchor for a file that promised not to need one.
         return Err(Error::issuance(format!(
-            "{} declares format version {} but stores a relative backup_dir \"{}\" — the on-disk \
-             value must be absolute; fix the file and re-run `interflow-cli issuer backup init`",
+            "{} stores a relative backup_dir \"{}\" — the on-disk value must be absolute; fix \
+             the file and re-run `interflow-cli issuer backup init`",
             path.display(),
-            cfg.version,
             cfg.backup_dir.display()
         )));
     }
-    Ok(Some((cfg, migrated)))
+    Ok(Some(cfg))
 }
 
 /// Default backup directory: a sibling of the store root
@@ -281,7 +230,7 @@ pub fn configure(
         ));
     }
     let stored_dir = resolve_backup_dir(store_root, backup_dir)?;
-    let initialized_at = rfc3339_now()?;
+    let initialized_at = crate::timestamp::rfc3339_now()?;
     let cfg = BackupConfig {
         version: CONFIG_VERSION,
         recipient: recipient.trim().to_owned(),
@@ -306,7 +255,7 @@ pub fn rekey(store_root: &Path, new_recipient: &str) -> Result<BackupConfig> {
     };
     parse_recipient(new_recipient)?;
     cfg.recipient = new_recipient.trim().to_owned();
-    cfg.initialized_at = rfc3339_now()?;
+    cfg.initialized_at = crate::timestamp::rfc3339_now()?;
     write_config(store_root, &cfg)?;
     Ok(cfg)
 }
@@ -348,12 +297,6 @@ fn write_config(store_root: &Path, cfg: &BackupConfig) -> Result<()> {
     })
 }
 
-fn rfc3339_now() -> Result<String> {
-    OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(|e| Error::issuance("backup timestamp".to_owned()).with_source(e))
-}
-
 // ---------------------------------------------------------------------------
 // Checkpoint (change-triggered, versioned, deduplicated)
 // ---------------------------------------------------------------------------
@@ -375,20 +318,13 @@ pub enum Checkpoint {
 /// zeroed), so the content hash — and with it the version name — is a pure
 /// function of file contents and modes.
 pub fn checkpoint(store_root: &Path) -> Result<Checkpoint> {
-    let Some((cfg, migrated)) = load_config(store_root)? else {
+    let Some(cfg) = config(store_root)? else {
         return Ok(Checkpoint::Unconfigured);
     };
     // The bookkeeping db lives under the store root and rides along in the
     // tar — flush its WAL first so the plain file copy carries every
     // committed row (the sidecar files themselves are skipped below).
     crate::state_db::wal_checkpoint(store_root)?;
-    if migrated {
-        // Persist the normalized config BEFORE hashing: the migration is a
-        // store change like any other, and the version this checkpoint
-        // writes must cover it — never a side-channel edit that silently
-        // stales the newest backup against the store it just recorded.
-        write_config(store_root, &cfg)?;
-    }
     let files = collect_files(store_root, &cfg.backup_dir)?;
     let tar_bytes = build_tar(&files)?;
     let hash8 = interflow_util::sha256_hex(&tar_bytes)[..8].to_owned();
@@ -970,8 +906,10 @@ fn same_device(a: &Path, b: &Path) -> Option<bool> {
     Some(ma.dev() == mb.dev())
 }
 
+/// Off unix the device identity is not exposed: "unknown" is the honest
+/// answer (a constant one — the unix variant reads metadata).
 #[cfg(not(unix))]
-fn same_device(_a: &Path, _b: &Path) -> Option<bool> {
+const fn same_device(_a: &Path, _b: &Path) -> Option<bool> {
     None
 }
 
@@ -1350,97 +1288,6 @@ mod tests {
     fn set_mtime(path: &Path, at: std::time::SystemTime) {
         let file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
         file.set_modified(at).unwrap();
-    }
-
-    /// The store exactly as the 2026-10-10 deployments stood when the CWD
-    /// bug was found: v1 backup.json with a raw relative backup_dir, its
-    /// sibling backup dir already populated, and (for the read-only test)
-    /// a newest version whose hash covers those very bytes.
-    fn legacy_v1_store(tag: &str) -> (tempfile::TempDir, PathBuf, GeneratedIdentity) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join(tag);
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(dir.path().join(format!("{tag}-backups"))).unwrap();
-        let identity = generate_identity().unwrap();
-        std::fs::write(root.join("realm-issuer.crt"), b"a store file").unwrap();
-        std::fs::write(
-            root.join(BACKUP_FILE),
-            serde_json::json!({
-                "recipient": identity.recipient,
-                "backup_dir": format!("{tag}-backups"),
-                "retention": DEFAULT_RETENTION,
-                "initialized_at": "2026-10-10T04:20:00Z",
-            })
-            .to_string(),
-        )
-        .unwrap();
-        (dir, root, identity)
-    }
-
-    #[test]
-    fn legacy_v1_relative_backup_dir_resolves_on_read_without_writing() {
-        let (dir, root, identity) = legacy_v1_store("legacy-ro");
-        // The version a pre-fix binary would have left: hash over the
-        // store exactly as it stands (v1 bytes included), in the sibling
-        // dir the deployment-tree operator meant.
-        let backup_dir = dir.path().join("legacy-ro-backups");
-        let files = collect_files(&root, &backup_dir).unwrap();
-        let tar_bytes = build_tar(&files).unwrap();
-        let hash8 = interflow_util::sha256_hex(&tar_bytes)[..8].to_owned();
-        let ciphertext =
-            encrypt_to(&parse_recipient(&identity.recipient).unwrap(), &tar_bytes).unwrap();
-        std::fs::write(
-            backup_dir.join(format!("{NAME_PREFIX}20261010T042000Z-{hash8}.age")),
-            ciphertext,
-        )
-        .unwrap();
-
-        let bytes_before = std::fs::read(root.join(BACKUP_FILE)).unwrap();
-        let s = status(&root).unwrap();
-        let cfg = s.config.as_ref().unwrap();
-        assert_eq!(cfg.version, CONFIG_VERSION);
-        assert!(
-            cfg.backup_dir.is_absolute(),
-            "the v1 relative value is anchored to the store's parent"
-        );
-        assert_eq!(
-            cfg.backup_dir.canonicalize().unwrap(),
-            backup_dir.canonicalize().unwrap()
-        );
-        assert_eq!(s.versions.len(), 1);
-        assert!(
-            s.newest_is_current,
-            "reads never rewrite backup.json — the currency hash cannot drift from the newest \
-             version just because someone ran from another CWD"
-        );
-        assert_eq!(
-            std::fs::read(root.join(BACKUP_FILE)).unwrap(),
-            bytes_before,
-            "status is read-only"
-        );
-    }
-
-    #[test]
-    fn checkpoint_persists_the_v2_migration_inside_its_hash() {
-        let (_dir, root, _identity) = legacy_v1_store("migrate");
-        let (cfg, migrated) = load_config(&root).unwrap().unwrap();
-        assert!(migrated, "the v1 shape is normalized in memory");
-        assert!(cfg.backup_dir.is_absolute());
-
-        assert!(matches!(
-            checkpoint(&root).unwrap(),
-            Checkpoint::Written { .. }
-        ));
-        let on_disk: BackupConfig =
-            serde_json::from_str(&std::fs::read_to_string(root.join(BACKUP_FILE)).unwrap())
-                .unwrap();
-        assert_eq!(on_disk.version, CONFIG_VERSION);
-        assert!(on_disk.backup_dir.is_absolute());
-        assert!(
-            status(&root).unwrap().newest_is_current,
-            "the migration was persisted BEFORE hashing — the checkpoint that wrote it covers \
-             it, with no stale window and no follow-up runbook step"
-        );
     }
 
     #[test]

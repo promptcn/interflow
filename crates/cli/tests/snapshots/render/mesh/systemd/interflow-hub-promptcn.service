@@ -1,3 +1,4 @@
+# rendered by interflow-cli 2026-11-04_594ce6e-dirty
 [Unit]
 Description=Interflow hub node promptcn
 After=network-online.target

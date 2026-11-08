@@ -678,6 +678,48 @@ pub fn pack_node_and_generation_of(dir: &Path) -> Result<(String, Generation)> {
     Ok((probe.node, probe.generation))
 }
 
+/// Lenient host-identity probe for host-level reconciliation
+/// (`doctor host`, `node install`'s closing sweep, `node retire`): the pack's
+/// kind, node, and realm — enough to name an installed node and group packs
+/// by realm — read across format vintages exactly like
+/// [`pack_node_and_generation_of`]. A directory whose pack.toml does not
+/// carry these keys is not an installed interflow node and fails the probe.
+pub fn pack_kind_node_realm_of(dir: &Path) -> Result<(PackKind, String, String)> {
+    #[derive(serde::Deserialize)]
+    struct KindNodeRealm {
+        kind: PackKind,
+        node: String,
+        realm: String,
+    }
+    let path = dir.join("pack.toml");
+    let text = std::fs::read_to_string(&path).map_err(|e| Error::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    let probe: KindNodeRealm = toml::from_str(&text)
+        .map_err(|e| Error::pack("pack.toml parse".to_string()).with_source(e))?;
+    Ok((probe.kind, probe.node, probe.realm))
+}
+
+/// Lenient fleet-roster probe: the pack's embedded signed policy, read for
+/// its generation and `nodes` roster WITHOUT signature verification (the
+/// pack was verified when it was installed; this face only ranks candidates
+/// on a host scan — it never authorizes anything).
+///
+/// `None` means "no roster authority": the policy is missing, unreadable, or
+/// predates format epoch 3 (no `nodes` face). Callers degrade gracefully —
+/// cross-referencing still works, roster judgment does not guess.
+pub fn pack_roster_of(dir: &Path) -> Option<(Generation, Vec<crate::policy::PolicyNode>)> {
+    #[derive(serde::Deserialize)]
+    struct RosterOnly {
+        generation: Generation,
+        nodes: Option<Vec<crate::policy::PolicyNode>>,
+    }
+    let text = std::fs::read_to_string(dir.join("policy").join("policy.toml")).ok()?;
+    let probe: RosterOnly = toml::from_str(&text).ok()?;
+    probe.nodes.map(|nodes| (probe.generation, nodes))
+}
+
 /// The SHA256SUMS digest as revocation-record provenance, when the file is
 /// intact. Tolerant on purpose: the digest is context for humans, not a
 /// gate — its absence must not block a revocation.
@@ -686,15 +728,46 @@ pub fn pack_digest_of(dir: &Path) -> Option<String> {
     digests_file_digest(dir).ok()
 }
 
+/// A tree path that may legitimately sit in the pack WITHOUT being listed
+/// in SHA256SUMS:
+///
+/// - the manifest itself;
+/// - the runtime `state/` tree (policy refresh, live CRLs, ACME, creds);
+/// - the audit ledger family the node writes while running (`audit.jsonl`
+///   plus its rotated `audit-<ts>-<seq>.jsonl[.gz]` segments);
+/// - the embedded revocation snapshot `trust/crls/` — an OPTIONAL member:
+///   apply writes it into the pack after sealing (unlisted until rotate or
+///   the next render folds it back into the manifest), so present-but-
+///   unlisted is the sanctioned intermediate state. The other direction is
+///   strict: once a CRL IS listed, the per-line digest check covers it and
+///   the reconciliation demands it exist.
+///
+/// Everything else in the tree must be listed — an unlisted file has
+/// escaped verification.
+fn may_be_unlisted(rel: &str) -> bool {
+    rel == "SHA256SUMS"
+        || rel == "state"
+        || rel.starts_with("state/")
+        || rel == "audit.jsonl"
+        || (rel.starts_with("audit-") && (rel.ends_with(".jsonl") || rel.ends_with(".jsonl.gz")))
+        || rel == "trust/crls"
+        || rel.starts_with("trust/crls/")
+}
+
 fn verify_digests(dir: &Path) -> Result<()> {
     let sums_path = dir.join("SHA256SUMS");
     let sums = std::fs::read_to_string(&sums_path).map_err(|e| Error::Io {
         path: sums_path.display().to_string(),
         source: e,
     })?;
-    for line in sums.lines() {
+    let mut listed = std::collections::BTreeSet::new();
+    for (index, line) in sums.lines().enumerate() {
         let Some((digest, rel)) = line.split_once("  ") else {
-            continue;
+            return Err(Error::pack(format!(
+                "SHA256SUMS line {} is malformed (expected \"<sha256>  <path>\") — the \
+                 pack is corrupted or was modified after sealing",
+                index + 1
+            )));
         };
         let bytes = std::fs::read(dir.join(rel)).map_err(|e| Error::Io {
             path: dir.join(rel).display().to_string(),
@@ -707,8 +780,43 @@ fn verify_digests(dir: &Path) -> Result<()> {
                  corrupted or was modified after sealing"
             )));
         }
+        listed.insert(rel.to_owned());
+    }
+    // Reconciliation, both directions: a non-optional file on disk but
+    // absent from the manifest has escaped verification; a listed path with
+    // no file is a missing member. Same stance as install.sh --verify-staging.
+    let tree = pack_tree(dir)?;
+    for rel in &tree {
+        if !may_be_unlisted(rel) && !listed.contains(rel) {
+            return Err(Error::pack(format!(
+                "credential pack file {rel:?} is absent from SHA256SUMS — the pack is \
+                 corrupted or was modified after sealing"
+            )));
+        }
+    }
+    for rel in &listed {
+        if !tree.contains(rel) {
+            return Err(Error::pack(format!(
+                "SHA256SUMS lists {rel:?} which the pack does not carry — the pack is \
+                 corrupted or was modified after sealing"
+            )));
+        }
     }
     Ok(())
+}
+
+/// Every file under the pack dir, as slash-separated tree-relative paths
+/// (the shared sorted walk; used as a set).
+fn pack_tree(dir: &Path) -> Result<Vec<String>> {
+    let walk = interflow_util::walk_sorted(dir).map_err(|e| Error::Io {
+        path: dir.display().to_string(),
+        source: e,
+    })?;
+    Ok(walk
+        .into_iter()
+        .filter(|entry| !entry.is_dir)
+        .map(|entry| entry.rel)
+        .collect())
 }
 
 fn digests_file_digest(dir: &Path) -> Result<String> {
@@ -825,10 +933,10 @@ service = "main/desktop/asr"
         let (_guard, out) = rendered_agent_pack("probe-retired");
         let text = std::fs::read_to_string(out.join("pack.toml"))
             .unwrap()
-            .replace("format_version = 1", "format_version = 2");
+            .replace("format_version = 3", "format_version = 4");
         std::fs::write(out.join("pack.toml"), text).unwrap();
-        assert_eq!(probe_pack_format(&out), Some(PackTreeStale::Retired(2)));
-        assert!(PackTreeStale::Retired(2).narrate().contains('2'));
+        assert_eq!(probe_pack_format(&out), Some(PackTreeStale::Retired(4)));
+        assert!(PackTreeStale::Retired(4).narrate().contains('4'));
     }
 
     #[test]
@@ -913,5 +1021,65 @@ service = "main/desktop/asr"
 
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(pack_digest_of(empty.path()), None);
+    }
+
+    /// A malformed SHA256SUMS line is a corruption error — never silently
+    /// skipped (a tampered manifest line used to escape verification).
+    #[test]
+    fn verify_digests_rejects_malformed_lines() {
+        let (_guard, out) = rendered_agent_pack("digests-malformed");
+        let sums = std::fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+        let mut lines: Vec<String> = sums.lines().map(str::to_owned).collect();
+        lines[1] = "not-a-sums-line".to_owned();
+        std::fs::write(out.join("SHA256SUMS"), lines.join("\n") + "\n").unwrap();
+        let err = CredentialPack::load(&out).unwrap_err().to_string();
+        assert!(err.contains("SHA256SUMS line 2 is malformed"), "{err}");
+    }
+
+    /// The sealed tree is exactly the listed set: an unlisted file at the
+    /// pack root has escaped verification and fails the load, while the
+    /// runtime-written artifacts (state/, the audit ledger family) are
+    /// exempt by design — a running node's pack must keep loading.
+    #[test]
+    fn verify_digests_reconciles_the_tree_both_ways() {
+        let (_guard, out) = rendered_agent_pack("digests-extra");
+        std::fs::write(out.join("smuggled.txt"), b"unlisted").unwrap();
+        let err = CredentialPack::load(&out).unwrap_err().to_string();
+        assert!(err.contains("smuggled.txt"), "{err}");
+        assert!(
+            err.contains("absent from SHA256SUMS"),
+            "the reconciliation must name the escape: {err}"
+        );
+
+        let (_guard, out) = rendered_agent_pack("digests-runtime");
+        std::fs::create_dir_all(out.join("state/policy")).unwrap();
+        std::fs::write(out.join("state/policy/live.policy"), b"hot").unwrap();
+        std::fs::write(out.join("audit.jsonl"), b"{}\n").unwrap();
+        std::fs::write(
+            out.join("audit-20261103T000000Z-0000000000000001.jsonl.gz"),
+            b"gz",
+        )
+        .unwrap();
+        // The post-seal embedded CRL snapshot (apply writes it after
+        // sealing; rotate folds it back into the manifest when re-sealing).
+        std::fs::create_dir_all(out.join("trust/crls")).unwrap();
+        std::fs::write(out.join("trust/crls/workspace-alpha.crl.pem"), b"pem").unwrap();
+        CredentialPack::load(&out).expect("runtime artifacts are exempt by design");
+    }
+
+    /// A CRL that IS listed is a member like any other: deleting it after
+    /// the fold is corruption, not the sanctioned intermediate state.
+    #[test]
+    fn verify_digests_demands_a_listed_crl_exists() {
+        let (_guard, out) = rendered_agent_pack("digests-listed-crl");
+        std::fs::create_dir_all(out.join("trust/crls")).unwrap();
+        std::fs::write(out.join("trust/crls/control.crl.pem"), b"pem").unwrap();
+        crate::pack::render::write_digests(&out).unwrap();
+        CredentialPack::load(&out).expect("the folded pack is self-consistent");
+        std::fs::remove_file(out.join("trust/crls/control.crl.pem")).unwrap();
+        // The per-line read names the missing member first (Io); the exact
+        // variant does not matter, the file must be named loudly.
+        let err = CredentialPack::load(&out).unwrap_err().to_string();
+        assert!(err.contains("trust/crls/control.crl.pem"), "{err}");
     }
 }

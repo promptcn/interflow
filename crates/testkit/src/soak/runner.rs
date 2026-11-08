@@ -9,7 +9,7 @@
 //! impairment proxies (egress↔hub link), per-PID RSS sampling, and hub
 //! `/metrics` scraping.
 //!
-//! Eight assertions (any failure → fail-fast + exit(1)):
+//! Assertions (any failure → fail-fast + exit(1)):
 //! 1. **Zero corruption**: strictly consecutive chunk seq per stream + full
 //!    payload pattern verification;
 //! 2. **Stall bound**: inter-chunk gap on any stream ≤ `--stall-bound-secs`
@@ -44,7 +44,33 @@
 //!    sentinel for sweeps that clear the table without notifying the peer, on
 //!    the production /metrics path). A relay-plane (QUIC) peer is torn down by
 //!    the table-entry drop and never increments this counter, so the QUIC
-//!    scenario skips the canary by design.
+//!    scenario skips the canary by design;
+//! 9. **Harness self-health**: the UDP impairment proxy's delay lines never
+//!    overflow (a tail-drop mistaken for injected loss would flatter the
+//!    product; 2026-09-16 quic-stall case file);
+//! 10. **Log volume bound**: a scenario's raw log bytes (hub + agents +
+//!     churn) stay under `--log-budget-mb`. Per-frame / per-beat lines live at
+//!     `trace` and the nodes run on `info` plus the `transport_stats` sampler
+//!     target; a debug-level leak back into that default face is what turned
+//!     one run's hub.log into hundreds of MB (2026-10-21 record). A forensic
+//!     `--node-log-filter` override is self-declared verbose and skips the check.
+//! 11. **Identity churn** (`identity_churn`): thousands of never-seen client
+//!     addresses presented through the PROXY preamble — the visitor-identity
+//!     axis the 2026-11-01 memory experiment found unbounded (71d1b20). Three
+//!     assertions on the production `/metrics` path: the per-client limiter's
+//!     tracked population never exceeds its configured bound
+//!     (`rate_limit_tracked_clients_bounded`), capacity evictions actually fire
+//!     under the pressure (`rate_limit_capacity_evictions_fired`), and the
+//!     population recedes once the churn stops and a sweep touches every shard
+//!     (`rate_limit_tracked_clients_recedes_after_churn`). The phase needs
+//!     real wall time (the store's rotation period is the product's); the
+//!     runner refuses a run too short to hold it — `--quick` is lengthened to
+//!     fit, `--identity-churn-per-sec 0` is the explicit forensic opt-out.
+//!
+//! Run directory hygiene (`retention`): before a run, past runs' `logs/`
+//! subtrees are pruned oldest-first to `--retention-mb` (results.json always
+//! kept, newest 3 completed runs never pruned); after the artifact is
+//! written, this run's `*.log` files are gzipped in place.
 //!
 //! Run: `just soak [-- args]`; smoke: `just soak -- --quick`.
 
@@ -60,11 +86,14 @@ use crate::backend::{
 use crate::impair::{DropPattern, ImpairConfig, ImpairKind, TcpImpairProxy, UdpImpairProxy};
 use crate::metrics::{LatencyStats, fmt_ms, latency_stats};
 use crate::soak::error::{SoakError, SoakResult};
+use crate::soak::identity_churn::{self, IdentityChurnSummary};
 use crate::soak::phases::{PhaseTimeline, SerializedSpan, run_phases};
 use crate::soak::proc::{
-    MeshProcess, churn_agent_config, egress_agent_config, hub_config, ingress_agent_config,
-    spawn_mesh, write_json,
+    HUB_MAX_TRACKED_CLIENTS, HUB_RATE_LIMIT_PER_MINUTE, MeshProcess, churn_agent_config,
+    default_log_level, egress_agent_config, hub_config, ingress_agent_config, spawn_mesh,
+    write_json,
 };
+use crate::soak::retention::{self, RetentionReport};
 use crate::soak::{rss, scrape};
 use crate::stack::wait_for_tcp;
 use clap::Parser;
@@ -88,7 +117,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "soak",
-    about = "Long-running soak gate (real process topology + eight assertions; run several rounds nightly/before releases)"
+    version = interflow_buildinfo::VERSION_WITH_TAG,
+    about = "Long-running soak gate (real process topology + assertion suite; run several rounds nightly/before releases)"
 )]
 pub struct SoakArgs {
     /// Transports to exercise (comma-separated: h2,quic)
@@ -191,6 +221,32 @@ pub struct SoakArgs {
     #[arg(long)]
     out: Option<PathBuf>,
 
+    /// Log filter handed to every node under test (hub + agents). Default: `info` plus the
+    /// QUIC transport-stats sampler target (`info,transport_stats=debug`). A forensic rerun
+    /// widens it explicitly, e.g. `--node-log-filter "info,transport_stats=debug,interflow_mesh=trace"`;
+    /// setting it declares the run verbose and skips the `log_volume_bound` assertion.
+    #[arg(long)]
+    node_log_filter: Option<String>,
+
+    /// Upper bound of raw log bytes per scenario in MiB (`log_volume_bound` assertion; 0 disables).
+    /// Catches per-frame / per-beat lines leaking back into the default filter.
+    #[arg(long, default_value_t = 64)]
+    log_budget_mb: u64,
+
+    /// Capacity cap in MiB for the logs kept under bench-results/soak-*: before the run, the oldest
+    /// runs' logs/ subtrees are removed until the total fits (results.json always kept, newest 3
+    /// completed runs never pruned). 0 disables.
+    #[arg(long, default_value_t = 512)]
+    retention_mb: u64,
+
+    /// Identity-churn pace: never-seen client addresses presented to the hub per second (the
+    /// phase churns 3/4 of the hub's tracked-client bound, idles two rotation periods, then
+    /// sweeps every limiter shard). The run must be long enough to hold the phase after
+    /// warmup — the runner refuses one that is not. 0 disables the phase (forensic opt-out;
+    /// its three assertions then record the opt-out rather than a verdict).
+    #[arg(long, default_value_t = 400)]
+    identity_churn_per_sec: u32,
+
     /// Smoke profile: h2 × 4 streams × 120s × cycle 30s/silence 8s
     #[arg(long, default_value_t = false)]
     quick: bool,
@@ -201,6 +257,10 @@ pub struct SoakArgs {
 }
 
 impl SoakArgs {
+    /// Smoke profile. Quick scales LOAD down (one transport, fewer streams,
+    /// shorter cycles), never the invariant set: with the identity-churn
+    /// phase enabled the duration is lengthened to the phase's budget, so the
+    /// same three limiter assertions run here as in a nightly.
     fn apply_quick(&mut self) {
         self.transports = vec!["h2".to_string()];
         self.streams = 4;
@@ -209,6 +269,27 @@ impl SoakArgs {
         self.silence_secs = 8;
         self.loss_pct = 1;
         self.churn_restart_every_secs = 40;
+        if let Some(schedule) = self.identity_churn_schedule() {
+            let needed = identity_churn::min_duration_secs(self.warmup(), &schedule);
+            self.duration_secs = self.duration_secs.max(needed);
+        }
+    }
+
+    /// The identity-churn phase's sizing for this run (`None` when disabled).
+    fn identity_churn_schedule(&self) -> Option<identity_churn::Schedule> {
+        (self.identity_churn_per_sec > 0).then(|| {
+            identity_churn::Schedule::for_bound(
+                HUB_MAX_TRACKED_CLIENTS,
+                HUB_RATE_LIMIT_PER_MINUTE,
+                self.identity_churn_per_sec,
+            )
+        })
+    }
+
+    /// The warmup every after-warmup assertion skips (RSS drift, the
+    /// identity-churn start): two cycles, capped at half the run.
+    fn warmup(&self) -> Duration {
+        Duration::from_secs((self.cycle_secs * 2).min(self.duration_secs / 2))
     }
 }
 
@@ -244,6 +325,34 @@ fn validate(args: &SoakArgs) -> SoakResult<()> {
         return Err(SoakError::Args(format!(
             "duration ({}s) must cover at least one full cycle ({}s)",
             args.duration_secs, args.cycle_secs
+        )));
+    }
+    if let Some(schedule) = args.identity_churn_schedule() {
+        let needed = identity_churn::min_duration_secs(args.warmup(), &schedule);
+        if args.duration_secs < needed {
+            // Honest scheduling: the store's rotation period is the
+            // product's, so the phase cannot be compressed — a run too short
+            // to hold it must say so up front, never run and skip.
+            return Err(SoakError::Args(format!(
+                "duration ({}s) cannot hold the identity-churn phase after warmup ({}s warmup + \
+                 {}s churn at {}/s + {}s idle (two rotation periods) + sweep + settle = {needed}s \
+                 minimum); lengthen the run, or pass --identity-churn-per-sec 0 to opt out \
+                 explicitly",
+                args.duration_secs,
+                args.warmup().as_secs(),
+                schedule.churn_duration().as_secs(),
+                schedule.per_sec,
+                schedule.idle.as_secs(),
+            )));
+        }
+    }
+    if let Some(level) = &args.node_log_filter
+        && let Err(e) = tracing_subscriber::EnvFilter::try_new(level)
+    {
+        // The nodes would silently fall back to `info` on a bad directive —
+        // a forensic rerun must not discover that after a 10-minute run.
+        return Err(SoakError::Args(format!(
+            "--node-log-filter {level:?} is not a valid tracing filter: {e}"
         )));
     }
     Ok(())
@@ -392,6 +501,17 @@ struct HarnessSummary {
     udp_queue_capacity: usize,
 }
 
+/// Raw log footprint of one scenario, measured after teardown and before
+/// compression (the `log_volume_bound` observable; per-file so a breach is
+/// attributable to the process that produced it).
+#[derive(Serialize, Default)]
+struct LogSummary {
+    raw_bytes: u64,
+    budget_bytes: u64,
+    /// `(file name, bytes)` of every file in the scenario's logs directory.
+    files: Vec<(String, u64)>,
+}
+
 #[derive(Serialize)]
 struct TransportResult {
     transport: String,
@@ -410,6 +530,8 @@ struct TransportResult {
     heartbeat: HeartbeatSummary,
     churn: ChurnSummary,
     harness: HarnessSummary,
+    logs: LogSummary,
+    identity_churn: IdentityChurnSummary,
     assertions: Vec<AssertionOut>,
 }
 
@@ -430,6 +552,8 @@ fn failed_result(name: &str, args: &SoakArgs, err: impl std::fmt::Display) -> Tr
         heartbeat: HeartbeatSummary::default(),
         churn: ChurnSummary::default(),
         harness: HarnessSummary::default(),
+        logs: LogSummary::default(),
+        identity_churn: IdentityChurnSummary::default(),
         assertions: Vec::new(),
     }
 }
@@ -736,6 +860,10 @@ struct MetricSample {
     pings_sent: u64,
     supervisor_restarts: u64,
     pong_total: u64,
+    /// `interflow_rate_limit_tracked_clients` (the limiter's population).
+    tracked_clients: u64,
+    /// `interflow_rate_limit_capacity_evictions` (cumulative).
+    capacity_evictions: u64,
 }
 
 struct MetricsSeries {
@@ -764,6 +892,9 @@ async fn metrics_sampler(
                 pings_sent: or_zero("interflow_hub_heartbeat_pings_sent"),
                 supervisor_restarts: or_zero("interflow_hub_heartbeat_supervisor_restarts"),
                 pong_total: or_zero("interflow_hub_pong_received"),
+                tracked_clients: scrape::gauge_value(&text, identity_churn::TRACKED_GAUGE)
+                    .unwrap_or(0),
+                capacity_evictions: or_zero(identity_churn::EVICTIONS_COUNTER),
             });
         } else {
             out.misses += 1;
@@ -939,6 +1070,12 @@ async fn run_scenario(
             format!("failed to create scenario directory: {e}"),
         );
     }
+    // One filter for every node under test; `--node-log-filter` is the forensic
+    // override of the narrow default.
+    let log_level = args
+        .node_log_filter
+        .clone()
+        .unwrap_or_else(default_log_level);
 
     // ---- Ports: everything binds :0 and materializes in the children /
     // ready handoffs (no pick-then-bind windows). ----
@@ -983,6 +1120,7 @@ async fn run_scenario(
         "127.0.0.1:0".parse().expect("hub :0"),
         "127.0.0.1:0".parse().expect("metrics :0"),
         &certs,
+        &log_level,
     );
     if let Err(e) = write_json(&scenario_dir.join("hub.json"), &hub_cfg) {
         return failed_result(name, args, e);
@@ -1072,7 +1210,13 @@ async fn run_scenario(
     // file. ----
     let ingress_ready_path = scenario_dir.join("ingress.ready.json");
     let _ = std::fs::remove_file(&ingress_ready_path);
-    let egress_cfg = egress_agent_config(hub_endpoint_via_proxy, transport, &certs, backend_addr);
+    let egress_cfg = egress_agent_config(
+        hub_endpoint_via_proxy,
+        transport,
+        &certs,
+        backend_addr,
+        &log_level,
+    );
     let ingress_cfg = ingress_agent_config(
         hub_addr,
         transport,
@@ -1080,6 +1224,7 @@ async fn run_scenario(
         "127.0.0.1:0".parse().expect("ingress :0"),
         backend_addr,
         args.idle_timeout_secs,
+        &log_level,
     );
     if let Err(e) = write_json(&scenario_dir.join("egress.json"), &egress_cfg)
         .and_then(|()| write_json(&scenario_dir.join("ingress.json"), &ingress_cfg))
@@ -1176,6 +1321,7 @@ async fn run_scenario(
         &certs,
         "127.0.0.1:0".parse().expect("churn :0"),
         backend_addr,
+        &log_level,
     );
     if let Err(e) = write_json(&churn_config_path, &churn_cfg) {
         teardown_procs(&procs).await;
@@ -1296,6 +1442,21 @@ async fn run_scenario(
     let rss_task = tokio::spawn(rss_sampler(rss_targets, mem_interval, cancel.clone()));
     let metrics_task = tokio::spawn(metrics_sampler(metrics_addr, mem_interval, cancel.clone()));
 
+    // Identity churn: never-seen client addresses through the PROXY preamble
+    // on the hub's own TCP face (not through the impairment proxy — the
+    // identities are the load, not the link). Starts after warmup; its budget
+    // was validated against the run duration up front.
+    let identity_churn_task = args.identity_churn_schedule().map(|schedule| {
+        tokio::spawn(identity_churn::run_phase(
+            hub_addr,
+            metrics_addr,
+            schedule,
+            HUB_MAX_TRACKED_CLIENTS,
+            args.warmup(),
+            cancel.clone(),
+        ))
+    });
+
     // Egress fd sampling (data source for the orphaned-stream sentinel; fixed 10s interval,
     // denser than RSS — the leak signal is "accumulated across waves", so the sampling
     // granularity must be smaller than the wave interval)
@@ -1401,6 +1562,18 @@ async fn run_scenario(
             samples: Vec::new(),
             misses: 0,
         },
+    };
+    let identity_churn_summary = match identity_churn_task {
+        Some(task) => match tokio::time::timeout(Duration::from_secs(10), task).await {
+            Ok(Ok(summary)) => summary,
+            _ => IdentityChurnSummary {
+                enabled: true,
+                bound: HUB_MAX_TRACKED_CLIENTS,
+                interrupted: true,
+                ..IdentityChurnSummary::default()
+            },
+        },
+        None => IdentityChurnSummary::default(),
     };
     // Impairment events (fetched before shutdown; used for stall attribution)
     let impair_events: Vec<crate::impair::ImpairEvent> = match (&tcp_proxy, &udp_proxy) {
@@ -1806,6 +1979,67 @@ async fn run_scenario(
         },
     );
 
+    // 10. Log volume bound: the processes under test ran on the narrow
+    //     default filter, so their raw log bytes are a direct read of
+    //     log-level discipline on the data plane — a per-frame or per-beat
+    //     line that slid back from trace to debug shows up here as a
+    //     budget breach attributable to one file. Measured after teardown
+    //     (files complete) and before compression.
+    let log_files = retention::logs_dir_files(&logs_dir);
+    let log_raw_bytes: u64 = log_files.iter().map(|(_, b)| b).sum();
+    let log_budget_bytes = args.log_budget_mb * 1024 * 1024;
+    let log_breakdown = log_files
+        .iter()
+        .map(|(f, b)| format!("{f} {:.1} MiB", *b as f64 / 1024.0 / 1024.0))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if args.node_log_filter.is_some() {
+        push_assert(
+            &mut assertions,
+            &mut pass,
+            "log_volume_bound",
+            true,
+            format!(
+                "forensic --node-log-filter override in effect, budget not asserted ({:.1} MiB raw: {log_breakdown})",
+                log_raw_bytes as f64 / 1024.0 / 1024.0
+            ),
+        );
+    } else if args.log_budget_mb == 0 {
+        push_assert(
+            &mut assertions,
+            &mut pass,
+            "log_volume_bound",
+            true,
+            format!(
+                "budget disabled (--log-budget-mb 0), {:.1} MiB raw: {log_breakdown}",
+                log_raw_bytes as f64 / 1024.0 / 1024.0
+            ),
+        );
+    } else {
+        push_assert(
+            &mut assertions,
+            &mut pass,
+            "log_volume_bound",
+            log_raw_bytes <= log_budget_bytes,
+            format!(
+                "{:.1} MiB raw logs vs budget {} MiB ({log_breakdown}); per-frame/per-beat lines belong at trace, samplers behind their own target",
+                log_raw_bytes as f64 / 1024.0 / 1024.0,
+                args.log_budget_mb
+            ),
+        );
+    }
+
+    // 11. Identity churn: the per-client limiter's state is bounded under
+    // visitor-identity pressure, evicts for real past the bound, and recedes
+    // once the pressure stops (production /metrics path).
+    identity_churn_assertions(
+        &mut assertions,
+        &mut pass,
+        &identity_churn_summary,
+        &metrics_series,
+        final_scrape.as_deref(),
+    );
+
     let chunks_verified: usize = stream_stats.iter().map(|s| s.chunks).sum();
     TransportResult {
         transport: name.to_string(),
@@ -1836,8 +2070,136 @@ async fn run_scenario(
             fd_misses: fd_series.misses,
             sweep_peer_notified: sweep_notified_final,
         },
+        logs: LogSummary {
+            raw_bytes: log_raw_bytes,
+            budget_bytes: log_budget_bytes,
+            files: log_files,
+        },
+        identity_churn: identity_churn_summary,
         assertions,
     }
+}
+
+/// The three identity-churn verdicts (assertion 11). A disabled phase is
+/// the explicit forensic opt-out and records itself as such; an
+/// interrupted phase (the run ended first) is a failure — the budget
+/// validation makes that a harness defect, not a product one.
+fn identity_churn_assertions(
+    assertions: &mut Vec<AssertionOut>,
+    pass: &mut bool,
+    churn: &IdentityChurnSummary,
+    metrics_series: &MetricsSeries,
+    final_scrape: Option<&str>,
+) {
+    const NAMES: [&str; 3] = [
+        "rate_limit_tracked_clients_bounded",
+        "rate_limit_capacity_evictions_fired",
+        "rate_limit_tracked_clients_recedes_after_churn",
+    ];
+    if !churn.enabled {
+        for name in NAMES {
+            assertions.push(AssertionOut {
+                name: name.to_string(),
+                pass: true,
+                detail: "identity churn disabled (--identity-churn-per-sec 0): explicit forensic \
+                         opt-out, no verdict"
+                    .to_string(),
+            });
+        }
+        return;
+    }
+    let push = |assertions: &mut Vec<AssertionOut>,
+                pass: &mut bool,
+                name: &str,
+                ok: bool,
+                detail: String| {
+        if !ok {
+            *pass = false;
+        }
+        assertions.push(AssertionOut {
+            name: name.to_string(),
+            pass: ok,
+            detail,
+        });
+    };
+    if churn.interrupted {
+        for name in NAMES {
+            push(
+                assertions,
+                pass,
+                name,
+                false,
+                format!(
+                    "identity-churn phase did not complete (churned {} / failed {}, swept {}): \
+                     the run ended first — a scheduling defect, see the duration validation",
+                    churn.churned, churn.churn_failures, churn.swept
+                ),
+            );
+        }
+        return;
+    }
+
+    // Bounded: every observation of the gauge — the sampler's timeline, the
+    // phase's own reads, the closing scrape — stays within the bound.
+    let bound = churn.bound as u64;
+    let final_tracked =
+        final_scrape.and_then(|t| scrape::gauge_value(t, identity_churn::TRACKED_GAUGE));
+    let observed_max = metrics_series
+        .samples
+        .iter()
+        .map(|s| s.tracked_clients)
+        .chain(churn.tracked_after_churn)
+        .chain(churn.tracked_after_sweep)
+        .chain(final_tracked)
+        .max()
+        .unwrap_or(0);
+    push(
+        assertions,
+        pass,
+        NAMES[0],
+        observed_max <= bound,
+        format!(
+            "tracked clients peaked at {observed_max} against the bound {bound} ({} churned, \
+             {} connect failures, after-churn reading {:?})",
+            churn.churned, churn.churn_failures, churn.tracked_after_churn
+        ),
+    );
+
+    // Evictions fired: the churn overflowed generations, so the capacity path
+    // ran for real (the closing scrape is the authoritative count).
+    let evictions_final = final_scrape
+        .map(|t| scrape::counter_value(t, identity_churn::EVICTIONS_COUNTER).unwrap_or(0))
+        .or(churn.evictions_after_churn)
+        .unwrap_or(0);
+    push(
+        assertions,
+        pass,
+        NAMES[1],
+        evictions_final >= 1,
+        format!(
+            "capacity evictions {evictions_final} (after churn {:?}); {} clients churned past a \
+             bound of {bound}",
+            churn.evictions_after_churn, churn.churned
+        ),
+    );
+
+    // Recedes: after two rotation periods idle and a sweep across every
+    // shard, the population is back near the sweep itself — the churned
+    // generations were dropped (lazily, when touched), not retained.
+    let recede_ok = match (churn.tracked_after_churn, churn.tracked_after_sweep) {
+        (Some(peak), Some(after)) => after < peak && after <= churn.swept + 64,
+        _ => false,
+    };
+    push(
+        assertions,
+        pass,
+        NAMES[2],
+        recede_ok,
+        format!(
+            "tracked clients after churn {:?} → after idle + {}-client sweep {:?} (bound {bound})",
+            churn.tracked_after_churn, churn.swept, churn.tracked_after_sweep
+        ),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1888,8 +2250,37 @@ pub async fn run(mut args: SoakArgs) -> SoakOutcome {
     let (run_dir, out_path) = resolve_out(args.out.as_deref());
     let _ = std::fs::create_dir_all(&run_dir);
 
+    // Run-directory hygiene first: past runs' logs are bounded by capacity
+    // before this run adds its own (results.json of every run stays).
+    let retention_report = (args.retention_mb > 0).then(|| {
+        let report = retention::prune_soak_logs(
+            &workspace_root().join("bench-results"),
+            args.retention_mb * 1024 * 1024,
+            Some(&run_dir),
+        );
+        if report.pruned.is_empty() {
+            println!(
+                "retention: soak logs {:.1} MiB within cap {} MiB, nothing pruned ({} completed runs shielded)",
+                report.before_bytes as f64 / 1024.0 / 1024.0,
+                args.retention_mb,
+                report.protected,
+            );
+        } else {
+            println!(
+                "retention: soak logs {:.1} MiB over cap {} MiB → pruned logs of {} run(s) [{}], now {:.1} MiB (results.json kept, {} newest runs shielded)",
+                report.before_bytes as f64 / 1024.0 / 1024.0,
+                args.retention_mb,
+                report.pruned.len(),
+                report.pruned.join(", "),
+                report.after_bytes as f64 / 1024.0 / 1024.0,
+                report.protected,
+            );
+        }
+        report
+    });
+
     println!(
-        "## soak long-running gate (real process topology): {} × {} streams × {}s/transport, cycle {}s/silence {}s, loss {}%/RTT {}ms",
+        "## soak long-running gate (real process topology): {} × {} streams × {}s/transport, cycle {}s/silence {}s, loss {}%/RTT {}ms, node log filter {:?}",
         transports
             .iter()
             .map(|&t| transport_name(t))
@@ -1901,6 +2292,9 @@ pub async fn run(mut args: SoakArgs) -> SoakOutcome {
         args.silence_secs,
         args.loss_pct,
         args.rtt_ms,
+        args.node_log_filter
+            .clone()
+            .unwrap_or_else(default_log_level),
     );
 
     let mut results = Vec::new();
@@ -1912,11 +2306,12 @@ pub async fn run(mut args: SoakArgs) -> SoakOutcome {
         );
         let r = run_scenario(&args, t, &run_dir, &mesh_bin).await;
         println!(
-            "=== scenario {} finished: {} (verified {} chunks, max gap {})",
+            "=== scenario {} finished: {} (verified {} chunks, max gap {}, raw logs {:.1} MiB)",
             r.transport,
             if r.pass { "PASS" } else { "FAIL" },
             r.chunks_verified,
             fmt_ms((r.max_gap_ms * 1e6) as u64),
+            r.logs.raw_bytes as f64 / 1024.0 / 1024.0,
         );
         results.push(r);
     }
@@ -1924,7 +2319,26 @@ pub async fn run(mut args: SoakArgs) -> SoakOutcome {
     let pass = results.iter().all(|r| r.pass);
     print_report(&args, &results);
 
-    let artifact_path = write_artifact(&out_path, &args, &results);
+    let artifact_path = write_artifact(&out_path, &args, &results, retention_report.as_ref());
+
+    // Evidence stays complete at a fraction of the bytes; the artifact is
+    // already on disk, so a compression fault can never cost it.
+    let compressed = retention::compress_run_logs(&run_dir);
+    if compressed.files > 0 {
+        println!(
+            "compressed {} log file(s): {:.1} MiB → {:.1} MiB (*.log.gz; `zless` / `gunzip -c` to read)",
+            compressed.files,
+            compressed.before_bytes as f64 / 1024.0 / 1024.0,
+            compressed.after_bytes as f64 / 1024.0 / 1024.0,
+        );
+    }
+    for (path, err) in &compressed.failed {
+        eprintln!(
+            "log compression skipped {} (left raw): {err}",
+            path.display()
+        );
+    }
+
     SoakOutcome {
         pass,
         artifact_path,
@@ -1939,6 +2353,7 @@ fn write_artifact(
     out_path: &Path,
     args: &SoakArgs,
     results: &[TransportResult],
+    retention: Option<&RetentionReport>,
 ) -> Option<PathBuf> {
     #[derive(Serialize)]
     struct Artifact<'a> {
@@ -1966,7 +2381,13 @@ fn write_artifact(
                 "rss_drift_max_pct": args.rss_drift_max_pct,
                 "seed": args.seed,
                 "quick": args.quick,
+                "node_log_filter": args.node_log_filter.clone().unwrap_or_else(default_log_level),
+                "node_log_filter_overridden": args.node_log_filter.is_some(),
+                "log_budget_mb": args.log_budget_mb,
+                "retention_mb": args.retention_mb,
+                "identity_churn_per_sec": args.identity_churn_per_sec,
             },
+            "retention": retention,
             "ts": chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         }),
         results,
@@ -2087,6 +2508,18 @@ mod tests {
         let mut a = args();
         a.apply_quick();
         assert!(validate(&a).is_ok());
+    }
+
+    #[test]
+    fn node_log_filter_override_must_be_a_valid_filter() {
+        let mut a = args();
+        a.node_log_filter = Some("info,transport_stats=debug,interflow_mesh=trace".to_string());
+        assert!(validate(&a).is_ok());
+        a.node_log_filter = Some("interflow_mesh=not-a-level".to_string());
+        assert!(
+            validate(&a).is_err(),
+            "a bad directive must fail validation up front, not fall back to info in the nodes"
+        );
     }
 
     #[test]

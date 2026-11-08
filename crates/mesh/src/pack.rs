@@ -48,6 +48,7 @@ pub fn init_pack_logging() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_ansi(interflow_core::telemetry::ansi_enabled())
         .try_init();
 }
 
@@ -191,6 +192,7 @@ pub fn build_hub_config(
         },
         auth: AuthConfig {
             rate_limit_per_minute: Default::default(),
+            max_tracked_clients: interflow_core::security::MAX_TRACKED_CLIENTS,
             tenants,
         },
         tls: Some(HubTlsConfig {
@@ -446,6 +448,7 @@ pub(crate) fn policy_channel_fingerprint(
 pub(crate) fn spawn_hub_policy_reload(
     pack_dir: &Path,
     shared: crate::hub::SharedHubConfig,
+    watchdog: std::sync::Arc<crate::hub::watchdog::WatchdogRegistry>,
     shutdown: &tokio_util::sync::CancellationToken,
     tracker: &tokio_util::task::TaskTracker,
 ) {
@@ -458,11 +461,36 @@ pub(crate) fn spawn_hub_policy_reload(
         // unreadable at spawn — retried each tick, a torn update defers the
         // plane instead of killing it).
         let mut seen: Option<u64> = None;
+        // Register at spawn (same discipline as the sibling rows).
+        watchdog.register(
+            "hub_policy_reload",
+            crate::agent::policy_watch::POLICY_WATCH_INTERVAL.as_secs(),
+            u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0),
+        );
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(crate::agent::policy_watch::POLICY_WATCH_INTERVAL) => {}
             }
+            // The watchdog row attests THIS pass; the stall-class fault
+            // point models the wedged task (alive, not progressing) for
+            // the e2e silent-watcher shape — the pass sleeps out without
+            // ticking, shutdown stays observable, and disarming restores
+            // the cadence (revival) on the next pass.
+            if interflow_core::fault::stall(
+                interflow_core::fault::FaultPoint::HubPolicyReloadWatchTick,
+            ) {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(crate::agent::policy_watch::POLICY_WATCH_INTERVAL) => {}
+                }
+                continue;
+            }
+            watchdog.tick(
+                "hub_policy_reload",
+                crate::agent::policy_watch::POLICY_WATCH_INTERVAL.as_secs(),
+                u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0),
+            );
             let Some(watermark) = seen else {
                 match CredentialPack::load_runtime(&dir) {
                     Ok(pack) => {
@@ -684,12 +712,11 @@ pub fn policy_egress_rules(
 /// override ?? signed default ?? pack default.
 ///
 /// A service id with no resolvable address is **skipped with a warning**,
-/// not a rejection — a hot-added service on a legacy policy (no signed
-/// address) and no pack entry simply waits for an address to arrive via
-/// the override channel; the rest of the policy still applies
-/// (fail-forward, not fail-closed: the id set is signed truth, the address
-/// is a node fact). Single derivation for startup and hot reload, like
-/// [`policy_egress_rules`].
+/// not a rejection — the id set is signed truth, the address is a node
+/// fact, and the rest of the policy still applies. In practice every
+/// signed default is manifest-validated and always resolves; the branch
+/// guards a damaged policy from wedging the node. Single derivation for
+/// startup and hot reload, like [`policy_egress_rules`].
 pub fn policy_service_egress_rules(
     policy: &RuntimePolicy,
     node: &str,
@@ -701,7 +728,7 @@ pub fn policy_service_egress_rules(
         if service.agent != node {
             continue;
         }
-        let Some(target) = addresses.resolve(&service.id, service.address.as_deref()) else {
+        let Some(target) = addresses.resolve(&service.id, Some(&service.address)) else {
             tracing::warn!(
                 node,
                 service = %service.id,
@@ -791,6 +818,9 @@ pub async fn run_hub(pack_dir: &Path) -> Result<()> {
     }
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    // Captured before the run future consumes the token: the self-slot
+    // reporter below ends with the same shutdown the hub run does.
+    let crl_self_shutdown = shutdown.clone();
     let hub_run = hub.run_until_signalled(shutdown, ready_tx);
     tokio::pin!(hub_run);
     // READY=1 once the TCP + QUIC listeners are bound (releases a
@@ -822,12 +852,52 @@ pub async fn run_hub(pack_dir: &Path) -> Result<()> {
         })
     });
 
+    // The hub's own renewal face: one `Arc` shared by the scheduler spawn
+    // below (its writes) and the self-slot copy task (the fleet face's
+    // hub-half source). An offline-identity hub gets neither — nothing
+    // polls, so nothing reports; a silent self slot must always mean a
+    // hung poller, never "offline by design".
+    let crl_face = std::sync::Arc::new(interflow_renewal::CrlPollFace::new());
+    if pack.metadata.identity_mode != interflow_identity::manifest::IdentityMode::Offline {
+        crate::hub::crl_liveness::spawn_self_reporter(
+            hub_state_handle.clone(),
+            std::sync::Arc::clone(&crl_face),
+            crl_self_shutdown,
+        );
+    }
+
+    // The renewal loop's watchdog row: the loop's own cadence anchors the
+    // silence judgment (the 60s CRL-poll cap online; the 1h expiry check
+    // offline), and the loop attests each pass through the TickWatch —
+    // its liveness level, not an external poller's guess.
+    let online_identity =
+        pack.metadata.identity_mode != interflow_identity::manifest::IdentityMode::Offline;
+    let renewal_interval_secs = if online_identity {
+        interflow_renewal::CRL_POLL.as_secs()
+    } else {
+        3600
+    };
+    hub_state_handle.watchdog.register(
+        "renewal",
+        renewal_interval_secs,
+        u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0),
+    );
+    let renewal_watchdog = hub_state_handle.watchdog.clone();
+    let renewal_watch: interflow_renewal::TickWatch = std::sync::Arc::new(move || {
+        renewal_watchdog.touch(
+            "renewal",
+            u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0),
+        );
+    });
+
     tokio::select! {
         result = &mut hub_run => result,
-        result = interflow_renewal::renewal_scheduler_with_crl_reload(
+        result = interflow_renewal::renewal_scheduler_with_watch(
             pack_dir,
             None,
             Some(crl_hook),
+            crl_face,
+            Some(renewal_watch),
         ) => result,
     }
 }
@@ -848,9 +918,25 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
     let hub_url = config.agent.hub_url.clone();
     let rules = config.ingress.len() + config.egress.len();
     let has_ingress_listeners = !config.ingress.is_empty();
+    // The renewal face: one `Arc` shared by the scheduler spawn below and
+    // the client's liveness reporter (the fleet face's agent-row source).
+    // Offline-identity agents attach none — nothing polls, so nothing
+    // reports (a hub-side silent row must mean a hung poller, never
+    // "offline by design").
+    let online_identity =
+        pack.metadata.identity_mode != interflow_identity::manifest::IdentityMode::Offline;
+    let renewal_face = std::sync::Arc::new(interflow_renewal::CrlPollFace::new());
     // The signed-policy watcher rides the engine itself (the config's
     // policy plane) — nothing to spawn or fail over here.
-    let mut agent = crate::agent::AgentClient::new(config)?.start();
+    let mut agent = if online_identity {
+        crate::agent::AgentClient::with_renewal_face(
+            config,
+            Some(std::sync::Arc::clone(&renewal_face)),
+        )?
+        .start()
+    } else {
+        crate::agent::AgentClient::new(config)?.start()
+    };
     println!(
         "mesh agent {} started: {} rule(s) → {}",
         pack.metadata.node, rules, hub_url
@@ -891,10 +977,9 @@ pub async fn run_agent(pack_dir: &Path) -> Result<()> {
     // CRL update) is a clean restart cycle; signals exit with the
     // conventional codes.
     let scheduler_pack_dir = pack_dir.to_owned();
-    let mut scheduler =
-        tokio::spawn(
-            async move { interflow_renewal::renewal_scheduler(&scheduler_pack_dir).await },
-        );
+    let mut scheduler = tokio::spawn(async move {
+        interflow_renewal::renewal_scheduler(&scheduler_pack_dir, renewal_face).await
+    });
     tokio::select! {
         () = wait_for_shutdown_signal() => {
             pump.abort();

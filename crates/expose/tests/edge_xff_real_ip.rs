@@ -108,6 +108,7 @@ async fn spawn_stack(opts: StackOpts) -> (SocketAddr, std::path::PathBuf) {
         hub_quic_addr: None,
 
         identity_offline: false,
+        renewal_face: None,
     };
     let client = interflow_expose::client::start(&client_args).expect("expose client start");
     assert!(
@@ -238,5 +239,75 @@ async fn untrusted_peer_ignores_the_header_and_still_routes() {
     assert!(
         request_routes(edge, Some("6.6.6.6, 198.51.100.7")).await,
         "untrusted peer forges XFF: request still routes, keyed on the peer"
+    );
+}
+
+/// Scenario 4 (per-client keying): the restored IP is a client key, not a
+/// table key — an IPv6 /64 shares one budget no matter which address in it
+/// the traffic names, and the IPv4-mapped spelling of an IPv4 address is
+/// the same client as the plain form. A neighbouring /64 and a different
+/// IPv4 client stay isolated. The audit record still names the exact
+/// address the header carried.
+#[tokio::test]
+async fn per_client_budget_keys_ipv6_slash64_and_mapped_ipv4() {
+    let (edge, audit) = spawn_stack(StackOpts {
+        xff: XffMode::Required,
+        trusted_proxies: vec!["127.0.0.1".to_string()],
+        rate_per_ip_per_min: 3,
+    })
+    .await;
+
+    // 2001:db8:1:2::/64 — three different addresses, one budget of 3.
+    assert!(
+        request_routes(edge, Some("2001:db8:1:2::11")).await,
+        "first address in the /64 passes"
+    );
+    assert!(
+        request_routes(edge, Some("2001:db8:1:2::22")).await,
+        "second address in the same /64 shares the budget"
+    );
+    assert!(
+        request_routes(edge, Some("2001:db8:1:2:ffff:0:0:33")).await,
+        "third address in the same /64 spends the last cell"
+    );
+    let denial = send_request(edge, Some("2001:db8:1:2::44"))
+        .await
+        .expect("over-quota denial is answered with bytes");
+    assert!(
+        denial.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "4th address in the same /64 must hit the shared budget: {denial}"
+    );
+    // The neighbouring /64 is a different client.
+    assert!(
+        request_routes(edge, Some("2001:db8:1:3::1")).await,
+        "a different /64 has its own budget"
+    );
+
+    // 198.51.100.8 — plain and IPv4-mapped spellings are one client.
+    assert!(
+        request_routes(edge, Some("198.51.100.8")).await,
+        "plain IPv4 passes"
+    );
+    assert!(
+        request_routes(edge, Some("::ffff:198.51.100.8")).await,
+        "the mapped spelling shares the IPv4 budget"
+    );
+    assert!(
+        request_routes(edge, Some("198.51.100.8")).await,
+        "third cell of the shared IPv4 budget"
+    );
+    let denial = send_request(edge, Some("::ffff:198.51.100.8"))
+        .await
+        .expect("over-quota denial is answered with bytes");
+    assert!(
+        denial.starts_with("HTTP/1.1 429 Too Many Requests\r\n"),
+        "the mapped spelling must hit the same budget: {denial}"
+    );
+
+    // The denial audit records the exact address the header carried, not
+    // the /64 summary.
+    assert!(
+        await_audit_contains(&audit, "\"source\":\"2001:db8:1:2::44\"").await,
+        "audit must record the exact XFF address, not the client-key summary"
     );
 }

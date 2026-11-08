@@ -123,9 +123,11 @@ export const commands = {
 	/**
 	 *  The bookkeeping-level "would apply do anything" pre-check — the Deploy
 	 *  overview's "unapplied changes" badge and next-steps face. No minting,
-	 *  no hub dial (apply re-runs the full watermark-aware funnel).
+	 *  no hub dial (apply re-runs the full watermark-aware funnel); the dist
+	 *  tree and the deny list are local reads, so the answer covers the stale
+	 *  trees and local watermark divergences the funnel would act on.
 	 */
-	deployChangeState: (manifest: string, issuer: string) => typedError<ChangeStateDto, string>(__TAURI_INVOKE("deploy_change_state", { manifest, issuer })),
+	deployChangeState: (manifest: string, issuer: string, out: string) => typedError<ChangeStateDto, string>(__TAURI_INVOKE("deploy_change_state", { manifest, issuer, out })),
 	/**
 	 *  The running hub's operator overview (watermarks + fleet presence and
 	 *  pull convergence) — the Apply-result card and the fleet table's online
@@ -143,11 +145,109 @@ export const commands = {
 	/**  What the hub actually serves; `None` = this hub cannot report it. */
 	serving: number | null,
 	/**
+	 *  The hub-side capture instant (unix seconds) — the anchor every
+	 *  per-leg recency judgment reads against; `None` = an older hub
+	 *  (recency then stays unjudgeable, never guessed).
+	 */
+	captured_at_unix?: number | null,
+	/**
+	 *  The policy-watch silent threshold in seconds (3× the engine's
+	 *  watch interval), self-reported so clients never hardcode a
+	 *  cadence they do not own.
+	 */
+	policy_silent_after_secs?: number,
+	/**
+	 *  The CRL-poll silent threshold in seconds (3× the renewal loop's
+	 *  poll cadence), self-reported so clients never hardcode a cadence
+	 *  they do not own (same discipline as
+	 *  [`Self::policy_silent_after_secs`]).
+	 */
+	crl_silent_after_secs?: number,
+	/**
+	 *  Unix seconds of THIS hub's own last successful CRL poll (its
+	 *  renewal loop's liveness face, self slot); `None` = an older hub
+	 *  or no renewal loop.
+	 */
+	crl_last_success_unix?: number | null,
+	/**  Failed CRL polls since this hub process started. */
+	crl_failures_total?: number | null,
+	/**
+	 *  The currently-OPEN route breakers (edge gateways; empty on plain
+	 *  mesh hubs) — the hub card's ⚠ chips and the doctor line read this.
+	 */
+	route_breakers_open?: RouteBreakerOpenRowDto[],
+	/**
+	 *  The resident-task watchdog's rows (the armed-assertion face): every
+	 *  long-lived hub task with its cadence anchor and last tick. Empty on
+	 *  older hubs — the assertion is then unjudgeable, never passed.
+	 */
+	watchers?: WatcherFaceRowDto[],
+	/**
+	 *  The silence judgment factor (a row is silent strictly past this
+	 *  multiple of its own interval), self-reported so clients never
+	 *  hardcode a threshold they do not own.
+	 */
+	watcher_silent_factor?: number,
+	/**
+	 *  The proposals queue's watermark face (`None` when nothing is
+	 *  pending or the hub carries no store).
+	 */
+	proposals_pending?: ProposalsPendingDto | null,
+	/**
+	 *  The hub's currently-admitted streams across all agents (`None` on
+	 *  older hubs).
+	 */
+	streams_in_flight_total?: number | null,
+	/**
+	 *  The admission caps the headroom judgments read against (`None` on
+	 *  older hubs).
+	 */
+	stream_limits?: StreamLimitsDto | null,
+	/**
+	 *  The fossil-judgment anchors, self-reported so clients never
+	 *  hardcode thresholds they do not own: a budgeted stream reads
+	 *  fossil quiet past this multiple of its own budget.
+	 */
+	fossil_idle_multiple?: number,
+	/**  The fossil line for streams with NO idle budget (days). */
+	fossil_unbudgeted_days?: number,
+	/**
+	 *  The headroom warn ratio (percent; a scope under this remaining
+	 *  capacity reads tight).
+	 */
+	headroom_warn_pct?: number,
+	/**
+	 *  The credential-expiry face's thresholds, self-reported so clients
+	 *  never hardcode lines they do not own: the offline tier's yellow
+	 *  line (days remaining).
+	 */
+	offline_warn_days?: number,
+	/**  The offline tier's red line (days). */
+	offline_critical_days?: number,
+	/**  The registrar tier's yellow line (percent of the span remaining). */
+	registrar_warn_pct?: number,
+	/**  The registrar tier's red line (percent of the span). */
+	registrar_critical_pct?: number,
+	/**
 	 *  Every registered fleet member with presence and last-pulled
 	 *  watermark.
 	 */
 	agents: HubAgentRowDto[],
 } | null, string>(__TAURI_INVOKE("deploy_hub_overview", { manifest, issuer })),
+	/**
+	 *  Stream pause/resume, hub path (for streams whose source node runs
+	 *  elsewhere): queues the op under a minted control credential. The
+	 *  face converges within one watch interval; the caller refreshes as
+	 *  usual. `None` = the manifest names no hub endpoint.
+	 */
+	streamPauseHub: (manifest: string, issuer: string, agent: string, name: string, pause: boolean) => typedError<boolean, string>(__TAURI_INVOKE("stream_pause_hub", { manifest, issuer, agent, name, pause })),
+	/**  Node maintenance on/off, hub path (control credential). */
+	maintenanceHub: (manifest: string, issuer: string, agent: string, on: boolean) => typedError<boolean, string>(__TAURI_INVOKE("maintenance_hub", { manifest, issuer, agent, on })),
+	/**
+	 *  Stream pause/resume on a LOCAL node (in-process; no hub dependency —
+	 *  the node reports the change upstream itself). Idempotent.
+	 */
+	streamPauseLocal: (nodeId: string, name: string, pause: boolean) => typedError<boolean, string>(__TAURI_INVOKE("stream_pause_local", { nodeId, name, pause })),
 	/**
 	 *  The hub's stream-proposal queue (the operator's approve/reject face).
 	 *  `None` = the manifest names no hub endpoint.
@@ -238,6 +338,14 @@ export const commands = {
 	 */
 	guiPrefsSave: (prefs: GuiPrefsDto) => typedError<null, string>(__TAURI_INVOKE("gui_prefs_save", { prefs })),
 	/**
+	 *  Startup notices — the retirements this build NARRATES instead of
+	 *  silently absorbing: preferences it cannot read (a different GUI
+	 *  generation wrote them) and a remembered deployment that no longer opens
+	 *  as one. The shell shows each once; the dismissal key (`id`, tied to the
+	 *  format epoch) makes each era notify exactly once.
+	 */
+	guiStartupNotices: () => typedError<StartupNoticeDto[], string>(__TAURI_INVOKE("gui_startup_notices")),
+	/**
 	 *  Lists the deployments under `~/interflow-deployments` (name-sorted). A
 	 *  missing root is an empty list — the first-run onboarding entry, not an
 	 *  error.
@@ -272,7 +380,7 @@ export const commands = {
 	 *  `include_hub`) the hub's fleet face + every local join. The hub dial is
 	 *  opt-in so hub latency can never hold the local view hostage.
 	 */
-	fleetOverview: (manifest: string, issuer: string, includeHub: boolean) => typedError<FleetDto_Serialize, string>(__TAURI_INVOKE("fleet_overview", { manifest, issuer, includeHub })),
+	fleetOverview: (manifest: string, issuer: string, out: string, includeHub: boolean) => typedError<FleetDto_Serialize, string>(__TAURI_INVOKE("fleet_overview", { manifest, issuer, out, includeHub })),
 	/**
 	 *  The 发布 button's single backend entry: save (when the editor hands
 	 *  over text) → apply (the watermark-aware funnel; the policy-only fast
@@ -284,11 +392,24 @@ export const commands = {
 	 *  needs a manual re-run.
 	 */
 	deploymentPublish: (manifestText: string | null, manifest: string, issuer: string, out: string) => typedError<PublishResultDto, string>(__TAURI_INVOKE("deployment_publish", { manifestText, manifest, issuer, out })),
+	/**
+	 *  Starts the deployment's hub floor watcher — the background task that
+	 *  holds one blocking watch on the hub's floor version and emits
+	 *  `hub-floor` on every advance (the fleet read model's invalidation
+	 *  signal; see `hub_watch`). Pre-empts any previous watcher, so a
+	 *  deployment switch never leaves the old hub's task running.
+	 */
+	hubFloorWatchStart: (manifest: string, issuer: string) => typedError<null, string>(__TAURI_INVOKE("hub_floor_watch_start", { manifest, issuer })),
+	/**  Stops the hub floor watcher (deployment close). Idempotent. */
+	hubFloorWatchStop: () => typedError<null, string>(__TAURI_INVOKE("hub_floor_watch_stop")),
 };
 
 /** Events */
 export const events = {
+	hubFloor: makeEvent<HubFloorEvent>("hub-floor"),
 	log: makeEvent<LogEvent>("log"),
+	meshBreakers: makeEvent<MeshBreakersEvent>("mesh-breakers"),
+	meshCrl: makeEvent<MeshCrlEvent>("mesh-crl"),
 	meshListeners: makeEvent<MeshListenersEvent>("mesh-listeners"),
 	meshPeers: makeEvent<MeshPeersEvent>("mesh-peers"),
 	meshProposals: makeEvent<MeshProposalsEvent>("mesh-proposals"),
@@ -356,6 +477,22 @@ export type ApplyReportDto = {
 };
 
 /**
+ *  One OPEN breaker entry (agent egress dial keys locally, route hosts
+ *  on the hub face) — the open-set face's row material (2026-10-19).
+ */
+export type BreakerOpenRowDto = {
+	/**
+	 *  The breaker key: `tcp:host:port` / `udp:host:port` (agent egress)
+	 *  or the bare public host (edge routes).
+	 */
+	target: string,
+	/**  Unix seconds of the trip. */
+	opened_unix: number,
+	/**  Unix seconds of the last admitted recovery probe; `0` = never. */
+	last_probe_unix: number,
+};
+
+/**
  *  The bookkeeping-level "would apply do anything" pre-check (no minting,
  *  no hub dial): the "unapplied changes" badge and the next-steps face.
  */
@@ -377,7 +514,39 @@ export type ChangeStateDto =
  *  The identity/trust/dial face changed — the next apply re-renders
  *  every pack.
  */
-{ kind: "identity_edits_pending" };
+{ kind: "identity_edits_pending" } | 
+/**
+ *  The declaration is unchanged but the rendered pack tree is not
+ *  "applied" — a retired pack format, or an embedded CRL snapshot
+ *  predating the issuer's deny list. The next apply re-renders every
+ *  pack and publishes a new generation above the watermarks; local
+ *  nodes restart per their captured intent.
+ */
+{ kind: "pack_tree_stale" } | 
+/**
+ *  The declaration is unchanged but the dist tree's signed artifacts
+ *  sit above the issuer bookkeeping — the next apply re-publishes the
+ *  same policy above the watermarks (hot, like policy edits; no pack
+ *  re-renders).
+ */
+{ kind: "watermarks_diverged" };
+
+/**
+ *  The connection-quality window stats (the supervisor domain's
+ *  levels): reconnect rate, liveness RTT percentiles, probe timeouts.
+ */
+export type ConnectionQualityDto = {
+	/**  Session establishments inside the reconnect window (one hour). */
+	reconnects_last_hour: number,
+	/**  Median answered roundtrip, millis (`None` = no answered sample). */
+	rtt_p50_ms?: number | null,
+	/**  99th-percentile answered roundtrip, millis. */
+	rtt_p99_ms?: number | null,
+	/**  Unanswered demanding roundtrips in the window. */
+	rtt_timeouts: number,
+	/**  Total roundtrip samples in the window. */
+	rtt_samples: number,
+};
 
 /**  One queue entry as the operator's Deploy face shows it. */
 export type ControlProposalDto = {
@@ -425,6 +594,20 @@ export type CredentialHealthDto = {
 	 *  (<10%, red). Surfaces color-code on this string.
 	 */
 	phase: string,
+};
+
+/**
+ *  The CRL-poll liveness plane for one running node — the renewal loop's
+ *  level (value + confirmation instant), the local half of the 2026-10-19
+ *  liveness face. The panel judges `last_success_unix` against its own
+ *  clock: a level that stopped advancing is a wedged poll loop, exactly
+ *  the reading this face exists to make visible.
+ */
+export type CrlPollPlaneDto = {
+	/**  Unix seconds of the last successful CRL poll; `0` = never. */
+	last_success_unix: number,
+	/**  Failed polls since the node's process started. */
+	failures_total: number,
 };
 
 /**
@@ -734,6 +917,58 @@ export type HubAgentRowDto = {
 	 *  since the hub process started.
 	 */
 	seen: number | null,
+	/**
+	 *  Unix seconds of the agent's last completed pull (`None` = an older
+	 *  hub, or no completed pull) — the LEVEL face's confirmation instant.
+	 */
+	policy_last_pull_unix?: number | null,
+	/**
+	 *  The stream names this member last reported paused (planned
+	 *  unavailability, stream-level); `None` = never reported.
+	 */
+	paused_streams?: string[] | null,
+	/**
+	 *  The member is declared under maintenance (planned unavailability,
+	 *  node-level — its absence is expected, not an accident).
+	 */
+	maintenance?: boolean,
+	/**
+	 *  Unix seconds of the member's last successful CRL poll (its renewal
+	 *  reporter's level); `None` = never reported / an older hub.
+	 */
+	crl_last_success_unix?: number | null,
+	/**  Failed CRL polls since the member's process started. */
+	crl_failures_total?: number | null,
+	/**
+	 *  The operator's queued stream ops waiting on this leg (the mailbox
+	 *  watermark face); `None` = nothing waiting and nothing ever
+	 *  dropped, or an older hub.
+	 */
+	pending_ops?: MailboxFaceDto | null,
+	/**
+	 *  This agent's currently-admitted hub streams (`None` on older
+	 *  hubs / legs with no live count).
+	 */
+	streams_in_flight?: number | null,
+	/**
+	 *  The agent's per-stream byte-activity levels (the fossil face;
+	 *  empty on older agents / agents without mesh stream rules).
+	 */
+	streams?: NodeStreamActivityDto[],
+	/**  The last-seen leaf validity window (the credential-expiry face). */
+	leaf_not_before_unix?: number | null,
+	/**  See [`Self::leaf_not_before_unix`]. */
+	leaf_not_after_unix?: number | null,
+	/**  The tier the span implies (`registrar` / `offline`). */
+	credential_mode?: string | null,
+	/**  Unix seconds of the registration that last presented the window. */
+	credential_last_seen_unix?: number | null,
+	/**  The connection-quality window stats (`None` on older agents). */
+	connection?: ConnectionQualityDto | null,
+	/**  The renewal backoff ladder's current stage. */
+	renewal_backoff_failures?: number | null,
+	/**  The stage's observed maximum today. */
+	renewal_backoff_max_today?: number | null,
 };
 
 /**  One `[mesh.hub.<name>]`. */
@@ -759,6 +994,24 @@ export type HubEditDto = {
 };
 
 /**
+ *  `hub-floor` event payload: the deployment's hub floor version advanced
+ *  (hub floor watcher → here). The composed fleet read model is a pull
+ *  over `/policy/floor`; this event is its invalidation signal — the
+ *  deployment scope re-pulls on receipt, so external writers (a CLI
+ *  pause/resume, a maintenance declaration, another operator's publish,
+ *  an agent's re-report) reach every fleet-reading view the moment the
+ *  hub's face moves, not at the next manual refresh
+ */
+export type HubFloorEvent = {
+	/**
+	 *  The hub's floor version at the advance (diagnostics; the payload
+	 *  stays with the floor endpoint — narrowed u64 → u32 per the
+	 *  BigInt-ban contract rule).
+	 */
+	version: number,
+};
+
+/**
  *  The running hub's operator overview: watermarks plus the fleet's
  *  presence and pull convergence (from the control-credential
  *  `GET /policy/floor` — all facts the hub already holds).
@@ -773,6 +1026,90 @@ export type HubOverviewDto = {
 	floor: number,
 	/**  What the hub actually serves; `None` = this hub cannot report it. */
 	serving: number | null,
+	/**
+	 *  The hub-side capture instant (unix seconds) — the anchor every
+	 *  per-leg recency judgment reads against; `None` = an older hub
+	 *  (recency then stays unjudgeable, never guessed).
+	 */
+	captured_at_unix?: number | null,
+	/**
+	 *  The policy-watch silent threshold in seconds (3× the engine's
+	 *  watch interval), self-reported so clients never hardcode a
+	 *  cadence they do not own.
+	 */
+	policy_silent_after_secs?: number,
+	/**
+	 *  The CRL-poll silent threshold in seconds (3× the renewal loop's
+	 *  poll cadence), self-reported so clients never hardcode a cadence
+	 *  they do not own (same discipline as
+	 *  [`Self::policy_silent_after_secs`]).
+	 */
+	crl_silent_after_secs?: number,
+	/**
+	 *  Unix seconds of THIS hub's own last successful CRL poll (its
+	 *  renewal loop's liveness face, self slot); `None` = an older hub
+	 *  or no renewal loop.
+	 */
+	crl_last_success_unix?: number | null,
+	/**  Failed CRL polls since this hub process started. */
+	crl_failures_total?: number | null,
+	/**
+	 *  The currently-OPEN route breakers (edge gateways; empty on plain
+	 *  mesh hubs) — the hub card's ⚠ chips and the doctor line read this.
+	 */
+	route_breakers_open?: RouteBreakerOpenRowDto[],
+	/**
+	 *  The resident-task watchdog's rows (the armed-assertion face): every
+	 *  long-lived hub task with its cadence anchor and last tick. Empty on
+	 *  older hubs — the assertion is then unjudgeable, never passed.
+	 */
+	watchers?: WatcherFaceRowDto[],
+	/**
+	 *  The silence judgment factor (a row is silent strictly past this
+	 *  multiple of its own interval), self-reported so clients never
+	 *  hardcode a threshold they do not own.
+	 */
+	watcher_silent_factor?: number,
+	/**
+	 *  The proposals queue's watermark face (`None` when nothing is
+	 *  pending or the hub carries no store).
+	 */
+	proposals_pending?: ProposalsPendingDto | null,
+	/**
+	 *  The hub's currently-admitted streams across all agents (`None` on
+	 *  older hubs).
+	 */
+	streams_in_flight_total?: number | null,
+	/**
+	 *  The admission caps the headroom judgments read against (`None` on
+	 *  older hubs).
+	 */
+	stream_limits?: StreamLimitsDto | null,
+	/**
+	 *  The fossil-judgment anchors, self-reported so clients never
+	 *  hardcode thresholds they do not own: a budgeted stream reads
+	 *  fossil quiet past this multiple of its own budget.
+	 */
+	fossil_idle_multiple?: number,
+	/**  The fossil line for streams with NO idle budget (days). */
+	fossil_unbudgeted_days?: number,
+	/**
+	 *  The headroom warn ratio (percent; a scope under this remaining
+	 *  capacity reads tight).
+	 */
+	headroom_warn_pct?: number,
+	/**
+	 *  The credential-expiry face's thresholds, self-reported so clients
+	 *  never hardcode lines they do not own: the offline tier's yellow
+	 *  line (days remaining).
+	 */
+	offline_warn_days?: number,
+	/**  The offline tier's red line (days). */
+	offline_critical_days?: number,
+	/**  The registrar tier's yellow line (percent of the span remaining). */
+	registrar_warn_pct?: number,
+	/**  The registrar tier's red line (percent of the span). */
+	registrar_critical_pct?: number,
 	/**
 	 *  Every registered fleet member with presence and last-pulled
 	 *  watermark.
@@ -933,6 +1270,12 @@ export type ListenerStatusDto = {
 	bound_addr: string | null,
 	/**  The last bind failure (`null` = healthy). */
 	last_error: string | null,
+	/**
+	 *  The stream is paused by intent (planned unavailability): no
+	 *  listener should be up and the port is deliberately free — its own
+	 *  face, not a bind failure.
+	 */
+	paused: boolean,
 };
 
 /**  The local-machine face of a declared node: what the NodeManager knows. */
@@ -1004,6 +1347,26 @@ export type LogLine = {
 };
 
 /**
+ *  The mailbox watermark face for one member: queued stream ops waiting
+ *  on the leg, plus the capacity-drop history
+ * . Ages judge
+ *  against the overview's `captured_at_unix`.
+ */
+export type MailboxFaceDto = {
+	/**  Ops occupying the mailbox (undelivered AND delivered-unacked). */
+	pending_count: number,
+	/**  Unix seconds of the oldest queued op. */
+	oldest_queued_unix?: number | null,
+	/**  The oldest op, rendered (`"pause ollama"`). */
+	oldest_op?: string | null,
+	/**
+	 *  Ops dropped by the capacity guard, cumulative for this hub
+	 *  process.
+	 */
+	dropped_total: number,
+};
+
+/**
  *  One `[[agent.<node>.mesh_egress]]` rule; exactly one of `target_addr` /
  *  `target_cidr` is set.
  */
@@ -1060,6 +1423,30 @@ export type ManifestTemplateParams = {
 	agent: string,
 	service: string,
 	service_address: string,
+};
+
+/**
+ *  `mesh-breakers` event payload: a running mesh agent's egress-breaker
+ *  open set moved (table publish → manager forwarder → here). The node
+ *  detail's "Egress breakers" panel patches its node's `breakers` from
+ *  these.
+ */
+export type MeshBreakersEvent = {
+	id: string,
+	breakers: BreakerOpenRowDto[],
+};
+
+/**
+ *  `mesh-crl` event payload: a running node's CRL-poll liveness level
+ *  moved (renewal loop atomics → ticking forwarder → here). The node
+ *  detail's "CRL polling" panel patches its node's `crl` field from
+ *  these — same push-not-poll contract as [`MeshPeersEvent`]; the local
+ *  half of the 2026-10-19 liveness face (fleet rows come from the hub's
+ *  floor face instead).
+ */
+export type MeshCrlEvent = {
+	id: string,
+	crl: CrlPollPlaneDto,
 };
 
 /**  One serve-side mesh rule. */
@@ -1230,6 +1617,17 @@ export type NodeInfo_Deserialize = {
 	 */
 	peers: PeersPlaneDto | null,
 	/**
+	 *  The renewal loop's CRL-poll liveness plane (agent/edge kinds,
+	 *  running). `None` for other kinds or a stopped node — a stale
+	 *  reading must come from a running loop or not at all.
+	 */
+	crl: CrlPollPlaneDto | null,
+	/**
+	 *  The egress-breaker open set (mesh agents, running, breaker
+	 *  enabled). `None` for other kinds or a stopped node.
+	 */
+	breakers: BreakerOpenRowDto[] | null,
+	/**
 	 *  This node's stream-proposal receipts (mesh agents only, running) —
 	 *  `None` for other kinds or a stopped node.
 	 */
@@ -1323,6 +1721,17 @@ export type NodeInfo_Serialize = {
 	 *  display.
 	 */
 	peers: PeersPlaneDto | null,
+	/**
+	 *  The renewal loop's CRL-poll liveness plane (agent/edge kinds,
+	 *  running). `None` for other kinds or a stopped node — a stale
+	 *  reading must come from a running loop or not at all.
+	 */
+	crl: CrlPollPlaneDto | null,
+	/**
+	 *  The egress-breaker open set (mesh agents, running, breaker
+	 *  enabled). `None` for other kinds or a stopped node.
+	 */
+	breakers: BreakerOpenRowDto[] | null,
 	/**
 	 *  This node's stream-proposal receipts (mesh agents only, running) —
 	 *  `None` for other kinds or a stopped node.
@@ -1424,6 +1833,22 @@ export type NodeStateEvent_Deserialize = {
 export type NodeStateEvent_Serialize = {
 	id: string,
 	state: NodeStateDto_Serialize,
+};
+
+/**  One stream's byte-activity level (the fossil face's row material). */
+export type NodeStreamActivityDto = {
+	/**  The stream rule's name (policy vocabulary). */
+	name: string,
+	/**
+	 *  Unix seconds of the last byte (arm-time baseline before the
+	 *  first byte ever crosses).
+	 */
+	last_byte_unix: number,
+	/**
+	 *  The rule's own idle budget, when it sets one — the fossil
+	 *  judgment's per-row anchor.
+	 */
+	idle_budget_secs?: number | null,
 };
 
 /**  One pack-swap failure, phrased for the fleet table's row. */
@@ -1572,6 +1997,18 @@ export type ProposalStatusDto = { status: "pending" } | { status: "approved"; ge
  */
 export type ProposalSubmitOutcomeDto = { outcome: "queued"; id: string; expires_at_unix: number } | { outcome: "duplicate"; id: string; expires_at_unix: number } | { outcome: "denied"; reason: string };
 
+/**
+ *  The proposals queue's watermark face: pending count plus the oldest
+ *  submission's instant (ages are consumer-side, judged against the
+ *  overview's `captured_at_unix`).
+ */
+export type ProposalsPendingDto = {
+	/**  Proposals awaiting an operator decision. */
+	pending_count: number,
+	/**  Unix seconds of the oldest pending submission. */
+	oldest_submitted_unix: number,
+};
+
 /**  `[public_tls]` as the form sees it. */
 export type PublicTlsDto = {
 	mode: PublicTlsModeDto,
@@ -1670,6 +2107,75 @@ export type RemoteFaceDto = {
 	online: boolean,
 	/**  The generation this agent last pulled; `None` = no completed pull. */
 	seen_generation: number | null,
+	/**
+	 *  Unix seconds of the agent's last completed pull; `None` = no
+	 *  completed pull, or an older hub without the field (recency then
+	 *  stays unjudgeable, never guessed).
+	 */
+	policy_last_pull_unix: number | null,
+	/**
+	 *  The overview's hub-side capture instant — the recency anchor (a
+	 *  face older than the silent threshold cannot support a per-leg
+	 *  silent verdict; the view degrades to "data age", not a guess).
+	 */
+	face_captured_at_unix: number | null,
+	/**
+	 *  The stream names this member last reported paused (planned
+	 *  unavailability, stream-level); `None` = never reported.
+	 */
+	paused_streams?: string[] | null,
+	/**
+	 *  The member is declared under maintenance (planned unavailability,
+	 *  node-level — its absence is expected, not an accident).
+	 */
+	maintenance?: boolean,
+	/**
+	 *  Unix seconds of the member's last successful CRL poll (its
+	 *  renewal reporter's level); `None` = never reported / an older
+	 *  hub.
+	 */
+	crl_last_success_unix?: number | null,
+	/**  Failed CRL polls since the member's process started. */
+	crl_failures_total?: number | null,
+	/**
+	 *  The operator's queued stream ops waiting on this leg (the mailbox
+	 *  watermark face); `None` = nothing waiting / an older hub.
+	 */
+	pending_ops?: MailboxFaceDto | null,
+	/**
+	 *  This agent's currently-admitted hub streams (`None` on older
+	 *  hubs / legs with no live count).
+	 */
+	streams_in_flight?: number | null,
+	/**  The agent's per-stream byte-activity levels (the fossil face). */
+	streams?: NodeStreamActivityDto[],
+	/**  The last-seen leaf validity window (the credential-expiry face). */
+	leaf_not_before_unix?: number | null,
+	/**  See [`Self::leaf_not_before_unix`]. */
+	leaf_not_after_unix?: number | null,
+	/**  The tier the span implies (`registrar` / `offline`). */
+	credential_mode?: string | null,
+	/**  Unix seconds of the registration that last presented the window. */
+	credential_last_seen_unix?: number | null,
+	/**  The connection-quality window stats (`None` on older agents). */
+	connection?: ConnectionQualityDto | null,
+	/**  The renewal backoff ladder's current stage. */
+	renewal_backoff_failures?: number | null,
+	/**  The stage's observed maximum today. */
+	renewal_backoff_max_today?: number | null,
+};
+
+/**
+ *  One OPEN route breaker on the answering hub, as the overview parses
+ *  it off the floor payload.
+ */
+export type RouteBreakerOpenRowDto = {
+	/**  The public host whose route breaker is OPEN. */
+	host: string,
+	/**  Unix seconds of the trip. */
+	opened_unix: number,
+	/**  Unix seconds of the last admitted probe/touch. */
+	last_probe_unix: number,
 };
 
 /**  One `[[route]]`: public host → service identity. */
@@ -1762,6 +2268,34 @@ export type ServiceFaceDto = {
 };
 
 /**
+ *  One startup notice: a known retirement this build narrates instead of
+ *  silently absorbing. `id` is the stable dismissal key — tied to the
+ *  format epoch whose retirement produced the notice, so each era
+ *  notifies exactly once per machine.
+ */
+export type StartupNoticeDto = {
+	id: string,
+	kind: StartupNoticeKindDto,
+};
+
+/**
+ *  Which known retirement a startup notice narrates. The wire tags are the
+ *  contract (the shell maps them to localized text).
+ */
+export type StartupNoticeKindDto = 
+/**
+ *  Stored preferences exist but this build cannot read them — they were
+ *  retired by the upgrade; removing prefs.db starts fresh.
+ */
+"prefs_retired" | 
+/**
+ *  The remembered deployment folder no longer opens as a deployment —
+ *  retired by an upgrade or moved; open a current one or import a node
+ *  pack.
+ */
+"deployment_gone";
+
+/**
  *  One mesh stream (the 流 view's row): a cross-machine pairing object —
  *  the source agent's listen rule AND the target's remote, joined with
  *  everything live about it.
@@ -1794,6 +2328,14 @@ export type StreamDto = {
 	source_node_id: string | null,
 };
 
+/**  The admission caps the headroom judgments read against. */
+export type StreamLimitsDto = {
+	/**  `max_streams_total` (0 = unlimited). */
+	total: number,
+	/**  `max_streams_per_agent` (0 = unlimited). */
+	per_agent: number,
+};
+
 /**
  *  One stream-proposal request (the requester's form = the validator's
  *  fields, verbatim).
@@ -1822,6 +2364,13 @@ export type StreamStatusDto =
  *  rides the listener face).
  */
 "down" | 
+/**
+ *  The stream is paused by intent (planned unavailability): no
+ *  listener should be up, the port is deliberately free (e.g. lent
+ *  to a local process). Yellow, not red — and resumable in one
+ *  action.
+ */
+"paused" | 
 /**
  *  The policy generation is still propagating (hub serving above the
  *  source node's seen/applied generation).
@@ -1881,6 +2430,27 @@ export type VersionInfo = {
 	 *  a remote machine must not be mistaken for the named commit.
 	 */
 	dirty: boolean,
+};
+
+/**
+ *  One resident hub task as the watchdog face carries it (the
+ *  armed-assertion face): a row whose `last_tick_unix` went quiet past
+ *  `watcher_silent_factor` multiples of its OWN `interval_secs` (judged
+ *  against the overview's `captured_at_unix`) is a task wedged while the
+ *  hub keeps serving.
+ */
+export type WatcherFaceRowDto = {
+	/**  The task's registry name (stable across restarts). */
+	name: string,
+	/**
+	 *  The task's own loop cadence, seconds — the silence judgment's
+	 *  anchor.
+	 */
+	interval_secs: number,
+	/**  Unix seconds of this row's (re-)registration. */
+	started_unix: number,
+	/**  Unix seconds of the last loop pass. */
+	last_tick_unix: number,
 };
 
 /* Tauri Specta runtime */

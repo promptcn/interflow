@@ -89,10 +89,10 @@ async fn facade_round_trip(
         &key.display().to_string(),
     )
     .map_err(|e| InterflowError::connection(format!("inner material")).with_source(e))?;
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(
+    let connector = tokio_rustls::TlsConnector::from(
         inner_client_config(&material, target_agent)
             .map_err(|e| InterflowError::connection(format!("inner connector")).with_source(e))?,
-    ));
+    );
     let adapter = E2eTunnelIo::ingress(data_rx, tunnel.clone(), sid);
     let mut tls = match inner_tls_connect(adapter, connector, Duration::from_secs(5)).await {
         E2eHandshakeOutcome::Established(tls, _) => tls,

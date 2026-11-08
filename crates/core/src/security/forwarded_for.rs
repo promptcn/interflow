@@ -3,7 +3,7 @@
 //! Stock nginx's HTTP `proxy_pass` cannot emit the PROXY protocol (that
 //! directive exists only in the stream module), so behind the standard
 //! topology every public connection arrives at the edge from the proxy's
-//! loopback address — per-IP rate limits, per-IP connection caps and audit
+//! loopback address — per-client rate limits, per-client connection caps
 //! records would all key on the proxy instead of the client. This module
 //! restores the real client IP from the de-facto standard
 //! `X-Forwarded-For` header under a strict trust model:

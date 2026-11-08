@@ -15,17 +15,27 @@
 //! - [`http`]      — wire contracts of the operator HTTP surface (typed `/agents` response)
 //! - [`snapshot`]  — `GET /snapshot`: the fleet's steady-state picture (upgrade-acceptance data plane)
 //! - [`crl`]       — the CRL hot-distribution channel (`PUT /crls`): plane hot-swap + revocation sweep
+//! - [`crl_liveness`] — the CRL-poll liveness face (`POST /crls/liveness`): renewal-loop levels + recency sweep
+//! - [`watchdog`]   — the resident-task armed-assertion face (register + tick + silence sweep)
+//! - [`floor_clock`] — the floor version clock: the change signal `GET /policy/floor/version` holds on
 //! - [`state`]     — shared state: `TunnelData`, `AgentSession`, `ActiveStream`, aliases
 //! - TLS certificate/private key loading and file permission checks: `interflow_core::tls`
 
 pub mod accept;
+pub mod biography;
 pub mod control;
+pub mod credential_watermarks;
 pub mod crl;
+pub mod crl_liveness;
+pub mod floor_clock;
 pub mod handle;
 pub mod handlers;
 pub mod heartbeat;
 pub mod http;
+pub mod maintenance;
+pub mod node_status;
 pub mod policy;
+pub mod policy_watermarks;
 pub mod poll;
 pub mod proposals;
 pub mod quic;
@@ -37,7 +47,12 @@ pub use server::HubDispatchHandle;
 pub mod service;
 pub mod snapshot;
 pub mod state;
+pub mod stream_intents;
+pub mod target_recovery;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod upload;
+pub mod watchdog;
 
 pub use crl::{CrlChannel, PublishCrlsOutcome, publish_crls};
 pub use handle::{HubHandle, HubLifecycle};

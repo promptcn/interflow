@@ -21,7 +21,7 @@
 
 use crate::config::HubConfig;
 use crate::hub::service::HubService;
-use crate::hub::state::{CONTROL_TENANT, HubResponseBody, HubState};
+use crate::hub::state::{CONTROL_TENANT, HubResponseBody, HubState, PeerIdentity};
 use http::Request;
 use http::Response;
 use http::StatusCode;
@@ -134,6 +134,18 @@ pub struct CrlChannel {
     /// (an evicted revoked agent otherwise resurrects itself over a
     /// still-open h2 connection; the acceptor only gates NEW ones).
     pub current: std::sync::Mutex<BTreeMap<String, String>>,
+    /// Pre-parsed revoked-serial sets per stem (2026-11-04 audit §3.2),
+    /// swapped together with [`Self::current`] by [`Self::swap_current`]:
+    /// the registration gate's membership query is a hash lookup, not a
+    /// PEM→DER→BigUint re-parse per check.
+    pub(crate) revoked: std::sync::Mutex<BTreeMap<String, std::collections::HashSet<String>>>,
+    /// Unix seconds of the last accepted plane reload — the CRL face's
+    /// "when did the counters last move" half (2026-10-19 liveness face:
+    /// the counters say WHAT is enforced, this says WHEN it last
+    /// changed; neither says the poll loop is alive — that is
+    /// `crl_liveness`'s job). Monotonic fetch_max; 0 = never since
+    /// process start.
+    pub(crate) last_reload_unix: std::sync::atomic::AtomicU64,
 }
 
 impl CrlChannel {
@@ -145,18 +157,74 @@ impl CrlChannel {
             .clone()
     }
 
-    /// Whether the CRLs currently in force revoke the given serial.
+    /// Unix seconds of the last accepted plane reload (0 = none since
+    /// process start).
+    pub fn last_reload_unix(&self) -> u64 {
+        self.last_reload_unix
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether the CRLs currently in force revoke the given serial — an
+    /// O(1) membership query on the pre-parsed set (absent stem / unparsed
+    /// CRL = cannot judge = not revoked, the same answer the old
+    /// re-parsing query gave on parse failure).
     pub fn revokes(&self, stem: &str, serial: &str) -> bool {
-        let current = self
+        let revoked = self
+            .revoked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        revoked.get(stem).is_some_and(|set| {
+            set.contains(&interflow_identity::revocation::normalize_serial_hex(
+                serial,
+            ))
+        })
+    }
+
+    /// Swaps the enforced PEMs AND their pre-parsed serial sets together
+    /// (the single writer for both maps; the two reader queries can never
+    /// observe a mixed generation). A PEM that fails to pre-parse keeps an
+    /// empty set for its stem — the membership gate then answers "not
+    /// revoked" for it, exactly the old per-query parse-failure behavior.
+    pub(crate) fn swap_current(&self, pems: BTreeMap<String, String>) {
+        let mut revoked = BTreeMap::new();
+        for (stem, pem) in &pems {
+            match interflow_identity::revocation::crl_revoked_serials(pem) {
+                Ok(set) => {
+                    revoked.insert(stem.clone(), set);
+                }
+                Err(e) => {
+                    tracing::warn!("CRL {stem:?} failed to pre-parse for the membership gate: {e}");
+                }
+            }
+        }
+        let mut current = self
             .current
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        current.get(stem).is_some_and(|pem| {
-            matches!(
-                interflow_identity::revocation::crl_revokes_serial(pem, serial),
-                Ok(Some(true))
-            )
-        })
+        *current = pems;
+        *self
+            .revoked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = revoked;
+    }
+}
+
+impl HubState {
+    /// Whether the presented identity's leaf is revoked by the CRLs the
+    /// hub currently enforces — the registration core's live gate,
+    /// identity-sourced (no connection state): every transport arm
+    /// consults it through the core. The handshake acceptor only gates
+    /// NEW h2 connections (and the QUIC handshake never carries CRLs);
+    /// an evicted revoked agent otherwise resurrects itself over a
+    /// still-open connection, exactly the resurrection the revocation
+    /// sweep exists to prevent.
+    pub(crate) fn credential_revoked(&self, identity: &PeerIdentity) -> Option<String> {
+        let serial = identity.leaf_serial_hex.as_ref()?;
+        let stem = tenant_crl_stem(&identity.tenant);
+        self.crl_channel
+            .as_ref()?
+            .revokes(&stem, serial)
+            .then(|| serial.clone())
     }
 }
 
@@ -210,14 +278,15 @@ pub(crate) async fn reload_tls_plane(state: &HubState) -> Result<ReloadCrlsRepor
             }
         }
     }
-    // The registration gates' membership source tracks the swap.
-    {
-        let mut current = channel
-            .current
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *current = pems.clone();
-    }
+    // The registration gates' membership source tracks the swap (the PEMs
+    // and their pre-parsed serial sets move together).
+    channel.swap_current(pems.clone());
+    // The reload recency half of the CRL face moves with every accepted
+    // swap (push and pull lanes alike — this is their convergence point).
+    channel.last_reload_unix.fetch_max(
+        u64::try_from(interflow_identity::expiry::now_unix()).unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // THE swap: every subsequent accept/derive/registration reads the new
     // plane. Failure before this line leaves the old plane in force.
     *state
@@ -280,41 +349,17 @@ struct CrlPushBody {
     crls: BTreeMap<String, String>,
 }
 
+/// The shared denial response of the registration gates (the h2 response
+/// half only — the metric + audit attribution lives in the registration
+/// core, where every transport arm gets it once).
+pub(crate) fn revoked_credential_response() -> Response<HubResponseBody> {
+    crate::hub::service::text_response(
+        StatusCode::FORBIDDEN,
+        "credential revoked — rotate the node and re-register",
+    )
+}
+
 impl HubService {
-    /// Whether THIS connection's credential is revoked by the CRLs the
-    /// hub currently enforces — the registration paths' live gate. The
-    /// handshake acceptor only gates NEW connections; an evicted revoked
-    /// agent otherwise resurrects itself over a still-open h2 connection
-    /// via implicit re-registration, exactly the resurrection the
-    /// revocation sweep exists to prevent.
-    pub(crate) async fn connection_credential_revoked(&self) -> Option<String> {
-        let identity = self.identity().await?;
-        let serial = identity.leaf_serial_hex.as_ref()?;
-        let stem = tenant_crl_stem(&identity.tenant);
-        self.state
-            .crl_channel
-            .as_ref()?
-            .revokes(&stem, serial)
-            .then(|| serial.clone())
-    }
-
-    /// The shared denial shape of the registration gates.
-    pub(crate) fn revoked_credential_denied(&self, serial: &str) -> Response<HubResponseBody> {
-        metrics::counter!("interflow_hub_auth_failures", "reason" => "credential_revoked")
-            .increment(1);
-        self.state.audit.record(
-            AuditKind::AgentRegisterDenied {
-                reason: format!("credential_revoked (serial {serial})"),
-            },
-            None,
-            Some(self.peer_str()),
-        );
-        super::service::text_response(
-            StatusCode::FORBIDDEN,
-            "credential revoked — rotate the node and re-register",
-        )
-    }
-
     /// Publishes a CRL set. Identity contract mirrors `PUT /policy`: the
     /// connection must present a control-plane principal (realm-anchored).
     ///
@@ -542,7 +587,7 @@ pub async fn publish_crls(
     let future = async {
         let mut send_request = super::policy::control_plane_dial(
             hub_endpoint,
-            ca_path,
+            super::policy::ServerTrust::Ca(ca_path),
             client_cert_path,
             client_key_path,
         )

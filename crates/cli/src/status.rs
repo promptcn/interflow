@@ -218,8 +218,30 @@ pub struct AgentDiff {
     /// Pulled-watermark move (`None` = unchanged).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seen_change: Option<SeenChange>,
+    /// Streams that became paused / unpaused between the captures
+    /// (planned unavailability moves — first-class diff facts, never
+    /// silence). Empty = no move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paused_streams_now: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resumed_streams_now: Vec<String>,
+    /// The maintenance declaration moved (declared or lifted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maintenance_change: Option<MaintenanceChange>,
+    /// Whether the leg reads under maintenance in the NEWER capture.
+    pub maintenance_now: bool,
     /// Whether the leg reads online in the newer capture.
     pub online_now: bool,
+}
+
+/// A maintenance-declaration move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceChange {
+    /// Declared between the captures.
+    Declared,
+    /// Lifted between the captures (operator or the node rejoining).
+    Lifted,
 }
 
 /// A build-string move; either side may be `None` (an older agent that
@@ -393,6 +415,39 @@ pub fn compare(old: &FleetSnapshotDoc, new: &FleetSnapshotDoc) -> SnapshotDiff {
                             to: row_new.seen_generation,
                         },
                     ),
+                    paused_streams_now: row_new
+                        .paused_streams
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|name| {
+                            !row_old
+                                .paused_streams
+                                .as_ref()
+                                .is_some_and(|old| old.iter().any(|n| n == name))
+                        })
+                        .collect(),
+                    resumed_streams_now: row_old
+                        .paused_streams
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|name| {
+                            !row_new
+                                .paused_streams
+                                .as_ref()
+                                .is_some_and(|new| new.iter().any(|n| n == name))
+                        })
+                        .collect(),
+                    maintenance_change: match (
+                        row_old.maintenance.unwrap_or(false),
+                        row_new.maintenance.unwrap_or(false),
+                    ) {
+                        (false, true) => Some(MaintenanceChange::Declared),
+                        (true, false) => Some(MaintenanceChange::Lifted),
+                        _ => None,
+                    },
+                    maintenance_now: row_new.maintenance.unwrap_or(false),
                     online_now: row_new.online,
                 });
             }
@@ -404,6 +459,10 @@ pub fn compare(old: &FleetSnapshotDoc, new: &FleetSnapshotDoc) -> SnapshotDiff {
                 transport_change: None,
                 circuit_rotated: false,
                 seen_change: None,
+                paused_streams_now: Vec::new(),
+                resumed_streams_now: Vec::new(),
+                maintenance_change: None,
+                maintenance_now: false,
                 online_now: false,
             }),
         }
@@ -418,6 +477,10 @@ pub fn compare(old: &FleetSnapshotDoc, new: &FleetSnapshotDoc) -> SnapshotDiff {
                 transport_change: None,
                 circuit_rotated: false,
                 seen_change: None,
+                paused_streams_now: Vec::new(),
+                resumed_streams_now: Vec::new(),
+                maintenance_change: None,
+                maintenance_now: row_new.maintenance.unwrap_or(false),
                 online_now: row_new.online,
             });
         }
@@ -537,6 +600,38 @@ pub fn render_diff_text(diff: &SnapshotDiff) -> String {
             _ => {}
         }
         let _ = writeln!(out, "{line}");
+        // Planned-unavailability moves are first-class facts (yellow), so
+        // a diff never mistakes a declared pause for an anomaly — nor
+        // stays silent about one landing.
+        if !leg.paused_streams_now.is_empty() {
+            let _ = writeln!(
+                out,
+                "  ⚠ streams paused (planned): {}",
+                leg.paused_streams_now.join(", ")
+            );
+        }
+        if !leg.resumed_streams_now.is_empty() {
+            let _ = writeln!(
+                out,
+                "  ⚠ streams resumed: {}",
+                leg.resumed_streams_now.join(", ")
+            );
+        }
+        match leg.maintenance_change {
+            Some(MaintenanceChange::Declared) => {
+                let _ = writeln!(
+                    out,
+                    "  ⚠ maintenance declared — the leg's absence is expected, not an accident"
+                );
+            }
+            Some(MaintenanceChange::Lifted) => {
+                let _ = writeln!(
+                    out,
+                    "  ⚠ maintenance lifted (operator or the node rejoining)"
+                );
+            }
+            None => {}
+        }
     }
 
     let (before, after) = diff.online_leg_counts();
@@ -576,6 +671,14 @@ mod tests {
         FleetSnapshotDoc {
             format_version: 1,
             hub: interflow_mesh::hub::snapshot::FleetSnapshotHub {
+                crl_last_success_unix: None,
+                crl_failures_total: None,
+                crl_last_reload_unix: None,
+                route_breakers_open: vec![],
+                watchers: vec![],
+                proposals_pending: None,
+                streams_in_flight_total: None,
+                stream_limits: None,
                 node: Some("promptcn".into()),
                 serving_generation: Some(generation),
                 serving_source: Some(ServingSource::StateLineage),
@@ -595,12 +698,27 @@ mod tests {
         circuit: &str,
     ) -> interflow_mesh::hub::snapshot::FleetSnapshotAgent {
         interflow_mesh::hub::snapshot::FleetSnapshotAgent {
+            crl_last_success_unix: None,
+            crl_failures_total: None,
+            pending_ops: None,
+            streams_in_flight: None,
+            streams: vec![],
+            leaf_not_before_unix: None,
+            leaf_not_after_unix: None,
+            credential_mode: None,
+            credential_last_seen_unix: None,
+            connection: None,
+            renewal_backoff_failures: None,
+            renewal_backoff_max_today: None,
             agent: agent.to_owned(),
             online,
             seen_generation: Some(15),
+            last_pull_unix: None,
             build: build.map(str::to_owned),
             transport: Some(SnapshotTransport::Quic),
             circuit: Some(circuit.repeat(16)),
+            paused_streams: None,
+            maintenance: None,
         }
     }
 

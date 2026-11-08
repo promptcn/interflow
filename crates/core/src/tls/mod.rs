@@ -7,11 +7,11 @@ pub mod inner;
 pub mod server;
 pub mod tenant;
 
-pub use cert_pin::{PinError, PinnedCertVerifier, make_pinned_verifier};
+pub use cert_pin::{PinError, PinnedCertVerifier, make_pinned_verifier, sha256_of_pem_cert};
 pub use inner::{
     INNER_QUIC_ALPN, INNER_SERVER_NAME, InnerTlsMaterial, classify_handshake_error,
-    inner_client_config, inner_quic_client_config, inner_quic_server_name, inner_server_config,
-    inner_server_config_unbound,
+    inner_client_config, inner_quic_client_config, inner_quic_server_config_unbound,
+    inner_quic_server_name, inner_server_config, inner_server_config_unbound,
 };
 pub use server::{
     TlsMinVersion, build_mtls_acceptor, build_rustls_server_config_with_roots,

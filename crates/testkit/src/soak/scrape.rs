@@ -65,6 +65,14 @@ pub fn counter_value(text: &str, name: &str) -> Option<u64> {
     found.then_some(sum)
 }
 
+/// Read a gauge family: the same text shape as a counter (`name{labels} value`),
+/// summed across its series. For a single-series family (one `limiter` label
+/// value per process) that is the gauge's current level. Returns None if the
+/// family is absent — a gauge that was never set has no level to assert on.
+pub fn gauge_value(text: &str, name: &str) -> Option<u64> {
+    counter_value(text, name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +110,16 @@ interflow_hub_heartbeat_supervisor_restarts 0
     #[test]
     fn missing_counter_returns_none() {
         assert_eq!(counter_value(FIXTURE, "interflow_hub_absent"), None);
+    }
+
+    #[test]
+    fn gauge_reads_its_single_series_level() {
+        let text = "# TYPE interflow_rate_limit_tracked_clients gauge\n\
+                    interflow_rate_limit_tracked_clients{limiter=\"hub\"} 6144\n";
+        assert_eq!(
+            gauge_value(text, "interflow_rate_limit_tracked_clients"),
+            Some(6144)
+        );
+        assert_eq!(gauge_value(text, "interflow_rate_limit_absent"), None);
     }
 }

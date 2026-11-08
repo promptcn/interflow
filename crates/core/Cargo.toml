@@ -30,8 +30,8 @@ interflow-buildinfo.workspace = true
 tokio = { workspace = true }
 
 # HTTP/2
-hyper = { version = "1.10", features = ["full", "http2"] }
-http = "1.4"
+hyper = { workspace = true, features = ["full", "http2"] }
+http = { workspace = true }
 http-body-util = "0.1.3"
 
 # Async utilities
@@ -40,7 +40,7 @@ async-trait = "0.1"
 
 # Config / serialization
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = { workspace = true }
 toml = "1"
 # Home-directory lookup for tilde expansion (config path normalization)
 dirs = { workspace = true }
@@ -50,11 +50,11 @@ dirs = { workspace = true }
 fs2 = { workspace = true }
 
 # Error handling
-thiserror = "2"
+thiserror = { workspace = true }
 
 # Audit-chain timestamps (ISO 8601 UTC, second precision); also used by the
 # inner-TLS verifier tests to construct explicit validity windows
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { workspace = true, features = ["formatting", "macros"] }
 
 # Byte buffers (frame codec)
 bytes = "1.12"
@@ -62,27 +62,27 @@ bytes = "1.12"
 getrandom = "0.4.3"
 
 # Logging / metrics
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 
 # QUIC transport (rustls provider matches the rustls above: aws-lc-rs)
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
+quinn = { workspace = true }
 quinn-proto = { version = "0.11.17", default-features = false, features = ["rustls-aws-lc-rs", "log"] }
 
 # TLS (rustls-only, openssl forbidden)
-rustls = "0.23"
-rustls-pemfile = "2.2.0"
-tokio-rustls = "0.26.4"
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
 rustls-native-certs = "0.8.4"
 
 # mTLS: extract the CN from client certificates for agent identity binding
-x509-parser = "0.18"
+x509-parser = { workspace = true }
 
 # Cert pinning: SHA256 fingerprint verification + hex encode/decode
-sha2 = "0.11"
-hex = "0.4"
+sha2 = { workspace = true }
+hex = { workspace = true }
 # Audit-log rotation: gzip-compressing sealed segments (flate2 is already
 # in the dependency tree via the QUIC/TLS ecosystem; miniz_oxide backend,
 # pure Rust, no new system dependencies)
@@ -103,7 +103,7 @@ ipnetwork = "0.21.1"
 tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
-criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
+criterion = { workspace = true }
 # Property-based tests for the hand-written wire codecs (tests/frame_proptest.rs):
 # arbitrary bytes, mutations, truncations, splices — the decoder must never
 # panic and must preserve its buffer-consumption contract.
@@ -114,7 +114,7 @@ interflow-certs.workspace = true
 # Paused clock (start_paused) for unit tests to deterministically verify the INCOMING_SEND_TIMEOUT path
 tokio = { workspace = true, features = ["test-util"] }
 # Audit rotation/persistence unit tests: isolated segment directories
-tempfile = "3"
+tempfile = { workspace = true }
 
 # ============================================================================
 # Benchmarks (criterion)
@@ -123,3 +123,13 @@ tempfile = "3"
 name = "frame_codec"
 harness = false
 path = "benches/frame_codec.rs"
+
+[[bench]]
+name = "tunnel_dispatch"
+harness = false
+path = "benches/tunnel_dispatch.rs"
+
+[[bench]]
+name = "inner_tls_config"
+harness = false
+path = "benches/inner_tls_config.rs"

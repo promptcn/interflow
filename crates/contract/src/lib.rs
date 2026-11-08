@@ -18,7 +18,19 @@
 /// unknown caps bits — never bumps the epoch (documentation/versioning.md,
 /// "Format epoch"). A breaking change must pair the bump with a MINOR
 /// release and a CHANGELOG migration section.
-pub const FORMAT_VERSION: u8 = 1;
+///
+/// Epoch 2 (2026-11-03, the breaking-refactor batch): the signed Runtime
+/// Policy's `services[].address` and `mesh_egress` became required keys —
+/// the absent-field serde shims that read policies signed before those keys
+/// existed were retired with the epoch. Every pack re-renders; there is no
+/// migration path by design.
+///
+/// Epoch 3 (2026-11-04, the epoch-2 redeploy follow-up batch): the Runtime
+/// Policy gained the required `nodes` fleet-roster face — membership became a
+/// signed fact so host-side reconciliation can tell a retired or renamed
+/// node's leftovers from a serving member. Same terms: every pack re-renders,
+/// no migration path.
+pub const FORMAT_VERSION: u8 = 3;
 
 /// The generational-handle contract.
 ///

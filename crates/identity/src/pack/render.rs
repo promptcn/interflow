@@ -494,7 +494,7 @@ fn render_pack(
 /// `rotate` can fold the embedded CRL snapshot (`trust/crls/`) into the
 /// digest manifest.
 pub fn write_digests(dir: &Path) -> Result<()> {
-    let mut entries = collect_files(dir, dir)?;
+    let mut entries = collect_files(dir)?;
     entries.sort();
     let mut sums = String::new();
     for rel in entries {
@@ -512,38 +512,30 @@ pub fn write_digests(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn collect_files(root: &Path, dir: &Path) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| Error::Io {
-        path: dir.display().to_string(),
+fn collect_files(root: &Path) -> Result<Vec<String>> {
+    let walk = interflow_util::walk_sorted(root).map_err(|e| Error::Io {
+        path: root.display().to_string(),
         source: e,
-    })? {
-        let entry = entry.map_err(|e| Error::Io {
-            path: dir.display().to_string(),
-            source: e,
-        })?;
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(collect_files(root, &path)?);
-        } else {
-            let rel = path
-                .strip_prefix(root)
-                .map_err(|e| Error::pack("path handling".to_string()).with_source(e))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            if rel != "SHA256SUMS" && rel != "state" && !rel.starts_with("state/") {
-                out.push(rel);
-            }
-        }
-    }
-    Ok(out)
+    })?;
+    Ok(walk
+        .into_iter()
+        .filter(|entry| {
+            !entry.is_dir
+                && entry.rel != "SHA256SUMS"
+                && entry.rel != "state"
+                && !entry.rel.starts_with("state/")
+        })
+        .map(|entry| entry.rel)
+        .collect())
 }
 
 /// The endpoint's host when it is a DNS name (an IP literal carries no SNI,
-/// so public-port dispatch cannot key on it).
+/// so public-port dispatch cannot key on it). Parsed through the shared
+/// authority parser — a hand-rolled `split_once(':')` truncated IPv6
+/// literals at the first colon; an unparseable endpoint yields no dispatch
+/// host, exactly as before.
 fn dns_host(endpoint: &str) -> Option<String> {
-    let rest = endpoint.split_once("://").map_or(endpoint, |(_, r)| r);
-    let host = rest.split_once(':').map_or(rest, |(h, _)| h);
+    let host = interflow_util::parse_endpoint(endpoint).ok()?.host;
     let looks_dns = !host.is_empty()
         && host
             .chars()
@@ -573,4 +565,35 @@ fn write_private_key(path: &Path, pem: &str) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dns_host;
+
+    /// The SNI dispatch host extraction parses through the shared authority
+    /// parser: DNS names arrive whole (lowercased), IPv6 literals carry no
+    /// SNI and yield none — never a bracket truncated at the first colon.
+    #[test]
+    fn dns_host_extracts_names_and_rejects_ip_literals() {
+        assert_eq!(
+            dns_host("https://relay.example.com:443"),
+            Some("relay.example.com".to_owned())
+        );
+        assert_eq!(
+            dns_host("relay.example.com:16666"),
+            Some("relay.example.com".to_owned())
+        );
+        assert_eq!(
+            dns_host("relay.example.com"),
+            Some("relay.example.com".to_owned())
+        );
+        // IP literals, IPv4 or IPv6, dispatch on nothing.
+        assert_eq!(dns_host("https://192.0.2.1:443"), None);
+        assert_eq!(dns_host("[2001:db8::1]:443"), None);
+        assert_eq!(dns_host("https://[2001:db8::1]:443"), None);
+        // Garbage fails closed into "no dispatch host".
+        assert_eq!(dns_host("relay example.com"), None);
+        assert_eq!(dns_host(""), None);
+    }
 }

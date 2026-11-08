@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [dependencies]
 interflow-core.workspace = true
 interflow-mesh.workspace = true
+interflow-renewal.workspace = true
 # Shared endpoint/authority parsing (hub QUIC addr derivation, Host routing)
 interflow-util.workspace = true
 # Compile-time build identity (engine startup log line)
@@ -26,20 +27,20 @@ futures = "0.3"
 
 
 # TLS (issuance itself lives in interflow-certs)
-tokio-rustls = "0.26.4"
-rustls = "0.23"
-rustls-pemfile = "2.2.0"
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 # Config / serialization
-serde_json = "1"
+serde_json = { workspace = true }
 
 # Logging
-tracing = "0.1.44"
+tracing = { workspace = true }
 
 
 # Utilities
 bytes = "1.12"
-uuid = { version = "1.23", features = ["v4"] }
+uuid = { workspace = true, features = ["v4"] }
 
 # CLI
 
@@ -57,9 +58,9 @@ workspace = true
 
 [dev-dependencies]
 interflow-certs.workspace = true
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tempfile = "3"
-criterion = { version = "0.8", default-features = false, features = ["async_tokio"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tempfile = { workspace = true }
+criterion = { workspace = true }
 # Shared test harness (certs for the QUIC e2e stack; fault-injection for the
 # self-healing tests; production graph unaffected)
 interflow-testkit = { workspace = true, features = ["fault-injection"] }

@@ -5,12 +5,20 @@
 //! workspace and drives the inner-TLS client side of every stream routed
 //! to it. There is deliberately no cross-workspace identity: a stream for
 //! workspace A never presents workspace B's credential.
+//!
+//! Cache discipline (2026-11-04 hot-path audit §2.5): the active-credential
+//! pointer (`current.json`) is validated by file stamp (mtime + size) —
+//! one `stat` per connection instead of a read + JSON parse. The stamp
+//! compare is a microsecond-scale local syscall, deliberately kept inline
+//! on the async path; only an actual rotation (stamp changed) pays the
+//! read/parse/rebuild, off the async workers via `spawn_blocking`.
 
 use interflow_core::error::{InterflowError, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// One workspace-scoped ingress principal (the engine's only identity
 /// model since the shared-gateway track was retired).
@@ -34,6 +42,11 @@ pub struct WorkspaceTrust {
     pub ca: PathBuf,
 }
 
+/// File stamp for the active-credential pointer: `(mtime, size)`; `None`
+/// when the pointer (or its credential-store root) is absent. A rotation
+/// rewrites `current.json`, changing at least one component.
+type SequenceStamp = Option<(SystemTime, u64)>;
+
 /// The per-deployment ingress identity source: principals plus per-
 /// workspace trust anchors, with a per-workspace inner-TLS material cache.
 pub struct IngressIdentity {
@@ -45,7 +58,15 @@ pub struct IngressIdentity {
     /// `interflow_identity::pack::crl_path_for` — the engine crate does not
     /// depend on the identity crate.
     identity_offline: bool,
-    cache: Mutex<HashMap<String, (u64, Arc<interflow_core::tls::InnerTlsMaterial>)>>,
+    cache: Mutex<HashMap<String, CachedMaterial>>,
+}
+
+/// One workspace's cached material plus the stamp it was validated
+/// against.
+#[derive(Debug)]
+struct CachedMaterial {
+    stamp: SequenceStamp,
+    material: Arc<interflow_core::tls::InnerTlsMaterial>,
 }
 
 impl IngressIdentity {
@@ -103,20 +124,71 @@ impl IngressIdentity {
     /// The inner material for one route's workspace (cached). Missing
     /// anchors and stale certificate files are configuration errors: the
     /// affected stream fails closed instead of proceeding in plaintext.
-    pub fn material_for(
-        &self,
+    ///
+    /// Steady state costs one `stat` of the workspace's credential pointer
+    /// (`current.json`); a stamp change (credential rotation) rebuilds the
+    /// material on the blocking pool.
+    pub async fn material_for(
+        self: &Arc<Self>,
         workspace: &str,
     ) -> Result<Arc<interflow_core::tls::InnerTlsMaterial>> {
-        let current_sequence = self.current_sequence(workspace)?.unwrap_or(0);
-        if let Some((sequence, hit)) = self
-            .cache
-            .lock()
-            .expect("ingress identity cache")
-            .get(workspace)
-            && *sequence == current_sequence
-        {
-            return Ok(Arc::clone(hit));
+        let stamp = self.sequence_stamp(workspace);
+        if let Some(material) = cache_hit(&self.cache, workspace, stamp) {
+            return Ok(material);
         }
+        let identity = Arc::clone(self);
+        let workspace = workspace.to_owned();
+        tokio::task::spawn_blocking(move || identity.rebuild_and_cache(&workspace, stamp))
+            .await
+            .map_err(|e| {
+                InterflowError::config("ingress identity rebuild task".to_string()).with_source(e)
+            })?
+    }
+
+    /// The synchronous shape of [`Self::material_for`] for callers that
+    /// cannot await (the policy-apply watch callback): the same stamp
+    /// cache, with any rebuild inlined. Per-connection paths must use the
+    /// async form so a rotation's disk reads never block the runtime.
+    pub fn material_for_blocking(
+        self: &Arc<Self>,
+        workspace: &str,
+    ) -> Result<Arc<interflow_core::tls::InnerTlsMaterial>> {
+        let stamp = self.sequence_stamp(workspace);
+        if let Some(material) = cache_hit(&self.cache, workspace, stamp) {
+            return Ok(material);
+        }
+        self.rebuild_and_cache(workspace, stamp)
+    }
+
+    /// Stamp of the workspace's active-credential pointer; `None` also
+    /// covers "no credential store" (the base-principal shape) and "no
+    /// pointer file", matching [`Self::read_sequence`]'s fallbacks.
+    fn sequence_stamp(&self, workspace: &str) -> SequenceStamp {
+        let Ok(principal) = self.principal(workspace) else {
+            // Configuration error surfaces on rebuild (fail closed); the
+            // stamp for a principal-less workspace is just "absent".
+            return None;
+        };
+        let root = credentials_root(&principal.cert)?;
+        std::fs::metadata(root.join("current.json"))
+            .ok()
+            .map(|meta| {
+                (
+                    meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    meta.len(),
+                )
+            })
+    }
+
+    /// Rebuilds the workspace material and swaps it into the cache under
+    /// the observed stamp. Runs on the blocking pool (async callers) or
+    /// inline (the policy watch).
+    fn rebuild_and_cache(
+        &self,
+        workspace: &str,
+        stamp: SequenceStamp,
+    ) -> Result<Arc<interflow_core::tls::InnerTlsMaterial>> {
+        let current_sequence = self.read_sequence(workspace)?.unwrap_or(0);
         let ca_path = self.trust.get(workspace).ok_or_else(|| {
             InterflowError::config(format!(
                 "route workspace {workspace:?} has no trust anchor; refusing plaintext ingress stream"
@@ -163,12 +235,18 @@ impl IngressIdentity {
         let material = Arc::new(material);
         self.cache.lock().expect("ingress identity cache").insert(
             workspace.to_string(),
-            (current_sequence, Arc::clone(&material)),
+            CachedMaterial {
+                stamp,
+                material: Arc::clone(&material),
+            },
         );
         Ok(material)
     }
 
-    fn current_sequence(&self, workspace: &str) -> Result<Option<u64>> {
+    /// Reads and parses the active-credential pointer. `None` when there
+    /// is no credential store or no pointer file (the base-principal
+    /// shape); malformed JSON is a configuration error (propagates).
+    fn read_sequence(&self, workspace: &str) -> Result<Option<u64>> {
         let principal = self.principal(workspace)?;
         let Some(root) = credentials_root(&principal.cert) else {
             return Ok(None);
@@ -188,6 +266,20 @@ impl IngressIdentity {
                 })?,
         ))
     }
+}
+
+/// Cached hit under an unchanged stamp: same pointer, no disk read beyond
+/// the caller's `stat`.
+fn cache_hit(
+    cache: &Mutex<HashMap<String, CachedMaterial>>,
+    workspace: &str,
+    stamp: SequenceStamp,
+) -> Option<Arc<interflow_core::tls::InnerTlsMaterial>> {
+    let guard = cache.lock().expect("ingress identity cache");
+    guard
+        .get(workspace)
+        .filter(|entry| entry.stamp == stamp)
+        .map(|entry| Arc::clone(&entry.material))
 }
 
 fn credentials_root(cert: &Path) -> Option<&Path> {
@@ -228,5 +320,127 @@ fn workspace_crl(anchor: &Path, offline: bool) -> Result<Option<String>> {
     } else {
         let live = pack_root.join("state").join("crls").join(&file);
         Ok(live.is_file().then(|| live.display().to_string()))
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::missing_docs_in_private_items
+)]
+mod tests {
+    use super::*;
+    use interflow_certs::{LoadedCa, Validity};
+
+    /// Credential-store layout on disk: `<root>/current/<stem>.crt|.key`,
+    /// the sequence-1 rotated pair, and optionally `current.json` (the
+    /// rotation pointer), mirroring the production store shape
+    /// `credentials_root` recognizes.
+    struct Store {
+        root: PathBuf,
+        ca_pem: PathBuf,
+    }
+
+    fn store(with_pointer: bool) -> Store {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = LoadedCa::generate("bench", Validity::ca_default()).unwrap();
+        let ca_pem = dir.path().join("ca.pem");
+        std::fs::write(&ca_pem, ca.cert_pem()).unwrap();
+
+        let root = dir.path().join("store");
+        let current = root.join("current");
+        std::fs::create_dir_all(&current).unwrap();
+        let leaf = ca
+            .build_client_cert("edge", Validity::leaf_default())
+            .unwrap();
+        std::fs::write(current.join("edge.crt"), &leaf.cert_pem).unwrap();
+        write_secret(&current.join("edge.key"), &leaf.key_pem);
+
+        let seq_dir = root.join("sequences").join("1");
+        std::fs::create_dir_all(&seq_dir).unwrap();
+        let rotated = ca
+            .build_client_cert("edge", Validity::leaf_default())
+            .unwrap();
+        std::fs::write(seq_dir.join("edge.crt"), &rotated.cert_pem).unwrap();
+        write_secret(&seq_dir.join("edge.key"), &rotated.key_pem);
+        if with_pointer {
+            std::fs::write(root.join("current.json"), r#"{"sequence":1}"#).unwrap();
+        }
+        // The tempdir outlives the material (fully loaded into memory); the
+        // test process is short-lived and `TempDir` drop would remove the
+        // tree before later assertions re-stat it — keep it for the run.
+        std::mem::forget(dir);
+        Store { root, ca_pem }
+    }
+
+    /// Writes a key file with owner-only permissions (the loader's
+    /// 0600 requirement).
+    fn write_secret(path: &Path, pem: &str) {
+        std::fs::write(path, pem).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
+
+    fn identity(store: &Store) -> Arc<IngressIdentity> {
+        Arc::new(
+            IngressIdentity::new(
+                vec![IngressPrincipal {
+                    workspace: "test".into(),
+                    cert: store.root.join("current").join("edge.crt"),
+                    key: store.root.join("current").join("edge.key"),
+                }],
+                vec![WorkspaceTrust {
+                    workspace: "test".into(),
+                    ca: store.ca_pem.clone(),
+                }],
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn stamp_unchanged_serves_cached_material() {
+        let store = store(false);
+        let identity = identity(&store);
+        let first = identity.material_for("test").await.unwrap();
+        let second = identity.material_for("test").await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged stamp must serve the cached Arc (no rebuild)"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_rebuilds_material() {
+        let store = store(false);
+        let identity = identity(&store);
+        let first = identity.material_for("test").await.unwrap();
+
+        // Rotate: the pointer appears (stamp None → Some), pointing at the
+        // sequence-1 credential.
+        std::fs::write(store.root.join("current.json"), r#"{"sequence":1}"#).unwrap();
+
+        let second = identity.material_for("test").await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "stamp change (rotation) must rebuild the material"
+        );
+    }
+
+    #[test]
+    fn blocking_form_matches_async_cache() {
+        let store = store(false);
+        let identity = identity(&store);
+        let first = identity.material_for_blocking("test").unwrap();
+        let second = identity.material_for_blocking("test").unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

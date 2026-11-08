@@ -51,13 +51,34 @@ use crate::pack::{
     policy_service_egress_rules,
 };
 
-/// How often the node-local policy update channel (`state/policy`) is
-/// polled — the renewal scheduler's polling discipline (no platform watch
+/// How often the node-local policy update channel (`state/policy`) is polled.
+///
+/// The renewal scheduler's polling discipline (no platform watch
 /// dependencies); one interval of latency is well inside the product goal
 /// for policy changes ("minutes, not days"). Session establishment (the
 /// `Connected` state transition) triggers an immediate pull on top of this
 /// cadence, so a re-registering agent converges in ~1s, not one interval.
-pub(crate) const POLICY_WATCH_INTERVAL: Duration = Duration::from_secs(10);
+///
+/// Public because the READ side judges recency against it: the hub's
+/// watermark face sweeper, `doctor link --hub`'s silent reading, and the
+/// GUI's per-leg recency chip all derive their threshold from this one
+/// cadence constant (no consumer-carried lore).
+pub const POLICY_WATCH_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How many missed watch intervals make a leg's policy face SILENT.
+///
+/// The recency class the fleet faces distinguish
+///. The criterion
+/// is "an integral multiple of the convergence window with no pull": one
+/// or two missed ticks are known transients (a mid-rebuild session, a
+/// flapping link); three quiet intervals match no healthy or transient
+/// cadence, so the absence is the signal.
+pub const POLICY_SILENT_AFTER_TICKS: u64 = 3;
+
+/// [`POLICY_SILENT_AFTER_TICKS`] in seconds — the single-source threshold
+/// every recency judgment reads.
+pub const POLICY_SILENT_AFTER_SECS: u64 =
+    POLICY_SILENT_AFTER_TICKS * POLICY_WATCH_INTERVAL.as_secs();
 
 /// One point-in-time reading of [`PolicyWatchState`]'s six live values.
 ///
@@ -305,6 +326,12 @@ async fn run(
         .map(crate::config::ServiceAddresses::subscribe);
 
     loop {
+        // Fault-injection call point (feature-gated no-op in production):
+        // an armed plan panics HERE, killing the watcher task silently
+        // under the agent's TaskTracker — the "watermark frozen, node
+        // healthy" failure class the hub-side watermark face's recency
+        // dimension and its sweeper exist to expose.
+        interflow_core::fault::trigger(interflow_core::fault::FaultPoint::AgentPolicyWatchTick);
         watch.last_tick_unix.store(now_unix(), Ordering::Release);
         // Publish at the top of every iteration: the previous iteration's
         // writes (wherever they happened — pull branches, `try_reload`, a

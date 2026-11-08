@@ -39,7 +39,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::{RwLock, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 impl HubService {
     /// Handles a `POST /stream/up` long-lived upload request.
@@ -209,7 +209,7 @@ impl HubService {
             if let Some(state_arc) = state_arc {
                 state_arc.write().await.last_pong = Instant::now();
                 metrics::counter!("interflow_hub_pong_received", "path" => "upload").increment(1);
-                debug!("agent circuit={circuit} heartbeat Pong (upload data stream)");
+                trace!("agent circuit={circuit} heartbeat Pong (upload data stream)");
             }
             return true;
         }

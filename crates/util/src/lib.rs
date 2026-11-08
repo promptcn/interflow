@@ -10,6 +10,7 @@ pub mod authority;
 pub mod defaults;
 pub mod digest;
 pub mod error_chain;
+pub mod fs_tree;
 pub mod systemd;
 
 pub use atomic_write::{WriteMode, atomic_write};
@@ -20,3 +21,4 @@ pub use defaults::{
 };
 pub use digest::sha256_hex;
 pub use error_chain::format_chain;
+pub use fs_tree::{WalkEntry, copy_dir_recursive, walk_sorted};
