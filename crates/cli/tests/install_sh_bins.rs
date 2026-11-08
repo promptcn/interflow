@@ -1,9 +1,12 @@
+#![cfg(unix)]
 //! Execution-level tests for the generated `install.sh` — the real script,
 //! run end-to-end in its self-contained `--root` layout (the same contract
 //! `node install --root` offers). The byte-identical skip is the point: a
 //! second realm's install on the same machine must leave unchanged binaries
 //! — same inode, same mtime — or the disk-swap detection fires on nodes
-//! running the very same build.
+//! running the very same build. Unix-only end to end: the script is a bash
+//! bootstrap and the assertions ride the inode, so the file compiles empty
+//! elsewhere (the msvc clippy face died on `std::os::unix` before the gate).
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};

@@ -267,8 +267,23 @@ jobs:
           tool: cargo-nextest
       - name: build (workspace, gui excluded)
         run: cargo build --locked --workspace --exclude interflow-gui
+      # Warnings on this face are invisible to every local gate and to the
+      # ubuntu clippy job (platform-conditional code compiles per target), so
+      # the step converts each rustc/clippy diagnostic into a public
+      # ::error:: annotation — the same failure-visibility channel the test
+      # stages use. Without it the 0.12.0 cut burned two blind ci rounds on
+      # an msvc-only face (const-for-fn, a unix-API test file).
       - name: clippy (msvc target)
-        run: cargo clippy --workspace --exclude interflow-gui --all-targets --all-features
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --exclude interflow-gui --all-targets --all-features \
+            2>&1 | sed 's/\x1b\[[0-9;]*m//g' | tee msvc-clippy.log || {
+            awk '/^(warning|error)(\[|:)/ { msg = $0; sub(/^(warning|error)(\[[^]]*\])?: /, "", msg) }
+                 /^[[:space:]]*-->/ { loc = $0; sub(/^[[:space:]]*--> /, "", loc); split(loc, a, ":");
+                   if (a[1] != "") printf "::error file=%s,line=%s::clippy: %s\n", a[1], a[2], msg }' msvc-clippy.log || true
+            exit 1
+          }
       - name: unit tests on the Windows risk classes (NTFS atomic writes, SQLite store, config/paths)
         run: cargo nextest run --all-features --lib -p interflow-util -p interflow-identity -p interflow-core -p interflow-buildinfo -p interflow-contract
       - name: mesh smoke (version face, pack assembly, agent lifecycle)

@@ -786,6 +786,14 @@ the first public release carrying this changelog.
   it; the windows-smoke job caught it): `const` now, in step with the
   stub conventions elsewhere (`same_device` is const, `chown_tree` allows
   the lint). No behavior change.
+- The install.sh execution tests rode `std::os::unix`'s inode face
+  through an ungated module import, a hard compile error on the msvc
+  test face (the build step compiles bins only and stayed green — the
+  blind spot survived a ci round): the file is `#![cfg(unix)]` now,
+  empty elsewhere — it runs a bash bootstrap and asserts inodes, unix
+  end to end. The windows clippy step also converts its diagnostics
+  into public annotations, the channel the test stages already use.
+  No production code changed.
 
 ### Security
 
