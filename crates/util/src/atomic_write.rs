@@ -61,11 +61,31 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: WriteMode) -> io::Result<()
         return Err(e);
     }
 
-    if let Err(e) = tmp.persist(path) {
-        // persist consumed the temp file handle; its error carries the file
-        // back — remove the leftover explicitly, best-effort.
-        let _ = std::fs::remove_file(e.file.path());
-        return Err(e.error);
+    // The rename-over is atomic, but on Windows a concurrent replace of
+    // the same target can transiently refuse with a sharing violation
+    // (the "NTFS atomic writes" risk face): the persist error carries the
+    // temp file back, so a bounded retry rides out the microsecond-scale
+    // collision window. On unix a rename refusal is permanent (permissions,
+    // read-only) and never retried.
+    let mut attempt = 0u32;
+    let mut outcome = tmp.persist(path);
+    loop {
+        match outcome {
+            Ok(_) => break,
+            Err(e) if attempt < 5 && is_transient_rename_refusal(&e.error) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    u64::from(2 * attempt),
+                ));
+                outcome = e.file.persist(path);
+            }
+            Err(e) => {
+                // persist consumed the temp file handle; its error carries
+                // the file back — remove the leftover explicitly, best-effort.
+                let _ = std::fs::remove_file(e.file.path());
+                return Err(e.error);
+            }
+        }
     }
 
     // Unix: best-effort fsync of the parent directory so the rename itself
@@ -77,6 +97,20 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: WriteMode) -> io::Result<()
     }
 
     Ok(())
+}
+
+/// A rename-over refusal worth retrying: on Windows a concurrent replace
+/// of the same target surfaces as a permission-denied sharing violation
+/// that clears in microseconds; on unix the same kind is a permanent
+/// permission fact and retrying would only burn the budget.
+#[cfg(windows)]
+fn is_transient_rename_refusal(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+#[cfg(not(windows))]
+fn is_transient_rename_refusal(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// Applies the [`WriteMode`] policy to the staged temp file.

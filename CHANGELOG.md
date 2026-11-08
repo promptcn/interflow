@@ -816,6 +816,11 @@ the first public release carrying this changelog.
   the ledger itself is never locked, single-writer holds across
   processes on both platforms, and the fd closes with the last sink
   handle — the claim's exact lifetime.
+- `atomic_write`'s rename-over now retries a bounded five times on the
+  Windows-only transient refusal (a concurrent replace of the same
+  target surfaces as a microsecond-scale sharing violation; unix rename
+  refusals are permanent and never retried) — the "NTFS atomic writes"
+  risk face caught it through the same unit-test window.
 
 ### Security
 
